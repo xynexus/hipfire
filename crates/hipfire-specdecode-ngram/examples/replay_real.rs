@@ -232,12 +232,10 @@ fn main() {
             100.0 * s.marginal_acceptance(d)
         );
     }
-    println!("\noptimal draft width by slot-cost ratio r = c1/(c0+c1):");
-    println!("  (r = marginal cost of one verify slot as a fraction of a full AR");
-    println!("   step — a per-arch constant measured offline, never a clock)");
-    for r in [0.02f64, 0.05, 0.10, 0.20, 0.40] {
-        println!("    r={r:<5} -> optimal width {}", s.optimal_width(r, 64));
-    }
+    println!("\n  (choosing the width is BlockController's job — it argmaxes committed");
+    println!("   tokens per window wall-time from live timing. This curve is the");
+    println!("   diagnostic: it shows how slowly acceptance decays with depth, and");
+    println!("   that depth 1 beats depth 0 because of the inline next2 pair.)");
     println!(
         "\n--- tier attribution (first hit wins, so each row is that tier's marginal value) ---"
     );

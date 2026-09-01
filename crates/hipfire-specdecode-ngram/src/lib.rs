@@ -61,7 +61,6 @@
 
 pub mod cold;
 pub mod hot;
-pub mod slot_cost;
 
 use std::io;
 use std::path::{Path, PathBuf};
@@ -303,11 +302,17 @@ impl NgramStats {
     ///   acceptance still exceeds `r`.
     ///
     /// Both knobs are approximations of one rule: stop drafting when the
-    /// marginal acceptance falls below the marginal slot cost. This curve is the
-    /// left-hand side, measured; `r` is the right-hand side, and it has to come
-    /// from an offline per-arch measurement (the shape
-    /// `benchmarks/perf-baselines/gfx*.json` already holds) because no count can
-    /// supply a time ratio.
+    /// marginal acceptance falls below the marginal slot cost.
+    ///
+    /// **Choosing the width is not this type's job.**
+    /// `hipfire_specdecode_dspark::dspark_block_controller::BlockController`
+    /// already does it, better, and is explicitly drafter-agnostic — it argmaxes
+    /// `tau(N) / (t_ar + (N-1)*dt)`, i.e. committed tokens per window wall-time,
+    /// which is tok/s directly rather than the greedy marginal rule this curve
+    /// would support. The n-gram drafter feeds it from `generate.rs` like DFlash
+    /// does. This curve stays as a DIAGNOSTIC: it is what showed depth 1 beating
+    /// depth 0, which is a property of the store (the inline `next2` pair) that
+    /// a width controller has no reason to surface.
     ///
     /// ## Measured curve (`replay_real`, 400k tokens of this repo's Rust)
     ///
@@ -327,26 +332,14 @@ impl NgramStats {
     /// BETTER prediction than a fresh probe, which is a direct validation of the
     /// inline-pair design — it is not merely free, it is more accurate.
     ///
-    /// **The optimal width is wide unless slots are expensive.** Reading
-    /// [`optimal_width`](Self::optimal_width) off this curve:
-    ///
-    /// | r | optimal width |
-    /// |---|---|
-    /// | 0.02 | 16 (the cap) |
-    /// | 0.05 | 16 |
-    /// | 0.10 | 16 |
-    /// | 0.20 | 11 |
-    /// | 0.40 | 5 |
-    ///
-    /// So if the target forward is bandwidth-bound — which this module's own
-    /// header asserts — then `c0` dominates, `r` is SMALL, and the right move is
-    /// to draft **more**, not less. That is the opposite direction to
-    /// `min_acceptance`, and it means the gate is only the right tool on a part
-    /// where a verify slot is genuinely expensive (`r >= 0.2`).
-    ///
-    /// Neither knob should be set from taste. Measure `r` once per arch, read
-    /// the width off this curve, and both `min_acceptance` and `chain_floor`
-    /// follow from one number instead of a sweep.
+    /// **The curve decays slowly, which argues for a wide draft.** Marginal
+    /// acceptance is still 24.8% at depth 8 and 14.3% at depth 14, so on a
+    /// bandwidth-bound part — where an extra verify slot is nearly free, which
+    /// this module's header asserts is the usual case — the throughput-optimal
+    /// move is to draft MORE, not less. That is the opposite direction to
+    /// `min_acceptance`, which is only the right tool where a slot is genuinely
+    /// dear. `BlockController` decides that from live window timing; this curve
+    /// only explains why its answer is usually "wide".
     ///
     /// Deliberately NOT derived from a clock. A wall-clock term would make the
     /// bar depend on thermals and on which other requests share the batch, and
@@ -360,25 +353,6 @@ impl NgramStats {
             return 0.0;
         }
         self.accepted_by_depth[d] as f64 / drafted as f64
-    }
-
-    /// The deepest spine position whose marginal acceptance still pays for its
-    /// slot at cost ratio `r` — i.e. the optimal draft width, read off the
-    /// measured curve. `min_samples` guards against a depth seen too rarely to
-    /// judge.
-    pub fn optimal_width(&self, r: f64, min_samples: u64) -> usize {
-        let mut best = 0;
-        for d in 0..MAX_TRACKED_DEPTH {
-            if self.drafted_by_depth[d] < min_samples {
-                break;
-            }
-            if self.marginal_acceptance(d) > r {
-                best = d + 1;
-            } else {
-                break;
-            }
-        }
-        best
     }
 
     pub fn marginal_share(&self, t: Tier) -> f64 {
@@ -516,6 +490,9 @@ pub struct NgramSpec {
     /// Measured outcome per gram. Bounded by `outcomes_cap`; see `note_outcome`.
     outcomes: std::collections::HashMap<(u32, u64), GramOutcome>,
     outcomes_cap: usize,
+    /// Hard cap on drafted TOKENS when a throughput controller is driving.
+    /// See [`set_spine_token_cap`](NgramSpec::set_spine_token_cap).
+    spine_token_cap: Option<usize>,
     stats: NgramStats,
     max_order: usize,
     /// Grams the trickle path could not place — a key owns no blocks until a
@@ -599,11 +576,44 @@ impl NgramSpec {
             // recent enough to draft again, so it is pointless for it to
             // outlive them.
             outcomes_cap: cfg_hot_capacity,
+            spine_token_cap: None,
             stats: NgramStats::default(),
             max_order,
             merge_backlog: Vec::new(),
             merge_backlog_cap: 1 << 21,
         }
+    }
+
+    /// Cap the drafted spine in TOKENS, so an external throughput controller can
+    /// drive the width.
+    ///
+    /// `BlockController` owns that decision (see `marginal_acceptance`); this is
+    /// the seam it drives through.
+    ///
+    /// **This is not `cfg.max_spine`, and the difference is load-bearing.**
+    /// `max_spine` bounds probe STEPS, and a step carrying an inline `next2`
+    /// pushes two tokens — so a `max_spine` of 16 drafts up to 24. A controller
+    /// setting `max_spine` from `block()` would therefore be steering a quantity
+    /// roughly double what it believes it is steering, and its cost model would
+    /// be fitted against the wrong width. This cap counts tokens.
+    ///
+    /// `None` (the default) leaves drafting exactly as it was, so the measured
+    /// baselines still hold; only a driven session narrows.
+    ///
+    /// Clamped to at least 1 — a zero cap would silently stop drafting rather
+    /// than narrow it, which is invisible from outside.
+    pub fn set_spine_token_cap(&mut self, n: Option<usize>) {
+        self.spine_token_cap = n.map(|v| v.max(1));
+    }
+
+    /// The active token cap, if a controller has set one.
+    pub fn spine_token_cap(&self) -> Option<usize> {
+        self.spine_token_cap
+    }
+
+    /// `cfg.max_spine` — a bound on probe STEPS, not on drafted tokens.
+    pub fn max_spine_steps(&self) -> usize {
+        self.cfg.max_spine
     }
 
     pub fn set_scope(&mut self, scope: SessionScope) {
@@ -810,6 +820,14 @@ impl NgramSpec {
 
         let orders = self.cfg.orders.clone();
         for step in 0..self.cfg.max_spine {
+            // Token cap, when a controller is driving. Checked at the top of the
+            // step because a single step can emit two tokens.
+            if self
+                .spine_token_cap
+                .is_some_and(|cap| self.spine.len() >= cap)
+            {
+                break;
+            }
             let mut hit = None;
             for &ord in &orders {
                 let o = ord as usize;
@@ -845,7 +863,11 @@ impl NgramSpec {
             ctx.push(next);
 
             // A stored second token is free — it needs no further block read.
-            if next2 != NO_TOKEN && self.spine.len() < self.cfg.max_spine {
+            let token_room = self
+                .spine_token_cap
+                .map(|cap| self.spine.len() < cap)
+                .unwrap_or(true);
+            if next2 != NO_TOKEN && token_room && self.spine.len() < self.cfg.max_spine {
                 self.spine.push(next2);
                 self.tiers.push(tier);
                 self.spine_grams.push((key, fp));
@@ -1547,31 +1569,6 @@ mod marginal_curve_tests {
     }
 
     #[test]
-    fn optimal_width_tracks_the_slot_cost() {
-        // Marginal acceptance by depth: 0.90, 0.50, 0.10, 0.05.
-        let s = stats_with(&[100, 100, 100, 100], &[90, 50, 10, 5]);
-        // A cheap slot (bandwidth-bound verify) pays for a deeper spine...
-        assert_eq!(s.optimal_width(0.04, 10), 4);
-        // ...a dearer one stops earlier...
-        assert_eq!(s.optimal_width(0.20, 10), 2);
-        // ...and a slot costing more than any depth returns pays for none.
-        assert_eq!(s.optimal_width(0.95, 10), 0);
-        // Breaking even is not worth it: at r exactly equal to a depth's
-        // marginal acceptance that slot costs precisely what it returns, so the
-        // comparison is strict and depth 3 (0.05) is excluded at r = 0.05.
-        assert_eq!(s.optimal_width(0.05, 10), 3);
-    }
-
-    #[test]
-    fn a_depth_with_too_little_evidence_stops_the_scan() {
-        // Depth 2 is barely sampled, so the curve is not read past it even
-        // though its rate looks fine — the same "no evidence is not evidence"
-        // rule the per-gram bound follows.
-        let s = stats_with(&[100, 100, 3], &[90, 80, 3]);
-        assert_eq!(s.optimal_width(0.10, 10), 2);
-    }
-
-    #[test]
     fn the_curve_is_a_pure_function_of_counts() {
         // The point of deriving from counts rather than a clock: identical
         // inputs give an identical answer, so a replay is bit-identical.
@@ -1580,6 +1577,59 @@ mod marginal_curve_tests {
         for d in 0..MAX_TRACKED_DEPTH {
             assert_eq!(a.marginal_acceptance(d), b.marginal_acceptance(d));
         }
-        assert_eq!(a.optimal_width(0.5, 1), b.optimal_width(0.5, 1));
+    }
+}
+
+#[cfg(test)]
+mod width_seam_tests {
+    use super::*;
+
+    /// The seam an external throughput controller drives.
+    #[test]
+    fn the_spine_cap_is_settable_and_never_zero() {
+        let mut spec = NgramSpec::new(NgramConfig::default());
+        assert_eq!(spec.spine_token_cap(), None, "undriven by default");
+        spec.set_spine_token_cap(Some(4));
+        assert_eq!(spec.spine_token_cap(), Some(4));
+        // A zero cap would silently stop drafting rather than narrow it —
+        // "off by configuration", which is invisible from outside.
+        spec.set_spine_token_cap(Some(0));
+        assert_eq!(
+            spec.spine_token_cap(),
+            Some(1),
+            "zero must clamp, not disable"
+        );
+    }
+
+    /// Narrowing the cap must actually shorten the draft, or the controller is
+    /// steering something that does not move.
+    #[test]
+    fn a_narrower_cap_shortens_the_draft() {
+        let mut cfg = NgramConfig::default();
+        cfg.chain_floor = 0; // let the chain run to the cap
+        let mut spec = NgramSpec::new(cfg);
+        // Teach it a long, perfectly repeating sequence so the spine can fill.
+        let cycle: Vec<u32> = (0..8).collect();
+        for _ in 0..64 {
+            spec.observe(&cycle);
+        }
+        let undriven = spec.draft().map(|s| s.len()).unwrap_or(0);
+        spec.set_spine_token_cap(Some(2));
+        let narrow = spec.draft().map(|s| s.len()).unwrap_or(0);
+        assert!(undriven > 2, "the fixture should draft a long spine");
+        assert!(
+            narrow <= 2,
+            "the cap counts TOKENS: undriven={undriven} narrow={narrow}"
+        );
+
+        // The documented hazard: cfg.max_spine bounds STEPS, and a step with an
+        // inline next2 emits two tokens — so it is not a token cap and must not
+        // be used as one by a controller.
+        spec.set_spine_token_cap(None);
+        let steps_cap = spec.max_spine_steps();
+        assert!(
+            undriven > steps_cap,
+            "max_spine ({steps_cap}) bounds steps, not tokens; drafted {undriven}"
+        );
     }
 }
