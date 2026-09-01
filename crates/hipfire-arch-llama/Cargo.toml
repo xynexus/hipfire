@@ -11,3 +11,9 @@ hipfire-arch-llama-spec = { path = "../hipfire-arch-llama-spec" }
 hipfire-specdecode-dspark = { path = "../hipfire-specdecode-dspark" }
 hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-rdna = { path = "../hipfire-rdna" }
+
+[dev-dependencies]
+hipfire-specdecode-ngram = { path = "../hipfire-specdecode-ngram" }
+
+[[example]]
+name = "ngram_seam_demo"

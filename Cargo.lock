@@ -1677,6 +1677,7 @@ dependencies = [
  "hipfire-rdna",
  "hipfire-runtime",
  "hipfire-specdecode-dspark",
+ "hipfire-specdecode-ngram",
 ]
 
 [[package]]
@@ -2659,6 +2660,7 @@ dependencies = [
  "hipfire-rdna",
  "hipfire-runtime",
  "hipfire-specdecode",
+ "hipfire-specdecode-ngram",
  "serde",
  "serde_json",
  "smallvec",

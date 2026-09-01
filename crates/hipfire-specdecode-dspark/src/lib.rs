@@ -18,6 +18,7 @@
 
 pub mod dspark_block_controller;
 pub mod dspark_core;
+pub mod ngram_speculator;
 pub mod spec;
 
 pub use dspark_core::{
