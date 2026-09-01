@@ -1,8 +1,29 @@
 # TODO: run the co-resident training test — M8's last untested half
 
-**Status:** OPEN, and now **unblocked**. PR #363 wired `train_lora` to accept a
-`.hfq` base, which was the thing stopping this. Runnable on **nix1**; no halo
-booking, no download, no `.pth` conversion.
+**Status:** OPEN, and **unblocked in code** — PR #363 wired `train_lora` to
+accept a `.hfq` base, which was the thing stopping this. No halo booking, no
+download, no `.pth` conversion.
+
+> **Feasibility re-checked on nix2, 2026-08-31. "Unblocked" does not yet mean
+> "runnable here" — the two artifacts in "The run" are NOT on this box.**
+>
+> - `Llama-3.2-3B-Instruct--bf16.hfq` — absent. Only the HuggingFace source repo
+>   `models--meta-llama--Llama-3.2-3B-Instruct` is present, so the trainer base
+>   has to be built first.
+> - `Qwen3.6-35B-A3B--oq4.hfq` — absent. The nearest artifact is
+>   `Qwen3.6-35B-A3B--oq4.moeblocks.hfq` (19.4 GB), a different variant; do not
+>   silently substitute it, the resident cost and the layout both differ.
+> - **The box itself is fine.** nix2's GTT total is 45,097,156,608 B = **42.0 GB**,
+>   the same figure this doc plans nix1's 31/42 GB arithmetic against.
+> - **One term the arithmetic omits:** on a box that is also serving, the
+>   `hipfire serve` daemon is co-resident and holds its own model. The 31 GB
+>   figure assumes trainer + one served model only. Stop the daemon or add its
+>   residency to the sum before trusting the headroom.
+>
+> So the remaining prerequisite is artifact construction, not code. Given the
+> doc's own warning that the ledger understates by ~8.5 GB and the true figure
+> "could land near the ceiling", this was not started unattended on a serving
+> box.
 
 ## What is still untested
 

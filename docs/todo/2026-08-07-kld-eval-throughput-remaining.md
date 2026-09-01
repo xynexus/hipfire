@@ -62,6 +62,27 @@ full restore — `hipfire-coexistence/src/repack.rs`).
 This was blocked on batched LUT3 being a prefill regression. With the
 cooperative kernel it is not, so the transcode is now payable.
 
+> **Update 2026-08-31 — the transcode itself is now WRITTEN; what is missing is a
+> call site.** `hipfire_quant_format::storage::transcode_resident` composes
+> exactly the two functions named above: `Bf16Huff` -> `bf16_huff::decode_par`
+> -> `bf16_lut3::encode`, with `Bf16Lut3` returned borrowed (no work, no copy).
+> Its companion `resident_type()` maps `Bf16Huff -> Bf16Lut3` and documents the
+> same conclusion this section reaches — "the useful combination is Huffman on
+> disk and LUT3 resident". The round trip is exactly lossless, so the result is
+> "the same bytes `gemv_bf16l3` would have read had the artifact been written as
+> LUT3 in the first place".
+>
+> `transcode_resident` has **no caller outside `storage.rs`**. So this item is no
+> longer "write the transcode", it is "call it from the load path" — a
+> materially smaller task than the section implies. The consuming side is
+> already real: a Lut3 lm_head is handed to the GPU packed and decoded in-kernel
+> by `gemv_bf16l3_xf32` (`qwen35/loading.rs:4620`).
+>
+> Two cautions carried over from `2026-08-12-router-bf16-codec-upgrade.md`:
+> `HIPFIRE_BF16L3_RESIDENT` is global, so enabling it leaves every bf16 tensor
+> packed and every loader needing a decode arm — defaulting it on once took
+> tiny-quant-gate from 8 failures to 58.
+
 ## Measured negatives — do not re-run these
 
 Four ideas were tested and lost. `bench_bf16l3_vs_bf16_gemm` reproduces all of

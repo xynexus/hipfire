@@ -95,7 +95,32 @@ qwen3.**5**-35B-A3B oq4.25++. Two different models, and the artifacts may differ
 in which gate they trip, so confirm on the same model before attributing the
 branch's speedup to any one clause.
 
-### 2. ⚠️ BLOCKER — settle this before landing (1)
+### 2. ~~⚠️ BLOCKER~~ — RESOLVED 2026-08-31: the branch's fix is already on master
+
+**Answered.** The branch DID find a latent bug, and it has since landed on
+master independently — so this no longer gates (1).
+
+`gemm_oq4g256_moe_grouped_wmma` on master now takes `weight_byte_offset` as its
+final parameter (`kernels/src/gemm_oq4g256_moe_grouped_wmma.hip`), and
+`crates/hipfire-dispatch/src/pipeline/mod.rs:1810` computes it with the exact
+expression this section attributes to the branch:
+
+```rust
+if oq_arch_combined { m * (k / 2) + m * (k / 256) * 4 } else { 0 }
+```
+
+threaded from `routed_oq_arch_combined` (`families/moe.rs:569`, passed at
+`pipeline/mod.rs:2031` and `:2374`). Corroborated by the sibling call sites,
+which now document the asymmetry deliberately: `prefill_chunk.rs:1119` says
+"weight_byte_offset is 0: resident OQ8 experts point straight at ..." while
+`qwen35/mod.rs:2750` notes the Oq4 sibling documents a nonzero one.
+
+So enabling (1) no longer turns an unreachable bug into a live one on OQ4 MoE
+models. The original text is kept below because the REASONING — do not flip an
+eligibility gate without knowing what the kernel underneath reads — is what
+made this worth stopping for, and it still applies to the next such change.
+
+### 2a. Original blocker text (kept for the reasoning)
 
 `gemm_oq4g256_moe_grouped_wmma` takes a **10th** parameter on master and an
 **11th** on the branch: `weight_byte_offset`, threaded from a

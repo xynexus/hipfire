@@ -67,11 +67,30 @@ HIPFIRE_TINYQUANT_RECORD=1 ./tests/tiny-quant-gate.sh   # on gfx1151
 1. **Per-tensor-mixed loader support.** gemma3 loads uniform oq4 and uniform oq8;
    does it dispatch a *mixed* model (some tensors oq4, some oq8) correctly? Verify
    before recording a baseline — this is the main unknown.
-2. **Is `TierPlan` generic or LFM2-gated?** `main.rs:268` implies the tiered plan
-   is consumed at the LFM2 dense-linear site. If LFM2-only, a gemma3 cell won't
-   exercise the tiering and either the plan must be generalized or an `lfm2`
-   fixture family added to `families()`. The OpusMixedSpec (`oq4.25++`) path is
-   the safer first cell if so.
+2. ~~**Is `TierPlan` generic or LFM2-gated?**~~ **ANSWERED 2026-08-31: LFM2-gated
+   at the consumption site.** The suspicion here was correct, so take the
+   fallback this item already names — the OpusMixedSpec (`oq4.25++`) cell — or
+   add an `lfm2` fixture family. Do not plan a gemma3 cell against this path.
+
+   The module is arch-agnostic: `hipfire-quantize/src/mixed_precision.rs`
+   contains no LFM2 reference at all. The GATE is at the point of use.
+   `MIXED_PLAN` (`cli.rs:318`) is consulted exactly once, at `cli.rs:10177`,
+   behind `lfm2_oq_format.filter(|_| is_lfm2_dense_linear)` and then a second
+   `if is_lfm2_dense_linear` inside the match. `is_lfm2_dense_linear_shape`
+   (`cli.rs:3499`) matches on LFM2 tensor NAMES — `.conv.in_proj.weight`,
+   `.conv.out_proj.weight`, `.self_attn.{q,k,v,out}_proj.weight` — so a gemma3
+   checkpoint matches nothing and the tiering never fires.
+
+   The line reference in the original question is stale: `main.rs` is now
+   `cli.rs`.
+
+   **Do not confuse the two mixed-precision mechanisms** — this is the same trap
+   `docs/bugs/2026-08-27-mixed-bpw-ignored-off-hfq.md` warns about:
+   - `--mix-target-bpw` -> `MIXED_PLAN` -> 3-tier oq2/oq4/oq8, source input,
+     **LFM2 dense-linear only** (this item);
+   - `--mixed-bpw` -> `assign_tiers` at `cli.rs:5995` -> per-tensor oq4->oq8
+     promotion, **generic across archs**, but only on the `.hfq` -> `.hfq` path
+     (it now refuses a source input rather than silently no-op'ing).
 3. **oq2 not generally serveable.** Full 3-tier (oq2/oq4/oq8) can't tiny-test
    until oq2 serving lands (codec+DType+gemv+dispatch — see
    `project_opus_quant_family_coverage`). Use `--mix-floor` (oq4/oq8 only) so the

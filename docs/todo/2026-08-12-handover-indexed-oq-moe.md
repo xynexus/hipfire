@@ -17,6 +17,34 @@ went from **5.108296 to 0.031515** (ppl 1171.67 -> 7.46) — 162x better, and
 within 3.8% of the CPU fallback it has to match. **`HIPFIRE_QWEN35_MOE_OQ_INDEXED`
 now defaults ON** — see "The default is now ON" below for what it took.
 
+> **RECONCILED 2026-08-31.** This section and the paragraph above it read as a
+> contradiction — "now defaults ON" followed by "flipped ON and reverted the same
+> day". Both are true of different moments, and the FINAL state is: **ON, with an
+> admissibility guard.**
+>
+> `oq_indexed_decode_enabled_from` defaults ON — it returns true unless the value
+> is an explicit off-spelling (`0`/`off`/`false`/`no`), matched "explicitly and
+> generously" so an unrecognised spelling leaves the path on rather than
+> silently off. The code notes "the default has been inverted twice", which is
+> this history.
+>
+> What makes ON safe now is `oq_indexed_admissible`:
+>
+> ```rust
+> hidden != 0 && mi != 0 && hidden % 256 == 0 && mi % 256 == 0 && k_top == INDEXED_MOE_K_TOP
+> ```
+>
+> The `% 256 == 0` terms are precisely the root cause recorded below — the FWHT
+> rotates compute `n_groups = K / 256` and use it as `grid.x`, so a toy preset
+> whose dims are not multiples of 256 launches an EMPTY grid. The guard excludes
+> exactly those shapes, so the tiny fixture routes to the CPU fallback and stays
+> finite while real models take the indexed path. Callers use
+> `oq_indexed_decode_active` (flag AND admission) rather than the flag alone.
+>
+> Same family as the `k_top` admission that makes `tiny-prefill-gate` SKIP
+> `qwen3_5_moe` — see `2026-08-27-oq4-moe-prefill-coverage.md`, where
+> `moe_prefill_topk_shape_supported` declines K=2 for the same reason.
+
 ⚠️ **It was flipped ON and reverted the same day** — the account below is the
 first attempt, kept because the sequence is the lesson. `tests/tiny-quant-gate.sh`
 turned seven `qwen3_5_moe` OQ cells from finite to **non-finite KLD** (oq4, oq8,

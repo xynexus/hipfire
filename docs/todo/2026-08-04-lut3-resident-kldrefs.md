@@ -1,5 +1,11 @@
 # BF16L3-resident KLD reference artifacts (GPU only)
 
+> **PARKED 2026-08-31.** The forcing question ("is any kldref large enough that
+> 1.38x decides whether it fits?") was measured and answered NO — largest ref is
+> 2.31 GiB against 28 GiB available on the smallest box. See Open questions.
+> The landed transcode primitive stays; the resident-kldref work does not
+> proceed without a new reason.
+
 Status: transcode primitive landed (`storage::transcode_resident`, same commit
 series as this doc); batched LUT3 path not started
 
@@ -157,8 +163,23 @@ before sizing this work off whatever happens to be on the share.
 
 ## Open questions
 
-- Is any kldref large enough that 1.38x decides whether it fits? If not, this is
-  optimisation without a forcing constraint and should stay parked.
+- ~~Is any kldref large enough that 1.38x decides whether it fits?~~
+  **ANSWERED 2026-08-31 — no. PARKED, by this document's own criterion.**
+
+  Measured every `*.kldref*.hfq` on `/srv`. The largest is **2.31 GiB**
+  (2,476,184,996 bytes), and the 9B and 27B refs are that size *to the byte* —
+  so ref size is set by the scoring corpus and vocab, not by model size, and it
+  will not grow as models do. The only smaller one is a 130 MiB work copy.
+
+  At 1.38x that is 3.19 GiB, a delta of **0.88 GiB**. nix2 is the smallest box
+  in the fleet at 30 GiB total / 28 GiB available, and halo has 128 GiB. There
+  is no configuration where 0.88 GiB is the difference between fitting and not
+  fitting.
+
+  So this is optimisation without a forcing constraint. Parked, not rejected:
+  the transcode primitive (`storage::transcode_resident`) already landed and is
+  useful on its own. Revisit only if a kldref shape appears whose size scales
+  with the model rather than the corpus.
 - Should `bf16_huff` remain disk-only, or is there a case for Huffman-resident
   once a transcode exists? (Analysis says no: the chunk-overhead maths survives
   at 1.43-1.47x for per-lane chunks, but the bit-serial cursor is a dependency

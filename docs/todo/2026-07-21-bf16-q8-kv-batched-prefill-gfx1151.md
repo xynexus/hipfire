@@ -1,5 +1,22 @@
 # BF16 weights + Q8 KV batched-prefill → garbage on gfx1151
 
+> **CLOSED 2026-08-31 — root-caused and fixed; the status line below is STALE.**
+> It says BF16 prefill is routed per-token on gfx1151 by a guard. That guard is
+> GONE: `DType::BF16` now sits in `is_batchable_la`'s always-batchable list
+> (`crates/hipfire-arch-qwen35/src/qwen35/mod.rs`).
+>
+> The failure was not the attention kernel. It was **missing BF16 projection
+> arms** — the same root cause as the llama analogue in BUGS.md — and fixing
+> those made the fault stop reproducing. The guard outlived the bug. Re-measured
+> on gfx1151 / qwen3.5-0.8b bf16 at a 2048-token chunk: prefill **58.5 -> 1646.3
+> tok/s**, PPL 24.0318 -> 24.0551, top-1 argmax agreeing 99.36%. "Slightly
+> slower" was off by 28x.
+>
+> One caveat is deliberately accepted and documented at that call site: the
+> batched path is not bit-identical to per-token (typical |delta logit| ~6e-2,
+> flat across position — a path difference, not accumulating drift). Anything
+> needing the two to agree exactly must pin the path.
+
 **STATUS: GUARDED/FIXED** (`is_batchable_la` now routes BF16 prefill per-token on
 gfx1151 — bf16+q8 verified coherent, mq4/mq6 unaffected). The *root cause* (the
 batched-arm BF16 q/k/v projection inflating `fa_q` ~9× on gfx1151) is still latent

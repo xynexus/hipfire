@@ -1,5 +1,9 @@
 # TODO: embedding table → per-row Lloyd codebook
 
+> **CLOSED — REJECTED by measurement 2026-07-21.** Measure-before-build killed
+> it; the rejection IS the finished work. Kept so the idea is not re-proposed
+> without reading why it lost.
+
 **Status: REJECTED 2026-07-21** — measure-before-build killed it. See "Outcome".
 
 ## Outcome (2026-07-21): rejected; embed should go HIGHER precision, not lower

@@ -1,5 +1,13 @@
 # HFQ compose/decompose for DFLASH and TRIA
 
+> **CLOSED 2026-08-31 — shipped.** `crates/hipfire-runtime/src/hfq_compose.rs`
+> handles the cases this doc was written for: a raw `TRIA` v1 payload
+> (`source_format == "tria-v1"`), role-tagged components rather than one flat
+> index, and sidecar arch IDs that differ from the base. `hipfire model compose`
+> records a provenance manifest so `decompose` is lossless, and `--check`
+> validates roles, formats, architectures, geometry, lengths, digests and
+> reserved namespaces without writing.
+
 Status: implemented
 
 Owner: offline tooling / HFQ format

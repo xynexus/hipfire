@@ -60,7 +60,44 @@ calib artifact is reusable.
 * Artifact built: `~/.hipfire/drafts/Qwen3.8-27B--dflash2.oq4+.hfq`. Loads,
   `block=8`, draft=84 ms/cycle vs DFlash1's 197 ms at B=16.
 
-## The open bug — ROOT-CAUSED 2026-08-20
+## The open bug — FIXED, and the asymmetry has since INVERTED
+
+> **Re-checked 2026-08-31 against `decode_layers.rs`. Two corrections, and the
+> second reverses this section's headline conclusion.**
+>
+> **1. The bug below is FIXED.** Root cause was narrower than "the hand arms
+> miscompute": the dense DeltaNet arm never applied `ffn_norm`, so it fed its FFN
+> the attention-normalized, PRE-attention residual. Hand and lowered now agree —
+> measured self-KLD **5.3e-10** across 2044 scored tokens, byte-identical greedy
+> output over 204 tokens.
+>
+> **2. DFlash verify no longer routes onto the hand arms at all.** `hidden_rb`
+> used to force the hand path, which is the entire mechanism this section
+> describes. It has been removed from the routing condition — the lowered
+> executor extracts per-layer hidden itself now, so spec-decode verify runs the
+> same forward as production decode. Today only a GDN tape capture, a steer
+> session, or the RoughQuant opt-in force the hand path:
+>
+> ```rust
+> let take_lowered = forward_lowered_enabled()
+>     && gdn_tape_capture.is_none()
+>     && !rq_hand_optin
+>     && !steer_forces_hand;
+> ```
+>
+> **3. ⚠️ THE ASYMMETRY IS NOW THE OTHER WAY ROUND.** This section says "MoE
+> stays correct under the same flag ... the fault is in the DENSE arms
+> specifically". That is no longer true. Re-measured 2026-08-26 on
+> Qwen3.5-35B-A3B, greedy AR decode, `HIPFIRE_FORWARD_LOWERED=0`: the hand path
+> emits a correct FIRST token and then token 0 (`"!"`) forever, on **both** bf16
+> and oq4.25++. It is not slow or approximate — it runs clean at 68.9 tok/s and
+> returns garbage. **Dense is now the healthy side and MoE is the broken one.**
+>
+> So the NEXT step below still stands, but for the opposite reason, and the
+> reproducer in this section (`qwen3.5-2b--bf16.hfq`, dense) will no longer
+> reproduce anything. Anyone picking this up should chase MoE, not dense.
+
+## Original section — ROOT-CAUSED 2026-08-20 (superseded above)
 
 Not a DFlash bug, and not an Opus bug. The hand-written decode arms in
 `crates/hipfire-arch-qwen35/src/qwen35/decode_layers.rs` miscompute on DENSE

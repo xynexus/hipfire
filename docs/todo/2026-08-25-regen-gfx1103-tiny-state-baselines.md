@@ -1,5 +1,18 @@
 # TODO: record the 10 missing gfx1103 tiny-state baselines — AFTER verification
 
+> **CLOSED 2026-08-31 — the baselines were recorded.** `tiny-state-gate` now
+> reports `PASS (18 cell(s))` on nix2 (gfx1103); no family is missing a baseline
+> and none FAILs, so `tiny-affected-gate --require-coverage` reaches a verdict.
+> Verified by running it, not by reading a status line.
+>
+> Not every hash below became the baseline. `gemma3/fp16` did, byte for byte
+> (`0xd1dd59a3807131d8` / `0xfb591816f3e3b34d`). The three qwen3.5 DeltaNet
+> families did NOT — e.g. `qwen3_5/fp16` is baselined at
+> `0xed48922801655d8b`, not the `0xccf17f154e164290` observed here — because
+> `f5b32ea32` flipped `deltanet_state_precision` to fp16 in between. Both are
+> intended values recorded at different times; the difference is the default
+> change, not drift.
+
 **Status:** OPEN. Blocking `tiny-affected-gate --require-coverage` from ever
 reaching a verdict on this box.
 

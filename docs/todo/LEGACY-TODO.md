@@ -1,5 +1,32 @@
 # TODO
 
+> **PASS DONE 2026-09-01. Section-by-section verdicts below — 7 of the 21
+> sections are ALREADY DONE.** Verified against the tree, not against the prose.
+> Nothing is struck through: this file is a legacy catch-all and the entries
+> carry reasoning worth keeping. Read the verdict, then the entry.
+>
+> | section | verdict | evidence |
+> |---|---|---|
+> | Evaluation Branch → Active | **progress tracker, not drift** | its past-tense sub-bullets are landed work recorded under still-open parents. Sampled the accelerator-inventory item: daemon `inventory` command (`handlers/status.rs:113`), health payload (`routes/health.rs:80`), `not_probed` fallback (`hipfire-model/src/lib.rs:357`) — all present |
+> | Vision embedding cache (xxh64, on-disk LRU) | **DONE** | `crates/hipfire-vision-cache`, xxh64 content hash, namespace hashing |
+> | PFlash drafter checkpoint/resume | **DONE** | `save_drafter` / `load_drafter` in `hipfire-train/src/checkpoint.rs` |
+> | Native Rust/GPU Hessian collector | **DONE, by another shape** | `hessian_io.rs` + `hfhs_diag.rs` in `hipfire-quantize`; the Python it replaced sits in `scripts/depreciated/collect_hessian.py`. The "finish the `collect_hessian.rs` scaffold" framing is stale — no such file exists and none is needed |
+> | Tiny random-init fixtures + golden tripwire | **DONE** | the whole `tests/tiny-*.sh` family: affected-gate, selftest, nogpu, deltanet, moe-mixed |
+> | Family-seam state-container unification (P2c) | **DONE** | `hipfire-runtime/src/sequence_state.rs` — `SequenceState { profile: MixerProfile, kv, recurrent }` |
+> | DeltaNet state precision | **DONE** | `deltanet_state_precision` is a real config field (`schema.rs:643`), not an env hack |
+> | packed 4-bit ops on gfx1151 | **PARTIAL** | `bench_iu4_wmma.gfx1151.hip` and `fused_qkvza_oq4_dp4a.gfx1151.hip` exist, so the investigation ran and produced kernels |
+> | Check all hot paths for graph safety | **PARTIAL** | hipGraph capture is wired across `dispatch/`; "all paths audited" is not mechanically checkable |
+> | GPU (HIP) trellis-encode kernel for QTIP | **OPEN** | `qtip.rs` is host-side only; no `.hip` kernel contains `trellis`. Matches `2026-07-03-qtip-gpu-beam-encoder.md` ("planned, not started") |
+> | FWHT Residual QJL Transform | **OPEN — never started** | no `qjl` symbol anywhere in `crates/` or `kernels/` |
+> | MQ4++ Hessian/LDLQ producer track | **OPEN for MQ** | `hipfire-quantize` offers `oq4+`/`oq4++` but only plain `mq4`. The `++` producer shipped for Opus, not Magnum |
+> | Deterministic MoE-down reduction | **OPEN** | `atomicAdd` is still the reduction in the moe-down kernels (e.g. `gemv_hfq4g256_moe_down_indexed_batched_wave64.hip:132`) |
+> | hipfire finetune tool | **OPEN as a named tool** | no `finetune` subcommand; training reaches users through `hipfire jobs` |
+>
+> **NOT individually verified**, and still to check: "Deferred", "PFLASH Review
+> Debt", "Legible golden for the tiny fixtures", "extend tiny-golden coverage",
+> "Router-margin tuning of the tiny MoE fixture", "QTIP recovery export
+> circle-back". Six of twenty-one.
+
 ## Evaluation Branch
 
 ### Active
