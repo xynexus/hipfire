@@ -17,7 +17,12 @@ use std::io::Write;
 use std::path::Path;
 
 const HFQ_MAGIC: &[u8; 4] = b"HFQM";
+/// Output version. This tool writes the v1 index shape (12-byte per-entry tail,
+/// payloads back to back), which is still read by everything; it accepts a v1 or
+/// v2 INPUT (see `read_hfq`).
 const HFQ_VERSION: u32 = 1;
+/// v2 stores each index entry's data offset divided by this.
+const HFQM_V2_OFFSET_ALIGN: usize = 32;
 
 fn quantize_mq4g256(f32_data: &[f32], signs1: &[f32], signs2: &[f32]) -> Vec<u8> {
     let group_size = 256;
@@ -60,7 +65,11 @@ fn read_hfq(path: &Path) -> (u32, String, Vec<HfqInTensor>) {
     let file = File::open(path).expect("open input");
     let mmap = unsafe { Mmap::map(&file).expect("mmap") };
     assert_eq!(&mmap[0..4], HFQ_MAGIC, "bad magic");
-    let _version = u32::from_le_bytes(mmap[4..8].try_into().unwrap());
+    let version = u32::from_le_bytes(mmap[4..8].try_into().unwrap());
+    assert!(
+        version > 0 && version <= 2,
+        "HFQM version {version} is newer than this tool understands (max 2)"
+    );
     let arch_id = u32::from_le_bytes(mmap[8..12].try_into().unwrap());
     let n_tensors = u32::from_le_bytes(mmap[12..16].try_into().unwrap()) as usize;
     let metadata_offset = u64::from_le_bytes(mmap[16..24].try_into().unwrap()) as usize;
@@ -124,7 +133,19 @@ fn read_hfq(path: &Path) -> (u32, String, Vec<HfqInTensor>) {
         pos += 4;
         let data_size = u64::from_le_bytes(mmap[pos..pos + 8].try_into().unwrap()) as usize;
         pos += 8;
-        let data = mmap[cumulative..cumulative + data_size].to_vec();
+        // v2 stores each entry's offset explicitly, in 32-byte units, and does
+        // not promise the payloads are contiguous. The version was read into
+        // `_version` and dropped, so a v2 input had these 8 bytes misread as the
+        // next entry's name_len — and `from_utf8_lossy` below meant the garbage
+        // name did not even error, it just landed in the output artifact.
+        let src = if version >= 2 {
+            let div32 = u64::from_le_bytes(mmap[pos..pos + 8].try_into().unwrap()) as usize;
+            pos += 8;
+            div32 * HFQM_V2_OFFSET_ALIGN
+        } else {
+            cumulative
+        };
+        let data = mmap[src..src + data_size].to_vec();
         cumulative += data_size;
         out.push(HfqInTensor {
             name,

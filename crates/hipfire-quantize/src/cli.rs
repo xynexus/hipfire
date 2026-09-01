@@ -8498,11 +8498,22 @@ pub fn main() {
     // --mixed-bpw <F>: target average bits-per-weight over quantised tensors.
     // Drives mixed_precision::assign_tiers to pick WHICH tensors get oq8++,
     // instead of hand-listing them with --tensor-format.
-    let mixed_bpw_target: Option<f64> = args
-        .iter()
-        .position(|a| a == "--mixed-bpw")
-        .and_then(|i| args.get(i + 1))
-        .and_then(|v| v.parse::<f64>().ok());
+    // A malformed or missing value used to `.ok()` into `None`, which is
+    // indistinguishable from not passing the flag at all — the same silence the
+    // non-HFQ guard below closes.
+    let mixed_bpw_target: Option<f64> = match args.iter().position(|a| a == "--mixed-bpw") {
+        None => None,
+        Some(i) => match args.get(i + 1).and_then(|v| v.parse::<f64>().ok()) {
+            Some(target) => Some(target),
+            None => {
+                eprintln!(
+                    "error: --mixed-bpw needs a target average bits-per-weight, \
+                     e.g. `--mixed-bpw 4.5`"
+                );
+                std::process::exit(2);
+            }
+        },
+    };
 
     let ldlq_requested =
         oq_ldlq_recipe || args.iter().any(|a| a == "--ldlq") || qtip_cond_mode().is_some();
@@ -8812,6 +8823,22 @@ pub fn main() {
         }
         if !tensor_format_overrides.is_empty() {
             eprintln!("error: --tensor-format currently requires an HFQ input");
+            std::process::exit(2);
+        }
+        // `--mixed-bpw` is threaded only into `run_hfq_source_pipeline`, so on a
+        // safetensors directory or an `.hfa` archive it produced a uniform
+        // artifact and said nothing. Refusing is the honest half of the fix:
+        // the promoter genuinely does not run here, and a silent no-op is worse
+        // than either alternative.
+        if mixed_bpw_target.is_some() {
+            eprintln!(
+                "error: --mixed-bpw currently requires an HFQ input; the per-tensor \
+                 oq4->oq8 promoter runs only on the .hfq -> .hfq path.\n\
+                 Quantize the source to an .hfq anchor first, then re-quantize that \
+                 with --mixed-bpw.\n\
+                 Note --mixed-bpw is per-TENSOR promotion; the `.25` in a format like \
+                 oq4.25++ is within-tensor magnitude tiering and is unrelated."
+            );
             std::process::exit(2);
         }
         if is_gguf_input(raw_input) {

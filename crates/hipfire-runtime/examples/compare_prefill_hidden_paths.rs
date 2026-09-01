@@ -33,6 +33,14 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv::KvCache;
 
 fn main() {
+    // Pin the fixture environment BEFORE anything reads config or touches the
+    // GPU: `~/.hipfire/config.json` with `qwen35_paged_experts: true` otherwise
+    // sends the MoE fixtures down the paged path, where routed_experts is empty
+    // by design, and this probe dies with
+    // `moe.decode-routed-dtype-unsupported-no-fallback`. tiny_quant_probe has
+    // always done this; this binary did not, so tiny-prefill-gate's hidden-state
+    // arm failed on both MoE families on any box configured for paging.
+    hipfire_runtime::gate_env::pin_fixture_environment();
     let argv: Vec<String> = std::env::args().collect();
     let mut model = None;
     // Default must CROSS the prefill chunk boundary (PREFILL_MAX_BATCH = 256).

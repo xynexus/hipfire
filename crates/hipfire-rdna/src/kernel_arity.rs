@@ -24,6 +24,16 @@
 //! statically — the kernel is sometimes chosen at runtime — so those are SKIPPED,
 //! not guessed at. The test asserts a floor on how many sites it actually checked
 //! so the coverage cannot quietly rot to zero while the test keeps passing.
+//!
+//! `kernargs!` sites are additionally checked by argument **kind**, because a
+//! swap that keeps the count is invisible to the count check and just as silent
+//! at runtime: a scalar bound to a pointer parameter is a wild address, and an
+//! `i32` bound to a `float` is a denormal. The macro's own token (`ptr`/`i32`/
+//! `u32`/`f32`/`u64`) is the Rust side, and the `.hip` parameter type is the
+//! other. Only unambiguous types are compared — anything the classifier cannot
+//! read (a typedef, `_Float16`, a struct) is `Unknown` and skipped, so this
+//! reports nothing it cannot prove. It found zero mismatches when added; it
+//! exists to keep it that way.
 
 #![cfg(test)]
 
@@ -52,12 +62,100 @@ fn strip_comments(src: &str) -> String {
     out
 }
 
+/// What a kernel parameter or a `kernargs!` entry is, coarsely enough to be
+/// decidable from source on both sides.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+enum Kind {
+    Ptr,
+    Float,
+    Int,
+    /// Not confidently classifiable — never reported as a mismatch.
+    Unknown,
+}
+
+/// Classify one `.hip` parameter declaration.
+fn hip_kind(param: &str) -> Kind {
+    if param.contains('*') {
+        return Kind::Ptr;
+    }
+    let cleaned = param
+        .split_whitespace()
+        .filter(|t| {
+            !matches!(
+                *t,
+                "const" | "__restrict__" | "__restrict" | "volatile" | "unsigned" | "signed"
+            )
+        })
+        .collect::<Vec<_>>();
+    match cleaned.first().copied() {
+        Some("float") => Kind::Float,
+        Some(
+            "int" | "long" | "short" | "char" | "bool" | "size_t" | "int32_t" | "uint32_t"
+            | "int64_t" | "uint64_t" | "uint8_t",
+        ) => Kind::Int,
+        _ => Kind::Unknown,
+    }
+}
+
+/// Classify one `kernargs!` entry from the macro token that opens it.
+fn kernarg_kind(entry: &str) -> Kind {
+    match entry.split_whitespace().next() {
+        Some("ptr") => Kind::Ptr,
+        Some("f32") => Kind::Float,
+        Some("i32" | "u32" | "u64") => Kind::Int,
+        _ => Kind::Unknown,
+    }
+}
+
+/// Do a declared parameter and a passed argument agree?
+///
+/// `Unknown` on either side abstains. Everything else must match exactly — in
+/// particular a pointer parameter accepts only `ptr`, and vice versa.
+fn kinds_agree(declared: Kind, passed: Kind) -> bool {
+    match (declared, passed) {
+        (Kind::Unknown, _) | (_, Kind::Unknown) => true,
+        (a, b) => a == b,
+    }
+}
+
+/// Split a parameter or argument list on top-level commas.
+fn split_top_level(text: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let (mut depth, mut cur) = (0i32, String::new());
+    for c in text.chars() {
+        match c {
+            '(' | '[' | '<' | '{' => depth += 1,
+            ')' | ']' | '>' | '}' => depth -= 1,
+            ',' if depth == 0 => {
+                out.push(std::mem::take(&mut cur));
+                continue;
+            }
+            _ => {}
+        }
+        cur.push(c);
+    }
+    if !cur.trim().is_empty() {
+        out.push(cur);
+    }
+    out.into_iter().map(|s| s.trim().to_string()).collect()
+}
+
 /// `name -> declared parameter count`, over every `__global__` in kernels/src.
 /// A name may legitimately appear more than once (per-arch variants), so the
 /// value is a set and a dispatch matching ANY of them is accepted.
 fn kernel_arity() -> HashMap<String, HashSet<usize>> {
+    kernel_signatures()
+        .into_iter()
+        .map(|(name, sigs)| (name, sigs.into_iter().map(|s| s.len()).collect()))
+        .collect()
+}
+
+/// `name -> declared parameter KIND signatures`. A name may legitimately appear
+/// more than once (per-arch variants), so a dispatch matching ANY signature is
+/// accepted.
+fn kernel_signatures() -> HashMap<String, HashSet<Vec<Kind>>> {
     let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../kernels/src");
-    let mut out: HashMap<String, HashSet<usize>> = HashMap::new();
+    let mut out: HashMap<String, HashSet<Vec<Kind>>> = HashMap::new();
     let entries = std::fs::read_dir(dir).expect("kernels/src must be readable");
     for e in entries.flatten() {
         let path = e.path();
@@ -97,22 +195,15 @@ fn kernel_arity() -> HashMap<String, HashSet<usize>> {
                 j += 1;
             }
             let params = src[start..j.saturating_sub(1)].trim();
-            let count = if params.is_empty() {
-                0
+            let kinds: Vec<Kind> = if params.is_empty() {
+                Vec::new()
             } else {
-                let mut n = 1usize;
-                let mut d = 0i32;
-                for c in params.chars() {
-                    match c {
-                        '(' | '<' | '[' => d += 1,
-                        ')' | '>' | ']' => d -= 1,
-                        ',' if d == 0 => n += 1,
-                        _ => {}
-                    }
-                }
-                n
+                split_top_level(params)
+                    .iter()
+                    .map(|p| hip_kind(p))
+                    .collect()
             };
-            out.entry(name.to_string()).or_default().insert(count);
+            out.entry(name.to_string()).or_default().insert(kinds);
         }
     }
     out
@@ -188,6 +279,7 @@ fn top_level_entries(text: &str) -> usize {
 fn scan_kernargs(
     text: &str,
     arity: &HashMap<String, HashSet<usize>>,
+    signatures: &HashMap<String, HashSet<Vec<Kind>>>,
     file: &str,
     checked: &mut usize,
     mismatches: &mut Vec<String>,
@@ -233,7 +325,8 @@ fn scan_kernargs(
         let Some(declared) = arity.get(name) else {
             continue;
         };
-        let passed = top_level_entries(&text[open..j.saturating_sub(1)]);
+        let args = &text[open..j.saturating_sub(1)];
+        let passed = top_level_entries(args);
         *checked += 1;
         if !declared.contains(&passed) {
             let line = text[..open].matches('\n').count() + 1;
@@ -242,12 +335,42 @@ fn scan_kernargs(
             mismatches.push(format!(
                 "{file}:{line} launches `{name}` with {passed} args; the kernel declares {want:?}"
             ));
+            // The kinds cannot line up if the counts do not; reporting both
+            // would be one bug named twice.
+            continue;
+        }
+        // Same count — now check the KINDS. `kernargs!` names each argument's
+        // type, so a scalar bound to a pointer parameter (a wild address) or an
+        // int bound to a float is decidable here and invisible above.
+        let Some(sigs) = signatures.get(name) else {
+            continue;
+        };
+        let got: Vec<Kind> = split_top_level(args)
+            .iter()
+            .map(|e| kernarg_kind(e))
+            .collect();
+        let agrees = sigs.iter().any(|want| {
+            want.len() == got.len()
+                && want
+                    .iter()
+                    .zip(got.iter())
+                    .all(|(w, g)| kinds_agree(*w, *g))
+        });
+        if !agrees {
+            let line = text[..open].matches('\n').count() + 1;
+            let want: Vec<String> = sigs.iter().map(|s| format!("{s:?}")).collect();
+            mismatches.push(format!(
+                "{file}:{line} launches `{name}` with kinds {got:?}; the kernel declares \
+                 {}",
+                want.join(" or ")
+            ));
         }
     }
 }
 
 #[test]
 fn raw_kernel_launches_match_their_hip_arity() {
+    let signatures = kernel_signatures();
     let arity = kernel_arity();
     assert!(
         arity.len() > 300,
@@ -272,7 +395,14 @@ fn raw_kernel_launches_match_their_hip_arity() {
             continue;
         };
         let fname = path.file_name().unwrap().to_string_lossy().to_string();
-        scan_kernargs(&text, &arity, &fname, &mut checked, &mut mismatches);
+        scan_kernargs(
+            &text,
+            &arity,
+            &signatures,
+            &fname,
+            &mut checked,
+            &mut mismatches,
+        );
         let lines: Vec<&str> = text.lines().collect();
 
         // Function spans, so a kernel name never leaks across a `fn` boundary.
@@ -343,8 +473,79 @@ fn raw_kernel_launches_match_their_hip_arity() {
     );
     assert!(
         mismatches.is_empty(),
-        "kernel argument-count mismatches ({} site(s)):\n  {}",
+        "kernel argument mismatches ({} site(s)):\n  {}",
         mismatches.len(),
         mismatches.join("\n  ")
+    );
+}
+
+/// A cross-lane reduction that starts at offset 32 is a wave64 idiom. RDNA is
+/// wave32, where the `offset = 32` step crosses a wave boundary and
+/// `__shfl_xor` returns the caller's own value — the step becomes `v += v` and
+/// the result is exactly 2x too large, uniformly, with no error and no NaN.
+///
+/// Recorded in BUGS.md after it was caught in `qsa_block_score.hip` by a control
+/// that asserted an exact value; a tolerance check with a loose bound passes a
+/// doubled answer. The entry asked for a note near the idiom, which is now in
+/// `kernels/AGENTS.md`. This is the half a note cannot do.
+///
+/// Only genuinely wave64 kernels may do it: those live under `kernels/src/gfx906`
+/// and say `wave64` in the filename.
+#[test]
+fn wave_reduction_offsets_are_wave32_safe() {
+    let dir = concat!(env!("CARGO_MANIFEST_DIR"), "/../../kernels/src");
+    let mut files = Vec::new();
+    fn walk(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for e in entries.flatten() {
+            let p = e.path();
+            if p.is_dir() {
+                walk(&p, out);
+            } else if p.extension().and_then(|s| s.to_str()) == Some("hip") {
+                out.push(p);
+            }
+        }
+    }
+    walk(std::path::Path::new(dir), &mut files);
+    files.sort();
+    assert!(
+        files.len() > 300,
+        "found only {} .hip files — the walker is broken, not the kernels",
+        files.len()
+    );
+
+    let mut offenders = Vec::new();
+    for path in &files {
+        let display = path.strip_prefix(dir).unwrap_or(path).display().to_string();
+        // A wave64 kernel is allowed the wave64 idiom, and says so twice: it
+        // lives under gfx906 and carries `wave64` in its name.
+        let is_wave64 = display.contains("gfx906") && display.contains("wave64");
+        let Ok(raw) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        for (i, line) in strip_comments(&raw).lines().enumerate() {
+            let starts_at_32 = line.contains("__shfl")
+                && (line.contains("offset = 32")
+                    || line.contains("off = 32")
+                    || line.contains("o = 32"));
+            // The loop header and the shuffle are often on separate lines.
+            let loop_from_32 = (line.contains("offset = 32")
+                || line.contains("off = 32")
+                || line.contains("o = 32"))
+                && line.contains("for (");
+            if (starts_at_32 || loop_from_32) && !is_wave64 {
+                offenders.push(format!("{display}:{} {}", i + 1, line.trim()));
+            }
+        }
+    }
+    assert!(
+        offenders.is_empty(),
+        "wave64 reduction idiom in a wave32 kernel ({} site(s)); reduce from \
+         offset 16 with an explicit width of 32, or put the kernel under \
+         kernels/src/gfx906 with `wave64` in its name:\n  {}",
+        offenders.len(),
+        offenders.join("\n  ")
     );
 }

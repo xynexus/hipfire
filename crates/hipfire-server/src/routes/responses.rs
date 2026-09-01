@@ -181,7 +181,7 @@ pub async fn post_responses(
     }
 }
 
-fn error_status(error: &Value) -> StatusCode {
+pub(crate) fn error_status(error: &Value) -> StatusCode {
     if error
         .get("error")
         .and_then(|inner| inner.get("type"))

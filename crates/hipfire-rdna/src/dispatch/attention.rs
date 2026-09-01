@@ -1443,6 +1443,46 @@ impl Gpu {
         }
         result
     }
+    /// Refuse a `head_dim` the fixed-stride batched tile kernels cannot express.
+    ///
+    /// `attention_flash_{asym3,fwht3,q8_0,f16k_q8v}_tile_batched` assign
+    /// `d0 = tid * 8` — 32 lanes x 8 dims — so they only cover `head_dim == 256`.
+    /// Their asym2/asym4/fwht2/fwht4 siblings were given a
+    /// `n_halves = head_dim / 128` loop and are general; the kvarn tile derives
+    /// `dpt = head_dim / 32` at runtime. These four were left behind, and
+    /// `attention_flash_asym_reduce_batched` was fixed to derive `dpt` with a
+    /// comment claiming the tile side already did the same — it does not.
+    ///
+    /// Nothing checked it. At `head_dim == 128` each lane above 15 reads Q past
+    /// its head and writes `p[2 + d0 + i]` past the `2 + head_dim` partials
+    /// stride, into the next tile's slot: silently wrong output, no error. At
+    /// `head_dim > 256` the upper dims are never written at all — the same class
+    /// of defect `5e34d05c5` fixed in the non-batched Q8 tile and did not carry
+    /// across.
+    ///
+    /// Refusing is deliberately not a clamp: there is no head_dim other than 256
+    /// these kernels compute correctly, so every refused call was already
+    /// returning garbage. Teaching them the runtime `dpt` is the real fix and
+    /// needs a GPU to validate — see
+    /// `docs/bugs/2026-08-30-batched-flash-tile-head-dim-256.md`.
+    fn require_head_dim_256(kernel: &str, head_dim: usize) -> HipResult<()> {
+        debug_assert!(
+            HEAD_DIM_256_ONLY_TILES.iter().any(|(n, _)| *n == kernel),
+            "{kernel} is guarded as 256-only but is not in HEAD_DIM_256_ONLY_TILES"
+        );
+        if head_dim == 256 {
+            return Ok(());
+        }
+        Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "{kernel} only supports head_dim=256 (its tile assigns 32 lanes x 8 \
+                 dims); got head_dim={head_dim}, which would read past the head and \
+                 write past the partials stride"
+            ),
+        ))
+    }
+
     /// Batched flash attention for Q8_0 KV cache.
     ///
     /// This is the no-LDS-cap replacement for the old per-position
@@ -1472,6 +1512,7 @@ impl Gpu {
         block_start: usize,
         block_cols: usize,
     ) -> HipResult<()> {
+        Self::require_head_dim_256("attention_flash_q8_0_tile_batched", head_dim)?;
         self.bind_thread()?;
         self.launch_asym_flash_batched(
             "attention_flash_q8_0_tile_batched",
@@ -1521,6 +1562,7 @@ impl Gpu {
         block_start: usize,
         block_cols: usize,
     ) -> HipResult<()> {
+        Self::require_head_dim_256("attention_flash_f16k_q8v_tile_batched", head_dim)?;
         self.bind_thread()?;
         self.launch_asym_flash_batched(
             "attention_flash_f16k_q8v_tile_batched",
@@ -2111,6 +2153,7 @@ impl Gpu {
         block_start: usize,
         block_cols: usize,
     ) -> HipResult<()> {
+        Self::require_head_dim_256("attention_flash_asym3_tile_batched", head_dim)?;
         self.bind_thread()?;
         self.launch_asym_flash_batched(
             "attention_flash_asym3_tile_batched",
@@ -2199,6 +2242,7 @@ impl Gpu {
         block_cols: usize,
         _v_mode_bits: i32,
     ) -> HipResult<()> {
+        Self::require_head_dim_256("attention_flash_fwht3_tile_batched", head_dim)?;
         self.bind_thread()?;
         self.launch_asym_flash_batched(
             "attention_flash_fwht3_tile_batched",
@@ -5671,6 +5715,106 @@ impl Gpu {
                 self.stream_ref(),
                 &mut params,
             )
+        }
+    }
+}
+
+/// The batched flash tile kernels that hardcode `d0 = tid * 8` and therefore
+/// only cover `head_dim == 256`. Paired with their sources so the test below
+/// can check the list against the code rather than against a memory of it.
+const HEAD_DIM_256_ONLY_TILES: [(&str, &str); 4] = [
+    (
+        "attention_flash_q8_0_tile_batched",
+        kernels::ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC,
+    ),
+    (
+        "attention_flash_f16k_q8v_tile_batched",
+        kernels::ATTENTION_FLASH_F16K_Q8V_TILE_BATCHED_SRC,
+    ),
+    (
+        "attention_flash_asym3_tile_batched",
+        kernels::ATTENTION_FLASH_ASYM3_TILE_BATCHED_SRC,
+    ),
+    (
+        "attention_flash_fwht3_tile_batched",
+        kernels::ATTENTION_FLASH_FWHT3_TILE_BATCHED_SRC,
+    ),
+];
+
+#[cfg(test)]
+mod head_dim_guard_tests {
+    use super::*;
+
+    /// Every batched flash tile that hardcodes 8 dims per lane must be guarded,
+    /// and every guarded kernel must still hardcode it.
+    ///
+    /// This is the drift catcher, not the guard's own unit test: "one tile fixed,
+    /// its siblings not" is the shape that produced this bug, and the list of
+    /// laggards is only correct until someone edits a `.hip`.
+    #[test]
+    fn the_256_only_list_matches_the_kernel_sources() {
+        const ALL_TILES: [(&str, &str); 9] = [
+            (
+                "attention_flash_asym2_tile_batched",
+                kernels::ATTENTION_FLASH_ASYM2_TILE_BATCHED_SRC,
+            ),
+            (
+                "attention_flash_asym3_tile_batched",
+                kernels::ATTENTION_FLASH_ASYM3_TILE_BATCHED_SRC,
+            ),
+            (
+                "attention_flash_asym4_tile_batched",
+                kernels::ATTENTION_FLASH_ASYM4_TILE_BATCHED_SRC,
+            ),
+            (
+                "attention_flash_fwht2_tile_batched",
+                kernels::ATTENTION_FLASH_FWHT2_TILE_BATCHED_SRC,
+            ),
+            (
+                "attention_flash_fwht3_tile_batched",
+                kernels::ATTENTION_FLASH_FWHT3_TILE_BATCHED_SRC,
+            ),
+            (
+                "attention_flash_fwht4_tile_batched",
+                kernels::ATTENTION_FLASH_FWHT4_TILE_BATCHED_SRC,
+            ),
+            (
+                "attention_flash_q8_0_tile_batched",
+                kernels::ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC,
+            ),
+            (
+                "attention_flash_f16k_q8v_tile_batched",
+                kernels::ATTENTION_FLASH_F16K_Q8V_TILE_BATCHED_SRC,
+            ),
+            (
+                "attention_flash_kvarn_tile_batched",
+                kernels::ATTENTION_FLASH_KVARN_TILE_BATCHED_SRC,
+            ),
+        ];
+
+        for (name, src) in ALL_TILES {
+            let hardcoded = src.contains("d0 = tid * 8");
+            let guarded = HEAD_DIM_256_ONLY_TILES.iter().any(|(n, _)| *n == name);
+            assert_eq!(
+                hardcoded, guarded,
+                "{name}: hardcodes 8 dims/lane = {hardcoded}, but guarded as \
+                 256-only = {guarded}. Either teach the kernel a runtime \
+                 `dpt = head_dim / 32` (see attention_flash_kvarn_tile_batched) \
+                 and drop it from HEAD_DIM_256_ONLY_TILES, or add it."
+            );
+        }
+    }
+
+    #[test]
+    fn the_guard_admits_256_and_refuses_everything_else() {
+        assert!(Gpu::require_head_dim_256("attention_flash_q8_0_tile_batched", 256).is_ok());
+        for head_dim in [64usize, 128, 192, 512] {
+            let err = Gpu::require_head_dim_256("attention_flash_q8_0_tile_batched", head_dim)
+                .expect_err("a non-256 head_dim must be refused, not clamped");
+            assert!(
+                err.to_string().contains("head_dim=256"),
+                "the refusal must name the constraint: {err}"
+            );
         }
     }
 }

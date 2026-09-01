@@ -35,6 +35,22 @@ cargo build --release --example tiny_quant_probe >/dev/null 2>&1 || { echo "  BU
 set -e
 $Q --emit-fixture "$FAM" --out "$W/src" --seed 42 >/dev/null 2>&1
 $Q --input "$W/src" --output "$W/anchor.fp16.hfq" --format fp16 --arch-id 6 >/dev/null 2>&1
+set +e
+# The promoter only runs on the .hfq -> .hfq path, so the source path must REFUSE
+# --mixed-bpw rather than quietly emitting a uniform artifact (docs/bugs/
+# 2026-08-27-mixed-bpw-ignored-off-hfq.md). CPU-only, so it runs before the GPU steps.
+# `oq4`, not `oq4.25++`: the `++` formats demand --hessian first, so that arm
+# would refuse for an unrelated reason and assert nothing about the promoter.
+$Q --input "$W/src" --output "$W/should-not-exist.hfq" --format oq4 --arch-id 6 \
+   --mixed-bpw 4.5 >/dev/null 2>&1
+if [ $? -eq 0 ]; then
+    echo "tiny-moe-mixed-gate: FAIL — --mixed-bpw was accepted on a SOURCE input"
+    echo "  it is threaded only into run_hfq_source_pipeline; accepting it silently"
+    echo "  produces a uniform artifact that looks mixed-precision"
+    exit 1
+fi
+set -e
+
 $P collect --arch "$FAM" --model "$W/anchor.fp16.hfq" --out "$W/calib.hfq" --len 128 >/dev/null 2>&1
 # uniform reference (source path) and the MIXED build (HFQ path + promotion)
 $Q --input "$W/src" --output "$W/uniform.hfq" --format oq4.25++ --arch-id 6 \

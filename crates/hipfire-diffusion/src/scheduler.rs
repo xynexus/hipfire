@@ -138,7 +138,10 @@ impl SchedulerSolver {
         // longer advertises it either, so the refusal and the advertisement agree.
         if config.class_name == "EulerAncestralDiscreteScheduler" {
             return Err(DiffusionError::InvalidMetadata(
-                "EulerAncestralDiscreteScheduler (\"Euler a\") is not implemented: it                  needs a per-step sigma_up/sigma_down split with a seeded noise draw,                  and running plain Euler instead would silently return a different                  sampler than requested. Use \"Euler\", \"DPM++ 2M\" or \"DDIM\"."
+                "EulerAncestralDiscreteScheduler (\"Euler a\") is not implemented: it \
+                 needs a per-step sigma_up/sigma_down split with a seeded noise draw, \
+                 and running plain Euler instead would silently return a different \
+                 sampler than requested. Use \"Euler\", \"DPM++ 2M\" or \"DDIM\"."
                     .to_string(),
             ));
         }
@@ -547,7 +550,9 @@ impl DiffusionSchedule {
         // degrade silently through the other route.
         if config.class_name == "EulerAncestralDiscreteScheduler" {
             return Err(DiffusionError::InvalidMetadata(
-                "EulerAncestralDiscreteScheduler (\"Euler a\") is not implemented: it                  needs a per-step sigma_up/sigma_down split with a seeded noise draw.                  Use \"Euler\", \"DPM++ 2M\" or \"DDIM\"."
+                "EulerAncestralDiscreteScheduler (\"Euler a\") is not implemented: it \
+                 needs a per-step sigma_up/sigma_down split with a seeded noise draw. \
+                 Use \"Euler\", \"DPM++ 2M\" or \"DDIM\"."
                     .to_string(),
             ));
         }

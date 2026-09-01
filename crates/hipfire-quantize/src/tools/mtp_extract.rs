@@ -599,7 +599,16 @@ fn verify_round_trip(path: &Path, expected: &[HfqTensor], verbose: bool) {
     let file = File::open(path).expect("open output for verify");
     let mmap = unsafe { Mmap::map(&file).expect("mmap output for verify") };
     assert_eq!(&mmap[0..4], HFQ_MAGIC, "verify: bad magic");
-    let _version = u32::from_le_bytes(mmap[4..8].try_into().unwrap());
+    // This reads back a file THIS tool just wrote, so the v1 index shape below
+    // (12-byte per-entry tail, payloads back to back) is correct by
+    // construction — but only while the writer stays v1. Assert it rather than
+    // discarding the field: bumping HFQ_VERSION above without teaching the walk
+    // about v2's explicit offsets would otherwise misparse in silence.
+    let version = u32::from_le_bytes(mmap[4..8].try_into().unwrap());
+    assert_eq!(
+        version, HFQ_VERSION,
+        "verify: this walk assumes the v1 index shape it writes"
+    );
     let arch_id = u32::from_le_bytes(mmap[8..12].try_into().unwrap());
     let n_tensors = u32::from_le_bytes(mmap[12..16].try_into().unwrap()) as usize;
     let metadata_offset = u64::from_le_bytes(mmap[16..24].try_into().unwrap()) as usize;

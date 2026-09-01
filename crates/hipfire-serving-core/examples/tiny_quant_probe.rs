@@ -59,36 +59,12 @@ fn req(args: &[String], name: &str) -> String {
     })
 }
 
-/// Pin the model-shape knobs this probe's fixtures depend on, so a gate result
-/// does not move with whoever's `~/.hipfire/config.json` is on the box.
-///
-/// Every tiny gate drives its GPU work through this binary, which makes it the
-/// one place all of them route through. The leak it closes: `qwen35_paged_experts`
-/// defaults OFF but is switched on in real deployments, and the config is read
-/// ambiently at model build time. With it on, the tiny MoE fixtures take the
-/// paged path, where `MoeParams::routed_experts` is empty by design, and
-/// `check_moe_decode_supported` refuses -- so `tiny-state-gate.sh` reported
-/// `moe.decode-routed-dtype-unsupported-no-fallback` and looked like a model
-/// failure when it was a config leak.
-///
-/// Only the CONFIG FILE is overridden. An explicitly exported variable still
-/// wins, so deliberately probing the paged path stays possible; what cannot
-/// happen is a gate silently measuring a different code path than the one it
-/// records baselines for.
-///
-/// `HIPFIRE_QWEN35_RESIDENCY_MODE` is deliberately NOT touched. It is consulted
-/// BEFORE the paged-experts flag and short-circuits it, so pinning it to a
-/// neutral value here would make an explicit `HIPFIRE_QWEN35_PAGED_EXPERTS=1`
-/// silently ineffective — the exact class of override-that-does-nothing this
-/// function exists to prevent. It has no config-file equivalent either, so
-/// leaving it alone loses no hermeticity: only an exported variable can set it,
-/// and that is a deliberate act.
+/// Pin the fixture environment. The implementation moved to
+/// `hipfire_runtime::gate_env` so `compare_prefill_hidden_paths` — the other
+/// binary the tiny gates drive — gets the same hermeticity; it did not have it,
+/// and that cost tiny-prefill-gate six false failures.
 fn pin_fixture_environment() {
-    // SAFETY: single-threaded — called as the first statement of `main`, before
-    // `Gpu::init` or any thread spawn.
-    if std::env::var_os("HIPFIRE_QWEN35_PAGED_EXPERTS").is_none() {
-        std::env::set_var("HIPFIRE_QWEN35_PAGED_EXPERTS", "0");
-    }
+    hipfire_runtime::gate_env::pin_fixture_environment();
 }
 
 fn main() {

@@ -527,11 +527,13 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         Some("auto"),
         GLOBAL_MODEL_RUNTIME,
         ConfigMutability::LoadTime,
-        "KV-cache precision and memory policy. NOTE: asym2/asym3/asym4 are DEPRECATED — \
+        "KV-cache precision and memory policy. NOTE: q8 and asym2/asym3/asym4 are \
+         DEPRECATED and the model loader REFUSES them unless HIPFIRE_KV_ALLOW_DEPRECATED=1 — \
          single-tier KVarN strictly dominates them (better PPL+KLD at iso-memory, both \
          short and long ctx; see docs/plans/2026-07-12-hot-cold-hierarchical-kv-implementation.md \
-         and NEXT-STEPS Phase D). Prefer kvarn. asym is retained only for back-compat and \
-         because TriAttention/CASK eviction scoring reads the asym format."
+         and NEXT-STEPS Phase D). Prefer kvarn. They remain accepted values only so an \
+         existing config still resolves and gets named by a diagnostic rather than \
+         silently rewritten; see DEPRECATED_KV_MODES."
     ),
     field!(
         "lmhead_twostage",

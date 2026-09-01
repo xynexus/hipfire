@@ -122,6 +122,52 @@ original report suggested is wrong:
 
 Recurring shape, again: **a fix applied to one path and not its sibling.**
 
+## [GUARDED 2026-08-30] Four batched flash tiles are head_dim=256-only, unchecked
+
+Second never-executed sweep from the coverage-gaps doc ("46 `X`/`X_batched`
+sibling pairs"), ranked by commits touching exactly one side. `asym3`, `fwht3`,
+`q8_0` and `f16k_q8v` batched tiles hardcode `d0 = tid * 8` (32 lanes x 8 dims =
+head_dim 256) while their asym2/asym4/fwht2/fwht4 siblings got a
+`n_halves = head_dim / 128` loop and the kvarn tile derives `dpt` at runtime. At
+head_dim=128 the upper lanes read past the head and write past the partials
+stride into the next tile's slot — silently wrong, no error. The reduce kernel
+was fixed for exactly this and its comment claimed the tiles already agreed.
+
+`head_dim=128` is real here — `qwen3.5-0.8b--oq4++.hfq` (32x128) and the
+cohere2-moe `BLS-Mini-Code-1.0--bf16.hfq` both have it — but the KV mode narrows
+it: three of the four kernels are deprecated modes and the fourth has no
+production caller, so a default server does not reach them. Now REFUSED at the
+four dispatch wrappers, with a source-scanning test that fails if the guarded
+list and the kernels disagree.
+
+Independently confirmed: `41d597e14`, on the DISCONNECTED pre-fork lineage (not
+an ancestor of origin/master; edits a `crates/rdna-compute/` that does not exist
+here), hit this on hardware — "threads 16..31 out of bounds -> HIP 700 illegal
+memory access that wedged the stream (presented as a ~27-min hang)" — and fixed
+it with exactly the `dpt = head_dim / 32` scoped below, noting it is
+byte-identical at 256. Cited as evidence and a reference only; per AGENTS.md
+upstream is not merged.
+
+→ `docs/bugs/2026-08-30-batched-flash-tile-head-dim-256.md`
+
+## [FIXED 2026-08-30] Three HFQM parsers ignored the container version
+
+Found by running one of the never-executed sweeps from the coverage-gaps doc
+("12 of 20 `b\"HFQM\"` parsers have no `version >= 2` branch"). Three were live:
+`hipfire-train/src/hfq_patch.rs`, `hipfire-runtime/examples/hfq_split.rs` and
+`hipfire-quantize/src/tools/draft_to_mq4.rs` read the version into a discarded
+binding and walked a v1 index, so on a v2 artifact — which is what the
+quantizer writes and what most of `/srv/hipfire/models` holds — every offset
+after the first was wrong. `hfq_patch` also panicked on a truncated file from a
+`Result`-returning function. All fixed and pinned by tests.
+
+**The sibling half of that sweep is REFUTED and should not be re-filed:** the
+`HFQ_VERSION` constant really does disagree across 6 files (2 vs 1), but the
+five that say 1 are writers emitting a self-consistent v1 container. Importing
+the canonical constant would MAKE a bug, not fix one.
+
+→ `docs/bugs/2026-08-30-hfqm-v1-only-parsers.md`
+
 ## [High] cohere2 with `sliding_window > 1024` cannot serve — every sliding layer fails its first staging launch
 
 **Found 2026-08-29 on master `0c9e3d252`, nix1. Confirmed by source trace plus an
@@ -1310,7 +1356,32 @@ difference presents as 1.7% common prefix.
 Still worth a logit-level check if the fused path is ever leaned on for
 throughput, but it is not a correctness blocker and it is not new.
 
-## [High] `kv_cache = "auto"` bypasses the KV deprecation gate and is the shipping default
+## [RESOLVED 2026-08-30 — re-traced, kept for the record] `kv_cache = "auto"` bypasses the KV deprecation gate and is the shipping default
+
+**The coupling this entry demanded was honoured and the fix landed.** The entry
+said "the fix is coupled to the kvarn port and should not be applied alone";
+`load.rs:854` now normalises `auto` (and the empty string) to **kvarn** before
+anything else reads it, with the reasoning inline. Re-traced 2026-08-30 while
+fixing issue #386:
+
+- `q35_kv_mode` has exactly ONE producer, `load.rs:2938`, and it is assigned the
+  already-normalised `kv_mode`.
+- `qwen35_allocate_session_state` reads the mode only from `m.q35_kv_mode`, so
+  the literal `"auto"` cannot reach a KV constructor.
+
+Two leftovers, neither reachable but both worth knowing about before someone
+adds a caller: `session.rs:1773`/`:1782` still carry `"auto" | ""` arms that
+build **asym3** (at head_dim 256) or **q8**, and `load.rs:3028` still matches
+`"q8" | "int8" | "auto" | ""`. They predate the normalisation and now disagree
+with it — a new path that hands a raw config value straight to session
+allocation would get a deprecated mode, silently, which is exactly what this
+entry was about. They are commented as such rather than deleted, since removing
+KV construction arms wants a GPU gate.
+
+The original entry follows, unchanged, because its *reasoning* is what sequenced
+the fix correctly.
+
+## [Original, superseded] `kv_cache = "auto"` bypasses the KV deprecation gate and is the shipping default
 
 Found 2026-08-11 while auditing the KV deprecation. The deprecation added in this
 branch refuses `q8`/`asym3`/etc **by name**, but the default path never presents a
@@ -1979,7 +2050,7 @@ where the decode GEMV takes a per-expert table. Patching only the gate gives
 
 → `docs/bugs/2026-08-26-122b-prefill-ceiling.md`
 
-## [Medium] `--mixed-bpw` is silently ignored unless the input is an `.hfq`
+## [Medium — PARTLY FIXED 2026-08-30] `--mixed-bpw` is silently ignored unless the input is an `.hfq`
 
 Threaded only into `run_hfq_source_pipeline`, so safetensors and `.hfa` input
 drop it with no warning and produce uniform experts. (`.hfa` input itself is
@@ -2225,6 +2296,17 @@ kernel with a 64-lane block out of habit.
 
 Worth a one-line note near the reduction idiom in `kernels/README` or in a shared header, so
 the next kernel author does not re-derive it from a wrong answer.
+
+**DONE 2026-08-30.** There is no `kernels/README`, so the note went in
+`kernels/AGENTS.md` beside the other kernel rules, with the correct shape spelled
+out (`offset = 16`, explicit width `32`). A note alone would not stop the next
+author, so `wave_reduction_offsets_are_wave32_safe` in
+`crates/hipfire-rdna/src/kernel_arity.rs` also enforces it: a `__shfl` reduction
+starting at offset 32 fails unless the kernel is genuinely wave64 (under
+`kernels/src/gfx906/` AND `wave64` in the filename). Swept the tree first — the
+only offset-32 reductions today are in `attention_flash_q8_0_dp4a_wave64.gfx906.hip`,
+which is correct; every other kernel already reduces from 16 with an explicit
+width. Verified the test fails on an injected `offset = 32` in `attention.hip`.
 
 ## qsa_block_score cannot express the reference's block-key pipeline (low)
 
@@ -2496,6 +2578,34 @@ agree with each other.
 (a) is the better trade unless the state is being narrowed often outside prefill.
 
 Do NOT "fix" this by raising the tiny-prefill ceiling.
+
+## [tiny-state now GREEN; tiny-prefill still red — re-confirmed 2026-08-31] Three tiny-gate cells are already failing on origin/master
+
+**Re-run 2026-08-31 on nix2 (gfx1103) at `e4025250f`, A/B against a working
+branch on the same host and build cache. Two of the three populations have
+diverged in outcome:**
+
+- **`tiny-state` PASSES, 18/18 cells.** The 4 drifted cells now match, because
+  the baselines were re-recorded to what this file lists as the *observed*
+  values — `qwen3_5/fp16` is now baselined at
+  `0xed48922801655d8b/0xbccf1d6a241a4482`, which is exactly the hash this entry
+  records as drifting against `0xdb7f521096082900/0x1187a5029a78ab92`. So the
+  "confirm the cause before re-recording" caution below was overtaken; the
+  re-record happened. Worth knowing if anyone still expects those cells red.
+- **`tiny-prefill` is unchanged and still red**, and it is NOT branch-local:
+  clean `origin/master` and the branch both give `ran=4 fail=6`, the same six
+  `hidden-state probe emitted no parseable summary` failures (fp32/q8/kvarn on
+  `qwen3_5` and `qwen3_5_moe`) and the same two `qwen3_5_moe` SKIPs
+  (`batched prefill did not execute for this fixture`). The probe DOES work —
+  it prints `hidden fp32: 0.00e0 / q8 0.00e0 / kvarn 0.00e0` for the family that
+  parses — so this is the parser or the probe's output shape on the other two
+  families, not a quality regression.
+
+So the tripwire consequence below is now specific to `tiny-prefill`:
+`tiny-affected-gate` still fails for every commit touching a covered path, but
+`tiny-state` is once again a discriminating signal.
+
+Original 2026-08-29 investigation follows.
 
 ## [RESOLVED 2026-08-29 for state+quant; prefill open — see the entry above] Three tiny-gate cells are already failing on origin/master
 

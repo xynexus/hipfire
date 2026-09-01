@@ -2218,6 +2218,19 @@ fn blocking_chat_response_json(result: Result<BlockingChatResult, Value>) -> Val
     }
 }
 
+/// How long the buffered chat response waits for its outcome before it must
+/// commit to a streamed `200` and hold the connection open with heartbeats.
+const BLOCKING_CHAT_HEARTBEAT: Duration = Duration::from_secs(10);
+
+fn blocking_chat_body(status: StatusCode, bytes: Vec<u8>) -> Response {
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from(bytes))
+        .unwrap_or_else(|_| Response::new(Body::from("{}")))
+}
+
 async fn blocking_chat(
     state: SharedState,
     body: ChatRequest,
@@ -2228,7 +2241,7 @@ async fn blocking_chat(
         return (status, Json(error)).into_response();
     }
 
-    let (tx, mut rx) = mpsc::channel::<Vec<u8>>(1);
+    let (tx, mut rx) = mpsc::channel::<(StatusCode, Vec<u8>)>(1);
     tokio::spawn(async move {
         match execute_blocking_chat_cancellable(state, body, owner, || tx.is_closed()).await {
             Ok(Some(result)) => {
@@ -2237,25 +2250,38 @@ async fn blocking_chat(
                 }
                 let payload = blocking_chat_response_json(Ok(result));
                 if let Ok(bytes) = serde_json::to_vec(&payload) {
-                    let _ = tx.send(bytes).await;
+                    let _ = tx.send((StatusCode::OK, bytes)).await;
                 }
             }
             Ok(None) => {}
             Err(error) => {
+                let status = crate::routes::responses::error_status(&error);
                 let payload = blocking_chat_response_json(Err(error));
                 if let Ok(bytes) = serde_json::to_vec(&payload) {
-                    let _ = tx.send(bytes).await;
+                    let _ = tx.send((status, bytes)).await;
                 }
             }
         }
     });
 
+    // The status code is committed the moment a streamed body starts, which is why
+    // failures used to come back as `200` with an error object (issue #387). Wait out
+    // one heartbeat period first: admission, load and allocation failures all land in
+    // milliseconds, so they get a real 4xx/5xx. Only work that outlives the grace
+    // period falls back to the streamed 200 the heartbeat requires.
+    match tokio::time::timeout(BLOCKING_CHAT_HEARTBEAT, rx.recv()).await {
+        Ok(Some((status, bytes))) => return blocking_chat_body(status, bytes),
+        // Cancelled before anything was produced; nothing to report.
+        Ok(None) => return blocking_chat_body(StatusCode::OK, Vec::new()),
+        Err(_) => {}
+    }
+
     let stream = async_stream::stream! {
-        let mut heartbeat = tokio::time::interval(Duration::from_secs(10));
+        let mut heartbeat = tokio::time::interval(BLOCKING_CHAT_HEARTBEAT);
         loop {
             tokio::select! {
                 result = rx.recv() => {
-                    if let Some(bytes) = result {
+                    if let Some((_, bytes)) = result {
                         yield Ok::<Bytes, Infallible>(Bytes::from(bytes));
                     }
                     break;
@@ -2328,19 +2354,7 @@ async fn blocking_chat_buffered_for_tests(state: SharedState, body: ChatRequest)
             result.request_max_tokens,
         ))
         .into_response(),
-        Err(e) => {
-            let status = if e
-                .get("error")
-                .and_then(|error| error.get("type"))
-                .and_then(Value::as_str)
-                == Some("invalid_request_error")
-            {
-                StatusCode::BAD_REQUEST
-            } else {
-                StatusCode::INTERNAL_SERVER_ERROR
-            };
-            (status, Json(e)).into_response()
-        }
+        Err(e) => (crate::routes::responses::error_status(&e), Json(e)).into_response(),
     }
 }
 
@@ -3366,6 +3380,37 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("model not found"));
+    }
+
+    #[test]
+    fn blocking_chat_body_stamps_the_error_status() {
+        // Issue #387: a failed completion must not come back as HTTP 200.
+        let server = json!({"error": {"message": "hipMalloc failed", "type": "server_error"}});
+        let bad_request =
+            json!({"error": {"message": "no model", "type": "invalid_request_error"}});
+
+        assert_eq!(
+            crate::routes::responses::error_status(&server),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            crate::routes::responses::error_status(&bad_request),
+            StatusCode::BAD_REQUEST
+        );
+
+        let response = blocking_chat_body(
+            crate::routes::responses::error_status(&server),
+            serde_json::to_vec(&server).unwrap(),
+        );
+        assert_eq!(response.status(), StatusCode::INTERNAL_SERVER_ERROR);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+        assert_eq!(
+            blocking_chat_body(StatusCode::OK, b"{}".to_vec()).status(),
+            StatusCode::OK
+        );
     }
 
     #[test]

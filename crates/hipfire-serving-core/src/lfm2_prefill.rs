@@ -668,6 +668,21 @@ pub fn run_generate_batch_prefill_serial_lfm2(
         let _ = stdout.flush();
     }
 
+    // Bound the resident set, same safety net as the qwen35 path. Nothing
+    // releases an LFM2 request session today, so without this every request
+    // parks state that lives until unload (issue #385). Runs before `done` is
+    // built so `resident_sessions` reports the post-eviction count.
+    match crate::session::lfm2_evict_sessions_over_limit(
+        m,
+        gpu,
+        crate::session::resident_session_limit_value(),
+    ) {
+        Ok(0) => {}
+        Ok(n) => tracing::debug!("evicted {n} resident lfm2 session(s) over the limit"),
+        // Eviction is a safety net, never a reason to fail a served request.
+        Err(e) => tracing::warn!("resident lfm2 session eviction failed: {e}"),
+    }
+
     let elapsed_ms = t0.elapsed().as_secs_f64() * 1000.0;
     let worker = loaded_model_worker_runtime_view(m);
     let done = serde_json::json!({

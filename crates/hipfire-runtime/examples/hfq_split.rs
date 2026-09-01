@@ -108,6 +108,9 @@ fn print_usage() {
     );
 }
 
+/// v2 stores each index entry's data offset divided by this.
+const HFQM_V2_OFFSET_ALIGN: u64 = 32;
+
 fn parse_hfq_header(file: &mut File) -> std::io::Result<ParsedHfq> {
     let mut header = [0u8; 32];
     file.seek(SeekFrom::Start(0))?;
@@ -119,6 +122,12 @@ fn parse_hfq_header(file: &mut File) -> std::io::Result<ParsedHfq> {
         ));
     }
     let version = u32::from_le_bytes(header[4..8].try_into().unwrap());
+    if version == 0 || version > 2 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("HFQM version {version} is newer than this tool understands (max 2)"),
+        ));
+    }
     let arch_id = u32::from_le_bytes(header[8..12].try_into().unwrap());
     let n_tensors = u32::from_le_bytes(header[12..16].try_into().unwrap()) as usize;
     let metadata_offset = u64::from_le_bytes(header[16..24].try_into().unwrap());
@@ -207,13 +216,24 @@ fn parse_hfq_header(file: &mut File) -> std::io::Result<ParsedHfq> {
         pos += 4;
         let data_size = u64::from_le_bytes(idx_buf[pos..pos + 8].try_into().unwrap());
         pos += 8;
+        // v2 stores each entry's offset explicitly, in 32-byte units, and does
+        // not promise the payloads are contiguous. `version` was read and then
+        // ignored here, so a v2 container had these 8 bytes misread as the next
+        // entry's name_len and every offset after the first was wrong.
+        let data_offset_src = if version >= 2 {
+            let div32 = u64::from_le_bytes(idx_buf[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+            div32 * HFQM_V2_OFFSET_ALIGN
+        } else {
+            cumulative_offset
+        };
 
         tensors.push(TensorEntry {
             name,
             quant_type,
             shape,
             group_size,
-            data_offset_src: cumulative_offset,
+            data_offset_src,
             data_size,
         });
         cumulative_offset += data_size;
