@@ -46,6 +46,9 @@ bash tests/fixture-roundtrip-nogpu.sh
 echo "== Tiny affected-file selector (no GPU) =="
 bash tests/tiny-affected-gate-nogpu.sh
 
+echo "== Pre-commit tiny-affected verdict (a FAIL must block, not escalate) =="
+bash tests/precommit-escalation-selftest.sh
+
 echo "== Resident/streamed parity workflow (no GPU) =="
 bash tests/resident-streamed-parity-nogpu.sh
 
@@ -96,6 +99,7 @@ bash -n tests/tiny-affected-gate-nogpu.sh
 bash -n tests/tiny-quant-gate.sh
 bash -n tests/tiny-state-gate.sh
 bash -n tests/tiny-spec-gate.sh
+bash -n tests/precommit-escalation-selftest.sh
 bash -n tests/smoke/diffusion-sdapi-smoke.sh
 bash -n tests/smoke/diffusion-tiny-sd-hfq-admission.sh
 

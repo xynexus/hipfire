@@ -274,6 +274,7 @@ fi
 # DFlash/spec-decode uses the same tiny-model front tier; its heavyweight
 # diagnostic is manual-only.
 RUN_COHERENCE=1
+TINY_FAILED=0
 if [ "$GPU_GATES" = 0 ]; then
     RUN_COHERENCE=0
 elif [ "${HIPFIRE_FORCE_COHERENCE:-0}" = "1" ] || [ "${HIPFIRE_SKIP_TINY_AFFECTED:-0}" = "1" ]; then
@@ -287,7 +288,20 @@ else
     case "$tg" in
         0) echo "tiny affected: selected coverage passed → SKIPPING heavy coherence battery."
            RUN_COHERENCE=0 ;;
-        1) echo "tiny affected: FAIL → escalating to the full coherence battery." ;;
+        # exit 1 is a VERDICT, not an absence of one: the tripwire measured KLD
+        # drift / a crash / a non-finite. It used to "escalate to the full
+        # coherence battery", but that battery says of itself that it "only fails
+        # on hard daemon/error signals ... correctness is assessed qualitatively
+        # on the report" — it structurally CANNOT go red on the drift the tiny
+        # tier just found. So a definite red was laundered into a green, and the
+        # hook printed a passing summary. That is exactly how tiny-spec-gate
+        # stayed broken on master for its whole life (f212ae076).
+        #
+        # The battery still runs, because its report is useful evidence for
+        # deciding whether the drift is a regression or an intended numerical
+        # improvement. It just no longer gets to overrule the verdict.
+        1) echo "tiny affected: FAIL → the battery will run for evidence, but the COMMIT IS BLOCKED."
+           TINY_FAILED=1 ;;
         3) echo "tiny affected: inconclusive/no coverage → running full battery." ;;
         *) echo "tiny affected: could not run → running full battery." ;;
     esac
@@ -326,6 +340,31 @@ echo "coherent (fluent, on-topic, not stuck in a verbatim loop) before"
 echo "proceeding with the commit."
 echo
 fi  # RUN_COHERENCE
+
+if [ "$TINY_FAILED" = 1 ]; then
+    echo
+    echo "========================================================================"
+    echo "COMMIT BLOCKED: the tiny affected-model tripwire FAILED."
+    echo "========================================================================"
+    echo
+    echo "The coherence battery above cannot clear this: it only fails on hard"
+    echo "errors (panic / zero tokens / timeout) and does not compare output, so"
+    echo "it is silent on exactly the drift the tripwire measured. Read its report"
+    echo "as evidence, not as a verdict."
+    echo
+    echo "  ./tests/tiny-affected-gate.sh --require-coverage   # re-run, see the cell"
+    echo
+    echo "If the change is an INTENDED numerical improvement, re-record the"
+    echo "baseline for the affected cell in the same commit and say why:"
+    echo
+    echo "  ./tests/tiny-quant-gate.sh --record    # or tiny-state-gate.sh --record"
+    echo
+    exit 1
+fi
+# tests/precommit-escalation-selftest.sh extracts the region between
+# `RUN_COHERENCE=1` and the bare marker line below and runs it against stubbed
+# gates. Keep both markers exact if you move this block.
+# END tiny-affected verdict
 
 echo
 

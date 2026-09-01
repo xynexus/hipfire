@@ -336,7 +336,6 @@ fi
 
 # ---- Run cells -------------------------------------------------------------
 HARD_FAIL=0
-SOFT_WARN_TOTAL=0
 
 # Group cells by model for single-load efficiency.
 declare -A MODEL_CELLS
