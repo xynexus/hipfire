@@ -808,3 +808,52 @@ So #8 is **prefill-only by nature**, and prefill already has the iu4 path with a
 goal file of its own (`docs/plans/2026-08-23-iu4-gemm-close-the-half-goal.md`,
 measuring ~50% of the 110.9 TOPS iu4 ceiling). Nothing to extend; the item was
 asking for a batch-1 win from a batch-N mechanism.
+
+---
+
+## OPEN, well-characterised: `__amd_rocclr_copyBuffer` is 7.4% of decode GPU time
+
+Not on the twenty; it fell out of #7's profile and is the most suspicious
+remaining line.
+
+`rocprofv3`, Qwen3.6-35B-A3B, greedy decode:
+
+| shape | calls | ms |
+|---|---|---|
+| grid 512 / wg 512 | **25771** | **74.5** |
+| everything else | 52 | 0.3 |
+
+**~537 copies per token, ~2.9 us each, one workgroup — launch-latency-bound, not
+bandwidth-bound.** 62 layers means roughly 8–9 per layer per token.
+
+### Candidates eliminated
+
+- **`lowered.rs:496-497`** (`dn_q_raw -> dn_q`, `dn_k_raw -> dn_k`): fires only
+  when `linear_num_key_heads == linear_num_value_heads`. This model is 16 vs 32,
+  so it takes the `repeat_interleave_qk_f32` branch instead. **Not the source.**
+- **`decode_layers.rs`** (ten `memcpy_dtod_at_auto` sites): that hand path is not
+  live — `HIPFIRE_FORWARD_LOWERED` defaults on. **Not the source.**
+
+### Still in play
+
+- `moe_decode.rs:401,403` — two `memcpy_htod` per MoE layer (top-k indices and
+  weights). Every layer is MoE here, so ~124/token.
+- `lowered.rs:423,439` — `pos_buf` htod, 4 bytes, per layer.
+
+Those account for maybe a third. **The rest is unattributed** — there are copy
+sites I have not found, likely in the KV or expert-dispatch paths.
+
+### How to attribute it
+
+The kernel trace gives dispatches, not call sites. Either instrument
+`memcpy_dtod_auto` / `memcpy_htod_auto` with a counter keyed by
+`std::panic::Location::caller()`, or run under `HIP_LAUNCH_BLOCKING=1` with a
+sampling profiler to get host backtraces.
+
+### Why it is worth doing
+
+At 2.9 us and ~537 per token this is ~1.56 ms/token against a ~19 ms token —
+the 7.4% the profile reports. Unlike the sampler (see #7), these are not hidden
+behind a sync that would eat the saving: they are serialised kernel launches in
+the decode path. Halving them is worth ~4%, which is more than anything left on
+the twenty-item list except the large structural work.
