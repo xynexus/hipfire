@@ -645,3 +645,77 @@ budget is SLOWER**. 45.2 GiB resident on a 128 GB UMA box pressures the shared
 pool enough to cost more than the page-ins it avoids. The budget should be tuned
 DOWN, not up — the opposite of how a cache budget usually behaves, and worth
 knowing before anyone "optimises" by raising it.
+
+---
+
+## #7 MoE decode roofline · VERIFIED — premise stale, and a dead end found
+
+### The item's numbers were stale
+
+It said "AR 57.3 tok/s = 36% of a 157 ceiling; `grouped_v3` = 41.5% of decode".
+Two perf commits have landed since that was written — `dfc8141d7` (dwordx4 weight
+loads in indexed MoE gate_up, 57.3 -> 60.1) and `08dd9eea9` (split-K for small-M
+compact GEMV, 60.1 -> 63.4).
+
+Measured now, `hipfire-eval --battery speed` on `Qwen3.6-35B-A3B--oq4.25++`:
+
+    pp32   decode 62.8 tok/s   prefill 224.6 tok/s
+    pp128  decode 60.1 tok/s   prefill 360.1 tok/s
+
+Roofline: 3B active x 0.53 B/param (oq4.25) = 1.59 GB/token; 248.5 / 1.59 =
+**~156 tok/s**, so decode is at **40%**, not 36%.
+
+### Where decode time actually goes
+
+`rocprofv3 --kernel-trace` via the daemon stdin protocol, 64 greedy tokens,
+queried from `rocpd_kernel_dispatch` (NOT `top_kernels`, which mis-scales):
+
+| kernel | calls | ms | % |
+|---|---|---|---|
+| `gemv_oq_compact_grouped_v3_splitk` | 7040 | 237.5 | 22.8 |
+| `gemv_oq_compact_moe_gate_up_k8_indexed_batched_spl` | 2600 | 154.9 | 14.9 |
+| `gemv_oq_compact_grouped_v3` | 10305 | 125.7 | 12.1 |
+| `gemv_oq_compact_moe_down_k8_indexed_batched_expand` | 2600 | 112.8 | 10.8 |
+| **`sample_top_p`** | **65** | **78.5** | **7.5** |
+| **`__amd_rocclr_copyBuffer`** | **27311** | **77.0** | **7.4** |
+| `gated_delta_net_f16` | 1950 | 37.4 | 3.6 |
+
+**The MoE experts are NOT the dominant term.** gate_up + down = 25.7%; the DENSE
+compact GEMVs (v3_splitk + v3 + v2) are 36.2%. An item aimed at "MoE decode"
+would be optimising the smaller half.
+
+### The sampler: 7.5% of GPU time, 0% of wall clock — a dead end
+
+`sample_top_p` is ONE 256-thread block (grid `[1,1,1]`) that insertion-sorts a
+per-thread top-K over the whole vocabulary: each thread scans vocab/256 ~= 970
+entries doing up to TOP_K compares each, on 1 of 40 CUs. **1.21 ms per token**
+for a selection that reads ~1 MB (~4 us of bandwidth).
+
+At temperature 0 none of it is needed, so I added a greedy fast path routing to
+`argmax_f32` (guarded on the penalties being neutral; `blocked_tokens` needs no
+guard since step 2 already writes `-INF` into the logits).
+
+Result, same daemon command, warm, control re-run in the same session:
+
+| | kernel cost/call | tok/s | output sha |
+|---|---|---|---|
+| `sample_top_p` | 1.21 ms | 52.0 | `a3f1b5c88b4da66b` |
+| `argmax_f32` | **0.32 ms (3.8x less)** | **52.1** | `a3f1b5c88b4da66b` |
+
+**Bit-identical output, 3.8x less kernel time, and ZERO wall-clock change.**
+
+Both paths pay one 8-byte D2H sync per token, and that latency dominates the
+kernel duration — so the kernel time was never on the critical path. **REVERTED**:
+shipping it would add a branch and a per-call `hipMalloc` for no user-visible
+gain.
+
+**The lever for sampling is removing the per-token D2H sync, not making the
+kernel faster.** `argmax_f32` is also grid `[1,1,1]` and mallocs per call, so
+parallelising it would not have helped either. Anyone optimising sampling should
+start there and can skip the experiment above.
+
+### Still open from this profile
+
+`__amd_rocclr_copyBuffer` is **7.4% of GPU time across 27311 calls** — ~427 per
+token. Not investigated. That is a lot of small copies for a decode loop and is
+the most suspicious remaining line.
