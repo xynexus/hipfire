@@ -191,9 +191,43 @@ here. Revisit on CDNA/gfx12 (core-bound) and productionize the tuned kernel.
 **joint act+weight** learned M (item ii) for the W4A16 decode path; (d) a larger
 dense-llama oq4 with real outliers (Supra-50M is too clean).
 
-**R2 deploy** stays out of this item: the codec's 256-wide FWHT crosses head
-boundaries, so a per-head `apply_r2` can't be un-baked (net would be
-`F₂₅₆ ∘ blockdiag(R2)`, not `R2`) — needs a per-head codec variant, separate work.
+**R2 deploy** — the constraint below is real, and the **bake half is now done**
+(2026-09-01). The remaining work is wiring, not math.
+
+The blocker as stated: the codec's 256-wide FWHT crosses head boundaries, so a
+per-head `apply_r2` can't be un-baked (net would be `F₂₅₆ ∘ blockdiag(R2)`, not
+`R2`). Two things to add to that.
+
+**It is not a path (a) problem.** The safetensors round-trip hits it identically,
+because it runs the *same* quantizer and the same `cpu_fwht_256`. The wall is in
+the codec, so no plumbing choice avoids it.
+
+**The per-head codec already exists.** `paro_la_gates_codec` encodes MQ4G128 with
+a **128-wide** FWHT (seeds 43/1043), and `gemv_hfq4g128` reads it with tables
+uploaded by `ensure_mq_signs_128`. For `head_dim = 128` a 128-wide group IS one
+head, so the R1 identity applies per head.
+
+**Landed here:**
+- `Rotation::block_fwht_with(h, group, seed1, seed2)` — the general form.
+  `block_fwht(h)` is now that with the Oq4G256 parameters (256, 42/1042) and is
+  behaviour-identical; its existing tests still pass unchanged.
+- `bake_for_per_head_codec(r2, group, seed1, seed2)` -> `Fᵀ R2`, asserting
+  `group == r2.h` because a group spanning two heads cannot be un-baked per head.
+- `per_head_bake_cancels_the_codec_fwht_leaving_r2` — the proof, built on the
+  production `rotate_head_cols` rather than a hand-rolled multiply, so it tests
+  the convention that ships.
+- Two negative controls, because the failure modes here are silent — the product
+  stays orthonormal and the artifact quantizes cleanly either way:
+  `a_group_spanning_two_heads_cannot_be_un_baked` (F₂₅₆ has real cross-head
+  energy, so the 256 codec genuinely cannot carry R2) and
+  `baking_against_the_wrong_sign_seeds_does_not_cancel` (right width, wrong
+  seeds).
+
+**Still to wire, and it needs a GPU:** route `v_proj`/`o_proj` through the
+128-wide codec on a real model (they currently take the run-wide format), have
+the quantizer accept an R2 alongside `--rotate`, and parity-check against the
+fp reference. `head_dim = 128` only — 256 needs a 256-wide per-head codec, which
+is the same shape of work one width up.
 
 <details><summary>Original two-path plan (path (a) was chosen)</summary>
 
