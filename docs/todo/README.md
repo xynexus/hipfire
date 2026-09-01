@@ -56,10 +56,20 @@ deliberately not started.
 | `2026-08-04-lut3-resident-kldrefs.md` | PARKED by its own criterion — largest kldref is 2.31 GiB, 1.38x decides nothing |
 | `2026-07-21-tiny-quant-mixed-precision-opus.md` | `TierPlan` is LFM2-gated, so take its own stated fallback |
 
-## Not verified
+## LEGACY-TODO.md — passed 2026-09-01
 
-`LEGACY-TODO.md` — 666 lines, 21 sections. Sampled only: its first "Active" item
-is already landed. Needs a dedicated pass; treat every entry as unverified.
+666 lines, 21 sections, now carrying a per-section verdict table. **7 sections
+are already DONE** (vision embedding cache, PFlash checkpoint/resume, native
+Hessian collector, tiny fixtures + golden tripwire, P2c state-container
+unification, DeltaNet state precision, and the Active list's accelerator
+inventory), 2 are PARTIAL, 4 are genuinely OPEN, and its "Active" list turned
+out to be a legitimate progress tracker rather than drift — past-tense
+sub-bullets are landed work recorded under still-open parents.
+
+Six sections remain individually unverified and are named in the banner.
+
+Nothing is struck through there: it is a legacy catch-all whose entries carry
+reasoning worth keeping, so each gets a verdict rather than a deletion.
 
 ## Live, and startable without any decision
 

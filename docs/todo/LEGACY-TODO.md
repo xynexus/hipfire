@@ -1,25 +1,31 @@
 # TODO
 
-> **SAMPLED 2026-08-31, NOT fully verified — its "Active" section contains work
-> that is already landed.**
+> **PASS DONE 2026-09-01. Section-by-section verdicts below — 7 of the 21
+> sections are ALREADY DONE.** Verified against the tree, not against the prose.
+> Nothing is struck through: this file is a legacy catch-all and the entries
+> carry reasoning worth keeping. Read the verdict, then the entry.
 >
-> Spot-checked the first item under "Active", which is written in the past tense
-> and describes the accelerator-inventory work. All three of its sub-claims are
-> DONE in the tree:
-> - the daemon exposes a typed JSONL `inventory` command
->   (`hipfire-daemon/src/handlers/status.rs:113`);
-> - server health reports the shared inventory payload
->   (`routes/health.rs:80`, `server_accelerator_inventory`);
-> - the `source=not_probed` fallback exists
->   (`hipfire-model/src/lib.rs:357`).
+> | section | verdict | evidence |
+> |---|---|---|
+> | Evaluation Branch → Active | **progress tracker, not drift** | its past-tense sub-bullets are landed work recorded under still-open parents. Sampled the accelerator-inventory item: daemon `inventory` command (`handlers/status.rs:113`), health payload (`routes/health.rs:80`), `not_probed` fallback (`hipfire-model/src/lib.rs:357`) — all present |
+> | Vision embedding cache (xxh64, on-disk LRU) | **DONE** | `crates/hipfire-vision-cache`, xxh64 content hash, namespace hashing |
+> | PFlash drafter checkpoint/resume | **DONE** | `save_drafter` / `load_drafter` in `hipfire-train/src/checkpoint.rs` |
+> | Native Rust/GPU Hessian collector | **DONE, by another shape** | `hessian_io.rs` + `hfhs_diag.rs` in `hipfire-quantize`; the Python it replaced sits in `scripts/depreciated/collect_hessian.py`. The "finish the `collect_hessian.rs` scaffold" framing is stale — no such file exists and none is needed |
+> | Tiny random-init fixtures + golden tripwire | **DONE** | the whole `tests/tiny-*.sh` family: affected-gate, selftest, nogpu, deltanet, moe-mixed |
+> | Family-seam state-container unification (P2c) | **DONE** | `hipfire-runtime/src/sequence_state.rs` — `SequenceState { profile: MixerProfile, kv, recurrent }` |
+> | DeltaNet state precision | **DONE** | `deltanet_state_precision` is a real config field (`schema.rs:643`), not an env hack |
+> | packed 4-bit ops on gfx1151 | **PARTIAL** | `bench_iu4_wmma.gfx1151.hip` and `fused_qkvza_oq4_dp4a.gfx1151.hip` exist, so the investigation ran and produced kernels |
+> | Check all hot paths for graph safety | **PARTIAL** | hipGraph capture is wired across `dispatch/`; "all paths audited" is not mechanically checkable |
+> | GPU (HIP) trellis-encode kernel for QTIP | **OPEN** | `qtip.rs` is host-side only; no `.hip` kernel contains `trellis`. Matches `2026-07-03-qtip-gpu-beam-encoder.md` ("planned, not started") |
+> | FWHT Residual QJL Transform | **OPEN — never started** | no `qjl` symbol anywhere in `crates/` or `kernels/` |
+> | MQ4++ Hessian/LDLQ producer track | **OPEN for MQ** | `hipfire-quantize` offers `oq4+`/`oq4++` but only plain `mq4`. The `++` producer shipped for Opus, not Magnum |
+> | Deterministic MoE-down reduction | **OPEN** | `atomicAdd` is still the reduction in the moe-down kernels (e.g. `gemv_hfq4g256_moe_down_indexed_batched_wave64.hip:132`) |
+> | hipfire finetune tool | **OPEN as a named tool** | no `finetune` subcommand; training reaches users through `hipfire jobs` |
 >
-> So this file has drifted the same way the rest of `docs/todo` had — see
-> `README.md` for the pass that found six of ten documents misstating their own
-> status. At 666 lines and 21 sections it needs a **dedicated pass**, not a
-> drive-by: each item has to be checked against the tree before it is struck,
-> and one sample is not licence to strike the rest.
->
-> Treat every "Active" entry here as unverified until that pass happens.
+> **NOT individually verified**, and still to check: "Deferred", "PFLASH Review
+> Debt", "Legible golden for the tiny fixtures", "extend tiny-golden coverage",
+> "Router-margin tuning of the tiny MoE fixture", "QTIP recovery export
+> circle-back". Six of twenty-one.
 
 ## Evaluation Branch
 
