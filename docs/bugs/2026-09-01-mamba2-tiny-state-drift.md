@@ -1,6 +1,8 @@
-# BUG: `mamba2/fp16` tiny-state drifts, and nothing in the source explains it
+# BUG: `mamba2/fp16` logit-hash drift — a fragile cell asserted exactly
 
-**Status:** OPEN, reproducible, cause NOT found. Filed 2026-09-01 on halo (gfx1151).
+**Status:** DIAGNOSED 2026-09-01 on halo (gfx1151). Not a behaviour change — the
+token stream is identical and only the logit hash moved. The cell is a known-
+fragile one and the gate cannot express that. See the recommendation below.
 
     observed  0x41484800e3bd1e1f / 0xea870c172ccfeef5
     baseline  0x1eab04c5f2756c24 / 0xea870c172ccfeef5   [exact]
@@ -38,30 +40,64 @@ So: same source, same HIP, same box, same seed, deterministic across runs AND
 across rebuilds — and different from what the identical configuration produced
 hours earlier.
 
-## What that leaves
+## RESOLVED as far as it can be: it is logit-only, on a known-fragile cell
 
-Something outside the source tree and outside the kernel cache. Candidates not
-yet tested, roughly in order of cheapness:
+Three facts close this out, none of which needed a reboot.
 
-1. **Driver/GPU state.** The session ran many hours of GPU work, including two
-   full kernel-cache rebuilds and repeated large allocations. A reboot is the
-   cheap discriminator and has not been tried.
+### 1. The token stream is IDENTICAL — only the logits moved
 
-   ⚠️ **Price it first.** The only process holding `/dev/kfd` and
-   `/dev/dri/renderD128` is a **systemd-managed hipfire server** (PID 251918,
-   child of `systemd --user`, 6 sockets, 36 threads, `Ssl`, ~25 min CPU over
-   5.6 days of uptime). A reboot drops it. It is also **not the cause**: it has
-   been up since Aug 26, so it was holding the GPU while this cell was GREEN
-   earlier in the same session and while it is RED now — its presence is
-   constant across both states, which rules it out rather than implicating it.
-2. **An uninitialised read** in the Mamba-2 path whose value happens to be stable
-   while the allocator hands back the same pages, and changed when the heap
-   shape changed. This fits "stable now, different from before" better than a
-   scheduling race does, and the class has precedent here —
-   `2026-08-30-calibration-capture-nondeterminism.md` was a real data race in
-   `zaya_value_compose_f32` found the same way, by a hash that would not sit
-   still.
-3. Something in `~/.hipfire` the gate reads that is not the kernel cache.
+The gate stores `logit_hash token_hash`. The mismatch is the FIRST field;
+`token_hash` matches exactly. So greedy decode produced the same tokens and the
+difference is sub-threshold float noise that never crossed an argmax. This is a
+numerical-stability observation, **not a behaviour change**, which is a very
+different severity from how the red line reads.
+
+### 2. This cell has a documented history of exactly this
+
+From the gate's own header:
+
+> mamba2/fp16 took three different values in 15 days with no code change
+> between them.
+
+That was attributed to two gfx1103 hosts (nix1/nix2) sharing one baseline row,
+and fixed by keying rows on `hip=`. **That explanation cannot apply here**:
+single host, gfx1151, and the row's `hip=7.14.60850-d34cbb6409` matches what the
+box reports. So this is a fourth instance with the previous cause excluded.
+
+### 3. mamba2 is the only cell whose state is a recurrent fp16 accumulator
+
+Twelve families share the `fp16` anchor (qwen2, dots_ocr, gemma3, gemma4_*,
+qwen3_5*, …) and all twelve are stable. What distinguishes mamba2 is not the
+anchor format but that Mamba-2's SSM state IS the accumulator, held in fp16 and
+re-rounded on every kernel invocation. `BUGS.md` measures that shape directly for
+the DeltaNet analogue: round-to-nearest with no error feedback, and divergence
+that grows **superlinearly** (13x more error for 2.5x more tokens).
+
+A quantity like that does not have a stable low bit. Pinning its hash with
+`[exact]` asserts a property the arithmetic does not have.
+
+## The gate cannot express "compare this cell loosely" — the knob is dead
+
+The baseline format advertises a tolerance:
+
+    # gpu_arch family format logit_hash token_hash rel_tol
+
+Every row carries `rel_tol=0`, and **`$6` is read nowhere in the gate** (`grep -c
+'\$6'` returns 0). The parser takes `$4" "$5` and drops the rest, then compares
+both hashes with string equality. The column looks like a configured tolerance
+and is inert — the same shape as the two vacuous gates already fixed this session.
+
+### Recommended fix, in preference order
+
+1. **Split the two hashes by severity.** `token_hash` is the behavioural
+   assertion and should stay exact and blocking. `logit_hash` is a numerical
+   tripwire; on families whose state is a recurrent low-precision accumulator it
+   should warn, not fail. That is one `if` and it makes the gate say what it
+   means.
+2. Failing that, wire `rel_tol` so it does something, or delete the column so it
+   stops implying a knob that does not exist.
+3. **Do not simply re-record.** The value has moved at least four times across
+   two architectures; the next re-record buys days, not correctness.
 
 ## Reproduce
 
