@@ -23,32 +23,59 @@ three at once.
 
 Now one `MAX_DEPTH = 32` constant, with every array and range derived from it.
 
-## 2. The controller does not pay on the n-gram path — measured, not assumed
+## 2. ~~The controller does not pay on the n-gram path~~ — WITHDRAWN 2026-09-01
 
-gfx1103/nix2, `qwen3.5-0.8b--oq4++.hfq`, 2000 tokens, 3 reps, after the cap fix:
+**This section's conclusion was wrong and is retracted.** It reported the
+controller as 10-30% slower than a fixed block of 16 and reasoned that n-gram
+survival is flat, so "the optimum sits at the boundary and an argmax has nothing
+to find".
 
-| arm | rep1 | rep2 | rep3 | mean_draft_len |
-|---|---|---|---|---|
-| fixed b=16 | 321.0 / 344.7 | 319.9 / 343.7 | 319.3 / 343.5 | 11.27 / 12.15 **every rep** |
-| adaptive | 288.7 / 312.4 | 253.0 / 229.8 | 251.9 / 228.9 | 9.9/11.0, 8.1/7.4, 8.1/7.4 |
+Both halves were wrong.
 
-Two findings, and the second matters more:
+**The reasoning was wrong.** A search whose range contains the fixed value
+cannot legitimately lose to it — a correct argmax evaluating a boundary optimum
+returns the boundary. "It lost" was evidence the search was broken, not evidence
+there was nothing to find. It was broken, in four ways, all now fixed:
 
-- It is **slower**, by 10–30%.
-- It is **not reproducible**. The fixed arm produces an identical draft length on
-  every rep; the adaptive arm's trajectory moves run to run, because it
-  calibrates from `t_window_ms` — wall clock. Anything downstream that wants a
-  deterministic decode path cannot have one while this is on.
+- `argmax_block` iterated the BLOCK but indexed survival by drafted DEPTH.
+  `observe` receives `n_proposed = drafted.len() = block - 1`, so at
+  `block == max_block` the top index never got a sample: every trace line read
+  `16:0.00`, tau could not grow there, and **the largest block could never win**.
+  The fixed configuration was not in the controller's own reachable set.
+- Depths the block stopped reaching kept a stale estimate measured during the
+  ramp, when the n-gram store was still cold. That is a downward RATCHET, not
+  the "cap-trap fix" the comment claimed: a traced run walked 15 -> 14 -> 13
+  while true acceptance at those depths was ~0.9.
+- The survival estimator is not monotone — a real trace read
+  `1:0.89 2:0.85 3:0.94`, impossible for `P(accept_len >= k)` — because each
+  depth conditions on a different subset, which the argmax then sums as one
+  curve.
+- The controller was rebuilt per request, discarding the fitted cost curve that
+  `reset()` documents as "calibrate once, reuse across requests". Two generates
+  fitted two different curves for one GPU, one of them off a 6-sample slice with
+  a negative slope clamped to `dt=0`.
 
-The structural reason: the controller searches for an interior optimum on a
-DECAYING survival curve. n-gram survival stays near-flat out to the spine limit
-(accept_rate 0.87–0.94 measured), so the optimum sits at the BOUNDARY and an
-argmax has nothing to find — while the ramp and the slope-fit error are paid in
-full. That is the same conclusion the DFlash path reached independently ("the
-trained block IS the in-range optimum"), arrived at from the opposite direction.
+**The measurement was also invalid**, independently. Block width changes the
+emitted token sequence on this stack, so the two arms generated different text —
+one 1943 tokens, the other 1999 — and their tok/s were not measuring the same
+work. See `2026-09-01-spec-decode-not-output-equivalent-to-ar.md`.
 
-So `spec_adaptive_block` ships **off**. The wiring exists and is switchable; the
-default follows the measurement.
+After the four fixes, on the one comparison that was valid (a warm request where
+both arms emitted a byte-identical sequence), the controller **matched** the
+fixed block: 338.7 vs 343.9 tok/s, at better verify efficiency (0.78 vs 0.58),
+and the argmax selected 16 on all 503 post-ramp calls.
+
+`spec_adaptive_block` still ships OFF, but as the conservative default pending a
+benchmark that can hold output constant — not as a measured verdict against it.
+
+### Still open on the controller
+
+- The ramp sweeps upward from `min_block`, spending its most expensive windows
+  at the worst width before climbing. For a workload whose optimum is at the top
+  that is the worst exploration order.
+- `max_block` is `max_spine`, so the search cannot look ABOVE the spine supply.
+  If 16 wins, 16 is where the fence is, not a demonstrated optimum: proving it
+  needs the range and the spine raised together.
 
 ## 3. `dflash_adaptive_b` was a setting that applied to nothing
 

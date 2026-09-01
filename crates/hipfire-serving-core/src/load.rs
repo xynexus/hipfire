@@ -4165,24 +4165,15 @@ pub fn ngram_only_state(
         target_hidden_host: Vec::new(),
         ctx_capacity,
         block_size: max_spine.max(1),
-        // ON here, unlike the drafter path below, and the asymmetry is the
-        // point. There the controller is off because `max_block` is clamped to
-        // the TRAINED block, which already is the in-range optimum — no upside
-        // to find, and the ramp costs ~25% decode. Here there is no trained
-        // block: `max_spine` is a config ceiling nobody measured, so the search
-        // space genuinely contains a win. Measured on gfx1103/qwen3.5-0.8b,
-        // fixed widths either side of that ceiling: b=16 gave 397/557 tok/s and
-        // b=17 gave 328/397, so the optimum is strictly BELOW the ceiling and
-        // the ceiling is not it.
-        //
-        // This used to read "Adaptive-B tunes a DRAFTER's block; the spine
-        // length is n-gram's", which conflates two things: spine length is the
-        // n-gram's SUPPLY, but `b` is how many of those the target verifies per
-        // forward — a cost/benefit trade, which is exactly what the controller
-        // models, and it is drafter-agnostic by construction (it consumes only
-        // accept depth, proposal count and wall time).
-        // Fallback only; the daemon overwrites this from `spec_adaptive_block`.
+        // Fallback only; the daemon sets this from `spec_adaptive_block`.
+        // There is no TRAINED block here -- `max_spine` is a config ceiling
+        // nobody measured -- so unlike the drafter path there genuinely is a
+        // search space. Whether searching it pays is still unmeasured: block
+        // width changes the emitted sequence (see
+        // docs/bugs/2026-09-01-spec-decode-not-output-equivalent-to-ar.md), so
+        // widths cannot yet be ranked by throughput.
         adaptive_b: false,
+        block_controller: None,
         spec_block: None,
         // DDTree is a tree over a drafter's candidates.
         ddtree: None,
@@ -4438,6 +4429,7 @@ fn load_dflash_state_source(
         // ~25% decode. Revisit once scratches are sized for B above trained
         // (scope doc item 4) and the search space contains a win.
         adaptive_b: false,
+        block_controller: None,
         spec_block: None,
         ddtree,
     })

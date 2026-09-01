@@ -131,6 +131,14 @@ pub struct DflashState {
     /// measurement on both the drafter and drafter-free paths. A `spec_block`
     /// pin overrides it.
     pub adaptive_b: bool,
+    /// The adaptive block controller, when `adaptive_b` is on. Lives HERE, not
+    /// in the decode loop: it was constructed per `generate` call, so its
+    /// calibration -- documented in `reset()` as "a thermal-invariant hardware
+    /// cost: calibrate once, reuse across requests" -- was thrown away every
+    /// request and `reset()` was unreachable. Two generates produced two
+    /// different fitted cost curves for the same hardware.
+    pub block_controller:
+        Option<hipfire_specdecode_dspark::dspark_block_controller::BlockController>,
     /// Fixed verify block, or `None` for auto. From the `spec_block` setting;
     /// was the raw `HIPFIRE_DFLASH_BLOCK` env read, which outranked config
     /// silently. Auto means the trained block with a drafter, and the spine's

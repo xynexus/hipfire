@@ -86,6 +86,10 @@ const TIMING_WARMUP: u32 = 16;
 /// Windows each ramp block is held so the histogram can collect survival samples
 /// at that depth; after ramp_end the argmax takes over.
 const RAMP_HOLD: u32 = 2;
+/// Samples a depth needs before its survival estimate is trusted over the
+/// shallower one. Below this the estimate is thin AND biased: the only windows
+/// that reached the depth were ramp windows, when the draft source was cold.
+const MIN_DEPTH_SAMPLES: f32 = 8.0;
 
 impl BlockController {
     pub fn new(default_block: usize, min_block: usize, max_block: usize, p_star: f32) -> Self {
@@ -145,7 +149,16 @@ impl BlockController {
             };
         }
         self.timing_samples = self.timing_samples.saturating_add(1);
-        if self.calibrated || self.timing_samples < TIMING_WARMUP {
+        // Refit while the ramp is still widening the observed range, instead of
+        // freezing the first fit that clears TIMING_WARMUP. That threshold lands
+        // MID-ramp, so the frozen curve was fit over whatever narrow slice had
+        // been swept -- one measured run calibrated off n2..n7, read a NEGATIVE
+        // slope from 6 noisy samples, clamped it to dt=0, and carried that for
+        // the whole request; the next got n3..n17 and a completely different
+        // answer. Same workload, same hardware, different cost model, decided by
+        // where the warmup boundary happened to fall.
+        let ramp_done = self.windows_seen >= WARMUP_WINDOWS + 2 * self.max_block as u32;
+        if (self.calibrated && ramp_done) || self.timing_samples < TIMING_WARMUP {
             return;
         }
         let lo = (2..=MAX_DEPTH + 1).find(|&n| self.t_window_by_n[n] > 0.0);
@@ -218,23 +231,57 @@ impl BlockController {
         }
     }
 
-    /// argmax over N ∈ [1, max_tried] of τ(N)/(t_ar + (N-1)·Δt), clamped to
-    /// [min_block, max_block]. τ(N) = 1 + Σ_{k=1..N} S[k], S[k]=P(accept_len≥k).
+    /// Survival estimate at depth `k`, made monotone and optimistic-under-
+    /// uncertainty. Both corrections fix measured failures:
+    ///
+    /// MONOTONE: S is `P(accept_len >= k)`, which cannot rise with k. The raw
+    /// ratios do, because each depth conditions on a DIFFERENT subset (windows
+    /// that drafted >= k), and the argmax then sums them as one curve. A real
+    /// trace read `1:0.89 2:0.85 3:0.94` -- impossible for a survival function.
+    ///
+    /// OPTIMISTIC: a depth the block has stopped reaching stops accumulating
+    /// samples and keeps whatever estimate it last had. During the ramp the
+    /// n-gram store is still cold, so that frozen value is pessimistic, and it
+    /// can never be revised because nothing drafts that deep again. That is a
+    /// downward RATCHET, not the "cap-trap fix" the old comment claimed: a
+    /// measured run walked the block 15 -> 14 -> 13 while acceptance at those
+    /// depths was ~0.9. Under `MIN_DEPTH_SAMPLES`, carry the shallower estimate
+    /// forward instead of trusting a thin one, so an unexplored depth is
+    /// re-tried rather than condemned.
+    fn survival_at(&self, k: usize, prev: f32) -> f32 {
+        if k >= self.s_tot.len() || self.s_tot[k] < MIN_DEPTH_SAMPLES {
+            return prev;
+        }
+        (self.s_hit[k] / self.s_tot[k]).min(prev)
+    }
+
+    /// argmax over N ∈ [min_block, max_block] of τ(N)/(t_ar + (N-1)·Δt).
+    /// τ(N) = 1 + Σ_{k=1..N-1} S[k]: a block of N verifies the seed plus N-1
+    /// DRAFTED positions, so the deepest observable depth is N-1.
     fn argmax_block(&self) -> usize {
         if self.t_ar <= 0.0 || self.dt < 0.0 {
             return self.default_block;
         }
+        // The old loop ran `for n in 1..=max_tried` and indexed `s_hit[n]`,
+        // conflating the BLOCK with the drafted DEPTH. `observe` is called with
+        // `n_proposed = drafted.len() = block - 1`, so at `block == max_block`
+        // the top index never accumulated a single sample: every trace line read
+        // `16:0.00`, tau could not grow there, and the largest block was
+        // structurally unable to win -- the fixed configuration it was being
+        // compared against was not in its own reachable set.
+        let mut surv = 1.0f32;
         let mut tau = 1.0f32;
-        let mut best_n = 1usize;
+        for k in 1..self.min_block {
+            surv = self.survival_at(k, surv);
+            tau += surv;
+        }
+        let mut best_n = self.min_block;
         let mut best_score = f32::MIN;
-        for n in 1..=self.max_tried.min(MAX_DEPTH) {
-            // S(n)=P(accept_len≥n) from the counts; 0 for a never-drafted depth.
-            let survival = if self.s_tot[n] > 0.0 {
-                self.s_hit[n] / self.s_tot[n]
-            } else {
-                0.0
-            };
-            tau += survival;
+        for n in self.min_block..=self.max_block.min(MAX_DEPTH + 1) {
+            if n > self.min_block {
+                surv = self.survival_at(n - 1, surv);
+                tau += surv;
+            }
             let window_ms = self.t_ar + (n as f32 - 1.0) * self.dt; // > 0 by the guard above
             let score = tau / window_ms;
             if score > best_score {
@@ -242,7 +289,29 @@ impl BlockController {
                 best_n = n;
             }
         }
-        best_n.clamp(self.min_block, self.max_block)
+        let chosen = best_n.clamp(self.min_block, self.max_block);
+        if std::env::var("HIPFIRE_DSPARK_TRACE").is_ok() {
+            let surv: Vec<String> = (1..=self.max_tried.min(MAX_DEPTH))
+                .map(|n| {
+                    if self.s_tot[n] > 0.0 {
+                        format!("{n}:{:.2}", self.s_hit[n] / self.s_tot[n])
+                    } else {
+                        format!("{n}:--")
+                    }
+                })
+                .collect();
+            eprintln!(
+                "[dspark-trace] w={} max_tried={} best_n={} chosen={} dt={:.3} t_ar={:.1} S=[{}]",
+                self.windows_seen,
+                self.max_tried,
+                best_n,
+                chosen,
+                self.dt,
+                self.t_ar,
+                surv.join(" ")
+            );
+        }
+        chosen
     }
 
     #[cfg(test)]
@@ -273,7 +342,13 @@ mod tests {
         for i in 0..200 {
             c.observe([0, 1, 2, 2][i % 4], 5); // depth ~1.5, never > 2
         }
-        assert!((1..=2).contains(&c.block()), "got {}", c.block());
+        // Depth saturates at 2 accepted DRAFTED tokens, and a block of N
+        // verifies N-1 drafted positions, so the cheapest block that can still
+        // collect both is 3 (seed + 2). This asserted `<=2` while `argmax_block`
+        // summed survival over `1..=n` instead of `1..=n-1` -- the same
+        // block-vs-depth conflation that made the top block unreachable in
+        // production. The expectation moved by one because the model did.
+        assert!((2..=3).contains(&c.block()), "got {}", c.block());
     }
 
     // qwen3-like: cheap verify (dt small) + a drafter that accepts the whole drafted

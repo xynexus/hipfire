@@ -802,18 +802,16 @@ pub(crate) fn load(
             // the drafter-free n-gram one. `load.rs` hardcodes fallbacks; this is
             // the layer that reads config, so it is the layer that decides.
             //
-            // `spec_adaptive_block` defaults OFF and the measurements say keep it
-            // there. With a DFlash drafter, max_block is clamped to the trained
-            // block, which already is the in-range optimum. On the n-gram path,
-            // over 3 reps at 2000 tokens on gfx1103/qwen3.5-0.8b, a fixed block of
-            // 16 held 319-321 tok/s with an identical draft length every rep while
-            // the controller gave 252-289 and a draft length that moved between
-            // reps -- it calibrates off wall time, so its trajectory is not
-            // reproducible. It searches for an interior optimum on a DECAYING
-            // survival curve; n-gram survival stays near-flat out to the spine
-            // limit, so the optimum is at the boundary and there is nothing for an
-            // argmax to find. The switch exists so that is a setting, not a
-            // hardcoded `false` nobody can reach.
+            // `spec_adaptive_block` defaults OFF, but NOT for the reason first
+            // written here. The claim that the controller cost 10-30% on the
+            // n-gram path was withdrawn: speculative decode does not reproduce
+            // plain AR output on this stack, so runs at different block widths
+            // emit DIFFERENT token sequences and their tok/s compare different
+            // work. On the one valid comparison -- a warm request where both
+            // arms emitted a byte-identical sequence -- the controller matched
+            // the fixed block (338.7 vs 343.9 tok/s) at better verify
+            // efficiency. Off is the conservative default until the benchmark
+            // can hold output constant, not a measured verdict against it.
             if let Some(df) = m.dflash.as_mut() {
                 df.adaptive_b = spec_adaptive_block;
                 df.spec_block = spec_block;
