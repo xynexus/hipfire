@@ -774,3 +774,37 @@ useful batched-verify width at 16 on gate/up), but it is NOT what limits DDTree
 on a compact target. Anyone chasing it should confirm which kernel family their
 model actually dispatches first — that check is 30 seconds and would have saved
 this detour.
+
+---
+
+## #8 W4A4 beyond prefill · VERIFIED — cannot help decode, by arithmetic
+
+The item asks to extend 4-bit activations past prefill. It cannot pay at decode,
+and the reason is not difficulty — it is that A4 buys COMPUTE throughput
+(measured int4 = 2.0x int8 at the gfx1151 ISA) while decode is
+weight-bandwidth-bound at B=1.
+
+Qwen3.6-35B-A3B, per decode token:
+
+| | bytes | share |
+|---|---|---|
+| weights (3B active x 4.25 bits) | 1.594 GB | 99.4% |
+| activations (62 layers x ~8 hidden-sized f32 vectors) | 10.16 MB | **0.637%** |
+
+Taking activations f32 -> int4 removes **0.558% of per-token traffic**:
+
+    roofline, weights alone       155.9 tok/s
+    roofline, weights + f32 acts  154.9 tok/s
+    roofline, weights + int4 acts 155.8 tok/s
+
+A **0.6% ceiling improvement** — against a measured decode of 62.8 tok/s, which
+is 40% of that ceiling. The realisable gain is nil.
+
+**W4 is already there at decode**: the profile in #7 shows every decode GEMV is
+`gemv_oq_compact_*`, i.e. 4.25-bit weights. It is the A4 half that has nowhere to
+go, because there are no activation bytes worth saving at batch 1.
+
+So #8 is **prefill-only by nature**, and prefill already has the iu4 path with a
+goal file of its own (`docs/plans/2026-08-23-iu4-gemm-close-the-half-goal.md`,
+measuring ~50% of the 110.9 TOPS iu4 ceiling). Nothing to extend; the item was
+asking for a batch-1 win from a batch-N mechanism.
