@@ -56,7 +56,9 @@
 //! Env: HIPFIRE_CAP_DIR (default /tmp/residcap), HIPFIRE_RECOVER_LR (3e-4),
 //!      HIPFIRE_RECOVER_STEPS (200), HIPFIRE_RECOVER_ATTN (1 = also recover
 //!      input_layernorm; 0 = MLP norms only), HIPFIRE_RECOVER_LAYERS (cap the
-//!      layer sweep, for LR/step probes), HIPFIRE_RECOVER_ROWS (1024).
+//!      layer sweep, for LR/step probes), HIPFIRE_RECOVER_ROWS (1024),
+//!      HIPFIRE_RECOVER_GAMMA (teacher|student — `student` + STEPS=0 measures a
+//!      patched artifact's own block-local error).
 
 use hipfire_rdna::{DType, Gpu, GpuTensor};
 use hipfire_train::hfq_patch::{bf16_bits_to_f32, effective_metadata, parse_hfq, HfqEntry};
@@ -239,12 +241,16 @@ fn recover_gamma(
     dim: usize,
     eps: f32,
     gamma_h: &[f32],
+    gamma_teacher_h: &[f32],
     outs: &[(usize, Vec<f32>, Vec<f32>)],
     lr: f32,
     steps: usize,
 ) -> Result<(f32, f32, Vec<f32>), Box<dyn std::error::Error>> {
     let x_in = gpu.upload_f32(x_in_h, &[rows * dim])?;
     let gamma = gpu.upload_f32(gamma_h, &[dim])?;
+    // See `recover_mlp_gamma`: the teacher's norm is pinned so verification of a
+    // patched artifact does not move the target along with the student.
+    let gamma_t = gpu.upload_f32(gamma_teacher_h, &[dim])?;
     let mut opt = AdamW::new(gpu, &[dim], lr, 0.9, 0.999, 1e-8, 0.0)?;
     let yn = gpu.zeros(&[rows * dim], DType::F32)?;
     let rinv = gpu.zeros(&[rows], DType::F32)?;
@@ -267,7 +273,7 @@ fn recover_gamma(
     // the whole step on-device. Round-tripping activations through host memory
     // every step made this ~0.5 s/step and put a full sweep out of reach.
     let mut targets: Vec<GpuTensor> = Vec::new();
-    rmsnorm_forward(gpu, &x_in, &gamma, &yn, &rinv, rows, dim, eps)?;
+    rmsnorm_forward(gpu, &x_in, &gamma_t, &yn, &rinv, rows, dim, eps)?;
     for (i, (m, _, _)) in outs.iter().enumerate() {
         let t = gpu.zeros(&[rows * m], DType::F32)?;
         linear_forward(gpu, &yn, &w_t[i], &t, rows, dim, *m)?;
@@ -340,7 +346,7 @@ fn recover_gamma(
     for t in w_t.into_iter().chain(w_s).chain(y_buf).chain(targets) {
         gpu.free_tensor(t)?;
     }
-    for t in [x_in, gamma, yn, rinv, d_x_unused, d_yn, d_gamma] {
+    for t in [x_in, gamma, gamma_t, yn, rinv, d_x_unused, d_yn, d_gamma] {
         gpu.free_tensor(t)?;
     }
     Ok((start, last, tuned))
@@ -361,6 +367,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Cap the layer sweep so LR/step probes cost seconds, not an hour.
     let max_layers = envu("HIPFIRE_RECOVER_LAYERS", usize::MAX);
     let max_rows = envu("HIPFIRE_RECOVER_ROWS", 1024);
+    // Where the INITIAL γ comes from. `teacher` is right for recovery (student
+    // and teacher share the norm before any patch). `student` is how you VERIFY
+    // a patched artifact: run with 0 steps and the reported start MSE is that
+    // artifact's real block-local error, so a fold that worked shows up as a
+    // lower start than the unpatched control.
+    let gamma_from_student = envs("HIPFIRE_RECOVER_GAMMA", "teacher") == "student";
 
     let student = Artifact::open(&q_path)?;
     let teacher = Artifact::open(&bf_path)?;
@@ -448,15 +460,47 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (mut s_attn, mut f_attn, mut n_attn) = (0.0f64, 0.0f64, 0usize);
 
     for i in 0..n_layers.min(max_layers) {
+        // HIPFIRE_RECOVER_DUMP_NORMS=1: compare the STORED norm in the student
+        // artifact against the bf16 teacher's. Norms pass through unquantized, so
+        // an untouched build must match the teacher exactly; anything else means
+        // the build is rewriting them and the recovery started from the wrong γ.
+        if std::env::var("HIPFIRE_RECOVER_DUMP_NORMS").as_deref() == Ok("1") {
+            for leaf in ["input_layernorm.weight", "post_attention_layernorm.weight"] {
+                let n = prefix(i, leaf);
+                if let (Ok(t), Ok(st)) = (teacher.read(&n), student.read(&n)) {
+                    let d = t
+                        .iter()
+                        .zip(&st)
+                        .map(|(a, b)| (a - b).abs())
+                        .fold(0.0f32, f32::max);
+                    let mean = |v: &[f32]| v.iter().sum::<f32>() / v.len() as f32;
+                    println!(
+                        "N L{i:2} {leaf:<32} |teacher-student|max={d:.4e}  \
+                         mean_t={:.5} mean_s={:.5}",
+                        mean(&t),
+                        mean(&st)
+                    );
+                }
+            }
+        }
+
         // ---- post_attention_layernorm: the dense FFN ----
         let gate_n = prefix(i, "mlp.gate_proj.weight");
         if teacher.get(&gate_n).is_some() {
             let norm_n = prefix(i, "post_attention_layernorm.weight");
             let (xin, rows) = read_cap(&cap_dir, "premlp", i, dim, max_rows)?;
             finite(&xin, "capture", &format!("premlp.L{i}"))?;
-            let mut g0 = teacher.read(&norm_n)?;
+            let mut g_teacher = teacher.read(&norm_n)?;
+            let mut g0 = if gamma_from_student {
+                student.read(&norm_n)?
+            } else {
+                g_teacher.clone()
+            };
             if unit_offset {
                 for v in g0.iter_mut() {
+                    *v += 1.0;
+                }
+                for v in g_teacher.iter_mut() {
                     *v += 1.0;
                 }
             }
@@ -475,6 +519,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 inter,
                 eps,
                 &g0,
+                &g_teacher,
                 (&wg_s, &wu_s, &wd_s),
                 (&wg_t, &wu_t, &wd_t),
                 lr,
@@ -514,9 +559,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         };
         let norm_n = prefix(i, "input_layernorm.weight");
         let (xin, rows) = read_cap(&cap_dir, "pertoken", i - 1, dim, max_rows)?;
-        let mut g0 = teacher.read(&norm_n)?;
+        let mut g_teacher = teacher.read(&norm_n)?;
+        let mut g0 = if gamma_from_student {
+            student.read(&norm_n)?
+        } else {
+            g_teacher.clone()
+        };
         if unit_offset {
             for v in g0.iter_mut() {
+                *v += 1.0;
+            }
+            for v in g_teacher.iter_mut() {
                 *v += 1.0;
             }
         }
@@ -524,8 +577,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             .iter()
             .map(|n| load_pair(n))
             .collect::<Result<_, _>>()?;
-        let (start, last, tv) =
-            recover_gamma(&mut gpu, &xin, rows, dim, eps, &g0, &outs, lr, steps)?;
+        let (start, last, tv) = recover_gamma(
+            &mut gpu, &xin, rows, dim, eps, &g0, &g_teacher, &outs, lr, steps,
+        )?;
         let rec = 100.0 * (start - last) / start.max(1e-12);
         println!("L{i:2} attn: MSE {start:.3e} -> {last:.3e} ({rec:5.1}%)  rows={rows}");
         tuned.insert(norm_n, store_back(tv, unit_offset));
@@ -571,6 +625,7 @@ fn recover_mlp_gamma(
     inter: usize,
     eps: f32,
     gamma_h: &[f32],
+    gamma_teacher_h: &[f32],
     student: (&[f32], &[f32], &[f32]),
     teacher: (&[f32], &[f32], &[f32]),
     lr: f32,
@@ -578,6 +633,12 @@ fn recover_mlp_gamma(
 ) -> Result<(f32, f32, Vec<f32>), Box<dyn std::error::Error>> {
     let x_in = gpu.upload_f32(x_in_h, &[rows * dim])?;
     let gamma = gpu.upload_f32(gamma_h, &[dim])?;
+    // The teacher is the bf16 model with ITS OWN norm, and it does not move.
+    // During recovery this equals the initial `gamma`, so the target is the same
+    // either way; they diverge only when verifying an already-patched artifact,
+    // where reusing one tensor would move the target along with the student and
+    // silently compare two different objectives.
+    let gamma_t = gpu.upload_f32(gamma_teacher_h, &[dim])?;
     let mut opt = AdamW::new(gpu, &[dim], lr, 0.9, 0.999, 1e-8, 0.0)?;
     let yn = gpu.zeros(&[rows * dim], DType::F32)?;
     let rinv = gpu.zeros(&[rows], DType::F32)?;
@@ -605,8 +666,8 @@ fn recover_mlp_gamma(
     );
 
     macro_rules! ffn {
-        ($gpu:expr, $wg:expr, $wu:expr, $wd:expr) => {{
-            rmsnorm_forward($gpu, &x_in, &gamma, &yn, &rinv, rows, dim, eps)?;
+        ($gpu:expr, $g:expr, $wg:expr, $wu:expr, $wd:expr) => {{
+            rmsnorm_forward($gpu, &x_in, $g, &yn, &rinv, rows, dim, eps)?;
             linear_forward($gpu, &yn, $wg, &g, rows, dim, inter)?;
             linear_forward($gpu, &yn, $wu, &u, rows, dim, inter)?;
             swiglu_forward($gpu, &g, &u, &act, rows * inter)?;
@@ -618,7 +679,7 @@ fn recover_mlp_gamma(
     // which is both the loss and (up to the constant 2/N that AdamW normalises
     // away) the gradient. Keeps the step on-device.
     let target = gpu.zeros(&[rows * dim], DType::F32)?;
-    ffn!(gpu, &wg_t, &wu_t, &wd_t);
+    ffn!(gpu, &gamma_t, &wg_t, &wu_t, &wd_t);
     gpu.copy_d2d(&mlp, &target, rows * dim * 4)?;
     let resid = |gpu: &mut Gpu| -> Result<f32, Box<dyn std::error::Error>> {
         let v = gpu.download_f32(&mlp)?;
@@ -627,7 +688,7 @@ fn recover_mlp_gamma(
 
     macro_rules! student_resid {
         ($gpu:expr) => {{
-            ffn!($gpu, &wg_s, &wu_s, &wd_s);
+            ffn!($gpu, &gamma, &wg_s, &wu_s, &wd_s);
             $gpu.scaled_add_inplace_cpu_scalar_f32(&mlp, &target, -1.0)?;
         }};
     }
@@ -668,7 +729,7 @@ fn recover_mlp_gamma(
     eprintln!("      |dgamma|max={dmax:.3e}");
     for t in [
         wg_t, wu_t, wd_t, wg_s, wu_s, wd_s, x_in, gamma, yn, rinv, g, u, act, mlp, d_act, d_g, d_u,
-        d_yn, d_x_unused, target, d_gamma,
+        d_yn, d_x_unused, target, d_gamma, gamma_t,
     ] {
         gpu.free_tensor(t)?;
     }
