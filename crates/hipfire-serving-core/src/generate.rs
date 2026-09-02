@@ -4230,10 +4230,21 @@ pub fn generate_start(
             tracing::info!("mtp: head present but spec-decode not taken — {why}");
         }
     }
+    // KVarN: mirror the DFlash gate. `kvarn_specdecode_ok` is what makes
+    // speculative decode safe under a quantized cache (it tracks KVarN batched
+    // prefill, default-on), and DFlash has consulted it since 2026-08-27. MTP
+    // never did, so a bare `!kvarn_active` disabled MTP on EVERY supported
+    // configuration -- the `kv_cache` enum has no unquantized value, and q8 /
+    // asym* are deprecated and refused, so `kvarn_active` is always true in
+    // practice and the route was dead code.
+    //
+    // Correctness is not assumed from the DFlash precedent: speculative decode
+    // is only valid if it reproduces AR greedy EXACTLY, and that equality is
+    // checked against this artifact rather than argued from the gate's history.
     if m.dflash.is_none()
         && m.mtp_weights_present
         && m.mtp_mode != "off"
-        && !kvarn_active
+        && (!kvarn_active || kvarn_specdecode_ok)
         && temp <= 1e-6
         && is_qwen35_family_arch_id(m.arch_id)
         && !prefill_already_done
