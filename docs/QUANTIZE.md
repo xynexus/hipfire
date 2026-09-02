@@ -705,6 +705,40 @@ prefill numbers below before choosing it.
 - Between the two ~3.6 bpw options, `qtip3` wins quality (+27%) and decode (+16%);
   `oq3++` wins prefill and TTFT by ~8x. Neither dominates.
 
+### If you protect tensors, protect CHANNELS — and rank by gamma, not covariance
+
+Three protection strategies were measured on the same qtip3 body, against the line you
+get by simply interpolating qtip3 → `oq4.25++` (i.e. "would those bits have been better
+spent uniformly?"):
+
+| protection | est. body bpw | uniform line predicts | measured | |
+|---|---|---|---|---|
+| none (qtip3) | 3.364 | — | 0.2137 | |
+| **tensor**-level, covariance-ranked | 3.744 | 0.1570 | 0.2076 | **below** the line |
+| **channel**-level (`roughquant4-sim`) | 3.515 | 0.1912 | **0.1651** | **above** by 13.7% |
+
+Granularity is the whole story. An outlier lives in a **channel**; promoting the entire
+tensor that contains it pays for 1024 channels to fix one. `roughquant4-sim` ranks
+residual channels by activation energy once and keeps the top set exact in the *columns*
+of every residual reader **and** the *rows* of every residual writer, so a hot channel is
+exact where it is written and where it is read. At `protect_frac=0.03` that was 31/1024
+channels for −22.7% KLD.
+
+**Rank with gamma, not with `HIPFIRE_MIXED_BPW_RANK` density.** The density ranking
+(`err_oq4 / numel`) is input-covariance only, which implicitly sets the output side to
+the identity. On Qwen3.5-0.8B its top entries were all `linear_attn.in_proj_a` — [16,1024]
+tensors that are 0.158% of the body, so protecting them is free *and worthless*. The
+gamma table for the same model ranks **output projections** first (`out_proj`,
+`down_proj`, `o_proj` occupy the entire top 8), matching `calib_gamma`'s own note that
+covariance ranking "ranks `o_proj` 79th-113th of 113 while it is the single largest
+promotion win". Produce gamma with `gamma_hybrid` (it accepts a safetensors dir or an
+`.hfq`, and handles the VL `text_config` wrap) and feed it via `HIPFIRE_MIXED_BPW_GAMMA`.
+
+Caveat: `roughquant4` is a **sim** format — it emits bf16, so it measures the error a
+packed implementation would incur but is not itself shippable. Feed a quantized `.hfq`
+to `gamma_hybrid` and it fails on `Bf16Lut3` (qt 49); use the safetensors source, which
+is what its docs recommend anyway.
+
 **Set `HIPFIRE_QTIP_COND=greedy` if you use `qtip3` at all.** It enables output-aware
 OBS conditioning (GPU exact Viterbi + a device-resident residual) and was worth 26%
 on its own — KLD 0.3335 to 0.2469 — at no size cost. It is off by default.
