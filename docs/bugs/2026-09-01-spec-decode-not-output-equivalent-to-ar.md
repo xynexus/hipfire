@@ -195,54 +195,46 @@ Prefill-cache reuse is not the explanation: with speculation off, two identical
 back-to-back requests are byte-identical, so re-running a prompt does not by
 itself change output.
 
-## WITHDRAWN: "quantised KV is the root cause"
+## RESOLVED: quantised KV is the cause, and fp32 KV is bit-exact
 
-An earlier revision of this document called the quantised KV cache the root
-cause, on the strength of `compare_prefill_hidden_paths` showing fp32 KV
-IDENTICAL and every quantised mode diverging ~0.5-0.6 at layer 0. **That
-conclusion is withdrawn.** The measurement does not behave like quantisation
-error, and two follow-up controls killed it.
+The withdrawal recorded here earlier is itself withdrawn. The claim was right;
+the evidence I retracted it on was invalid, because **the daemon's KV mode
+setting did not work** (next section). Every "q8" and "kvarn8" run I compared was
+silently kvarn at 4 bits, so the widths could not order correctly and the physics
+looked broken.
 
-**The bit widths do not order correctly.** Expected physics: KVarN-8 should be
-close to fp32, KVarN-4 should comfortably beat q8, KVarN-2 should be markedly
-worse than KVarN-4. None of that appears:
+With a lever that works (`HIPFIRE_KV_MODE`), 300 greedy tokens, same prompt,
+AR vs speculation at b=16:
 
-    fp32          IDENTICAL (0.00e0)
-    q8            layer 0, worst 5.24e-1
-    kvarn 2-bit   layer 0, worst 6.18e-1
-    kvarn 4-bit   layer 0, worst 6.18e-1
-    kvarn 8-bit   layer 0, worst 6.18e-1
+| KV mode | AR | speculative | |
+|---|---|---|---|
+| kvarn 4-bit | `77ab36b1ad5a569f` | `675ebc8a5988cad6` | differs |
+| kvarn 8-bit | `86f354c73ef92541` | `2db61eab7d2c5b41` | differs |
+| **fp32** | `c27c9545c599d88d` | `c27c9545c599d88d` | **byte-identical** |
 
-Eight bits is no better than two. Per-layer, the width does move some
-layers — L3 reads 4.89e-1 / 5.08e-1 / 5.46e-1 at 2/4/8 bits, deterministic
-across repeated runs — but it moves the WRONG WAY, growing with precision, and
-the maximum never budges. Quantisation error would fall by roughly 64x from 2
-to 8 bits.
+**With an unquantised KV, speculative decode reproduces AR exactly.** The
+losslessness guarantee holds and the verify is correct. With any quantised KV it
+does not, and 8 bits does not rescue it — losslessness needs bit-exactness, not
+closeness, and a batched verify rounds a quantised KV differently from a
+per-token decode.
 
-**Pinning the DeltaNet state to FP32 changes nothing.** The natural reading of
-the divergence was the daemon's own prefill warning: "the per-token fallback
-rounds the FP16 DeltaNet state once per token where the batched path rounds once
-per chunk ... amplified ~65x by KVarN attention". But re-running the whole sweep
-with `HIPFIRE_DN_STATE_FP16=0` (log confirms `dn_quant=FP32`) reproduces the same
-numbers to three digits, and `tests/spec-ar-equivalence-gate.sh` still fails with
-FP32 state forced automatically by the restored redundancy guard.
+So this is not a logic bug in the verify. It is the interaction of quantised KV
+storage with the fact that speculation reads it in blocks while AR reads it one
+position at a time. Whether that is acceptable is a product decision — the
+speedup is real and the text stays fluent — but the guarantee as written ("the
+verify makes it lossless") is only true at fp32, and nothing says so.
 
-So: something makes the batched and per-token prefill paths disagree whenever the
-KV cache is quantised, it is not the KV's precision, and it is not the DeltaNet
-state's precision. **Either the probe is measuring something other than what its
-output implies, or one of the two paths is structurally wrong in a way that a
-narrower or wider KV does not change.** Both are open.
+### The lesson I nearly buried
 
-The per-row data argues against a metric artifact: at the last layer every row
-diverges (6.3e-2 to 2.5e-1), not one outlier with a tiny denominator.
+Twice I drew a conclusion from a knob that was not connected: first claiming the
+KV was the cause with no working width control, then retracting a correct finding
+because the broken control produced impossible physics. The physics WAS
+impossible — KVarN-8 behaving exactly like KVarN-2 is not a thing — and the right
+response to an impossible measurement is to distrust the instrument, not the
+theory. Check that a setting moved the number it should move before believing
+anything downstream of it.
 
-What survives from the earlier section, because it was measured directly rather
-than inferred: with fp32 KV the two paths are bit-identical, and with any
-quantised KV they are not. That is a real difference and worth chasing. What does
-not survive is the claim that its MECHANISM is quantisation error, or that it is
-the proven cause of the spec/AR divergence.
-
-## The measurement itself (kept for the record)
+## Supporting evidence: the prefill paths differ under quantised KV
 
 `crates/hipfire-runtime/examples/compare_prefill_hidden_paths` runs the BATCHED
 and PER-TOKEN forwards in one process against the same `HiddenStateRingBuffer`
