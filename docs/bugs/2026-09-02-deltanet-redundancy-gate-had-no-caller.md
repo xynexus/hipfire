@@ -103,6 +103,35 @@ artifacts were available to check, so that is a narrow sample, not a survey.
 that is ~19 MB per session, doubled again under spec decode. Negligible for the
 models the floor actually catches, which is the reason the floor is where it is.
 
+## tiny-quant-gate: what the guard moves, and what it does not
+
+`tests/tiny-affected-gate.sh` reports 9 failing tiny-quant cells. Attribution,
+by re-running the two affected families with the guard disabled
+(`HIPFIRE_DN_STATE_FP32_BELOW=0`):
+
+| cell | guard ON | guard OFF | attribution |
+|---|---|---|---|
+| gemma4_moe kld:oq8 | 0.000033 | 0.000033 | **unchanged — pre-existing** |
+| gemma4_moe kld:oq8+(calib) | 0.000019 | 0.000019 | unchanged — pre-existing |
+| gemma4_moe kld:oq8++(calib) | 0.000019 | 0.000019 | unchanged — pre-existing |
+| qwen3_5_moe kld:oq8 | 0.001695 | 0.019545 | guard improves it ~11x |
+| qwen3_5_moe kld:oq8+(calib) | 0.004914 | 0.071108 | guard improves it ~14x |
+
+gemma4 cannot be affected at all: `default_state_quant` is referenced only by the
+qwen35 crates and `serving-core`, and gemma4 has its own arch crate. Those three
+failures are pre-existing and unrelated to this change.
+
+The qwen3.5 cells DO move, and they move the right way — FP32 state gives an
+order of magnitude lower KLD than FP16. They still exceed the recorded budget
+because the baseline was captured under the old FP16 default, exactly as the
+four `tiny-state` hashes were.
+
+**Recommendation**: re-baseline the qwen3.5 KLD rows when accepting this change,
+the same way the four state hashes were, and treat the gemma4 oq8 drift as a
+separate pre-existing issue. It was NOT re-baselined here, because a KLD baseline
+encodes a quality expectation rather than a bit pattern and moving it deserves a
+deliberate decision rather than being folded into this change.
+
 ## Precedence: an explicit env request wins
 
 `dn_state_precedence` documents that the debug env var wins when SET, either way,
