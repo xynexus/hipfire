@@ -144,6 +144,10 @@ P="$ROOT/target/release/examples/tiny_quant_probe"
 fail=0
 skip=0
 ran=0
+# Comparisons that could not run at all (batched path declined). Reported
+# separately from `fail`: a coverage gap is not a divergence, but it must not
+# masquerade as a satisfied invariant either.
+nomeasure=0
 
 for raw_family in "${families[@]}"; do
     family="$(echo "$raw_family" | xargs)"
@@ -228,9 +232,22 @@ for raw_family in "${families[@]}"; do
         # 300: above the 256 chunk so the KV is actually read, and below the
         # tiny fixtures' context — 512 panics them ("--n exceeds fixture ctx").
         HID_N="${HIPFIRE_TINYPREFILL_HID_N:-300}"
+        # The probe compares a BATCHED arm against a per-token one. On some
+        # configurations the batched path declines and BOTH arms run per-token,
+        # so it reports `IDENTICAL (worst 0.00e0)` for a comparison that never
+        # happened. That is how `hidden fp32: 0.00e0 (invariant: must be exactly
+        # 0)` came to be printed for qwen3_5_moe_indexed, where fp32 KV declines
+        # batched prefill outright — an invariant asserted on nothing.
+        #
+        # The batched arm announces itself with a `[features] ... prefill
+        # batched` line. No line, no comparison, no pass.
+        hid_batched_ran() {
+            grep -qE '\[features\].*prefill[^,]*batched' "$HID_ERR" "$HID_OUT" 2>/dev/null
+        }
+        HID_OUT="$TMP/hidden-probe.out"
         hid_worst() {
-            "$HID" --model "$2" --n "$HID_N" --kv-mode "$1" 2>"$HID_ERR" |
-                grep -oE '\(worst (overall )?[0-9.eE+-]+\)' |
+            "$HID" --model "$2" --n "$HID_N" --kv-mode "$1" 2>"$HID_ERR" >"$HID_OUT"
+            grep -oE '\(worst (overall )?[0-9.eE+-]+\)' "$HID_OUT" |
                 sed -E 's/.*[[:space:]]([0-9.eE+-]+)\)/\1/' | tail -1
         }
         # A degenerate run must FAIL, not quietly report zeros. Without this the
@@ -251,6 +268,14 @@ for raw_family in "${families[@]}"; do
             echo "       every kv-mode returns IDENTICAL and the ceiling cannot fire."
             echo "       Raise HIPFIRE_TINYPREFILL_HID_N above 256."
             fail=$((fail + 1))
+        elif ! hid_batched_ran; then
+            # NOT a failure: the batched path declining is a coverage gap, not a
+            # divergence. But it must never print as a satisfied invariant --
+            # `0.00e0` from two per-token arms means "not measured".
+            echo "  NOT-MEASURED hidden fp32: batched prefill declined, both arms ran"
+            echo "               per-token — no comparison happened (was reported as"
+            echo "               'invariant: must be exactly 0' satisfied)"
+            nomeasure=$((nomeasure + 1))
         elif [ -z "$w32" ]; then
             echo "  FAIL hidden-state probe emitted no parseable summary at fp32 KV —"
             echo "       treating an unmeasured invariant as a pass is how this arm"
@@ -267,6 +292,12 @@ for raw_family in "${families[@]}"; do
         for hkv in "${kv_modes[@]}"; do
             hkv="$(echo "$hkv" | xargs)"; [ -n "$hkv" ] || continue
             wq="$(hid_worst "$hkv" "$hfq")"
+            if ! hid_batched_ran; then
+                # Same trap as the fp32 arm, same handling.
+                echo "  NOT-MEASURED hidden $hkv: batched prefill declined; nothing compared"
+                nomeasure=$((nomeasure + 1))
+                continue
+            fi
             if [ -z "$wq" ]; then
                 echo "  FAIL hidden-state probe emitted no parseable summary for $hkv"
                 echo "       probe said: $(hid_why)"
@@ -330,7 +361,12 @@ for raw_family in "${families[@]}"; do
     done
 done
 
-echo "tiny-prefill-gate: ran=$ran fail=$fail skip=$skip"
+echo "tiny-prefill-gate: ran=$ran fail=$fail skip=$skip not-measured=$nomeasure"
+if [ "$nomeasure" -gt 0 ]; then
+    echo "  note: $nomeasure hidden-state comparison(s) did not run because batched"
+    echo "        prefill declined. Those cells previously printed 0.00e0 and read as"
+    echo "        passes. They are coverage gaps, not divergences."
+fi
 [ "$fail" -gt 0 ] && exit 1
 [ "$ran" -eq 0 ] && exit 3
 exit 0
