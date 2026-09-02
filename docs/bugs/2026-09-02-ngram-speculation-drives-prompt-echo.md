@@ -102,9 +102,51 @@ One token does it, so whatever fails to restore is touched by any speculative
 write, not only by a block completion. The open block's var-norm statistics
 being recomputed on every write fits; a boundary-crossing requirement does not.
 
-**Not yet proven**: that the block scales specifically are what fails to roll
-back. The next step is to dump one block's var-norm record before a speculative
-write and after a rejection, and check whether it returns to its prior value.
+## Measured with a cache probe: the RECORDS are clean, the WINDOW is not
+
+`HIPFIRE_KVARN_ROLLBACK_PROBE=1` (added with this work) hashes the KVarN sealed
+records and the trailing window across a speculative step — before the verify
+writes, and after rollback — and counts how many window rows changed. 137
+speculating steps on the echo prompt:
+
+**The block-scale theory is REFUTED.** Records changed in 5 steps, and every one
+of those completed a 128-token block:
+
+    record changes with no block completion: 0
+
+So sealing behaves correctly and rejected drafts do not perturb an already-sealed
+record. (An earlier version of this probe reported 2 spurious changes; its
+completion test was `(pos/group) != ((pos+b-1)/group)`, which for `b=1` can never
+fire even when the written position IS the last of its block. A block completes
+when `p % group == group - 1`. The two "spurious" cases were positions 1663 and
+1791 — both exactly that.)
+
+**The window retains rejected rows.** Rows changed per step is `b` in every
+configuration, independent of how many tokens were committed:
+
+| b | accept | rejected | committed | window rows written |
+|---|---|---|---|---|
+| 2 | 0 | 1 | 1 | 2 |
+| 2 | 1 | 0 | 2 | 2 |
+| 3 | 0 | 2 | 1 | 3 |
+| 17 | 0 | 16 | 1 | **17** |
+| 17 | 16 | 0 | 17 | 17 |
+
+(The raw counter reads `2b` because the window is F16 held in an F32-typed
+buffer, so one real row occupies half the f32 slots the probe strides by.)
+
+The bottom row is the point: a step that committed ONE token wrote seventeen
+window rows and left sixteen of them — the rejected drafts' K — staged in the
+buffer. Nothing clears them.
+
+That is a concrete, reproducible asymmetry, and it is the only KV carrier left
+standing: the records are clean, and an exact (fp32) KV — which has neither
+records nor window — removes the corruption entirely.
+
+**Still not proven**: that those stale rows are READ. The window is a staging
+ring, so if attention is masked to the committed length they are inert. Proving
+the loop end-to-end means showing a read past the committed length — which is
+the next step, and is now a much narrower question than when this started.
 
 ## Why this matters more than the losslessness bug reads on its own
 
