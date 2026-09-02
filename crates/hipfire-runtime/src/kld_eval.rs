@@ -66,6 +66,36 @@ pub trait ChunkScoredForward {
 
     /// Vocabulary size (for reference provenance).
     fn kld_vocab_size(&self) -> usize;
+
+    /// Full-vocabulary logits at the FINAL position of `tokens`, in one forward.
+    ///
+    /// Scoring a single position — a cross-encoder reranker reading `yes` against `no`
+    /// at the answer slot — does not need the teacher-forced walk
+    /// [`ChunkScoredForward::forward_chunk_scored`] performs. That walk prefills one
+    /// token and then decodes the rest one at a time, so it costs a decode step per
+    /// prompt token; measured on a 0.6B reranker that was ~1.9 s per pair where a single
+    /// batched prefill is the actual work.
+    ///
+    /// The default routes through the walk so every implementor has this; the `SimpleAr`
+    /// blanket impl below overrides it with one `prefill`.
+    fn final_position_logits(&mut self, gpu: &mut Gpu, tokens: &[u32]) -> Result<Vec<f32>, String> {
+        if tokens.is_empty() {
+            return Err("final_position_logits: empty prompt".to_string());
+        }
+        // `forward_chunk_scored` only scores positions with a next token inside the
+        // chunk, so append one as a label and score the position before it. A causal
+        // model's logits at n-1 cannot depend on n.
+        let mut chunk = tokens.to_vec();
+        let scoring_start = chunk.len() - 1;
+        chunk.push(tokens[tokens.len() - 1]);
+        let mut out: Option<Vec<f32>> = None;
+        self.forward_chunk_scored(gpu, &chunk, scoring_start, &mut |w| {
+            if out.is_none() && w.rows() > 0 {
+                out = Some(w.row(0).to_vec());
+            }
+        })?;
+        out.ok_or_else(|| "final_position_logits: no scored position".to_string())
+    }
 }
 
 /// Every autoregressive backend is KLD-scorable: prefill the first token, decode
@@ -110,6 +140,20 @@ impl<T: SimpleAr> ChunkScoredForward for T {
 
     fn kld_vocab_size(&self) -> usize {
         SimpleAr::vocab_size(self)
+    }
+
+    /// One batched prefill over the whole prompt, then read the logits it leaves.
+    ///
+    /// `SimpleAr::prefill` is documented to take the full prompt and leave the
+    /// final-position logits in [`SimpleAr::logits`], which is exactly this question —
+    /// so the teacher-forced walk in the default is pure waste here.
+    fn final_position_logits(&mut self, gpu: &mut Gpu, tokens: &[u32]) -> Result<Vec<f32>, String> {
+        if tokens.is_empty() {
+            return Err("final_position_logits: empty prompt".to_string());
+        }
+        self.prefill(gpu, tokens)?;
+        gpu.download_f32(self.logits())
+            .map_err(|e| format!("final_position_logits: download logits: {e:?}"))
     }
 }
 
