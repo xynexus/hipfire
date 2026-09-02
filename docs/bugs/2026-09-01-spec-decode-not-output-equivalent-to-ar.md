@@ -141,22 +141,98 @@ The DFlash drafter path, which DID speculate, is the one with the AR-parity
 measurement quoted above. So the guarantee was verified where it was exercised
 and unverified where it was not.
 
-## Most likely cause: the drafted positions are visible to earlier rows
+## REFUTED: a causal-mask leak
 
-The batched verify evaluates seed + drafted positions in one forward. If the
-causal mask is wrong, row *i* can attend to drafted position *j > i*, and then
-the logits at *i* — and hence the token committed there — depend on tokens that
-were only guesses. That reproduces every observation above, including a
-single-token draft being sufficient and the dependence on store warmth.
+The earlier hypothesis was that row *i* of the batched verify could attend to
+drafted position *j > i*, so committed tokens depended on guesses. **Measurement
+refutes it.**
 
-**This exact bug class has occurred in this repo before**: "Routed KVarN prefill:
-rows in a wrapped block attend to FUTURE tokens"
-(`docs/bugs/2026-08-29-kvarn-routed-prefill-window-wrap.md`, fixed 2026-08-29) —
-same shape, different code path.
+`HIPFIRE_DFLASH_VERIFY_DEBUG=1` already dumps each verify block's inputs and its
+per-position argmax, and its own comment states the invariant: "Slot 0's argmax
+is the target's OWN next token for the already-committed prefix — it is what
+plain decode would emit at `start_pos`". At one position, varying only the block
+width:
 
-Not yet confirmed; the next step is to dump the target's logits at the first
-committed position of one window with two different drafted suffixes. If they
-differ, the mask is leaking and this is proven.
+    b=2   in=[760, 4536]                        argmax=[3766, 369]
+    b=4   in=[760, 4536, 5004, 264]             argmax=[3766, 369, 264, 2972]
+    b=8   in=[760, 4536, 5004, 264, ...]        argmax=[3766, 369, 264, 2972, ...]
+    b=16  in=[760, 4536, 5004, 264, ...]        argmax=[3766, 369, 264, 2972, ...]
+
+Slot 0 is `3766` in every case. At `b=2` the block holds only two tokens, and
+slot 0 is already wrong; adding fourteen more changes nothing. **Later tokens do
+not leak backward.** The mask is fine.
+
+## Cleanest statement of the bug
+
+`tests/spec-ar-equivalence-gate.sh` (added with this write-up) reduces it to one
+line. 200 greedy tokens, same prompt:
+
+    AR      69b9d6568590b620   <- reference
+    b=2     45e403a7b86ebae3   FAIL
+    b=4     45e403a7b86ebae3   FAIL
+    b=16    45e403a7b86ebae3   FAIL
+
+**Every speculative width produces the SAME sequence as every other, and all of
+them differ from AR.** So the defect is not width-dependent — it is
+speculation-versus-not, which is precisely the `b=1` / `b>=2` split the slot-0
+probe shows. (Over longer runs the widths eventually drift apart from each other
+too, but that is a secondary effect downstream of this one.)
+
+## PROVEN: the batched forward disagrees with the single-token forward
+
+The split is `b == 1` versus `b >= 2`, not block contents. At the same
+`start_pos`, with the same committed prefix and the same slot-0 input token:
+
+    b=1  (no speculation)  in=[760]   argmax=[4536]
+    b>=2 (any width)       in=[760,…] argmax=[3766, …]
+
+Slot 0 depends only on the prefix and its own input. It must be `4536`. Batching
+the forward changes it. Per the probe's own comment, that "localizes the
+miscompute to the verify forward itself rather than to acceptance or rollback",
+which is consistent with rollback having already been eliminated above.
+
+Prefill-cache reuse is not the explanation: with speculation off, two identical
+back-to-back requests are byte-identical, so re-running a prompt does not by
+itself change output.
+
+## Primary contributor: FP16 DeltaNet state
+
+Re-run with `HIPFIRE_DN_STATE_FP16=0` (log confirms `dn_quant=FP32`), same
+position, same probe:
+
+    b=1  in=[1919]                    argmax=[4536]
+    b=4  in=[1919, 4536, 5004, 264]   argmax=[4536, 5004, 264, 2972]
+
+Slot 0 now **agrees** with the single-token forward, and the whole block
+verifies cleanly (full acceptance). This is the mechanism the prefill path
+already warns about: "the per-token fallback rounds the FP16 DeltaNet state once
+per token where the batched path rounds once per chunk". A speculative block is
+a chunk; `b=1` is a token.
+
+**But FP32 does not fully close it.** End to end at 800 tokens, spec still
+diverges from AR — first difference moves from token 49 to 74 (request 1) and
+from token 1 to 18 (request 2). So FP16 state is a major contributor and there
+is at least one more source of batched/single-token disagreement still
+unidentified.
+
+## The FP16 default contradicts its own documentation
+
+Worth fixing regardless of the above, because it decides which path users get:
+
+| source | claim |
+|---|---|
+| `qwen35/state.rs:88` | "State precision is FP32 unless `HIPFIRE_DN_STATE_FP16` opts in." |
+| `default_state_quant` doc comment | "**FP32 is the DEFAULT and the numerical reference; FP16 is opt-in.**" |
+| `config/schema.rs:656` | `deltanet_state_precision` default is `Some("fp16")` |
+
+`dn_state_precedence` resolves `!cfg.eq_ignore_ascii_case("fp32")`, so the
+shipped default is FP16 and FP32 is the opt-in — the inverse of what both
+comments state. The comments also record the measurements that were used to
+choose FP32 ("This is the reading that kept the default at FP32"), so the
+default appears to have moved without those comments following.
+
+Given FP16 state demonstrably breaks slot-0 equivalence under speculation, the
+default deserves re-deciding on purpose rather than by drift.
 
 ## Why this matters beyond correctness
 
@@ -180,12 +256,26 @@ either the search is broken or the measurement is. Here both were.
 
 ## Fix direction
 
-1. Confirm the `repeat_penalty` mismatch and make the speculative path use the
-   same sampling parameters as the AR path.
-2. Add a gate asserting AR/spec output equivalence at several block widths on a
-   tiny fixture. `tests/tiny-state-gate.sh` hashes decode output already, but it
-   does not vary the block width, so it cannot see this.
-3. Only then re-run any block-width throughput comparison.
+1. **Find the remaining batched/single-token disagreement.** FP32 state moves the
+   divergence later but does not remove it. Bisect with the existing probe: run
+   at FP32 and find the first `start_pos` where a `b>=2` slot-0 argmax differs
+   from what `b=1` gives at that position, then narrow to the layer whose output
+   differs between a width-1 and width-N forward at the same position.
+2. **Re-decide `deltanet_state_precision`'s default deliberately**, and make the
+   comments and the schema agree whichever way it goes.
+3. **Add a gate.** `tests/tiny-state-gate.sh` already hashes decode output, but
+   it does not vary the block width, so it cannot see this. The missing
+   assertion is: for a fixed prompt, output is identical at b = 1, 2, 4, 16.
+   That single check would have caught this the day the drafter-free path
+   started speculating.
+4. Only then re-run any block-width throughput comparison.
+
+## Tooling note
+
+No new instrumentation was needed: `HIPFIRE_DFLASH_VERIFY_DEBUG=1` already
+existed and already documented the exact invariant this violates. It had simply
+never been pointed at the drafter-free path, because until the spine-discard fix
+that path never produced a block wider than 1.
 
 ## Reproduction hazard: this wedges the GPU
 
