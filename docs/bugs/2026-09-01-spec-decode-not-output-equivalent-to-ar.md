@@ -195,6 +195,68 @@ Prefill-cache reuse is not the explanation: with speculation off, two identical
 back-to-back requests are byte-identical, so re-running a prompt does not by
 itself change output.
 
+## ROOT CAUSE: quantised KV makes the batched and per-token forwards disagree
+
+`crates/hipfire-runtime/examples/compare_prefill_hidden_paths` runs the BATCHED
+and PER-TOKEN forwards in one process against the same `HiddenStateRingBuffer`
+and diffs them layer by layer. On the real model, above the prefill chunk size
+so attention actually reads the KV cache:
+
+    --n 512, qwen3.5-0.8b--oq4++.hfq
+      kv-mode fp32    IDENTICAL across all layers (worst 0.00e0)
+      kv-mode q8      FIRST DIVERGING LAYER: 0   (worst overall 5.24e-1)
+      kv-mode kvarn   FIRST DIVERGING LAYER: 0   (worst overall 6.18e-1)
+
+With an unquantised KV the two paths are bit-identical. With either quantised
+mode they diverge **at layer 0** by 0.5-0.6 relative — an order of magnitude over
+the 5e-2 ceiling this repo's own prefill gate applies.
+
+That is the mechanism, end to end:
+
+1. A speculative verify is a BATCHED forward; plain AR decode is PER-TOKEN.
+2. Under quantised KV those two forwards do not agree.
+3. So the token committed at slot 0 differs between `b=1` and `b>=2` — exactly
+   what the verify probe shows (4536 vs 3766).
+4. So speculative output diverges from AR output.
+
+**And every KV mode the daemon can select is quantised.** The `kv_cache` schema
+enum is `auto, q8, asym2, asym3, asym4, kvarn2, kvarn, kvarn4, kvarn8` — there is
+no fp32 entry, so the one configuration where the invariant holds is not
+reachable from config. The probe reaches it only through its own `--kv-mode`
+argument.
+
+This reframes the FP16-DeltaNet finding below: state precision changes how often
+the disagreement flips a token, but the KV path is where the disagreement comes
+from.
+
+## The gate that should have caught this was measuring nothing
+
+`tests/tiny-prefill-gate.sh` asserts exactly the right invariant — "the prefill
+paths must be exactly equivalent absent KV quantisation", with a 5e-2 ceiling for
+quantised modes. It ran the probe at `--n 32`.
+
+The prefill chunk size is 256. The probe prints, on its own initiative:
+
+    WARNING: --n 32 <= the prefill chunk size (256), so prefill runs as ONE
+    chunk, attention never reads the quantised KV cache, and every --kv-mode /
+    HIPFIRE_KVARN_BITS will return IDENTICAL numbers.
+
+So every per-KV-mode row was measuring a configuration in which the KV cache is
+never read. `hidden q8: worst 0.00e0` meant "not measured", not "no divergence",
+and the ceiling could never fire. This is the same failure the file warns about
+three comments earlier — an unmeasured invariant reported as a pass — reached by
+a different route.
+
+Fixed here: `--n` is now 300 (above the chunk, below the tiny fixtures' context —
+512 panics them), a degenerate run FAILS instead of reporting zeros, and the size
+is overridable via `HIPFIRE_TINYPREFILL_HID_N`. The gate immediately found two
+real violations that had been invisible:
+
+    qwen3_5              fp32 0.00e0   q8 5.75e-3   kvarn 3.35e-2    (pass)
+    qwen3_5_moe_indexed  fp32 0.00e0   q8 7.16e-2   kvarn 7.40e-2    (FAIL, ceiling 5e-2)
+
+Total failures went 6 -> 2, and the 2 are real findings rather than gate defects.
+
 ## Primary contributor: FP16 DeltaNet state
 
 Re-run with `HIPFIRE_DN_STATE_FP16=0` (log confirms `dn_quant=FP32`), same
