@@ -843,10 +843,32 @@ pub fn load_model(
     // Lets the CLI set size-aware defaults — e.g. Qwen3.5-27B prefers asym4
     // since layer-count compounding of asym3 noise flips argmax at decision
     // boundaries on deep stacks.
+    // Accept BOTH env spellings. `kv_cache` is the schema key, so its env layer
+    // spelling is `HIPFIRE_KV_CACHE` — which is what an operator reads in
+    // docs/config-schema.md and reasonably expects to work. But this fallback
+    // only ever consulted `HIPFIRE_KV_MODE`, an undocumented name, and this path
+    // (the daemon driven over stdin with no `kv_cache` load param) has no
+    // resolved config to fall back to. So setting the documented variable did
+    // nothing here while the undocumented one worked — two spellings selecting
+    // one setting, with the wrong one documented. That cost real time: a whole
+    // sweep of "different KV modes" in this session was silently one mode.
+    //
+    // `HIPFIRE_KV_MODE` still wins when both are set, so nothing that relies on
+    // it changes. See issue #386.
     let mut kv_mode = kv_mode_override
         .filter(|s| !s.is_empty())
         .map(|s| s.to_string())
-        .unwrap_or_else(|| std::env::var("HIPFIRE_KV_MODE").unwrap_or_default());
+        .unwrap_or_else(|| {
+            std::env::var("HIPFIRE_KV_MODE")
+                .ok()
+                .filter(|s| !s.is_empty())
+                .or_else(|| {
+                    std::env::var("HIPFIRE_KV_CACHE")
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                })
+                .unwrap_or_default()
+        });
     // `auto` (the config default) and unset both mean "the loader chooses".
     // KVarN: ~8x smaller K than fp32 with no token dropped, and batched-prefill
     // eligible. fp32 is an oracle/debug mode, not a production path — ask for it

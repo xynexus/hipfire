@@ -1,6 +1,6 @@
 # `kv_cache`: `fp32` was unwritable, and the daemon's fallback reads a raw env var
 
-Status: **PARTLY FIXED 2026-09-02.** Addresses GitHub issue #386.
+Status: **FIXED 2026-09-02.** Closes GitHub issue #386.
 
 ## CORRECTION to the first version of this document
 
@@ -47,17 +47,28 @@ The deprecated members are deliberately kept in the enum. Removing them would
 make an existing config fail domain validation, and this area's rule is that a
 bad value is WARNED about, not rejected.
 
-**3. The daemon's stdin fallback consults a raw env var — OPEN.**
-`load.rs:846` falls back to `std::env::var("HIPFIRE_KV_MODE")`, which is the
-"env as a bypass rather than a layer" pattern AGENTS.md warns about. It is
-defensible on the daemon-direct path, which has no resolved config by design, but
-it means two different spellings select the KV mode depending on how the daemon
-was driven, and only one of them is documented. Worth unifying.
+**3. The daemon's stdin fallback consulted an undocumented env var — FIXED.**
+`load.rs` fell back to `std::env::var("HIPFIRE_KV_MODE")` only. `kv_cache` is the
+schema key, so its env-layer spelling is `HIPFIRE_KV_CACHE` — what an operator
+reads in `docs/config-schema.md` and reasonably expects to work. Setting the
+documented variable did nothing on this path while the undocumented one worked.
+That cost real time: an entire sweep of "different KV modes" in this session was
+silently one mode, and a correct conclusion was retracted on the strength of it.
+
+Both spellings are now accepted, with `HIPFIRE_KV_MODE` still winning when both
+are set so nothing relying on it changes. Verified:
+
+    HIPFIRE_KV_CACHE=kvarn8                        -> K 8b
+    HIPFIRE_KV_MODE=kvarn8                         -> K 8b
+    HIPFIRE_KV_CACHE=kvarn2 HIPFIRE_KV_MODE=kvarn8 -> K 8b (MODE wins)
+
+The daemon-direct path still has no resolved config by design, so this is a
+fallback rather than a config read — env stays a layer, not a bypass.
 
 ## Issue #386's ask
 
 > Make the enum and the loader agree.
 
-Done for `fp32` (added) and for the deprecated modes (warned at config-resolution
-time, and the warning now actually reaches the operator). Item 3 above is the
-remaining divergence.
+Done. `fp32` is a legal config value, deprecated modes warn at config-resolution
+time and the warning now reaches the operator, and both env spellings select the
+mode. No known divergence remains between the enum and the loader.
