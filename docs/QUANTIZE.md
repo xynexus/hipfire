@@ -219,15 +219,27 @@ hipfire inspect     ~/.hipfire/models/Qwen3-Reranker-0.6B--oq8.hfq
 
 (`hipfire hfq verify --help` panics — it treats `--help` as the path.)
 
-**What a served reranker cannot do yet.** `/v1/rerank` refuses it —
-`rerank: loaded model is arch_id=1, expected embeddinggemma arch_id=19` — because the
-endpoint is wired to the embedding architecture. Driving it through
-`/v1/chat/completions` works and returns a sensible yes/no, but the API exposes no
-logprobs (`logprobs` is silently ignored; the token appears nowhere in the server or
-adapter), and the *sampled* token carries no ranking signal: measured over four
-near-identical documents it answers all-yes or all-no, scoring 0 of 4. The graded
-`softmax([logit_yes, logit_no])` is the entire signal, and it is currently unreachable.
-See `docs/todo/2026-09-02-rerank-is-cosine-not-reranking.md`.
+**Using it.** `/v1/rerank` routes a non-embedding model through the cross-encoder path
+and reports which scorer ran:
+
+```bash
+curl -s localhost:11435/v1/rerank -H 'Content-Type: application/json' -d '{
+  "model": "Qwen3-Reranker-0.6B--oq8",
+  "query": "a queue for one producer and one consumer",
+  "documents": ["wait-free single-producer-single-consumer bounded queue",
+                "lock-free multi-producer-multi-consumer queue"]}'
+# {"mode":"cross-encoder","results":[{"index":0,"relevance_score":0.995}, ...]}
+```
+
+`mode` is `cross-encoder` here and `cosine` for an EmbeddingGemma or Qwen3-embedding
+model, which is scored by embedding each side independently. The two are not
+interchangeable — cosine blends a document into a single vector and cannot express
+"matches on two axes at once" — so check `mode` rather than inferring it from the model
+name.
+
+**Still missing:** the generation API exposes no `logprobs`, so a client cannot reproduce
+this scoring itself against an arbitrary causal LM. See
+`docs/todo/2026-09-02-logprobs-on-the-generation-api.md`.
 
 The plus marks are positional:
 

@@ -215,7 +215,15 @@ attention families included. Layer composition is described by `hipfire-mixer`
   etc. Works with stable-diffusion-webui clients. `routes/sdapi.rs`.
 - **Health / metrics** — `GET /health` (worker/batch/diffusion status),
   `/admin/stats`, telemetry module.
-- **Not present:** legacy `/v1/completions`, text `/v1/embeddings`, OpenAI
+- **Embeddings and reranking** — `POST /v1/embeddings` (EmbeddingGemma, Qwen3
+  embedding; Matryoshka truncation) and `POST /v1/rerank`. Rerank has two scorers and
+  reports which one ran in `mode`: `cosine` embeds each side independently
+  (bi-encoder), while `cross-encoder` runs one forward per `(query, document)` pair and
+  scores `yes` against `no` at the answer position (Qwen3-Reranker). They are not
+  interchangeable — a single embedding blends a document into one vector and cannot
+  express "matches on two axes at once". `routes/embeddings.rs`.
+- **Not present:** legacy `/v1/completions`, `logprobs` / `top_logprobs` on the
+  generation endpoints (accepted and ignored — see `docs/todo/`), OpenAI
   `/v1/images/generations` (image gen is A1111-only), and native Ollama `/api/*`.
 
 ### Web UIs, terminal, daemon
