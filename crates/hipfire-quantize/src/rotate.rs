@@ -62,6 +62,14 @@ impl R1Plan {
         Self { h, r1 }
     }
 
+    /// The composed `R1 = FᵀM`, row-major `[h,h]`. Exposed so consumers that must
+    /// transform *statistics* into the same frame (the LDLQ Hessian: `H → R1 H R1ᵀ`)
+    /// can do so; quantizing rotated weights against an unrotated Hessian optimizes
+    /// in the wrong basis.
+    pub fn r1(&self) -> &[f32] {
+        &self.r1
+    }
+
     /// `max |R1 R1ᵀ − I|` — orthonormality residual (a correctness probe).
     pub fn orthonormality_error(&self) -> f32 {
         orthonormality_error(&self.r1, self.h)

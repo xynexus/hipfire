@@ -354,6 +354,8 @@ fn stamp_calib_provenance(path: &Path) {
 static LDLQ_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
 static LDLQ_SUCCESS: AtomicUsize = AtomicUsize::new(0);
 static LDLQ_MISSING: AtomicUsize = AtomicUsize::new(0);
+/// Hessians moved into the `--rotate` frame (reported so a silent miss is visible).
+static ROTATED_HESSIANS: AtomicUsize = AtomicUsize::new(0);
 static LDLQ_K_MISMATCH: AtomicUsize = AtomicUsize::new(0);
 static LDLQ_PACK_FAILED: AtomicUsize = AtomicUsize::new(0);
 
@@ -446,11 +448,31 @@ fn ldlq_hessian_for_tensor(idx: &Oq4LdlqHessian, name: &str, k: usize) -> Option
         eprintln!("  ldlq: skip {name} (Hessian K={hk} != weight K={k})");
         return None;
     }
-    idx.get_full(key).or_else(|| {
+    let full = idx.get_full(key).or_else(|| {
         LDLQ_MISSING.fetch_add(1, Ordering::Relaxed);
         eprintln!("  ldlq: skip {name} (Hessian entry existed but payload could not be read)");
         None
-    })
+    })?;
+    // Move the statistics into the rotated frame for tensors `--rotate` reader-rotated.
+    // Writers are rotated on their OUTPUT dim, so their input statistics are unchanged.
+    let rotated_reader = ROTATION_READERS
+        .get()
+        .is_some_and(|set| set.contains(name));
+    match ROTATION_R1.get() {
+        Some(r1) if rotated_reader && r1.len() == k * k => {
+            ROTATED_HESSIANS.fetch_add(1, Ordering::Relaxed);
+            Some(rotate_hessian_congruence(&full, r1, k))
+        }
+        _ => Some(full),
+    }
+}
+
+/// Print how many Hessians were moved into the `--rotate` frame.
+fn report_rotated_hessians() {
+    let n = ROTATED_HESSIANS.load(Ordering::Relaxed);
+    if n > 0 {
+        eprintln!("  --rotate: {n} Hessians transformed to the rotated frame (H -> R1 H R1ᵀ)");
+    }
 }
 
 fn ldlq_record_success() {
@@ -463,6 +485,7 @@ fn ldlq_record_pack_failed(name: &str) {
 }
 
 fn ldlq_report_and_validate(strict: bool) -> Result<(), String> {
+    report_rotated_hessians();
     let attempts = LDLQ_ATTEMPTS.load(Ordering::Relaxed);
     if attempts == 0 {
         if strict {
@@ -687,6 +710,49 @@ fn emit_coarse_sidecar(tensors: &mut Vec<HfqTensor>, name: &str, shape: &[u32]) 
 // the rotated tensor instead of the raw source, so every codec branch quantizes
 // the R1-rotated weights transparently. See `rotate.rs`.
 static ROTATION_OVERRIDE: OnceLock<HashMap<String, Vec<f32>>> = OnceLock::new();
+/// `R1 = FᵀM` from `--rotate`, and the tensors whose INPUT dim it rotated.
+///
+/// A reader quantized after `--rotate` consumes `R1·x`, so the calibration
+/// statistics must move to the same frame: `H → R1 H R1ᵀ`. Without this the
+/// quantizer optimizes rotated weights against a Hessian captured in the original
+/// activation basis, and the damage scales with how much the format leans on it --
+/// measured on Qwen3.5-0.8B with a Hadamard: oq8++ 1.6x worse, oq4.25++ 2.3x,
+/// qtip3 under OBS conditioning 173x. Rotations are supposed to *help* at low bits
+/// (QuaRot/QuIP#); a regression that deepens as bits drop is this bug, not the
+/// rotation.
+static ROTATION_R1: OnceLock<Vec<f32>> = OnceLock::new();
+static ROTATION_READERS: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
+
+/// `H → R1 H R1ᵀ` for a `[k,k]` row-major Hessian. Composes with the codec's own
+/// `rotate_hessian` (the per-256-group FWHT `F`): afterwards the codec sees
+/// `F·R1 H R1ᵀ·Fᵀ = M H Mᵀ`, which matches the stored weights `W·Mᵀ`.
+fn rotate_hessian_congruence(h: &[f32], r1: &[f32], k: usize) -> Vec<f32> {
+    use rayon::prelude::*;
+    // tmp = R1 · H
+    let mut tmp = vec![0.0f32; k * k];
+    tmp.par_chunks_mut(k).enumerate().for_each(|(i, row)| {
+        let rrow = &r1[i * k..i * k + k];
+        for (d, &rv) in rrow.iter().enumerate() {
+            if rv == 0.0 {
+                continue;
+            }
+            let hrow = &h[d * k..d * k + k];
+            for (o, hv) in row.iter_mut().zip(hrow.iter()) {
+                *o += rv * hv;
+            }
+        }
+    });
+    // out = tmp · R1ᵀ   (out[i,j] = Σ_d tmp[i,d] R1[j,d])
+    let mut out = vec![0.0f32; k * k];
+    out.par_chunks_mut(k).enumerate().for_each(|(i, row)| {
+        let trow = &tmp[i * k..i * k + k];
+        for (j, o) in row.iter_mut().enumerate() {
+            let rrow = &r1[j * k..j * k + k];
+            *o = trow.iter().zip(rrow.iter()).map(|(a, b)| a * b).sum();
+        }
+    });
+    out
+}
 
 // ─── Safetensors Parser ─────────────────────────────────────────────────────
 
@@ -1250,6 +1316,10 @@ fn build_rotation_overrides(
     }
 
     let mut ov: HashMap<String, Vec<f32>> = HashMap::new();
+    // Tensors whose INPUT dim gets rotated. Their calibration statistics must move
+    // to the same frame (`H → R1 H R1ᵀ`); writers are rotated on their OUTPUT dim,
+    // so their input statistics are untouched.
+    let mut reader_names: std::collections::HashSet<String> = std::collections::HashSet::new();
     let (mut n_readers, mut n_writers) = (0usize, 0usize);
     for l in 0..n_layers {
         let (mut layer_readers, mut layer_writers) = (0usize, 0usize);
@@ -1261,6 +1331,7 @@ fn build_rotation_overrides(
                     let out = w.len() / h;
                     rotate::fold_cols(&mut w, norm, out, h);
                     plan.rotate_reader(&mut w, out);
+                    reader_names.insert(name.clone());
                     ov.insert(name, w);
                     layer_readers += 1;
                 }
@@ -1327,6 +1398,10 @@ fn build_rotation_overrides(
     ov.insert(embed_name, embed);
     ov.insert(format!("{prefix}norm.weight"), vec![identity_norm; h]);
 
+    // The lm_head is reader-rotated too (it consumes the final residual).
+    reader_names.insert("lm_head.weight".to_string());
+    let _ = ROTATION_R1.set(plan.r1().to_vec());
+    let _ = ROTATION_READERS.set(reader_names);
     eprintln!(
         "  --rotate: prefix `{prefix}`, {n_readers} residual readers + {n_writers} writers \
          over {n_layers} layers; {} tensors folded+rotated; synthesized untied lm_head \
@@ -18204,6 +18279,75 @@ mod codec_golden {
         assert!(!j(serde_json::json!({"model_type": "qwen2"})));
         assert!(!j(serde_json::json!({"model_type": "qwen3"})));
         assert!(!j(serde_json::json!({})));
+    }
+
+    /// `H → R1 H R1ᵀ` must be a congruence by an ORTHOGONAL matrix: symmetry and
+    /// trace are preserved, `R1 = I` is the identity, and it agrees with the naive
+    /// triple loop. Worth pinning because the fast path is two separate blocked
+    /// passes (`R1·H` then `·R1ᵀ`) and a transposed index in either one still
+    /// produces a plausible symmetric matrix — it just optimizes in the wrong
+    /// basis, which is exactly the failure this transform exists to fix.
+    #[test]
+    fn hessian_congruence_is_orthogonal_and_matches_naive() {
+        let k = 8usize;
+        // A symmetric PSD H (H = AᵀA), and an orthogonal R1 (a 8-point FWHT block).
+        let a: Vec<f32> = (0..k * k).map(|i| ((i * 37 % 19) as f32 - 9.0) / 5.0).collect();
+        let mut h = vec![0.0f32; k * k];
+        for i in 0..k {
+            for j in 0..k {
+                h[i * k + j] = (0..k).map(|t| a[t * k + i] * a[t * k + j]).sum();
+            }
+        }
+        let mut r = vec![0.0f32; k * k];
+        for i in 0..k {
+            for j in 0..k {
+                let par = (i & j).count_ones() % 2;
+                r[i * k + j] = if par == 0 { 1.0 } else { -1.0 } / (k as f32).sqrt();
+            }
+        }
+        let out = rotate_hessian_congruence(&h, &r, k);
+
+        // naive reference: out[i,j] = Σ_a Σ_b R[i,a] H[a,b] R[j,b]
+        let mut want = vec![0.0f32; k * k];
+        for i in 0..k {
+            for j in 0..k {
+                let mut acc = 0.0f32;
+                for x in 0..k {
+                    for y in 0..k {
+                        acc += r[i * k + x] * h[x * k + y] * r[j * k + y];
+                    }
+                }
+                want[i * k + j] = acc;
+            }
+        }
+        for (o, w) in out.iter().zip(want.iter()) {
+            assert!((o - w).abs() < 1e-3, "fast path != naive: {o} vs {w}");
+        }
+        // symmetry
+        for i in 0..k {
+            for j in 0..k {
+                assert!(
+                    (out[i * k + j] - out[j * k + i]).abs() < 1e-3,
+                    "congruence must stay symmetric"
+                );
+            }
+        }
+        // trace is invariant under an orthogonal congruence
+        let tr_in: f32 = (0..k).map(|i| h[i * k + i]).sum();
+        let tr_out: f32 = (0..k).map(|i| out[i * k + i]).sum();
+        assert!(
+            (tr_in - tr_out).abs() / tr_in.abs().max(1.0) < 1e-3,
+            "trace must be preserved: {tr_in} vs {tr_out}"
+        );
+        // R1 = I is the identity transform
+        let mut eye = vec![0.0f32; k * k];
+        for i in 0..k {
+            eye[i * k + i] = 1.0;
+        }
+        let same = rotate_hessian_congruence(&h, &eye, k);
+        for (o, w) in same.iter().zip(h.iter()) {
+            assert!((o - w).abs() < 1e-4, "R1=I must leave H unchanged");
+        }
     }
 
     /// Every `--embed-precision` value maps to a DISTINCT non-zero code.
