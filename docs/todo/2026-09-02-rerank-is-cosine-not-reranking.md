@@ -44,13 +44,23 @@ involved is a worse outcome than no endpoint.
 - `/v1/rerank` routes to `embeddinggemma_rerank` (`hipfire-daemon/src/lib.rs:272`),
   which has two branches — a loaded Qwen3 embedding model, else EmbeddingGemma — and
   both end in `pooling::rank_by_cosine`.
+- **The models are already on this host.** `/srv/hipfire/models/` holds
+  `Qwen3-Reranker-0.6B.hfa`, `-4B.hfa` and `-8B.hfa`. They are `.hfa`; everything the
+  daemon serves is `.hfq`, so they are downloaded and unconverted.
+- **No architecture support.** `reranker` matches nothing in `hipfire-model` or
+  `hipfire-serving-core` beyond `rerank_yes_no` itself — there is no model kind, no
+  loader, and no arch id. This is the actual missing piece, and it is larger than the
+  scorer that is already written.
 
 ## What's missing
 
-1. **A served reranker model, and routing to it.** With a Qwen3-Reranker-class model
-   loaded, `/v1/rerank` should score `(query, document)` pairs through
-   `rerank_yes_no` rather than embedding each side independently. The primitive is
-   done; what is missing is a model kind and the request path that feeds it pairs.
+1. **A loading path for the reranker, and routing to it.** Qwen3-Reranker is a Qwen3
+   causal LM that answers a yes/no question about a `(query, document)` pair — which is
+   why `rerank_yes_no` takes *logits* rather than embeddings. So the work is plausibly
+   "load it through the existing Qwen3 path, apply the reranker's prompt template, read
+   the final-position logits, call `rerank_yes_no`" rather than a new architecture. That
+   should be confirmed against the `.hfa` metadata before it is planned as small.
+   Conversion to `.hfq` is a prerequisite either way.
 2. **Documentation.** `/v1/rerank` appears **zero times** in `docs/*.md`. It is an
    undocumented endpoint whose behaviour differs from what its name implies.
 3. **Self-description in the response.** The reply carries `model` but nothing saying
