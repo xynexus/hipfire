@@ -794,35 +794,64 @@ DeltaNet/attention mixer is never run. A block's input is the previous block's
 
 ### What it is worth
 
-Measured on `Qwen3.5-0.8B-e4--qtip3g` (3.78 bpw), 47 norms, ~30 min of GPU,
-against a control rebuilt by the same recipe:
+Measured on `Qwen3.5-0.8B-e4--qtip3g` (3.78 bpw) against a control rebuilt by
+the same recipe, and reproduced on a second independent capture:
 
-| | control | + norm QAT |
-|---|---|---|
-| evalA kld | 0.189131 | 0.189178 |
-| evalA ppl | 17.9114 | **17.8037** |
-| evalB kld | 0.164618 | 0.164600 |
-| evalB ppl | 15.6025 | **15.4958** |
-| evalB p99 kld | 0.290300 | **0.284181** |
+| | evalA kld | evalA ppl | evalB kld | evalB ppl | evalB p99 |
+|---|---|---|---|---|---|
+| control | 0.189131 | 17.9114 | 0.164618 | 15.6025 | 0.290300 |
+| layer norms, capture 1 | 0.189178 | **17.8037** | 0.164600 | **15.4958** | **0.284181** |
+| layer norms, capture 2 | 0.189146 | **17.8209** | 0.164658 | **15.4971** | **0.284799** |
 
-Block-local MSE recovers 11.4% (MLP norms) and 5.6% (attention norms), and
-that converts to: **mean KLD flat**, perplexity ~0.6–0.7% better, evalB's p99
-KLD 2.1% better. Block-local MSE against a bf16 teacher is not the same
-objective as KL-to-teacher, so a small perplexity gain with flat KLD is exactly
-the shape to expect.
+Block-local MSE recovers 11.6% (MLP norms) and 5.5% (attention norms), and it
+generalises — re-measured on a capture the recovery never trained on, the
+patched artifact beats the control on 15 blocks out of 15, by 1.0% to 10.1%.
+
+End to end that converts to: **mean KLD flat**, perplexity ~0.6% better, evalB's
+p99 KLD ~2% better. The two captures agree to three decimals, so the perplexity
+gain is a real effect rather than capture noise — it is just small.
 
 Verdict: real, cheap, and **not a lever on its own**. γ has `dim` free
-parameters against a `dim × inter` weight error; this is the ceiling of a
+parameters against a `dim × inter` weight error; that is the ceiling of a
 per-channel input scale. The earlier Supra-50M probe's "52% recovered" came
-mostly from LoRA on q/v, not from norms. The value delivered here is the
-plumbing — artifact-accurate student weights, both norms, and a build-time
-fold — which a LoRA variant can reuse directly.
+mostly from LoRA on q/v, not from norms. What is delivered here is the plumbing
+— artifact-accurate student weights, both norms, and a build-time fold — which
+a LoRA variant reuses directly.
 
 Recovery is converged, not under-trained: identical block-local MSE at lr
 1e-3 / 3e-3 / 1e-2 / 3e-2 over 300 steps, with `|Δγ|max` scaling exactly 100×
 with lr.
 
+### The final norm measures best and deploys worst
+
+The final norm is the only one whose error reaches the logits with no mixer in
+between, so its loss can be the **KL that is actually scored** rather than a
+block-local proxy. It posts the best local numbers of anything here, and both
+ways of training it make the artifact worse. `HIPFIRE_RECOVER_HEAD` is off by
+default.
+
+| | evalA kld | evalA ppl |
+|---|---|---|
+| control | 0.189131 | 17.9114 |
+| + final norm, teacher's hidden state | 0.194610 | 17.9895 |
+| final norm only, model's own hidden state | 0.262497 | 19.4805 |
+
+Fed the **teacher's** clean hidden state, local KL drops 59.4% and the artifact
+gets 2.9% worse: the correction is fitted for an input the deployed model never
+sees. Fed the **model's own** hidden state — which by the last layer has drifted
+to cos 0.9599 of the teacher's — the honest local KL is 5.07e-1, not 3.98e-2, so
+that is the error deployment actually has; recovery cuts it 67.9% and the
+artifact gets 39% worse, because γ has `dim` parameters and is being asked to
+absorb 24 layers of accumulated error. It fits the calibration rows and does not
+generalise.
+
+Two failures, same lesson from opposite sides, and the most useful thing this
+exercise produced: **a block-local win does not imply a deployed win, and here
+the variant that measured best locally was the worst deployed.** Score the
+artifact, every time.
+
 ### Two traps
+
 
 **The patch must be folded at BUILD time, not into a finished `.hfq`.** Once
 bf16 tensors carry a lossless recoding (`Bf16Huff`, the default), tuned values
