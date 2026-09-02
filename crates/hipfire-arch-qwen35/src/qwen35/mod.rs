@@ -4460,20 +4460,19 @@ mod tests {
         // it no longer SELECTS anything. The threshold that once chose Q8 above a
         // cutoff went with Q8 itself.
         assert_eq!(deltanet_state_redundancy(&cfg), 8);
-        // FP16 by default as of 2026-08-27 (`deltanet_state_precision`); the
-        // env var still overrides in EITHER direction. Guarded so a developer
-        // running with it exported does not see a false failure — the env is
-        // process-wide and this test cannot own it.
-        let want = if hipfire_env::DN_STATE_FP16.is_set() {
-            if hipfire_env::DN_STATE_FP16.flag() {
-                StateQuant::FP16
-            } else {
-                StateQuant::FP32
-            }
-        } else {
-            StateQuant::FP16
-        };
-        assert_eq!(default_state_quant(&cfg), want);
+        // This fixture's redundancy is 8 — far below `deltanet_state_fp32_below`
+        // (3000) — so the restored guard forces FP32 no matter what the config
+        // or the env asks for. That is the entire point of the guard: the
+        // low-redundancy end is where narrow state breaks first.
+        //
+        // This previously asserted FP16, encoding the window in which the guard
+        // had no caller: `default_state_quant` opened with `let _ = config;`, so
+        // the size check could not fire and `deltanet_state_precision` (which
+        // ships `fp16`) decided alone. The expectation moved because the
+        // behaviour was restored, not because the test was wrong about the
+        // config default.
+        assert!(deltanet_state_redundancy(&cfg) < deltanet_state_fp32_below());
+        assert_eq!(default_state_quant(&cfg), StateQuant::FP32);
     }
 
     #[test]

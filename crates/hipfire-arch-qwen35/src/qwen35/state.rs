@@ -86,9 +86,30 @@ pub fn deltanet_state_redundancy(config: &Qwen35Config) -> usize {
 /// Retained only so older references resolve; the redundancy threshold that
 /// once selected Q8 above a size cutoff is gone with Q8 itself. State precision
 /// is FP32 unless `HIPFIRE_DN_STATE_FP16` opts in.
-#[deprecated(note = "Q8 state was removed; precision is FP32 or opt-in FP16")]
+/// Default redundancy floor. The 0.8B/2B class sits at 2048
+/// (`key_head_dim 128 x 16 value heads`); the policy note above records 3000 as
+/// the boundary that would have put 9B/27B on the other side. So this catches
+/// exactly the low-redundancy models the note calls "where Q8 broke first",
+/// and leaves the large ones on whatever the config asks for.
+pub const DN_STATE_FP32_BELOW_DEFAULT: usize = 3000;
+
+/// Redundancy floor below which the DeltaNet state is forced to FP32.
+///
+/// This used to `return usize::MAX` and ignore its own documented env var, and
+/// nothing called it — see `default_state_quant`. Now it reads
+/// `HIPFIRE_DN_STATE_FP32_BELOW`; set it to `0` to disable the guard entirely.
 pub fn deltanet_state_fp32_below() -> usize {
-    usize::MAX
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| match std::env::var("HIPFIRE_DN_STATE_FP32_BELOW").ok() {
+        Some(v) => v.parse().unwrap_or_else(|_| {
+            eprintln!(
+                "HIPFIRE_DN_STATE_FP32_BELOW={v:?} is not a number — using \
+                     {DN_STATE_FP32_BELOW_DEFAULT}"
+            );
+            DN_STATE_FP32_BELOW_DEFAULT
+        }),
+        None => DN_STATE_FP32_BELOW_DEFAULT,
+    })
 }
 
 /// Default DeltaNet state precision, gated on redundancy (`head_dim × n_heads`)
@@ -104,7 +125,6 @@ pub fn deltanet_state_fp32_below() -> usize {
 /// The `HIPFIRE_QWEN35_STATE_QUANT` override referenced in earlier revisions of
 /// this comment does **not** exist — no code reads that variable.
 pub fn default_state_quant(config: &Qwen35Config) -> StateQuant {
-    let _ = config;
     // `.flag()`, NOT `.parse_or(false)`: `parse_or` goes through Rust's
     // `FromStr for bool`, which accepts ONLY "true"/"false", so `=1` parses as
     // Err and falls back silently. That cost a 24-minute KLD run which reported
@@ -178,14 +198,42 @@ pub fn default_state_quant(config: &Qwen35Config) -> StateQuant {
     //
     // Keeping FP32 one flag away also keeps the oracle: losing the ability to
     // diff against it is how quantized state hid for months.
-    match dn_state_precedence(
+    let requested = match dn_state_precedence(
         hipfire_env::DN_STATE_FP16.is_set(),
         hipfire_env::DN_STATE_FP16.flag(),
         deltanet_state_precision(),
     ) {
         true => StateQuant::FP16,
         false => StateQuant::FP32,
+    };
+
+    // The redundancy guard, restored. This function took `config` and threw it
+    // away (`let _ = config;`), so the size check the policy note above
+    // describes had NO production caller: `deltanet_state_redundancy` was
+    // referenced only by a unit test and `deltanet_state_fp32_below` only by doc
+    // comments. Meanwhile `deltanet_state_precision` shipped `fp16`, so exactly
+    // the low-redundancy models the note calls the numerical anchor — the ones
+    // "where Q8 broke first" — silently got the narrow state, with no warning.
+    //
+    // State traffic is ~1-3% of per-token bandwidth (see
+    // `deltanet_state_redundancy`), so paying FP32 on a small model is nearly
+    // free; getting it wrong there is not.
+    let redundancy = deltanet_state_redundancy(config);
+    let floor = deltanet_state_fp32_below();
+    if requested == StateQuant::FP16 && floor > 0 && redundancy < floor {
+        static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        WARNED.get_or_init(|| {
+            eprintln!(
+                "deltanet state: forcing FP32 — redundancy {redundancy} \
+                 (key_head_dim x value_heads) is below {floor}. Low-redundancy \
+                 models are where narrow state breaks first, and state is only \
+                 ~1-3% of per-token bandwidth. Override with \
+                 HIPFIRE_DN_STATE_FP32_BELOW=0."
+            );
+        });
+        return StateQuant::FP32;
     }
+    requested
 }
 
 /// Resolve DeltaNet state precision: the debug env var wins when SET (either

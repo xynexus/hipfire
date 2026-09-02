@@ -195,7 +195,54 @@ Prefill-cache reuse is not the explanation: with speculation off, two identical
 back-to-back requests are byte-identical, so re-running a prompt does not by
 itself change output.
 
-## ROOT CAUSE: quantised KV makes the batched and per-token forwards disagree
+## WITHDRAWN: "quantised KV is the root cause"
+
+An earlier revision of this document called the quantised KV cache the root
+cause, on the strength of `compare_prefill_hidden_paths` showing fp32 KV
+IDENTICAL and every quantised mode diverging ~0.5-0.6 at layer 0. **That
+conclusion is withdrawn.** The measurement does not behave like quantisation
+error, and two follow-up controls killed it.
+
+**The bit widths do not order correctly.** Expected physics: KVarN-8 should be
+close to fp32, KVarN-4 should comfortably beat q8, KVarN-2 should be markedly
+worse than KVarN-4. None of that appears:
+
+    fp32          IDENTICAL (0.00e0)
+    q8            layer 0, worst 5.24e-1
+    kvarn 2-bit   layer 0, worst 6.18e-1
+    kvarn 4-bit   layer 0, worst 6.18e-1
+    kvarn 8-bit   layer 0, worst 6.18e-1
+
+Eight bits is no better than two. Per-layer, the width does move some
+layers — L3 reads 4.89e-1 / 5.08e-1 / 5.46e-1 at 2/4/8 bits, deterministic
+across repeated runs — but it moves the WRONG WAY, growing with precision, and
+the maximum never budges. Quantisation error would fall by roughly 64x from 2
+to 8 bits.
+
+**Pinning the DeltaNet state to FP32 changes nothing.** The natural reading of
+the divergence was the daemon's own prefill warning: "the per-token fallback
+rounds the FP16 DeltaNet state once per token where the batched path rounds once
+per chunk ... amplified ~65x by KVarN attention". But re-running the whole sweep
+with `HIPFIRE_DN_STATE_FP16=0` (log confirms `dn_quant=FP32`) reproduces the same
+numbers to three digits, and `tests/spec-ar-equivalence-gate.sh` still fails with
+FP32 state forced automatically by the restored redundancy guard.
+
+So: something makes the batched and per-token prefill paths disagree whenever the
+KV cache is quantised, it is not the KV's precision, and it is not the DeltaNet
+state's precision. **Either the probe is measuring something other than what its
+output implies, or one of the two paths is structurally wrong in a way that a
+narrower or wider KV does not change.** Both are open.
+
+The per-row data argues against a metric artifact: at the last layer every row
+diverges (6.3e-2 to 2.5e-1), not one outlier with a tiny denominator.
+
+What survives from the earlier section, because it was measured directly rather
+than inferred: with fp32 KV the two paths are bit-identical, and with any
+quantised KV they are not. That is a real difference and worth chasing. What does
+not survive is the claim that its MECHANISM is quantisation error, or that it is
+the proven cause of the spec/AR divergence.
+
+## The measurement itself (kept for the record)
 
 `crates/hipfire-runtime/examples/compare_prefill_hidden_paths` runs the BATCHED
 and PER-TOKEN forwards in one process against the same `HiddenStateRingBuffer`
