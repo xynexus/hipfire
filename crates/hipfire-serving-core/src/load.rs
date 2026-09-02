@@ -2947,6 +2947,11 @@ pub fn load_model(
             Some(kv),
             Some(Box::new(dn)),
         ));
+        // AWQ pre-scaling is only correct if the runtime undoes it. Say so
+        // loudly when the artifact carries sidecars this build did not apply --
+        // see `warn_if_awq_sidecars_unconsumed`. Placed at every LoadedModel
+        // return so no arch path can skip the check.
+        hipfire_runtime::hfq::warn_if_awq_sidecars_unconsumed(&hfq);
         Ok(LoadedModel {
             arch_id: hfq.arch_id,
             registered_backend: None,
@@ -3107,6 +3112,11 @@ pub fn load_model(
         let chat_template = resolve_chat_template(&hfq, path);
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
+        // AWQ pre-scaling is only correct if the runtime undoes it. Say so
+        // loudly when the artifact carries sidecars this build did not apply --
+        // see `warn_if_awq_sidecars_unconsumed`. Placed at every LoadedModel
+        // return so no arch path can skip the check.
+        hipfire_runtime::hfq::warn_if_awq_sidecars_unconsumed(&hfq);
         Ok(LoadedModel {
             arch_id: hfq.arch_id,
             registered_backend: None,

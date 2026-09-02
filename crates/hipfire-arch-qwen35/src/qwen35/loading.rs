@@ -1287,7 +1287,15 @@ fn load_awq_scale_for(hfq: &HfqFile, gpu: &Gpu, name: &str, k: usize) -> Option<
         .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
         .collect();
     let f32_bytes: Vec<u8> = f32_data.iter().flat_map(|&v| v.to_le_bytes()).collect();
-    gpu.upload_raw(&f32_bytes, &[f32_bytes.len()]).ok()
+    let t = gpu.upload_raw(&f32_bytes, &[f32_bytes.len()]).ok();
+    if t.is_some() {
+        // This crate carries its own copy of the sidecar lookup, so the
+        // runtime's consumption counter cannot see it. Report in, or
+        // `warn_if_awq_sidecars_unconsumed` fires a false alarm on a model that
+        // is applying the scales correctly.
+        hipfire_runtime::hfq::note_awq_sidecar_consumed();
+    }
+    t
 }
 
 /// TODO(transformer-extraction): cross-arch duplicate of

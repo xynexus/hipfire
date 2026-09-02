@@ -2429,7 +2429,66 @@ pub fn load_awq_scale(hfq: &HfqFile, gpu: &Gpu, weight_name: &str, k: usize) -> 
         .map(|c| crate::quant::f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
         .collect();
     let f32_bytes: Vec<u8> = f32_data.iter().flat_map(|&v| v.to_le_bytes()).collect();
-    gpu.upload_raw(&f32_bytes, &[f32_bytes.len()]).ok()
+    let t = gpu.upload_raw(&f32_bytes, &[f32_bytes.len()]).ok();
+    if t.is_some() {
+        AWQ_SIDECARS_CONSUMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    t
+}
+
+/// Count of AWQ sidecars this process actually loaded, against
+/// [`awq_sidecars_present`] — see [`warn_if_awq_sidecars_unconsumed`].
+static AWQ_SIDECARS_CONSUMED: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Record that an AWQ sidecar was consumed by a loader OUTSIDE this module.
+///
+/// Some architectures carry their own copy of the sidecar lookup —
+/// `qwen35::loading::load_awq_scale_for` is one, and it is correct: it applies
+/// the scales and the dispatcher picks the AWQ-aware kernel. Counting only
+/// `load_awq_scale` calls would report those models as unconsumed and fire a
+/// false alarm on a healthy artifact. Any such loader must call this on success.
+pub fn note_awq_sidecar_consumed() {
+    AWQ_SIDECARS_CONSUMED.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// How many `*.awq_scale.weight` sidecars an artifact carries.
+pub fn awq_sidecars_present(hfq: &HfqFile) -> usize {
+    hfq.tensor_names()
+        .into_iter()
+        .filter(|n| n.ends_with(".awq_scale.weight"))
+        .count()
+}
+
+/// Shout when an artifact was AWQ pre-scaled but the runtime did not undo it.
+///
+/// AWQ multiplies each weight column by `s[j]` at quantization time and relies on
+/// the runtime dividing the activation by the same `s` before the GEMM:
+/// `(W·s)·(x/s) = W·x`. If the sidecars ship and nothing applies them, the model
+/// silently computes `(W·s)·x` — and the error scales with how far `s` strays
+/// from 1, so it is invisible on flat activations and catastrophic on peaky ones.
+///
+/// Measured on the tiny qwen2 fixture, oq8 vs oq8+ (same weights, AWQ the only
+/// difference): mean KLD 0.00002762 -> 0.02524465, a 914x regression, and
+/// `--awq-alpha 0` returns it to 0.00002762 EXACTLY. dots_ocr shows 894x. The
+/// tiny-quant baselines were recorded with this present, so the gate asserts the
+/// broken value as expected and only fires on drift away from it.
+///
+/// This cannot be a hard error: artifacts already in the field carry the
+/// sidecars, and refusing to load them would strand working setups on a defect
+/// they did not cause. It is loud instead, and names the escape hatch.
+pub fn warn_if_awq_sidecars_unconsumed(hfq: &HfqFile) {
+    let present = awq_sidecars_present(hfq);
+    if present == 0 {
+        return;
+    }
+    let consumed = AWQ_SIDECARS_CONSUMED.load(std::sync::atomic::Ordering::Relaxed);
+    if consumed >= present {
+        return;
+    }
+    tracing::warn!(
+        "AWQ: this artifact carries {present} `.awq_scale` sidecar(s) but the runtime applied          {consumed}. AWQ pre-scales weights by s and REQUIRES the activation to be divided by          the same s before the GEMM; unapplied, the model computes (W*s)*x instead of W*x.          Expect large quality loss on models with peaky activations (measured 914x KLD on a          qwen2 fixture). Re-quantize with `--awq-alpha 0` for an artifact this build can serve          correctly, or use an architecture that consumes the sidecars."
+    );
 }
 
 /// Load a weight tensor (quantized or F16) onto GPU.
