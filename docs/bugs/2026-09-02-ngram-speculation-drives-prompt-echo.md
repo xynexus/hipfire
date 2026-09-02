@@ -83,6 +83,25 @@ investigation:
   choice between them is irrelevant. That elimination was wrong and is retracted
   here.
 
+### A single speculative token is enough
+
+Holding FP16 state and kvarn4 fixed and sweeping only the verify width:
+
+    b=2    g1 echo=0.000   g2 echo=0.872    99 tok/s
+    b=4    g1 echo=0.000   g2 echo=0.897   168 tok/s
+    b=16   g1 echo=0.000   g2 echo=0.872   309 tok/s
+
+`b=2` is one drafted token per step, and it already corrupts as thoroughly as
+`b=16`. The corruption level is flat across widths; only the throughput scales
+with them, because a wider block emits the echoed text faster once the loop is
+running.
+
+This rules out the narrower version of the block-scale theory — that the damage
+needs a speculative write to CROSS a 128-token boundary and seal a block early.
+One token does it, so whatever fails to restore is touched by any speculative
+write, not only by a block completion. The open block's var-norm statistics
+being recomputed on every write fits; a boundary-crossing requirement does not.
+
 **Not yet proven**: that the block scales specifically are what fails to roll
 back. The next step is to dump one block's var-norm record before a speculative
 write and after a rejection, and check whether it returns to its prior value.
