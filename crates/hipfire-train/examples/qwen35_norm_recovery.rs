@@ -520,10 +520,68 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         Ok(())
     };
+    // HIPFIRE_RECOVER_LR_FOLD=1: add the artifact's own rank-r quantization-error
+    // sidecars (`<base>.lr_u/.lr_v`, from HIPFIRE_LOWRANK_R) into the student
+    // weight before measuring. Nothing serves these on qwen3.5 today
+    // (docs/bugs/2026-09-03-lowrank-sidecars-are-ignored-by-every-arch-but-
+    // minimax.md), so this measures the CEILING a low-rank residual could reach
+    // if it were wired — offline, before writing any serving code for it.
+    let lr_fold = envs("HIPFIRE_RECOVER_LR_FOLD", "0") == "1";
+    let fold_lr = |name: &str, w: &mut [f32], m: usize, k: usize| -> Result<bool, String> {
+        let stem = name.strip_suffix(".weight").unwrap_or(name);
+        let (un, vn) = (format!("{stem}.lr_u.weight"), format!("{stem}.lr_v.weight"));
+        let (Some(ue), Some(ve)) = (student.get(&un), student.get(&vn)) else {
+            return Ok(false);
+        };
+        let (u, v) = (student.read(&un)?, student.read(&vn)?);
+        let r = ue.shape[1] as usize;
+        if ue.shape[0] as usize != m || ve.shape[0] as usize != r || ve.shape[1] as usize != k {
+            return Err(format!(
+                "{stem}: lr shapes disagree with [{m},{k}] rank {r}"
+            ));
+        }
+        // W += lr_u [m,r] @ lr_v [r,k], but the factors live in the FWHT-ROTATED
+        // frame: the quantizer factorises `E_rot = W_rot - dequant(Q(W_rot))`.
+        // `read_f32` hands back the UN-rotated weight, so the correction has to
+        // be rotated back before it is added. Adding it raw makes the weight
+        // measurably worse (cos 0.9866 -> 0.9860, block MSE up 2.5x) — which is
+        // how this basis mismatch was found.
+        use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
+        use rayon::prelude::*;
+        const G: usize = 256;
+        if k % G != 0 {
+            return Err(format!("{stem}: k={k} is not a multiple of {G}"));
+        }
+        let s1 = gen_fwht_signs(42, G);
+        let s2 = gen_fwht_signs(1042, G);
+        w.par_chunks_mut(k).enumerate().for_each(|(i, row)| {
+            let mut corr = vec![0.0f32; k];
+            for t in 0..r {
+                let a = u[i * r + t];
+                if a == 0.0 {
+                    continue;
+                }
+                for (o, &b) in corr.iter_mut().zip(&v[t * k..(t + 1) * k]) {
+                    *o += a * b;
+                }
+            }
+            for g in corr.chunks_mut(G) {
+                cpu_fwht_256(g, &s2, &s1);
+            }
+            for (o, c) in row.iter_mut().zip(&corr) {
+                *o += *c;
+            }
+        });
+        Ok(true)
+    };
     let load_pair = |name: &str| -> Result<(usize, Vec<f32>, Vec<f32>), String> {
         let e = teacher.get(name).ok_or_else(|| format!("missing {name}"))?;
         let m = e.shape[0] as usize;
-        let (t, st) = (teacher.read(name)?, student.read(name)?);
+        let (t, mut st) = (teacher.read(name)?, student.read(name)?);
+        if lr_fold {
+            let k = st.len() / m.max(1);
+            fold_lr(name, &mut st, m, k)?;
+        }
         finite(&t, "teacher", name)?;
         finite(&st, "student", name)?;
         Ok((m, t, st))
