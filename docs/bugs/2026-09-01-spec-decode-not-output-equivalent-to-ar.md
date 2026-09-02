@@ -215,6 +215,35 @@ from token 1 to 18 (request 2). So FP16 state is a major contributor and there
 is at least one more source of batched/single-token disagreement still
 unidentified.
 
+## How much FP32 actually buys, and the residual case
+
+Method: run two identical requests with the n-gram on. The first is cold, so
+most windows miss and run at `b=1`; the second is warm and runs wide. Where both
+requests verify the SAME `start_pos` with the SAME slot-0 input token but
+different `b`, slot 0's argmax must agree.
+
+| DeltaNet state | comparable positions | slot-0 mismatches |
+|---|---|---|
+| FP16 (shipped default) | 2 | **2 (100%)** |
+| FP32 | 7 | **1 (14%)** |
+
+FP32 cuts the rate hard but does not reach zero, which matches the end-to-end
+result (divergence moves later, from token 49 to 74 and 1 to 18, rather than
+disappearing).
+
+The residual case, reproducible and specific — a starting point for the
+remaining work:
+
+    start_pos=1690   in slot0 = 2972
+      b=1  -> slot0 argmax 36514
+      b=4  -> slot0 argmax   608
+
+Sample sizes are small (2 and 7 comparable positions in a 100-token run) because
+a position only becomes comparable when the cold and warm requests happen to
+verify it at different widths. A longer run, or a probe that forces both widths
+at every position, would tighten these numbers; the FP16 result is unambiguous
+regardless.
+
 ## The FP16 default contradicts its own documentation
 
 Worth fixing regardless of the above, because it decides which path users get:
