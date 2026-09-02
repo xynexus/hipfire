@@ -104,6 +104,22 @@ That combination is diagnostic. A correct verify commits either the drafted
 token (only when it equals the target's own argmax) or the target's argmax — so
 the committed sequence cannot depend on what was drafted. Here it does.
 
+## RETRACTED: "the rollback replay path is ruled out"
+
+The section below concluded that rollback is not involved because the serial and
+batched replays diverge identically. **That inference is invalid.** Both replays
+restore the same quantity; if neither restores a KVarN block's var-norm record,
+choosing between them cannot change the outcome. Identical results across two
+implementations of the same operation say nothing about whether that operation is
+complete.
+
+Rollback is now the leading suspect, via the KV cache — see
+`2026-09-02-ngram-speculation-drives-prompt-echo.md`, where an exact (fp32) KV
+removes a speculation-induced output corruption that every quantised width
+exhibits.
+
+The original section is kept below for its measurements.
+
 ## Also ruled out: the rollback replay path
 
 `spec_step_dflash` has two rollback replay implementations and an env lever

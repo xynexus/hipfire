@@ -44,6 +44,49 @@ Two facts do the work:
 It is a feedback loop, and the verify is exactly the component that is supposed
 to break it. It cannot, because it does not reproduce the target's own argmax.
 
+## How the n-gram reaches the logits: through the KV cache
+
+The n-gram never touches the logits. The path is the KV cache, and it is
+measurable — holding FP16 state and speculation fixed and varying only the KV:
+
+    kv=kvarn4   g1 echo=0.000   g2 echo=0.872   (264 tok/s)
+    kv=fp32     g1 echo=0.026   g2 echo=0.000   (14 tok/s, oracle path)
+
+An exact KV removes the loop entirely, with everything else unchanged.
+
+The route: drafted tokens are INPUT POSITIONS of the verify forward. The model
+runs over `[seed, d1, d2, ...]`, computes hidden states for all of them, and
+writes their K/V into the cache. Positions whose drafts are rejected must have
+that K/V undone. If the undo is not exact, later attention reads keys for tokens
+the model never emitted — which, for an n-gram seeded on the prompt, are prompt
+tokens. That biases subsequent logits toward the prompt, which is the backfeed.
+
+KVarN makes the undo structurally hard, which is the likely reason fp32 is the
+only clean mode. Its K records are **block-granular**: one var-norm record per
+128-token block. Writing a speculative token into a block and sealing it computes
+that block's scales over data that includes the draft. Removing the token
+afterwards does not restore the previous scales unless the whole record is
+restored, so a rejected draft can perturb the stored K of tokens that were
+already committed.
+
+That one mechanism is consistent with every other observation in this
+investigation:
+
+- KV **bit width** barely matters (2/4/8-bit all ~6.18e-1) — the error is in the
+  scales, not the mantissa.
+- **Batched vs per-token prefill** diverges from the first multi-chunk prompt —
+  the two paths seal blocks on different schedules.
+- **spec != AR** at every quantised width, and byte-identical at fp32.
+- Swapping the two **rollback replay implementations** changed nothing, which
+  earlier reads as "rollback is not involved". It does not: both replays restore
+  the same thing, and if neither restores the block's prior var-norm record, the
+  choice between them is irrelevant. That elimination was wrong and is retracted
+  here.
+
+**Not yet proven**: that the block scales specifically are what fails to roll
+back. The next step is to dump one block's var-norm record before a speculative
+write and after a rejection, and check whether it returns to its prior value.
+
 ## Why this matters more than the losslessness bug reads on its own
 
 "Speculative output differs from AR output" sounds like a numerical footnote.
