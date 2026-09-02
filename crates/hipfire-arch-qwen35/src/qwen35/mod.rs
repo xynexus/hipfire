@@ -2926,6 +2926,24 @@ fn run_plain_gemm_key(
              for this model, or wire the compact arm at the call site.",
         ));
     }
+    // Qtip3G256 has exactly the same exposure and no arm here either: its 100 B
+    // trellis blocks would be decoded as HFQ4/Q8 by the fallthrough key, and a
+    // dtype absent from a call site's chain is also absent from that site's
+    // rotation-admission list, so the activation arrives unrotated too. Today it
+    // is routed away from the lowered prefill entirely (which is why a qtip3
+    // body prefills per-token at ~233 tok/s but scores correctly), so this is
+    // latent rather than live -- and it is precisely the trap waiting for the
+    // next person who wires the lowered path halfway.
+    if w_dtype == DType::Qtip3G256 {
+        return Err(HipError::new(
+            0,
+            "Qtip3G256 reached a KernelKey GEMM fallthrough with no qtip3 arm; \
+             its trellis blocks would be decoded as another format on an \
+             unrotated activation. Wire the qtip3 arm at the call site (the \
+             batched kernel is gemm_qtip3g256) rather than relying on the \
+             fallthrough key.",
+        ));
+    }
 
     use hipfire_dispatch::families::gemm::GemmParams;
     let ctx = DispatchCtx::new(gpu);
