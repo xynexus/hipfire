@@ -1,6 +1,6 @@
 # The FP16 DeltaNet recurrence is not chunk-invariant — batched prefill and speculation advance the state differently from decode
 
-Status: **FIXED 2026-09-02** (kernel change below); the residual FP32-state question is still open. This is the origin the batched/per-token and spec/AR
+Status: **OPEN — fix attempted and REVERTED 2026-09-02.** The measurement stands; the fix is larger than it looks. See "Fix attempted and reverted". This is the origin the batched/per-token and spec/AR
 divergences were pointing at. It is not the KV cache.
 
 ## The result
@@ -83,56 +83,49 @@ and the KVarN paths are chunk/batch invariant, that result needs a separate
 cause. It is measured on real generations, so it is not an artifact of the
 prefill probe. Do not treat this document as closing that question.
 
-## Fix applied
+## Fix attempted and REVERTED — and why
 
-Both `batch_seq` f16 kernels now narrow the state **once per token, in place**,
-instead of once per call:
+The obvious fix is to narrow once per token instead of once per call. Applied to
+`gated_delta_net_f16.hip`, it works on its own terms:
 
-- `kernels/src/gated_delta_net_f16.hip`
-- `kernels/src/gated_delta_net_f16_routed_batch_seq.hip`
+    gdn_chunk_seq_parity --f16   chunk 7/17/32/64, n 64/128   PASS bit-exact (was FAIL)
+    test_gated_delta_net_tree_f32                             PASS
 
-The final write becomes an exact conversion rather than a second rounding, since
-the tile already holds f16-representable values — so `n_tokens == 1` behaves
-exactly as before, and an N-token call now lands on the same state as N
-single-token calls.
+**But it broke `test_gated_delta_net_routed_f16`**, which the affected-gate runs:
 
-`gated_delta_net_f16_tree.hip` needed no change: it already narrowed per token on
-the persist-write. The two `batch_seq` kernels were the outliers, which is why
-the header's "the three MUST agree bit-for-bit" requirement was being violated in
-the multi-token case.
+    routed f16 vs per-session f16 linear: 1089/3072 byte-exact
+    FAIL: routed must be byte-exact against independent per-session replay
 
-**After:**
+That test replays each session through the LINEAR kernel and requires the ROUTED
+kernel to reproduce it byte-for-byte. Changing linear's narrowing while routed
+still narrowed once per call put them out of step immediately.
 
-    FP32  chunk 17 / 64    PASS (bit-exact)
-    FP16  chunk 7/17/32/64, n=64 and 128    PASS (bit-exact)
+Changing the routed kernel too did not fix it (1089 -> 1024 of 3072). The two
+kernels derive their dither index differently:
 
-and the agreement test the kernel header names still passes:
+    linear:  (row_start * HD + tile_flat) ^ (h << 19)
+    routed:  tile_flat ^ (blockIdx.x << 19) ^ (blockIdx.y << 7)
 
-    f32 tree vs f32 linear:  2560/2560 byte-exact
-    f16 tree vs f16 linear:  2560/2560 byte-exact
-    f16 STATE vs f32 linear: max|diff| 3.057e-6   <- the intended cost of half-precision state
+Narrowing once per call, those two coincide for the configurations the tests
+cover. Narrowing once per TOKEN makes the index part of the state trajectory, so
+the two derivations must agree element-for-element — and they do not. Reverting
+both kernels restores `3072/3072 byte-exact`.
 
-`tests/tiny-state-gate.sh` is PASS 18/18 with no baseline movement — because the
-restored redundancy guard forces FP32 state on the tiny fixtures, so they do not
-exercise the f16 path at all. **That is a coverage gap, not a clean bill**: no
-gate in the tree currently exercises multi-token f16 GDN, which is why this went
-unnoticed. `examples/gdn_chunk_seq_parity --f16` is the check that does.
+**So the fix is not "narrow per token". It is "narrow per token AND reconcile the
+dither-index derivations across all three f16 GDN kernels"** — which is exactly
+what the linear kernel's header demands ("The three MUST agree bit-for-bit ...
+Change all three together") and why that instruction is there. It needs the
+routed blockIdx -> (head, row_start) mapping worked out so both kernels index the
+same element identically, with `test_gated_delta_net_routed_f16` as the gate.
 
-### The trade this makes
+Reverted state verified:
 
-More roundings is a worse approximation of an FP32 reference, and the old
-comment optimised for exactly that ("a multi-token batch pays a single rounding
-rather than one per token"). That reasoning is sound in isolation and wrong in
-context: prefill and decode must agree with EACH OTHER, and `speculative.rs`
-already paid this same price on the rollback replay path for the same reason.
-Consistency beats a marginally better but inconsistent approximation.
+    test_gated_delta_net_tree_f32     PASS
+    test_gated_delta_net_routed_f16   PASS (3072/3072 byte-exact)
+    test_gated_delta_net_routed_f32   PASS
 
-### Not verified
-
-The routed kernel change is mechanically identical to the linear one and the
-reasoning transfers, but it was **not** exercised directly — that needs a
-routed-MoE run, and `gdn_chunk_seq_parity` drives the non-routed entry points.
-Anyone touching the routed path should extend the parity test to cover it.
+The measurement that motivated the fix is unaffected and still stands:
+`gdn_chunk_seq_parity --f16` FAILS on the unmodified tree, which is the bug.
 
 ## Fix directions## Fix directions
 

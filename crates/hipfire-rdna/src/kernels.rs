@@ -3301,14 +3301,8 @@ pub const GATED_DELTA_NET_F16_TREE_SRC: &str =
 /// purpose-built codec as the only alternatives to FP32, and rules out Q8).
 ///
 /// Storage f16, arithmetic FP32: the tile widens into LDS once per call and
-/// narrows back into it ON EVERY TOKEN, so an N-token batch pays N roundings at
-/// the same points N single-token calls would. That costs accuracy against an
-/// FP32 reference versus narrowing once per call — which is what this used to
-/// do — but it is what makes the kernel CHUNK-INVARIANT, and batched prefill
-/// must agree with per-token decode. Measured before the change: one 64-token
-/// launch differed from 64 single-token launches in every state element,
-/// worst |rel| 1.989. See
-/// `docs/bugs/2026-09-02-fp16-deltanet-recurrence-is-not-chunk-invariant.md`. Exactly half the state bytes of
+/// narrows once at the end, so a multi-token batch pays a single rounding
+/// rather than one per token. Exactly half the state bytes of
 /// [`GATED_DELTA_NET_SRC`], with no scales tensor, no error-feedback
 /// accumulator and no stochastic rounding — so unlike Q8 it is deterministic
 /// and spec-decode rollback is trivially lossless.
