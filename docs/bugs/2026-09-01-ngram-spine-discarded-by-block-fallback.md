@@ -63,6 +63,37 @@ This corpus is a favourable one (the prompt is Rust source, which the n-gram
 predicts well), so treat the ratio as a best case, not a headline. The direction
 and the zero are the findings.
 
+## The tok/s figures above are NOT reproducible — treat them as indicative only
+
+Re-measured 2026-09-02 during an audit, after the DeltaNet redundancy guard
+restored FP32 state on this model. The same harness shape now gives:
+
+    AR                    56-72 tok/s
+    n-gram auto           62/67 tok/s      mean_draft_len 1.5-2.1
+    n-gram spec_block=16  62/59 tok/s
+    n-gram adaptive       63/61 tok/s
+
+against the 328/397 recorded above. The difference is n-gram COVERAGE: 0.99 when
+those numbers were taken, 0.29-0.40 now. When coverage collapses the tier has
+almost nothing to draft, so speculation cannot help regardless of how the width
+is chosen.
+
+What is NOT the cause, tested: the DeltaNet guard (FP16 and FP32 both give ~0.3
+coverage, and FP32 is the faster of the two here), and the prompt's trailing
+instruction (removing it, so the model continues the code rather than explaining
+it, moves coverage only 0.29 -> 0.40).
+
+The original harness could not be reconstructed — it lived in `/tmp` and the host
+rebooted — so the gap is unexplained rather than refuted. Speculative throughput
+on this model is evidently very sensitive to how repetitive the generated text
+is, and a single favourable run is not a benchmark.
+
+**The correctness claims in this document stand on their own**: `accepted: 0`
+across 18897 drafted tokens is a functional fact, not a timing one, and the fix
+is verified by `tiny-state-gate` (token output unchanged) plus the unit test. The
+SPEEDUP is what should not be quoted without re-measuring, on a corpus chosen in
+advance and with coverage reported alongside.
+
 ## Fix
 
 `crates/hipfire-arch-qwen35/src/speculative.rs`: the width decision moved into
