@@ -482,3 +482,56 @@ mod tests {
         assert!((1..=7).contains(&c.block()), "got {}", c.block());
     }
 }
+
+#[cfg(test)]
+mod bounds_tests {
+    use super::*;
+
+    /// The widened `MAX_DEPTH` moved three array bounds and two loop bounds at
+    /// once. Drive the controller across widths on both sides of `MAX_DEPTH`,
+    /// with adversarial accept lengths, and assert it neither panics nor returns
+    /// a block outside `[min_block, max_block]`. Indexing is the risk: `observe`
+    /// writes `s_hit[k]`, `observe_timing` writes `t_window_by_n[n_verify]`, and
+    /// the argmax reads `survival_at(n - 1)` — three different arrays whose
+    /// lengths are all derived from one constant.
+    #[test]
+    fn never_panics_or_escapes_its_range() {
+        for max_block in [2usize, 3, 8, 16, 32, MAX_DEPTH, MAX_DEPTH + 1, 64] {
+            for min_block in [1usize, 2] {
+                if min_block > max_block {
+                    continue;
+                }
+                let mut c = BlockController::new(max_block, min_block, max_block, 0.2);
+                c.set_cost_for_test(0.5, 20.0);
+                for i in 0..400 {
+                    // Accept lengths that sweep past the cap, including 0 and
+                    // values above max_block, plus proposals above MAX_DEPTH.
+                    let proposed = (i % (max_block + 8)).max(1);
+                    let accepted = (i * 7) % (proposed + 3);
+                    c.observe_timing((10 + i % 40) as f32, proposed + 1);
+                    c.observe(accepted, proposed);
+                    let b = c.block();
+                    assert!(
+                        b >= min_block && b <= max_block,
+                        "block {b} escaped [{min_block}, {max_block}] at i={i}"
+                    );
+                }
+                c.reset();
+                assert!(c.block() >= min_block && c.block() <= max_block);
+            }
+        }
+    }
+
+    /// A spine longer than the controller can model must not index past the
+    /// survival arrays. `observe` clamps with `.min(MAX_DEPTH)`; this pins it.
+    #[test]
+    fn proposals_far_above_max_depth_are_clamped() {
+        let mut c = BlockController::new(16, 2, 16, 0.2);
+        c.set_cost_for_test(0.5, 20.0);
+        for _ in 0..100 {
+            c.observe_timing(15.0, 4096);
+            c.observe(4095, 4096);
+        }
+        assert!((2..=16).contains(&c.block()));
+    }
+}

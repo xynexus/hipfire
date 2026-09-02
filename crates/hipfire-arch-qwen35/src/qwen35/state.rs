@@ -198,8 +198,9 @@ pub fn default_state_quant(config: &Qwen35Config) -> StateQuant {
     //
     // Keeping FP32 one flag away also keeps the oracle: losing the ability to
     // diff against it is how quantized state hid for months.
+    let env_set = hipfire_env::DN_STATE_FP16.is_set();
     let requested = match dn_state_precedence(
-        hipfire_env::DN_STATE_FP16.is_set(),
+        env_set,
         hipfire_env::DN_STATE_FP16.flag(),
         deltanet_state_precision(),
     ) {
@@ -218,9 +219,27 @@ pub fn default_state_quant(config: &Qwen35Config) -> StateQuant {
     // State traffic is ~1-3% of per-token bandwidth (see
     // `deltanet_state_redundancy`), so paying FP32 on a small model is nearly
     // free; getting it wrong there is not.
+    // The guard applies to the CONFIG-derived default, not to an explicit
+    // `HIPFIRE_DN_STATE_FP16`. `dn_state_precedence` documents that the debug
+    // env var wins when set, either way, so `=0` still reaches the fp32 oracle;
+    // silently overriding `=1` would break the mirror image of that and remove
+    // the ability to measure FP16 on exactly the low-redundancy models where its
+    // behaviour is in question. An explicit request is honoured and warned about.
     let redundancy = deltanet_state_redundancy(config);
     let floor = deltanet_state_fp32_below();
-    if requested == StateQuant::FP16 && floor > 0 && redundancy < floor {
+    let would_guard = requested == StateQuant::FP16 && floor > 0 && redundancy < floor;
+    if would_guard && env_set {
+        static WARNED_OVERRIDE: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        WARNED_OVERRIDE.get_or_init(|| {
+            eprintln!(
+                "deltanet state: HIPFIRE_DN_STATE_FP16=1 is explicit, so FP16 is \
+                 honoured — but redundancy {redundancy} is below {floor}, where \
+                 narrow state breaks first. Unset it to get the guard."
+            );
+        });
+        return StateQuant::FP16;
+    }
+    if would_guard {
         static WARNED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
         WARNED.get_or_init(|| {
             eprintln!(

@@ -373,7 +373,7 @@ pub(crate) fn load(
         0 => None,
         n if n < 2 => {
             tracing::warn!(
-                "spec_block={n} is below 2, which would disable speculation entirely;                  ignoring it and using auto. Write 0 for auto."
+                "spec_block={n} is below 2, which would disable speculation entirely; ignoring it and using auto. Write 0 for auto."
             );
             None
         }
@@ -407,7 +407,7 @@ pub(crate) fn load(
     if ngram_orders.is_empty() {
         if ngram_spec {
             tracing::warn!(
-                "ngram_spec_orders={ngram_orders_raw:?} parsed to nothing usable (need                  comma-separated integers >= 2); using the default ladder"
+                "ngram_spec_orders={ngram_orders_raw:?} parsed to nothing usable (need comma-separated integers >= 2); using the default ladder"
             );
         }
         ngram_orders = vec![8, 7, 6, 5, 4, 3, 2];
