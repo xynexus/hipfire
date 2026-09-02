@@ -751,24 +751,29 @@ redundancy to spend and 3-bit weights cost roughly 3x the KLD of a 4-bit body fo
 | `--arch-id <id>` | Override the architecture id stamped in the `.hfq` header. |
 | `--embed-precision <p>` | `source` (default) / `q8` / `bf16` / `f16` / `hfq4`. See [Embedding Tables](#embedding-tables-usually-the-biggest-win) — usually the largest single lever on a large-vocab model. |
 | `--no-coarse-lmhead` | Drop the two-pass coarse lm_head tier (+1.36 bpw at a 248k vocab, but ~4x cheaper decode output projection). |
-| `--rotate <M.r1>` | SpinQuant R1 deploy pre-pass. **arch 0/1 only in practice** — see the caution below. |
+| `--rotate <M.r1>` | SpinQuant R1 deploy pre-pass (arch 0/1 dense llama, arch 5 qwen3.5). See the validation notes below — the no-op test is `M = F`, not `M = I`. |
 
 `--rotate` applies `FᵀM` and relies on the *codec's* per-256-group FWHT to cancel
-the `Fᵀ`. Two consequences that are easy to get wrong:
+the `Fᵀ`. Three things about validating it, each of which cost a wrong conclusion:
 
 - **It cannot be validated with `--format bf16`.** That path is a raw byte copy with
-  no FWHT, so the `Fᵀ` is left uncancelled and the model is broken by construction.
-  Gate it with a format whose codec does the FWHT (e.g. `oq8++`, which is otherwise
-  near-lossless and so makes a sharp control).
-- **It is not currently correct on qwen3.5 (arch 5)** and refuses unless
-  `HIPFIRE_ALLOW_ROTATE_QWEN35=1`. A `--emit-fixture llama` control shows the
-  feature is imperfect even on its native arch (oq8 KLD 0.000006 unrotated vs
-  0.058 rotated), so treat any rotated artifact as unvalidated until that fixture
-  loop is clean.
+  no FWHT, so the `Fᵀ` is never cancelled and the model is broken by construction.
+  Gate it with a format whose codec does the FWHT — `oq8++` is near-lossless
+  unrotated, which makes it a sharp control.
+- **The no-op rotation is `M = F`, not `M = I`.** Since `R1 = FᵀM`, feeding an
+  identity `M` leaves `R1 = Fᵀ`, which is emphatically not a no-op. Feed `M = F` and
+  `R1 = FᵀF = I`, which *must* reproduce the unrotated result exactly — that is the
+  correctness test. (`F` is orthogonal but **not** an involution: the two sign
+  vectors mean `FF ≠ I`. `gen_fwht_signs` is a plain LCG and `signed_fwht` is
+  sign-flip → butterfly → `1/sqrt(n)` → sign-flip, so `F` is easy to reconstruct
+  exactly outside the codec.)
+- **A non-trivial rotation legitimately costs some quality**, because readers come
+  out unchanged (`F·R1·w = M·w`) while *writers* are quantized in the rotated output
+  frame with nothing to cancel them. An arbitrary Hadamard has no reason to be a
+  better basis than the original — finding a `M` that is better is the entire point
+  of learning it. Measured on a tiny llama fixture at oq8: `R1 = I` reproduces the
+  unrotated KLD to the digit (0.000006), while a Hadamard costs 0.058.
 
-After producing a portable OQ4 artifact, use `hipfire optimize` to pre-pack it
-for a specific GPU architecture (the `repack` alias is still accepted):
-
-```bash
-hipfire optimize ~/.hipfire/models/Qwen3.5-9B--oq4++.hfq --arch gfx1103
-```
+A worked correctness loop lives in the run notes for
+`docs/plans/2026-09-02-qwen35-0.8b-sub4bit-induction-RESULT.md`:
+`--emit-fixture llama` plus an oq8 rotated/unrotated pair is a ~1 minute cycle.

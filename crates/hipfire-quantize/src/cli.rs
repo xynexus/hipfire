@@ -1305,7 +1305,21 @@ fn build_rotation_overrides(
     // then reader-rotate) BEFORE rotating the input embedding.
     let embed_name = format!("{prefix}embed_tokens.weight");
     let mut embed = get_f32(&embed_name).ok_or_else(|| format!("missing {embed_name}"))?;
-    let mut lm_head = embed.clone();
+    // On an UNTIED model the output head is its own tensor and must be rotated as
+    // itself. Cloning the embed here (correct only when the head IS the embed)
+    // silently replaces the trained output projection with the embedding matrix:
+    // the model still loads, still generates, and is simply wrong. Untied llama
+    // measured kld 0.058 rotated against 0.000006 unrotated purely from this.
+    let untied = ["lm_head.weight", &format!("{prefix}lm_head.weight")]
+        .iter()
+        .find_map(|n| get_f32(n).map(|w| ((*n).to_string(), w)));
+    let mut lm_head = match &untied {
+        Some((name, w)) => {
+            eprintln!("  --rotate: untied head — rotating {name} in place");
+            w.clone()
+        }
+        None => embed.clone(),
+    };
     rotate::fold_cols(&mut lm_head, &final_norm, vocab, h);
     plan.rotate_reader(&mut lm_head, vocab);
     // Input embedding: reader-rotate on h (no fold).
@@ -4516,7 +4530,7 @@ fn quantize_hfq_source_tensor(
         // --embed-precision bf16|f16: keep the gather table at source precision
         // instead of Q8 (no-op under the default q8). Only the embed table — the
         // router/conv1d/non-2D tensors below stay Q8.
-        if let Some(ov) = embed_precision_override(raw, src_dtype, &f32_data) {
+        if let Some(ov) = embed_precision_override(name, raw, src_dtype, &f32_data) {
             return Ok(ov);
         }
     }
@@ -7347,6 +7361,32 @@ fn awq_eligible(name: &str) -> bool {
     f1_match || f2_match
 }
 
+/// Source-precision bytes for a tensor that `--rotate` has an override for.
+///
+/// The raw-byte fast paths below are byte-preserving, which is exactly wrong
+/// under `--rotate`: the override is the fold+rotated weight and lives only in
+/// the f32 domain, so copying raw source bytes ships the tensor UNROTATED while
+/// every reader has been rotated to expect the new frame. On a tied embedding
+/// that seeds the whole residual stream in the wrong basis.
+///
+/// It is silent, and it hides from an identity-rotation test: at `R1 = I` the
+/// rotated and raw bytes agree, so the no-op check passes while any real
+/// rotation destroys the model. Measured on Qwen3.5-0.8B oq8++ (embed at the
+/// `source` default): kld 0.000656 at `R1 = I` versus 7.78 with a Hadamard.
+fn rotated_source_override(name: &str, dtype: &str) -> Option<(Vec<u8>, QuantType, &'static str)> {
+    let rot = ROTATION_OVERRIDE.get()?.get(name)?;
+    Some(match dtype {
+        "BF16" => (f32_slice_to_bf16_bytes(rot), QuantType::BF16, "BF16"),
+        "F16" => (f32_slice_to_f16_bytes(rot), QuantType::F16, "F16"),
+        "F32" => (
+            rot.iter().flat_map(|&v| v.to_le_bytes()).collect(),
+            QuantType::F32,
+            "F32",
+        ),
+        _ => return None,
+    })
+}
+
 fn source_precision_tensor_bytes(
     raw_data: &[u8],
     dtype: &str,
@@ -7435,10 +7475,21 @@ fn embed_precision_code_for(name: &str) -> Option<u8> {
 /// runtime gathers these via the raw bf16/f16 embedding kernels (f32 in-kernel,
 /// portable across RDNA2/3/4), or `embedding_lookup_hfq4g256` for `hfq4`.
 fn embed_precision_override(
+    name: &str,
     raw_data: &[u8],
     dtype: &str,
     f32_data: &[f32],
 ) -> Option<(Vec<u8>, QuantType, u32, &'static str)> {
+    // `--rotate` wins over every width below: the rotated embed must reach the
+    // artifact whatever storage width was asked for. bf16/f16/hfq4/q8 all
+    // re-encode from f32 already; only the `source` arm copied raw bytes.
+    if ROTATION_OVERRIDE.get().is_some_and(|m| m.contains_key(name)) {
+        if let Some((bytes, qt, label)) = rotated_source_override(name, dtype) {
+            if embed_precision_code() == 3 {
+                return Some((bytes, qt, 0, label));
+            }
+        }
+    }
     match embed_precision_code() {
         // Unconfigured (library / unit-test callers that never run main): keep
         // whatever the caller would have done. NOT the same as an explicit
@@ -8942,6 +8993,20 @@ pub fn main() {
     {
         let raw_input = Path::new(input_dir);
         if is_hfq_input(raw_input) {
+            // The SpinQuant pre-pass folds and rotates from the SAFETENSORS tensor
+            // set (it needs `st_files`), so this pipeline never consults it and
+            // `--rotate` here did nothing at all -- no warning, no rotate lines,
+            // an output byte-identical to the unrotated build. Refuse instead:
+            // a flag that is accepted and silently ignored is the failure mode
+            // this file has already produced four times.
+            if arg_value(&args, "--rotate").is_some() {
+                eprintln!(
+                    "error: --rotate is not supported with a .hfq input -- the R1 \
+                     pre-pass reads the safetensors tensor set.\n\
+                     \x20      Quantize from the HF/.hfa source to use it."
+                );
+                std::process::exit(2);
+            }
             let hfq_format = HfqInputFormat::from_flag(format).unwrap_or_else(|| {
                 eprintln!(
                     "HFQ input: --format '{format}' not recognized. \
@@ -9684,29 +9749,6 @@ pub fn main() {
             eprintln!(
                 "error: --rotate supports arch_id 0/1 (dense llama) and \
                  {ARCH_ID_QWEN35_DENSE} (qwen3.5 dense); got arch_id {arch_id}"
-            );
-            std::process::exit(2);
-        }
-        // arch 5 is NOT VALIDATED and currently produces a BROKEN model. The
-        // name table is complete (138 residual readers + 48 writers over 24
-        // layers on Qwen3.5-0.8B, matching the tensor inventory exactly) and the
-        // unit-offset RMSNorm fold is correct, but a bug remains: oq8++ scores
-        // kld 0.000676 unrotated and 7.78 rotated against a bf16 reference.
-        //
-        // A llama fixture control puts an upper bound on how much of that is
-        // ours: on arch 0 the same Hadamard takes oq8 from kld 0.000006 to
-        // 0.058 — imperfect, so PART of this predates arch 5 — but qwen3.5 is
-        // still ~130x worse than that, so an arch-5-specific bug remains.
-        //
-        // Gated rather than removed so the research can continue: shipping a
-        // flag that silently emits a broken model is the exact failure mode
-        // this file keeps hitting.
-        if arch_id == ARCH_ID_QWEN35_DENSE && !hipfire_env::ALLOW_ROTATE_QWEN35.flag() {
-            eprintln!(
-                "error: --rotate on arch_id {ARCH_ID_QWEN35_DENSE} (qwen3.5) is NOT VALIDATED \
-                 and currently produces a broken model\n\
-                 \x20      (measured: oq8++ kld 0.000676 unrotated vs 7.78 rotated).\n\
-                 \x20      Set HIPFIRE_ALLOW_ROTATE_QWEN35=1 to run it anyway for research."
             );
             std::process::exit(2);
         }
@@ -11758,7 +11800,7 @@ pub fn main() {
                 let mut awq_sidecar_scales: Option<Vec<f32>> = None;
 
                 let (quantized, qt, gs, label) = if let Some(ov) = is_embed
-                    .then(|| embed_precision_override(&raw_data, &meta.dtype, &f32_data))
+                    .then(|| embed_precision_override(name, &raw_data, &meta.dtype, &f32_data))
                     .flatten()
                 {
                     // --embed-precision: the operator's explicit choice for the
@@ -12816,8 +12858,13 @@ pub fn main() {
                 data: quantized,
                 spilled_len: 0,
             });
-        } else if (use_bf16 || (is_vision && vision_quant == "bf16")) && meta.dtype == "BF16" {
+        } else if (use_bf16 || (is_vision && vision_quant == "bf16"))
+            && meta.dtype == "BF16"
+            && !ROTATION_OVERRIDE.get().is_some_and(|m| m.contains_key(*name))
+        {
             // Store original BF16 bytes losslessly in source-precision containers.
+            // Skipped when `--rotate` has an override: raw bytes are the UNROTATED
+            // weight, and the later override arm re-encodes the rotated f32.
             quantized_params += n_elements as u64;
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
             let scope = if is_vision && vision_quant == "bf16" {

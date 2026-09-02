@@ -4204,6 +4204,32 @@ pub fn generate_start(
     // MTP spec-decode: qwen35 model with a co-trained MTP head, no DFlash
     // drafter, greedy, mtp_mode enabled. Uses the non-tree spec_step_mtp
     // (FP32 DeltaNet state is tree-incompatible — see generate_mtp / TODO.md).
+    //
+    // Eight conditions, and until now failing any of them was SILENT: a model
+    // carrying a verified MTP trailer would decode at plain AR speed with
+    // nothing logged, which is indistinguishable from a drafter that runs and
+    // never gets accepted. Name the first unmet condition so the difference is
+    // visible. Costs one string compare on a path that then does a forward pass.
+    if is_qwen35_family_arch_id(m.arch_id) && m.mtp_weights_present {
+        let unmet = if m.dflash.is_some() {
+            Some("a DFlash drafter is loaded (dflash wins the route)")
+        } else if m.mtp_mode == "off" {
+            Some("mtp_mode == \"off\"")
+        } else if kvarn_active {
+            Some("KVarN is active (FP32 DeltaNet state is tree-incompatible)")
+        } else if temp > 1e-6 {
+            Some("temperature > 0 (MTP verify is greedy-only)")
+        } else if prefill_already_done {
+            Some("prefill already ran for this request")
+        } else if budgeted_thinking_needs_ar {
+            Some("budgeted thinking forces autoregressive decode")
+        } else {
+            None
+        };
+        if let Some(why) = unmet {
+            tracing::info!("mtp: head present but spec-decode not taken — {why}");
+        }
+    }
     if m.dflash.is_none()
         && m.mtp_weights_present
         && m.mtp_mode != "off"
