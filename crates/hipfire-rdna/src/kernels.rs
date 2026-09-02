@@ -238,6 +238,14 @@ pub const GEMV_MQ3G256_LLOYD_SRC: &str =
 /// QTIP-3: FWHT-rotated trellis-coded 3-bit, fused on-the-fly decode + matvec
 /// (100 B/group, computed 1MAD codebook, zero LDS). Arch-generic (gfx1103/1100).
 pub const GEMV_QTIP3G256_SRC: &str = include_str!("../../../kernels/src/gemv_qtip3g256.hip");
+
+/// Batched QTIP-3 GEMM. `Qtip3G256` had a GEMV and no GEMM and was absent from
+/// `gemm_table`, so prefill / KLD scoring / speculative verify all degenerated
+/// to a per-token GEMV loop -- measured 238 tok/s prefill against 2128 for an
+/// oq4.25++ body of the same model. Decodes each weight once and reuses it
+/// across a 32-wide activation-column tile, exactly as `gemm_bf16l3_xf32` does
+/// for the LUT3 head.
+pub const GEMM_QTIP3G256_SRC: &str = include_str!("../../../kernels/src/gemm_qtip3g256.hip");
 /// QTIP-3 with the 3INST computed codebook (`QuantType::Qtip3G256I3` = 51).
 /// Same 100 B/group layout and 12-bit trellis as [`GEMV_QTIP3G256_SRC`]; only
 /// the state->value map differs (3INST, excess kurtosis -0.111, vs 1MAD's

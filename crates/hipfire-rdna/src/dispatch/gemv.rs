@@ -1850,6 +1850,48 @@ impl Gpu {
             &kernargs![ptr a_ptr, ptr x_ptr, ptr y_ptr, i32 m_val, i32 k_val],
         )
     }
+    /// Batched QTIP-3 GEMM: `y[N,M] = A[M,K] · x[N,K]ᵀ`, decoding each weight
+    /// once and reusing it across up to 32 activation columns per pass.
+    ///
+    /// `x` is `[n, K]` row-major and `y` is `[n, M]` row-major, matching
+    /// `gemm_bf16l3_xf32`. Columns are processed in tiles of 32; the caller
+    /// walks `col_base` in steps of 32 (`n_cols` is the size of the final,
+    /// possibly short, tile). With `n_cols == 1` this is bit-identical to
+    /// `gemv_qtip3g256` on that column -- which is what the parity example
+    /// checks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qtip3g256(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+        col_base: usize,
+        n_cols: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_qtip3g256",
+            kernels::GEMM_QTIP3G256_SRC,
+            "gemm_qtip3g256",
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let (m_val, k_val, n_val) = (m as i32, k as i32, n as i32);
+        let (cb_val, nc_val) = (col_base as i32, n_cols as i32);
+        self.launch_kernargs(
+            "gemm_qtip3g256",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![ptr a_ptr, ptr x_ptr, ptr y_ptr, i32 m_val, i32 k_val,
+                       i32 n_val, i32 cb_val, i32 nc_val],
+        )
+    }
+
     /// QTIP-3 GEMV with fused residual add (y += W·x). Same decode as
     /// `gemv_qtip3g256`; the kernel's final store accumulates.
     pub fn gemv_qtip3g256_residual(
