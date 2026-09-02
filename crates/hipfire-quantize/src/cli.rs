@@ -455,9 +455,7 @@ fn ldlq_hessian_for_tensor(idx: &Oq4LdlqHessian, name: &str, k: usize) -> Option
     })?;
     // Move the statistics into the rotated frame for tensors `--rotate` reader-rotated.
     // Writers are rotated on their OUTPUT dim, so their input statistics are unchanged.
-    let rotated_reader = ROTATION_READERS
-        .get()
-        .is_some_and(|set| set.contains(name));
+    let rotated_reader = ROTATION_READERS.get().is_some_and(|set| set.contains(name));
     match ROTATION_R1.get() {
         Some(r1) if rotated_reader && r1.len() == k * k => {
             ROTATED_HESSIANS.fetch_add(1, Ordering::Relaxed);
@@ -1253,10 +1251,10 @@ fn build_rotation_overrides(
 
     // Tensor-name prefix. A VL wrapper puts the decoder under
     // `model.language_model.`; a plain dense model uses `model.`.
-    let prefix = if st_files
-        .iter()
-        .any(|st| st.tensor_data("model.language_model.embed_tokens.weight").is_some())
-    {
+    let prefix = if st_files.iter().any(|st| {
+        st.tensor_data("model.language_model.embed_tokens.weight")
+            .is_some()
+    }) {
         "model.language_model."
     } else {
         "model."
@@ -1297,8 +1295,10 @@ fn build_rotation_overrides(
                 .ok_or_else(|| format!("missing input_layernorm for layer {l}"))?,
         );
         norm2.push(
-            get_f32(&format!("{prefix}layers.{l}.post_attention_layernorm.weight"))
-                .ok_or_else(|| format!("missing post_attention_layernorm for layer {l}"))?,
+            get_f32(&format!(
+                "{prefix}layers.{l}.post_attention_layernorm.weight"
+            ))
+            .ok_or_else(|| format!("missing post_attention_layernorm for layer {l}"))?,
         );
     }
     let mut final_norm = get_f32(&format!("{prefix}norm.weight"))
@@ -7552,7 +7552,11 @@ fn is_embedding_table_name(name: &str) -> bool {
 fn config_uses_unit_offset_norm(config: &serde_json::Value) -> bool {
     config
         .get("model_type")
-        .or_else(|| config.get("text_config").and_then(|tc| tc.get("model_type")))
+        .or_else(|| {
+            config
+                .get("text_config")
+                .and_then(|tc| tc.get("model_type"))
+        })
         .and_then(|v| v.as_str())
         .is_some_and(|mt| mt.starts_with("qwen3_5") || mt.starts_with("qwen3_next"))
 }
@@ -7596,7 +7600,10 @@ fn embed_precision_override(
     // `--rotate` wins over every width below: the rotated embed must reach the
     // artifact whatever storage width was asked for. bf16/f16/hfq4/q8 all
     // re-encode from f32 already; only the `source` arm copied raw bytes.
-    if ROTATION_OVERRIDE.get().is_some_and(|m| m.contains_key(name)) {
+    if ROTATION_OVERRIDE
+        .get()
+        .is_some_and(|m| m.contains_key(name))
+    {
         if let Some((bytes, qt, label)) = rotated_source_override(name, dtype) {
             if embed_precision_code() == 3 {
                 return Some((bytes, qt, 0, label));
@@ -7727,6 +7734,15 @@ OPTIONS:
                                HFQ4-G256, 4.25 stored bits/weight): on a tied-embedding model at a
                                large vocab the table dominates the artifact, and this is the only
                                way to get an average under 4 bits/weight. Opt-in, measure first.
+    --norm-patch <file.json>   fold recovered RMSNorm weights in, `{"<tensor name>": [f32, ...]}`
+                               as written by `hipfire-train`'s qwen35_norm_recovery (light QAT:
+                               block-local norm recovery against the served artifact's own
+                               dequantized weights). Norms are not quantized, so this only
+                               substitutes their values -- but it must happen HERE rather than by
+                               patching a finished .hfq, because a lossless bf16 recoding
+                               (Bf16Huff) makes the tuned values a different byte length. Values
+                               are in the STORED convention: a (1+w) family expects w, not 1+w.
+                               An entry matching no tensor is fatal, not skipped.
 
   MoE / K-map:
     --kmap-dense               enable K-map promotion on dense models (default: MoE-only)
@@ -12973,7 +12989,9 @@ pub fn main() {
             });
         } else if (use_bf16 || (is_vision && vision_quant == "bf16"))
             && meta.dtype == "BF16"
-            && !ROTATION_OVERRIDE.get().is_some_and(|m| m.contains_key(*name))
+            && !ROTATION_OVERRIDE
+                .get()
+                .is_some_and(|m| m.contains_key(*name))
         {
             // Store original BF16 bytes losslessly in source-precision containers.
             // Skipped when `--rotate` has an override: raw bytes are the UNROTATED
@@ -13117,7 +13135,11 @@ pub fn main() {
         // Same text_config fallback the pre-pass uses: a VL wrapper nests it.
         let h = config
             .get("hidden_size")
-            .or_else(|| config.get("text_config").and_then(|tc| tc.get("hidden_size")))
+            .or_else(|| {
+                config
+                    .get("text_config")
+                    .and_then(|tc| tc.get("hidden_size"))
+            })
             .and_then(|v| v.as_u64())
             .expect("hidden_size (validated in --rotate pre-pass)") as usize;
         let vocab = lm.len() / h;
@@ -14345,6 +14367,101 @@ pub fn main() {
         eprintln!(
             "gemma3: baked +1.0 into {n_baked} RMSNorm weight tensors (zero-centered (1+w) convention)"
         );
+    }
+
+    // ── --norm-patch: fold recovered RMSNorm weights in ────────────────
+    // Light QAT (block-local norm recovery, `hipfire-train`'s
+    // qwen35_norm_recovery) produces tuned γ for norms that are NOT quantized —
+    // they pass through at source precision. Applying them by rewriting the
+    // finished container in place does not work once the bf16 tensors carry a
+    // lossless recoding (`Bf16Huff`): the tuned values compress to a different
+    // byte length. So they are folded HERE, before the recode, and the artifact
+    // is written by the one writer that owns the container format.
+    //
+    // The values are in the STORED convention — for a `(1+w)` family the
+    // recovery tool subtracts 1 before writing the file, so a gemma-style bake
+    // above has already happened and is not applied twice.
+    if let Some(patch_path) = arg_value(&args, "--norm-patch") {
+        let raw = match std::fs::read_to_string(patch_path) {
+            Ok(r) => r,
+            Err(e) => {
+                eprintln!("--norm-patch: {patch_path}: {e}");
+                std::process::exit(2);
+            }
+        };
+        let patch: std::collections::HashMap<String, Vec<f32>> = match serde_json::from_str(&raw) {
+            Ok(p) => p,
+            Err(e) => {
+                eprintln!("--norm-patch: {patch_path}: {e}");
+                std::process::exit(2);
+            }
+        };
+        let mut applied = 0usize;
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        for t in hfq_tensors.iter_mut() {
+            let Some(vals) = patch.get(&t.name) else {
+                continue;
+            };
+            seen.insert(t.name.as_str());
+            // A norm is a 1-D unquantized vector. Refuse anything else rather
+            // than overwrite a quantized weight's code bytes with raw floats.
+            if !t.name.ends_with("norm.weight") {
+                eprintln!("--norm-patch: FATAL {} is not a norm tensor", t.name);
+                std::process::exit(2);
+            }
+            if t.spilled_len > 0 {
+                eprintln!(
+                    "--norm-patch: FATAL norm {} was spilled to disk before the patch",
+                    t.name
+                );
+                std::process::exit(2);
+            }
+            let dtype = match t.quant_type {
+                QuantType::F32 => "F32",
+                QuantType::F16 => "F16",
+                QuantType::BF16 => "BF16",
+                other => {
+                    eprintln!(
+                        "--norm-patch: FATAL norm {} has quant_type {} (expected F32/F16/BF16)",
+                        t.name, other as u8
+                    );
+                    std::process::exit(2);
+                }
+            };
+            let n = to_f32(&t.data, dtype).len();
+            if n != vals.len() {
+                eprintln!(
+                    "--norm-patch: FATAL {} has {n} elements, patch has {}",
+                    t.name,
+                    vals.len()
+                );
+                std::process::exit(2);
+            }
+            t.data = match t.quant_type {
+                QuantType::F32 => vals.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                QuantType::F16 => f32_slice_to_f16_bytes(vals),
+                QuantType::BF16 => f32_slice_to_bf16_bytes(vals),
+                _ => unreachable!(),
+            };
+            applied += 1;
+        }
+        // A patch entry that matches nothing is the failure mode this area keeps
+        // repeating: the flag parses, the run succeeds, and the recovery silently
+        // did not ship. Name every miss and refuse.
+        let missed: Vec<&String> = patch
+            .keys()
+            .filter(|k| !seen.contains(k.as_str()))
+            .collect();
+        if !missed.is_empty() {
+            eprintln!(
+                "--norm-patch: FATAL {} patch entries match no tensor in this artifact \
+                 (first: {}); the recovery would ship silently unapplied",
+                missed.len(),
+                missed[0]
+            );
+            std::process::exit(2);
+        }
+        eprintln!("--norm-patch: folded {applied} recovered norm tensors from {patch_path}");
     }
 
     // qtip3 (real) post-pass: pack every eligible 2D BF16 weight into
@@ -18329,7 +18446,9 @@ mod codec_golden {
     fn hessian_congruence_is_orthogonal_and_matches_naive() {
         let k = 8usize;
         // A symmetric PSD H (H = AᵀA), and an orthogonal R1 (a 8-point FWHT block).
-        let a: Vec<f32> = (0..k * k).map(|i| ((i * 37 % 19) as f32 - 9.0) / 5.0).collect();
+        let a: Vec<f32> = (0..k * k)
+            .map(|i| ((i * 37 % 19) as f32 - 9.0) / 5.0)
+            .collect();
         let mut h = vec![0.0f32; k * k];
         for i in 0..k {
             for j in 0..k {
