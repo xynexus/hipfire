@@ -1,7 +1,14 @@
 # TODO — `/v1/rerank` is cosine, not reranking; the cross-encoder path exists and is unwired
 
-Status: **not started.** The scoring primitive is already written and tested — see
-"What exists" before writing anything.
+Status: **half delivered, and it always was.** This is not a newly found gap — it is the
+unbuilt half of a planned capability, and the scoring function for it is already written.
+Read "What exists" and "Where this was already planned" before writing anything.
+
+**Correction to an earlier draft of this entry**, which presented the gap as a discovery.
+It is not. `542c5c0e8` ("feat(embeddinggemma): text embedding + reranker support") added
+*both* scoring modes to `pooling.rs` in one commit — "cosine reranking, **yes/no-logit
+reranking (Qwen3-Reranker true/false pair)**" — so `rerank_yes_no` was written
+deliberately, anticipating Qwen3-Reranker, and only the cosine half was wired up.
 
 ## Why
 
@@ -77,6 +84,28 @@ answer, it **is** the signal; argmax discards all of it. That is precisely why
 `rerank_yes_no` takes logits, and it means a client cannot work around the missing
 endpoint by prompting the model itself. Exposing `logprobs` on the generation API would
 unblock the same measurement from outside, and is a smaller change than the loader.
+
+## Where this was already planned
+
+`docs/plans/2026-06-19-arch-roster-feature-matrix.md` scopes this explicitly, and rates
+it cheap:
+
+- Family **E, non-generative heads**: "**Qwen3-Embedding** (0.6/4/8B), **Qwen3-Reranker**
+  (0.6/4/8B) — `Qwen3ForCausalLM` backbone, no AR loop | cheap: reuse qwen3 forward, add
+  encode→pool / score head" (line 128).
+- "Non-generative output heads — `encode → pool` (embedding) and pairwise `score`
+  (rerank). The **cheapest** new capability: the qwen3 forward already exists; add a
+  pooled/scoring output path + skip the AR loop."
+- Scope framing: "the near-term-cheap wins that fit the current engine are **(E)
+  embedding/rerank heads** (qwen3 forward exists)".
+
+`docs/plans/2026-06-19-multi-family-master-plan.md` places the same item at **E6**:
+"Embedding/rerank `Pool`/`Score` heads (cheap; qwen3 forward exists) validate non-AR
+*output*".
+
+So the plan named the model family, the backbone, the missing head and the cost. What
+followed delivered `Pool` (for EmbeddingGemma) and left `Score` unbuilt, while writing
+`Score`'s arithmetic. The evidence below is what that costs a caller today.
 
 ## What's missing
 
