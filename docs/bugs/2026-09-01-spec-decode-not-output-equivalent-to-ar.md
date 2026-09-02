@@ -51,29 +51,75 @@ Ruled out by measurement, because the divergence offset does not move:
   offset is stable across every precision knob and every block width, which is
   the signature of a deterministic logic difference, not rounding.
 
-## Leading hypothesis (not yet confirmed)
+## Ruled out: repeat_penalty (was the leading hypothesis — WRONG)
 
-The speculative call site passes sampling parameters the AR path does not:
+The speculative call site passes `1.0_f32, // repeat_penalty (off)` while the
+schema's `repeat_penalty` default is 1.05, which looked like the answer: two
+paths decoding different objectives would separate deterministically at a fixed
+offset, invariant to precision, exactly as observed.
 
-    crates/hipfire-serving-core/src/generate.rs:1153
-        1.0_f32, // repeat_penalty (off)
-        0,       // repeat_window
+**It is not the cause.** The daemon does not use the schema default here. It
+picks a per-ARCH default (`handlers/generate.rs:511`):
 
-while `repeat_penalty` is a schema field defaulting to **1.05**, and the other
-generate paths forward `cfg.repeat_penalty`. If the AR path applies 1.05 and the
-speculative path hardcodes 1.0, the two are not decoding the same objective, and
-they would separate at the first token where the penalty flips an argmax —
-deterministically, at a fixed offset, invariant to precision. That matches every
-observation.
+    let default_repeat_penalty = if m.arch_id == ARCH_ID_LFM2_MOE { 1.05 }
+        else if m.arch_id == ARCH_ID_GEMMA3_VL { 1.3 } else { 1.0 };
 
-This would explain **spec vs AR**. It does not by itself explain **b=16 vs b=8**,
-since both disable the penalty; that difference is probably ordinary numeric
-path-dependence in the batched verify, which only becomes visible once the runs
-have already separated. Both need confirming.
+`qwen3.5` is arch 5, so it takes the `else` branch: **1.0**, the same value the
+speculative path hardcodes. Both arms decoded with the penalty off, and the
+divergence is something else. (That the config field's 1.05 default reaches
+almost no model is a separate inconsistency, noted below.)
 
-The confirming experiment — rerun AR and spec with `repeat_penalty` forced to
-1.0 in the request — is written but **did not complete**: the run wedged the GPU
-(see below).
+## Refined diagnosis: the DRAFT CONTENT changes committed tokens
+
+Re-measured 2026-09-01 after a reboot, 800 tokens, two identical requests per
+run, `qwen3.5-0.8b--oq4++.hfq`, greedy.
+
+AR is deterministic and request-order independent: g1 and g2 are byte-identical
+(`dbd086d69db0`, 800 tokens each). Speculation is not:
+
+| block | g1 first divergence from AR | g2 first divergence from AR |
+|---|---|---|
+| b=2 | token 49 | **token 1** |
+| b=4 | token 49 | **token 1** |
+| b=16 | token 49 | **token 1** |
+
+Two facts narrow this sharply:
+
+1. **`b=2` diverges at exactly the same token as `b=16`.** `b=2` is the
+   narrowest possible speculation — a single drafted token. So this is not a
+   batch-width effect and not accumulated drift; a one-token draft is enough.
+2. **g1 and g2 differ from each other**, on an identical prompt, with AR
+   identical across both. The only thing that changed between them is the
+   n-gram store, which is warm by g2. So the DRAFT CONTENT is changing what
+   gets COMMITTED.
+
+The text confirms it is not a near-tie numeric flip:
+
+    AR   : 'The' ' module'   ' implements' ' a' ' **' 'RAM' ' staging'
+    b=16 : 'The' ' provided' ' code'       ' defines' ' a' ' **' 'RAM' ' staging'
+
+Different words, then the sequences re-converge.
+
+That combination is diagnostic. A correct verify commits either the drafted
+token (only when it equals the target's own argmax) or the target's argmax — so
+the committed sequence cannot depend on what was drafted. Here it does.
+
+## Most likely cause: the drafted positions are visible to earlier rows
+
+The batched verify evaluates seed + drafted positions in one forward. If the
+causal mask is wrong, row *i* can attend to drafted position *j > i*, and then
+the logits at *i* — and hence the token committed there — depend on tokens that
+were only guesses. That reproduces every observation above, including a
+single-token draft being sufficient and the dependence on store warmth.
+
+**This exact bug class has occurred in this repo before**: "Routed KVarN prefill:
+rows in a wrapped block attend to FUTURE tokens"
+(`docs/bugs/2026-08-29-kvarn-routed-prefill-window-wrap.md`, fixed 2026-08-29) —
+same shape, different code path.
+
+Not yet confirmed; the next step is to dump the target's logits at the first
+committed position of one window with two different drafted suffixes. If they
+differ, the mask is leaking and this is proven.
 
 ## Why this matters beyond correctness
 
