@@ -232,6 +232,17 @@ for raw_family in "${families[@]}"; do
         # 300: above the 256 chunk so the KV is actually read, and below the
         # tiny fixtures' context — 512 panics them ("--n exceeds fixture ctx").
         HID_N="${HIPFIRE_TINYPREFILL_HID_N:-300}"
+        # A SECOND size with a one-row trailing batch. PREFILL_MAX_BATCH is 256,
+        # so n=257 runs 256 rows then a batch of exactly 1 — and that lone row's
+        # attention is computed catastrophically wrong: 4.2e-1 on dense qwen3_5
+        # and 8.7e-1 on qwen3_5_moe_indexed, against ~5e-3 neighbours. n=258 and
+        # n=260 are clean, so it is the batch SIZE, not the position.
+        #
+        # At the default n=300 (a 44-row tail) dense qwen3_5 PASSES at 5.75e-3
+        # while carrying that 4.2e-1 row, so this gate could not see it. Any
+        # prompt of length 1 (mod 256) hits it in production.
+        # See docs/bugs/2026-09-02-single-row-trailing-prefill-batch.md
+        HID_N_TAIL="${HIPFIRE_TINYPREFILL_HID_N_TAIL:-257}"
         # The probe compares a BATCHED arm against a per-token one. On some
         # configurations the batched path declines and BOTH arms run per-token,
         # so it reports `IDENTICAL (worst 0.00e0)` for a comparison that never
@@ -289,6 +300,28 @@ for raw_family in "${families[@]}"; do
         else
             echo "  hidden fp32: $w32 (invariant: must be exactly 0)"
         fi
+        # One-row-trailing-batch cover, quantised KV only (the modes where the
+        # defect reproduces). Reported separately so a failure here is not
+        # confused with the n=300 divergence.
+        for tkv in "${kv_modes[@]}"; do
+            tkv="$(echo "$tkv" | xargs)"; [ -n "$tkv" ] || continue
+            wt="$("$HID" --model "$hfq" --n "$HID_N_TAIL" --kv-mode "$tkv" 2>"$HID_ERR" >"$HID_OUT"; \
+                  grep -oE '\(worst (overall )?[0-9.eE+-]+\)' "$HID_OUT" |
+                  sed -E 's/.*[[:space:]]([0-9.eE+-]+)\)/\1/' | tail -1)"
+            if ! hid_batched_ran; then
+                echo "  NOT-MEASURED tail n=$HID_N_TAIL $tkv: batched declined"
+                nomeasure=$((nomeasure + 1))
+            elif [ -z "$wt" ]; then
+                echo "  FAIL tail n=$HID_N_TAIL $tkv: no parseable summary"
+                fail=$((fail + 1))
+            elif [ "$(awk -v a="$wt" -v c="${HIPFIRE_TINYPREFILL_HID_MAX:-5e-2}" 'BEGIN{print (a>c)?1:0}')" = "1" ]; then
+                echo "  FAIL one-row trailing batch (n=$HID_N_TAIL) $tkv = $wt exceeds ${HIPFIRE_TINYPREFILL_HID_MAX:-5e-2}"
+                echo "       docs/bugs/2026-09-02-single-row-trailing-prefill-batch.md"
+                fail=$((fail + 1))
+            else
+                echo "  tail n=$HID_N_TAIL $tkv: worst $wt (ceiling ${HIPFIRE_TINYPREFILL_HID_MAX:-5e-2})"
+            fi
+        done
         for hkv in "${kv_modes[@]}"; do
             hkv="$(echo "$hkv" | xargs)"; [ -n "$hkv" ] || continue
             wq="$(hid_worst "$hkv" "$hfq")"

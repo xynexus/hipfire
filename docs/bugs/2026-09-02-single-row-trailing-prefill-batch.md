@@ -66,7 +66,25 @@ defect, and may be a ceiling-calibration decision rather than a code fix.
 
 1. Read the batched prefill's handling of a 1-row batch — the degenerate case is
    where a tile/wave-shaped kernel is most likely to fall back or mis-stride.
-2. Add `--n 257` to `tests/tiny-prefill-gate.sh` so the 1-row tail is covered.
-   Deliberately not done in the same change as the discovery: the gate is
-   currently reporting NOT-MEASURED cells and adding a new red cell on top would
-   muddy which failure is which.
+   NOT attempted here. `forward_prefill_batch` is a 13k-line path whose own
+   comments record that widening its eligibility gates produced garbage (KLD
+   10.69 vs 0.0389 on a MoE model), and a speculative fix there without the
+   ability to validate it broadly would be worse than the documented bug. The
+   gate cell above is the safe half: the defect is now covered and cannot
+   regress further or be forgotten.
+
+   One lead for whoever takes it: the multi-GPU sibling in `ep.rs` gates batched
+   prefill on `n_total >= 2`, so a 1-row batch there falls back to per-token. If
+   the in-play path lacks that guard, a batch of 1 may be entering a kernel that
+   assumes at least two rows.
+2. ~~Add `--n 257` to the gate~~ — DONE. `tests/tiny-prefill-gate.sh` now runs a
+   second probe size with a one-row trailing batch, per quantised KV mode,
+   reported separately from the n=300 cells so a failure in one is never
+   confused with the other:
+
+       qwen3_5              FAIL one-row trailing batch (n=257) q8 = 4.18e-1
+       qwen3_5              tail n=257 kvarn: 3.35e-2 (clean)
+       qwen3_5_moe_indexed  FAIL one-row tail q8 = 8.69e-1, kvarn = 7.40e-2
+
+   Dense `qwen3_5` passed this gate completely before; it now fails on a defect
+   it was always carrying. Overridable via `HIPFIRE_TINYPREFILL_HID_N_TAIL`.
