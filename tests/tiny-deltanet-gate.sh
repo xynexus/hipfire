@@ -35,6 +35,7 @@ if ! cargo build --release -p hipfire-rdna --features deltanet \
 fi
 
 status=0
+cells=${#EXAMPLES[@]}
 for e in "${EXAMPLES[@]}"; do
     out="$(./target/release/examples/"$e" 2>&1)"
     rc=$?
@@ -47,8 +48,44 @@ for e in "${EXAMPLES[@]}"; do
     fi
 done
 
+# CHUNK-INVARIANCE, both state dtypes. The trio above proves the three kernels
+# agree with EACH OTHER; it says nothing about whether one launch of N tokens
+# equals N launches of one. It does not, unless someone checks: the f16
+# batch_seq kernels narrowed the state once per CALL, so batched prefill and the
+# speculative verify advanced it differently from per-token decode. One 64-token
+# launch differed from 64 single-token launches in every state element, worst
+# |rel| 1.989. Nothing in the tree exercised multi-token f16 GDN, which is how
+# that survived — see
+# docs/bugs/2026-09-02-fp16-deltanet-recurrence-is-not-chunk-invariant.md
+#
+# Lives in hipfire-runtime, and takes arguments, so it gets its own stage.
+PARITY_ARGS=(
+    "--n 64 --chunk 17"
+    "--n 64 --chunk 64"
+    "--n 64 --chunk 17 --f16"
+    "--n 128 --chunk 32 --f16"
+)
+if ! cargo build --release -p hipfire-runtime --features deltanet \
+        --example gdn_chunk_seq_parity 2>&1 | tail -3; then
+    echo "tiny-deltanet-gate: BUILD FAILED (gdn_chunk_seq_parity)"
+    exit 2
+fi
+for a in "${PARITY_ARGS[@]}"; do
+    # shellcheck disable=SC2086
+    out="$(./target/release/examples/gdn_chunk_seq_parity $a 2>&1)"
+    rc=$?
+    if [ "$rc" -eq 0 ] && printf '%s' "$out" | grep -q PASS; then
+        echo "  pass  gdn_chunk_seq_parity $a"
+    else
+        echo "  FAIL  gdn_chunk_seq_parity $a"
+        printf '%s\n' "$out" | grep -E "state :|output:|FAIL|INCONCLUSIVE" | sed 's/^/        /'
+        status=1
+    fi
+    cells=$((cells + 1))
+done
+
 if [ "$status" -eq 0 ]; then
-    echo "tiny-deltanet-gate: PASS (${#EXAMPLES[@]} cells)"
+    echo "tiny-deltanet-gate: PASS ($cells cells)"
 else
     echo "tiny-deltanet-gate: FAIL"
 fi
