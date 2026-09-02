@@ -116,3 +116,82 @@ extern "C" __global__ void gemm_qtip3g256(
         if (tid == 0) y[(long long)(col_base + c) * M + row] = v;
     }
 }
+
+// Residual variant: y += A·x, for the projections that write straight back into
+// the residual stream (o_proj / out_proj / down_proj). Identical decode and
+// batching; only the final store accumulates. Duplicated verbatim rather than
+// shared through a macro, matching `gemv_qtip3g256_residual` next door — the
+// decode is the part a reader checks line-by-line against qtip::decode_group_bits.
+__launch_bounds__(32)
+extern "C" __global__ void gemm_qtip3g256_residual(
+    const char*  __restrict__ A,   // [M, K] Qtip3G256, 100 B per 256-group
+    const float* __restrict__ x,   // [N, K] F32 row-major (FWHT-rotated)
+    float*       __restrict__ y,   // [N, M] F32 row-major, PRE-ADD value
+    int M, int K, int N, int col_base, int n_cols
+) {
+    const int row = blockIdx.x;
+    if (row >= M) return;
+    const int tid = threadIdx.x;
+
+    const int groups_per_row = K / 256;
+    const char* row_ptr = A + (long long)row * groups_per_row * 100;
+
+    const int nc = n_cols < QTIP3_NT ? n_cols : QTIP3_NT;
+
+    float sum[QTIP3_NT];
+    #pragma unroll
+    for (int c = 0; c < QTIP3_NT; ++c) sum[c] = 0.0f;
+
+    for (int g = 0; g < groups_per_row; g++) {
+        const char* gptr = row_ptr + g * 100;
+        const float scale = *reinterpret_cast<const float*>(gptr);
+        const unsigned char* data = (const unsigned char*)(gptr + 4);
+
+        const int boff = tid * 3;
+        unsigned int pk = (unsigned int)data[boff]
+                        | ((unsigned int)data[boff + 1] << 8)
+                        | ((unsigned int)data[boff + 2] << 16);
+
+        unsigned int s_m3 = 0u, s_m2 = 0u, s_m1 = 0u;
+        if (tid > 0) {
+            const int pboff = (tid - 1) * 3;
+            unsigned int ppk = (unsigned int)data[pboff]
+                             | ((unsigned int)data[pboff + 1] << 8)
+                             | ((unsigned int)data[pboff + 2] << 16);
+            s_m3 = (ppk >> 15) & 7u;
+            s_m2 = (ppk >> 18) & 7u;
+            s_m1 = (ppk >> 21) & 7u;
+        }
+
+        unsigned int q0 = pk & 7u,        q1 = (pk >> 3) & 7u;
+        unsigned int q2 = (pk >> 6) & 7u, q3 = (pk >> 9) & 7u;
+        unsigned int q4 = (pk >> 12) & 7u, q5 = (pk >> 15) & 7u;
+        unsigned int q6 = (pk >> 18) & 7u, q7 = (pk >> 21) & 7u;
+
+        #define QST(a,b,c,d) ((((a)<<9)|((b)<<6)|((c)<<3)|(d)) & QTIP3_STATE_MASK)
+        // Decode ONCE per weight — this is the whole point of the kernel.
+        const float w0 = scale * qtip3_gemm_decode(QST(s_m3, s_m2, s_m1, q0));
+        const float w1 = scale * qtip3_gemm_decode(QST(s_m2, s_m1, q0,  q1));
+        const float w2 = scale * qtip3_gemm_decode(QST(s_m1, q0,  q1,  q2));
+        const float w3 = scale * qtip3_gemm_decode(QST(q0,   q1,  q2,  q3));
+        const float w4 = scale * qtip3_gemm_decode(QST(q1,   q2,  q3,  q4));
+        const float w5 = scale * qtip3_gemm_decode(QST(q2,   q3,  q4,  q5));
+        const float w6 = scale * qtip3_gemm_decode(QST(q3,   q4,  q5,  q6));
+        const float w7 = scale * qtip3_gemm_decode(QST(q4,   q5,  q6,  q7));
+        #undef QST
+
+        const int base_idx = g * 256 + tid * 8;
+        for (int c = 0; c < nc; ++c) {
+            const float* __restrict__ xc = x + (long long)(col_base + c) * K + base_idx;
+            sum[c] += w0 * xc[0] + w1 * xc[1] + w2 * xc[2] + w3 * xc[3]
+                    + w4 * xc[4] + w5 * xc[5] + w6 * xc[6] + w7 * xc[7];
+        }
+    }
+
+    for (int c = 0; c < nc; ++c) {
+        float v = sum[c];
+        for (int offset = 16; offset > 0; offset >>= 1)
+            v += __shfl_down(v, offset);
+        if (tid == 0) y[(long long)(col_base + c) * M + row] += v;
+    }
+}

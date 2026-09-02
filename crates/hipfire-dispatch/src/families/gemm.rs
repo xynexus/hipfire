@@ -165,6 +165,10 @@ impl GemmFamily {
             }
             K::GemmHfq4G256Wmma => hip!(gpu.gemm_hfq4g256_wmma(w.buf, x, y, m, k, batch_size)),
             K::GemmHfq4G256 => hip!(gpu.gemm_hfq4g256(w.buf, x, y, m, k, batch_size)),
+            K::GemmQtip3G256 => hip!(gpu.gemm_qtip3g256(w.buf, x, y, m, k, batch_size)),
+            K::GemmQtip3G256Residual => {
+                hip!(gpu.gemm_qtip3g256_residual(w.buf, x, y, m, k, batch_size))
+            }
             K::GemmHfq4G128 => hip!(gpu.gemm_hfq4g128(w.buf, x, y, m, k, batch_size)),
             // #397 Ship 5.1: plain-GEMM catalog. Each arm maps the registered
             // KernelKey to the exact hipfire-rdna method with the canonical

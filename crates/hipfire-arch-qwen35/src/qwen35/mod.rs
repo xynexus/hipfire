@@ -1180,6 +1180,15 @@ fn is_batchable_la(dt: DType, arch: &str, allow_compact: bool) -> bool {
         // models unaffected because no production checkpoint sets
         // wqkv.gpu_dtype = ParoQ4G128 outside the shisa-PARO codepath.
         | DType::ParoQ4G128 | DType::F32 | DType::F16
+        // Qtip3G256: batched arms exist (gemm_qtip3g256 + the FA QKV arm in
+        // prefill_lowered). Without this line those arms are unreachable — this
+        // predicate is the FOURTH admission list a dtype must appear in
+        // (is_batchable_la -> pbs_eligible -> the rotation list -> the branch
+        // chain), and being absent from any one of them is silent. Measured
+        // before it: a qtip3 body prefilled at 234 tok/s against 2128 for an
+        // oq4.25++ body of the same model, with the correctly-wired arms below
+        // never called. See docs/todo/2026-09-02-prefill-lowered-dispatch-table.md.
+        | DType::Qtip3G256
         // BF16 was excluded on gfx1151 by the BUG-001 guard: the batched
         // FullAttention BF16 q/k/v projection was reported to inflate `fa_q`
         // ~9x there, so BF16 prefill was routed through the per-token
@@ -2934,14 +2943,22 @@ fn run_plain_gemm_key(
     // body prefills per-token at ~233 tok/s but scores correctly), so this is
     // latent rather than live -- and it is precisely the trap waiting for the
     // next person who wires the lowered path halfway.
-    if w_dtype == DType::Qtip3G256 {
+    if w_dtype == DType::Qtip3G256
+        && !matches!(
+            key,
+            hipfire_dispatch::types::KernelKey::GemmQtip3G256
+                | hipfire_dispatch::types::KernelKey::GemmQtip3G256Residual
+        )
+    {
         return Err(HipError::new(
             0,
-            "Qtip3G256 reached a KernelKey GEMM fallthrough with no qtip3 arm; \
-             its trellis blocks would be decoded as another format on an \
-             unrotated activation. Wire the qtip3 arm at the call site (the \
-             batched kernel is gemm_qtip3g256) rather than relying on the \
-             fallthrough key.",
+            &format!(
+                "Qtip3G256 reached a KernelKey GEMM fallthrough with no qtip3 arm \
+                 (key={key:?} m={m} k={k} n={n}); its trellis blocks would be \
+                 decoded as another format on an unrotated activation. Wire the \
+                 qtip3 arm at the call site (the batched kernel is \
+                 gemm_qtip3g256) rather than relying on the fallthrough key."
+            ),
         ));
     }
 

@@ -109,6 +109,11 @@ impl<'a> Qwen35PrefillBindings<'a> {
                 // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
                 | DType::Oq8G256
                 | DType::OqCompactG256
+                // Qtip3G256 weights are stored FWHT-rotated exactly like the
+                // MQ/OQ family, so the activation must be rotated here. Adding
+                // the arm below WITHOUT this line is the unrotated-activation
+                // half of the failure `run_plain_gemm_key` refuses.
+                | DType::Qtip3G256
         );
         let qkv_is_6bit = matches!(layer.wq.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
         let qkv_is_mq3 = matches!(layer.wq.gpu_dtype, DType::MQ3G256);
@@ -116,6 +121,7 @@ impl<'a> Qwen35PrefillBindings<'a> {
         let qkv_is_fp4 = matches!(layer.wq.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
         let qkv_is_oq4 = matches!(layer.wq.gpu_dtype, DType::Oq4G256);
         let qkv_is_oq8 = matches!(layer.wq.gpu_dtype, DType::Oq8G256);
+        let qkv_is_qtip3 = matches!(layer.wq.gpu_dtype, DType::Qtip3G256);
         let qkv_is_q8 = matches!(layer.wq.gpu_dtype, DType::Q8_0);
         let qkv_is_f32 = matches!(layer.wq.gpu_dtype, DType::F32);
         let qkv_is_f16 = matches!(layer.wq.gpu_dtype, DType::F16 | DType::BF16);
@@ -274,6 +280,34 @@ impl<'a> Qwen35PrefillBindings<'a> {
             ] {
                 let bs = super::prefill_batch::oq_compact_block_stride(w)?;
                 gpu.gemm_oq_compact_grouped_prequant(&w.buf, y, w.m, w.k, n, bs)?;
+            }
+        } else if qkv_is_qtip3 && qkv_same_dtype {
+            // QTIP-3 FA QKV. Three plain batched GEMMs off the SHARED
+            // FWHT-rotated activation — no fused-QKV trellis kernel exists, and
+            // three batched GEMMs already remove the per-token weight re-read
+            // that made a qtip3 body prefill at ~233 tok/s against 2128 for an
+            // oq4.25++ body of the same model.
+            debug_assert!(
+                matches!(layer.wk.gpu_dtype, DType::Qtip3G256)
+                    && matches!(layer.wv.gpu_dtype, DType::Qtip3G256),
+                "FA qkv Qtip3 dispatch requires all of wq/wk/wv to be Qtip3G256",
+            );
+            for (w, y) in [
+                (&layer.wq, &pbs.fa_q_full_batch),
+                (&layer.wk, &pbs.fa_k_batch),
+                (&layer.wv, &pbs.fa_v_batch),
+            ] {
+                run_plain_gemm_key(
+                    gpu,
+                    hipfire_dispatch::types::KernelKey::GemmQtip3G256,
+                    &w.buf,
+                    w.gpu_dtype,
+                    &pbs.x_rot_batch,
+                    y,
+                    w.m,
+                    w.k,
+                    n,
+                )?;
             }
         } else if qkv_is_oq8 && qkv_same_dtype {
             // Opus W8A8 FA QKV: one grouped int8-WMMA GEMM per projection
@@ -1477,6 +1511,7 @@ impl<'a> Qwen35PrefillBindings<'a> {
                 // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
                 | DType::Oq8G256
                 | DType::OqCompactG256
+                | DType::Qtip3G256
         );
         let fa_wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
         let fa_wo_is_mq3 = matches!(layer.wo.gpu_dtype, DType::MQ3G256);
@@ -1501,7 +1536,20 @@ impl<'a> Qwen35PrefillBindings<'a> {
         } else {
             &pbs.fa_attn_out_batch
         };
-        if fa_wo_is_6bit {
+        if matches!(layer.wo.gpu_dtype, DType::Qtip3G256) {
+            // QTIP-3 batched residual GEMM off the FWHT-rotated input.
+            run_residual_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmQtip3G256Residual,
+                &layer.wo.buf,
+                layer.wo.gpu_dtype,
+                fa_wo_input,
+                &pbs.x_batch,
+                layer.wo.m,
+                layer.wo.k,
+                n,
+            )?;
+        } else if fa_wo_is_6bit {
             run_residual_gemm_key(
                 gpu,
                 hipfire_dispatch::types::KernelKey::GemmHfq6G256Residual,
@@ -1708,6 +1756,7 @@ impl<'a> Qwen35PrefillBindings<'a> {
                 // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
                 | DType::Oq8G256
                 | DType::OqCompactG256
+                | DType::Qtip3G256
         );
         let fa_ffn_is_6bit = matches!(layer.w_gate.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
         let fa_ffn_is_mq3 = matches!(layer.w_gate.gpu_dtype, DType::MQ3G256);
@@ -1744,7 +1793,30 @@ impl<'a> Qwen35PrefillBindings<'a> {
         // (batched-prefill gate+up variant), mirroring the LA-FFN block
         // above. Q8-non-WMMA stays as two plain GEMMs; HFQ3 WMMA-vs-base
         // is folded into the FusedGateUpHfq3G256 run-arm.
-        if fa_ffn_is_6bit {
+        if matches!(layer.w_gate.gpu_dtype, DType::Qtip3G256) {
+            // QTIP-3 gate+up: no fused trellis kernel exists, so two
+            // plain batched GEMMs off the shared FWHT-rotated activation.
+            debug_assert!(
+                matches!(layer.w_up.gpu_dtype, DType::Qtip3G256),
+                "Qtip3 gate/up dispatch requires both w_gate and w_up to be Qtip3G256",
+            );
+            for (w, y) in [
+                (&layer.w_gate, &pbs.gate_ffn_batch),
+                (&layer.w_up, &pbs.up_batch),
+            ] {
+                run_plain_gemm_key(
+                    gpu,
+                    hipfire_dispatch::types::KernelKey::GemmQtip3G256,
+                    &w.buf,
+                    w.gpu_dtype,
+                    &pbs.x_rot_batch,
+                    y,
+                    w.m,
+                    w.k,
+                    n,
+                )?;
+            }
+        } else if fa_ffn_is_6bit {
             run_fused_gate_up_key(
                 gpu,
                 hipfire_dispatch::types::KernelKey::FusedGateUpHfq6G256,
@@ -1997,6 +2069,7 @@ impl<'a> Qwen35PrefillBindings<'a> {
                 // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
                 | DType::Oq8G256
                 | DType::OqCompactG256
+                | DType::Qtip3G256
         );
         let fa_w_down_is_6bit = matches!(layer.w_down.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
         let fa_w_down_is_mq3 = matches!(layer.w_down.gpu_dtype, DType::MQ3G256);
@@ -2021,7 +2094,20 @@ impl<'a> Qwen35PrefillBindings<'a> {
         } else {
             gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
         }
-        if fa_w_down_is_6bit {
+        if matches!(layer.w_down.gpu_dtype, DType::Qtip3G256) {
+            // QTIP-3 batched residual GEMM off the FWHT-rotated input.
+            run_residual_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmQtip3G256Residual,
+                &layer.w_down.buf,
+                layer.w_down.gpu_dtype,
+                &pbs.ffn_hidden_batch,
+                &pbs.x_batch,
+                layer.w_down.m,
+                layer.w_down.k,
+                n,
+            )?;
+        } else if fa_w_down_is_6bit {
             run_residual_gemm_key(
                 gpu,
                 hipfire_dispatch::types::KernelKey::GemmHfq6G256Residual,
@@ -2392,6 +2478,7 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                 // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
                 | DType::Oq8G256
                 | DType::OqCompactG256
+                | DType::Qtip3G256
         );
         let is_6bit = matches!(layer.wqkv.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
         let is_mq3 = matches!(layer.wqkv.gpu_dtype, DType::MQ3G256);
@@ -2431,7 +2518,34 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
         }
 
         // Batched 4-way LA projection (wqkv + wz + w_beta + w_alpha).
-        if is_6bit {
+        if matches!(layer.wqkv.gpu_dtype, DType::Qtip3G256) {
+            // QTIP-3 LA in_proj: no fused qkvza trellis kernel exists, so four
+            // plain batched GEMMs off the shared FWHT-rotated activation.
+            debug_assert!(
+                matches!(layer.wz.gpu_dtype, DType::Qtip3G256)
+                    && matches!(layer.w_beta.gpu_dtype, DType::Qtip3G256)
+                    && matches!(layer.w_alpha.gpu_dtype, DType::Qtip3G256),
+                "LA qkvza Qtip3 dispatch requires all of wqkv/wz/w_beta/w_alpha to be Qtip3G256",
+            );
+            for (w, y) in [
+                (&layer.wqkv, &pbs.dn_qkv_batch),
+                (&layer.wz, &pbs.dn_z_batch),
+                (&layer.w_beta, &pbs.dn_beta_batch),
+                (&layer.w_alpha, &pbs.dn_alpha_batch),
+            ] {
+                run_plain_gemm_key(
+                    gpu,
+                    hipfire_dispatch::types::KernelKey::GemmQtip3G256,
+                    &w.buf,
+                    w.gpu_dtype,
+                    &pbs.x_rot_batch,
+                    y,
+                    w.m,
+                    w.k,
+                    n,
+                )?;
+            }
+        } else if is_6bit {
             run_fused_qkvza_key(
                 gpu,
                 hipfire_dispatch::types::KernelKey::FusedQkvzaHfq6G256,
@@ -3316,6 +3430,7 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                 // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
                 | DType::Oq8G256
                 | DType::OqCompactG256
+                | DType::Qtip3G256
         );
         let wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
         let wo_is_mq3 = matches!(layer.wo.gpu_dtype, DType::MQ3G256);
@@ -3351,7 +3466,20 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                 n * v_row_bytes,
             )?;
         }
-        if wo_is_6bit {
+        if matches!(layer.wo.gpu_dtype, DType::Qtip3G256) {
+            // QTIP-3 batched residual GEMM off the FWHT-rotated input.
+            run_residual_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmQtip3G256Residual,
+                &layer.wo.buf,
+                layer.wo.gpu_dtype,
+                wo_input,
+                &pbs.x_batch,
+                layer.wo.m,
+                layer.wo.k,
+                n,
+            )?;
+        } else if wo_is_6bit {
             run_residual_gemm_key(
                 gpu,
                 hipfire_dispatch::types::KernelKey::GemmHfq6G256Residual,
@@ -3604,6 +3732,7 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                 // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
                 | DType::Oq8G256
                 | DType::OqCompactG256
+                | DType::Qtip3G256
         );
         let ffn_is_6bit = matches!(layer.w_gate.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
         let ffn_is_mq3 = matches!(layer.w_gate.gpu_dtype, DType::MQ3G256);
@@ -3655,7 +3784,30 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
         // GEMMs (not a fused kernel — slice 1). The HFQ3 WMMA-vs-base
         // split is folded into the FusedGateUpHfq3G256 run-arm, which
         // re-derives it from gpu.arch_caps.has_wmma() (== arch_has_wmma).
-        if ffn_is_6bit {
+        if matches!(layer.w_gate.gpu_dtype, DType::Qtip3G256) {
+            // QTIP-3 gate+up: no fused trellis kernel exists, so two
+            // plain batched GEMMs off the shared FWHT-rotated activation.
+            debug_assert!(
+                matches!(layer.w_up.gpu_dtype, DType::Qtip3G256),
+                "Qtip3 gate/up dispatch requires both w_gate and w_up to be Qtip3G256",
+            );
+            for (w, y) in [
+                (&layer.w_gate, &pbs.gate_ffn_batch),
+                (&layer.w_up, &pbs.up_batch),
+            ] {
+                run_plain_gemm_key(
+                    gpu,
+                    hipfire_dispatch::types::KernelKey::GemmQtip3G256,
+                    &w.buf,
+                    w.gpu_dtype,
+                    &pbs.x_rot_batch,
+                    y,
+                    w.m,
+                    w.k,
+                    n,
+                )?;
+            }
+        } else if ffn_is_6bit {
             run_fused_gate_up_key(
                 gpu,
                 hipfire_dispatch::types::KernelKey::FusedGateUpHfq6G256,
@@ -4016,6 +4168,7 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                 // oq8 GEMM an unrotated activation (garbage: PPL 3.5e6).
                 | DType::Oq8G256
                 | DType::OqCompactG256
+                | DType::Qtip3G256
         );
         let w_down_is_6bit = matches!(layer.w_down.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
         let w_down_is_mq3 = matches!(layer.w_down.gpu_dtype, DType::MQ3G256);
@@ -4062,7 +4215,20 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
         }
 
         // Batched w_down + residual.
-        if w_down_is_6bit {
+        if matches!(layer.w_down.gpu_dtype, DType::Qtip3G256) {
+            // QTIP-3 batched residual GEMM off the FWHT-rotated input.
+            run_residual_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmQtip3G256Residual,
+                &layer.w_down.buf,
+                layer.w_down.gpu_dtype,
+                &pbs.ffn_hidden_batch,
+                &pbs.x_batch,
+                layer.w_down.m,
+                layer.w_down.k,
+                n,
+            )?;
+        } else if w_down_is_6bit {
             run_residual_gemm_key(
                 gpu,
                 hipfire_dispatch::types::KernelKey::GemmHfq6G256Residual,

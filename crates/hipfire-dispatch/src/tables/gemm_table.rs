@@ -18,6 +18,25 @@ pub fn populate(registry: &mut KernelRegistry) {
         has_awq: false,
         tile: TileImpl::None,
     });
+    // QTIP-3 batched GEMM. Cross-arch: the trellis decode is plain integer ALU
+    // (a 1MAD hash, no table, no matrix intrinsic), so it carries no arch
+    // predicate -- it runs wherever wave32 does, same as the GEMV it mirrors.
+    registry.register(KernelVariant {
+        key: KernelKey::GemmQtip3G256Residual,
+        arch_required: ArchPredicate::Always,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    registry.register(KernelVariant {
+        key: KernelKey::GemmQtip3G256,
+        arch_required: ArchPredicate::Always,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
     registry.register(KernelVariant {
         key: KernelKey::GemmQ8_0BatchedChunked,
         arch_required: ArchPredicate::Always,

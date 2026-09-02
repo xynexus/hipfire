@@ -275,6 +275,12 @@ pub enum KernelKey {
     GemvMq4G256LloydSwiGLUResidual,
     // GEMM
     GemmHfq4G256,
+    /// Batched QTIP-3 trellis GEMM. Like the MQ/OQ keys, the CALL SITE owns the
+    /// FWHT rotation: `Qtip3G256` weights are stored rotated, so `x` must arrive
+    /// pre-rotated (`fused_rmsnorm_rotate_mq_batched_for` or equivalent).
+    GemmQtip3G256,
+    /// Residual form (`y += W·x`) of [`KernelKey::GemmQtip3G256`].
+    GemmQtip3G256Residual,
     GemmHfq4G128,
     GemmQ8_0BatchedChunked,
     GemmQ8_0Wmma,

@@ -1869,7 +1869,11 @@ impl Gpu {
         k: usize,
         n: usize,
     ) -> HipResult<()> {
-        assert_eq!(k % 256, 0, "gemm_qtip3g256 requires K % 256 == 0, got K={k}");
+        assert_eq!(
+            k % 256,
+            0,
+            "gemm_qtip3g256 requires K % 256 == 0, got K={k}"
+        );
         if n == 0 {
             return Ok(());
         }
@@ -1904,7 +1908,64 @@ impl Gpu {
             }
             col += cols;
         }
-        crate::profile::end_timer(&self.hip, timer);
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Residual form of [`Self::gemm_qtip3g256`]: `y += A·x`, for projections
+    /// that write straight back into the residual stream. Same decode, same
+    /// tiling; only the store accumulates. `x` must be FWHT-rotated.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qtip3g256_residual(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        assert_eq!(k % 256, 0, "gemm_qtip3g256_residual requires K % 256 == 0");
+        if n == 0 {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_qtip3g256_residual",
+            kernels::GEMM_QTIP3G256_SRC,
+            "gemm_qtip3g256_residual",
+        )?;
+        const NT: usize = 32;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let (m_val, k_val, n_val) = (m as i32, k as i32, n as i32);
+        let bytes = crate::profile::hfq4g256_weight_bytes(m, k);
+        let timer =
+            crate::profile::begin_timer(&self.hip, "gemm", "gemm_qtip3g256_residual", bytes);
+        let mut col = 0usize;
+        let mut result = Ok(());
+        while col < n {
+            let cols = NT.min(n - col);
+            let (cb, nc) = (col as i32, cols as i32);
+            result = self.launch_kernargs(
+                "gemm_qtip3g256_residual",
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                &kernargs![ptr a_ptr, ptr x_ptr, ptr y_ptr, i32 m_val, i32 k_val,
+                           i32 n_val, i32 cb, i32 nc],
+            );
+            if result.is_err() {
+                break;
+            }
+            col += cols;
+        }
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
         result
     }
 
