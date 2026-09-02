@@ -168,8 +168,11 @@ fn default_max_resident_workers() -> u32 {
 fn default_dflash_draft() -> String {
     "off".to_string()
 }
-fn default_dflash_adaptive_b() -> bool {
-    true
+fn default_spec_adaptive_block() -> bool {
+    false
+}
+fn default_spec_block() -> u32 {
+    0
 }
 fn default_ngram_spec() -> bool {
     false
@@ -439,8 +442,10 @@ pub struct HipfireConfig {
     /// Split with [`dflash_draft_setting`].
     #[serde(default = "default_dflash_draft")]
     pub dflash_draft: String,
-    #[serde(default = "default_dflash_adaptive_b")]
-    pub dflash_adaptive_b: bool,
+    #[serde(default = "default_spec_adaptive_block")]
+    pub spec_adaptive_block: bool,
+    #[serde(default = "default_spec_block")]
+    pub spec_block: u32,
     #[serde(default = "default_dflash_no_repeat_ngram")]
     pub dflash_no_repeat_ngram: serde_json::Value,
     /// Opt-in drafter-free n-gram speculative decode. Drafts from token
@@ -680,7 +685,8 @@ impl Default for HipfireConfig {
             flash_mode: default_flash_mode(),
             max_resident_workers: default_max_resident_workers(),
             dflash_draft: default_dflash_draft(),
-            dflash_adaptive_b: default_dflash_adaptive_b(),
+            spec_adaptive_block: default_spec_adaptive_block(),
+            spec_block: default_spec_block(),
             ngram_spec: default_ngram_spec(),
             ngram_spec_store_root: default_ngram_spec_store_root(),
             ngram_spec_scope: default_ngram_spec_scope(),
@@ -1442,7 +1448,7 @@ mod tests {
         assert_eq!(cfg.kv_adaptive, "off");
         assert_eq!(cfg.flash_mode, "auto");
         assert_eq!(cfg.dflash_draft, "off");
-        assert!(cfg.dflash_adaptive_b);
+        assert!(!cfg.spec_adaptive_block);
         assert_eq!(cfg.dflash_no_repeat_ngram, serde_json::json!("auto"));
         assert_eq!(cfg.mtp_mode, "auto");
         assert_eq!(cfg.mtp_k, 3);

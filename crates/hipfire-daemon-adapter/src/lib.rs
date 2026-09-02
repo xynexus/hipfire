@@ -1036,11 +1036,15 @@ impl DaemonEngine {
 
     /// Send `rerank` and wait for the daemon-sorted relevance scores. Each result
     /// preserves the document's original input index.
-    pub async fn rerank(&mut self, req: RerankRequest) -> anyhow::Result<Vec<RerankResult>> {
+    /// Returns the scores and the mode that produced them (`cosine` / `cross-encoder`).
+    pub async fn rerank(
+        &mut self,
+        req: RerankRequest,
+    ) -> anyhow::Result<(Vec<RerankResult>, String)> {
         self.send(&DaemonRequest::Rerank(req)).await?;
         loop {
             match self.recv().await? {
-                DaemonResponse::RerankScores { results } => return Ok(results),
+                DaemonResponse::RerankScores { results, mode } => return Ok((results, mode)),
                 DaemonResponse::Error(e) => anyhow::bail!("daemon rerank error: {}", e.message),
                 DaemonResponse::Unknown => {}
                 other => {

@@ -4165,8 +4165,16 @@ pub fn ngram_only_state(
         target_hidden_host: Vec::new(),
         ctx_capacity,
         block_size: max_spine.max(1),
-        // Adaptive-B tunes a DRAFTER's block; the spine length is n-gram's.
+        // Fallback only; the daemon sets this from `spec_adaptive_block`.
+        // There is no TRAINED block here -- `max_spine` is a config ceiling
+        // nobody measured -- so unlike the drafter path there genuinely is a
+        // search space. Whether searching it pays is still unmeasured: block
+        // width changes the emitted sequence (see
+        // docs/bugs/2026-09-01-spec-decode-not-output-equivalent-to-ar.md), so
+        // widths cannot yet be ranked by throughput.
         adaptive_b: false,
+        block_controller: None,
+        spec_block: None,
         // DDTree is a tree over a drafter's candidates.
         ddtree: None,
     })
@@ -4414,12 +4422,15 @@ fn load_dflash_state_source(
         target_hidden_host,
         ctx_capacity,
         block_size,
-        // Opt-in (dflash_adaptive_b:true). Measured on gfx1103/Qwen3.8-27B:
-        // with max_block clamped to the trained block the controller has no
-        // upside to find (the trained block IS the in-range optimum) and the
-        // ramp costs ~25% decode. Flip once scratches are sized for B above
-        // trained (scope doc item 4) and the search space contains a win.
+        // Fallback only; the daemon overwrites both from `spec_adaptive_block`
+        // and `spec_block` after the load. Measured on gfx1103/Qwen3.8-27B: with
+        // max_block clamped to the trained block the controller has no upside to
+        // find (the trained block IS the in-range optimum) and the ramp costs
+        // ~25% decode. Revisit once scratches are sized for B above trained
+        // (scope doc item 4) and the search space contains a win.
         adaptive_b: false,
+        block_controller: None,
+        spec_block: None,
         ddtree,
     })
 }

@@ -269,6 +269,105 @@ fn embeddinggemma_embed(
         .collect())
 }
 
+/// Qwen3-Reranker's prompt. Fixed by the model, not by a chat template: it is trained to
+/// answer this exact framing with a single "yes" or "no" token.
+fn qwen3_reranker_prompt(instruction: &str, query: &str, document: &str) -> String {
+    format!(
+        "<|im_start|>system\nJudge whether the Document meets the requirements based on \
+         the Query and the Instruct provided. Note that the answer can only be \"yes\" or \
+         \"no\".<|im_end|>\n<|im_start|>user\n<Instruct>: {instruction}\n<Query>: {query}\n\
+         <Document>: {document}<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n"
+    )
+}
+
+/// Yes/no-logit reranking through a causal-LM cross-encoder (Qwen3-Reranker).
+///
+/// This is the `Score` half of the non-generative output heads planned in
+/// `docs/plans/2026-06-19-arch-roster-feature-matrix.md` (family E). The arithmetic —
+/// [`pooling::rerank_yes_no`] — shipped with the EmbeddingGemma work; what was missing
+/// was a path that produces logits for it, so `/v1/rerank` could only ever answer with
+/// bi-encoder cosine.
+///
+/// The scored position is the one that would emit the model's answer, so its
+/// full-vocabulary logits carry `yes` against `no`. That distinction is the entire
+/// signal: sampling the token instead collapses it, and a sampled reranker answers
+/// all-yes or all-no over near-identical documents (measured: 0 of 4).
+fn causal_lm_yes_no_rerank(
+    gpu: &mut hipfire_rdna::Gpu,
+    m: &mut LoadedModel,
+    query: &str,
+    documents: &[String],
+) -> Result<Vec<RerankResult>, String> {
+    const INSTRUCTION: &str =
+        "Given a web search query, retrieve relevant passages that answer the query";
+    // Qwen3-Reranker's true/false pair, the same ids its `1_LogitScore` sidecar ships.
+    const YES_TOKEN: usize = 9693;
+    const NO_TOKEN: usize = 2152;
+
+    let tokenizer = m
+        .tokenizer
+        .as_ref()
+        .ok_or_else(|| "rerank: loaded model has no tokenizer".to_string())?
+        .clone();
+    // Two slots can hold a Qwen3/LLaMA model: the factory-assembled `registered_backend`
+    // and the older typed `llama_backend`. Which one is populated depends on the load
+    // path, not on the model, so both are accepted — checking only the first reports
+    // "no serving backend" for a model that is loaded and perfectly scorable.
+    let scorer: &mut dyn hipfire_runtime::kld_eval::ChunkScoredForward =
+        if let Some(b) = m.registered_backend.as_mut() {
+            b.backend
+                .kld_forward()
+                .ok_or_else(|| "rerank: this architecture cannot produce logits".to_string())?
+        } else if let Some(lb) = m.llama_backend.as_mut() {
+            // `LlamaBackend: SimpleAr`, so the blanket impl makes it scorable directly.
+            lb
+        } else {
+            return Err("rerank: loaded model has no logit-producing backend".to_string());
+        };
+
+    let mut out = Vec::with_capacity(documents.len());
+    for (index, document) in documents.iter().enumerate() {
+        let mut tokens = tokenizer.encode(&qwen3_reranker_prompt(INSTRUCTION, query, document));
+        if tokens.is_empty() {
+            return Err("rerank: prompt tokenized to nothing".to_string());
+        }
+        // `forward_chunk_scored` scores `[scoring_start, len - 1)` — every position that
+        // has a next token INSIDE the chunk — so the last position is not scored. Append
+        // one token to give it a next, then score the position before it. The appended
+        // token is only a label: a causal model's logits at position n-1 cannot depend on
+        // position n.
+        let scoring_start = tokens.len() - 1;
+        tokens.push(YES_TOKEN as u32);
+
+        let mut score: Option<f32> = None;
+        scorer.forward_chunk_scored(gpu, &tokens, scoring_start, &mut |w| {
+            if score.is_none() && w.rows() > 0 {
+                score = Some(hipfire_serving_core::pooling::rerank_yes_no(
+                    w.row(0),
+                    YES_TOKEN,
+                    NO_TOKEN,
+                ));
+            }
+        })?;
+        let relevance_score =
+            score.ok_or_else(|| "rerank: forward produced no scored position".to_string())?;
+        out.push(RerankResult {
+            index,
+            relevance_score,
+        });
+    }
+    // Best first, matching the cosine path's contract.
+    let mut scored: Vec<(usize, f32)> = out.iter().map(|r| (r.index, r.relevance_score)).collect();
+    hipfire_serving_core::pooling::sort_desc(&mut scored);
+    Ok(scored
+        .into_iter()
+        .map(|(index, relevance_score)| RerankResult {
+            index,
+            relevance_score,
+        })
+        .collect())
+}
+
 fn embeddinggemma_rerank(
     gpu: &mut hipfire_rdna::Gpu,
     m: &LoadedModel,
