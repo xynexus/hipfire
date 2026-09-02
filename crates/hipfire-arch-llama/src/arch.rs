@@ -256,4 +256,13 @@ impl ServingBackend for LlamaBackend {
         b.scratch.free_gpu(gpu);
         b.kv_cache.free_gpu(gpu);
     }
+
+    /// `LlamaBackend` already implements [`SimpleAr`], so the blanket impl gives it
+    /// [`ChunkScoredForward`] for free — this only publishes it on the boxed seam, as
+    /// qwen2/gemma4/cohere2 already do. Without it `kld_forward()` takes the trait
+    /// default and reports `None`, so every caller that needs logits (KLD evaluation,
+    /// and now yes/no-logit reranking) sees arch 0/1 as unscorable.
+    fn kld_forward(&mut self) -> Option<&mut dyn hipfire_runtime::kld_eval::ChunkScoredForward> {
+        Some(self)
+    }
 }

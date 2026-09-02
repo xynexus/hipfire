@@ -203,9 +203,10 @@ pub async fn post_rerank(
         })
         .await
     {
-        Ok(results) => results,
+        Ok(scored) => scored,
         Err(e) => return server_error(e.to_string()),
     };
+    let (results, mode) = results;
     let results = results
         .into_iter()
         .map(|item| {
@@ -223,6 +224,10 @@ pub async fn post_rerank(
     }
     Json(json!({
         "object": "list",
+        // Which scorer ran. `cosine` blends each side into one vector; `cross-encoder`
+        // scores the pair jointly. A caller needing the latter must be able to see that
+        // it did not silently get the former.
+        "mode": mode,
         "results": results,
         "model": model,
     }))

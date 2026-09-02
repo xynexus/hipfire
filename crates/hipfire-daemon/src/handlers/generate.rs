@@ -115,11 +115,34 @@ pub(crate) fn rerank(
         emit_error_with_id(&mut daemon_state.out.sink, id, "no model loaded");
         return;
     };
-    match embeddinggemma_rerank(&mut daemon_state.gpu, m, &req.query, &req.documents) {
+    // Two scoring modes, chosen by what is loaded rather than by a request flag.
+    //
+    // A bi-encoder (EmbeddingGemma arch 19, or a Qwen3 embedding model) embeds each side
+    // and ranks by cosine. Anything else that can produce logits is scored as a
+    // cross-encoder: one forward per (query, document) pair, reading `yes` against `no`
+    // at the answer position. The two are not interchangeable — cosine blends a document
+    // into one vector and cannot express "matches on two axes at once" — so the reply
+    // reports which one ran instead of leaving the caller to infer it.
+    let is_bi_encoder = m.arch_id == 19 || m.qwen3_embedding.is_some();
+    let (mode, scored) = if is_bi_encoder {
+        (
+            "cosine",
+            embeddinggemma_rerank(&mut daemon_state.gpu, m, &req.query, &req.documents),
+        )
+    } else {
+        // Disjoint fields, so the model may be borrowed mutably alongside the GPU.
+        let m = daemon_state.model.as_mut().expect("checked above");
+        (
+            "cross-encoder",
+            causal_lm_yes_no_rerank(&mut daemon_state.gpu, m, &req.query, &req.documents),
+        )
+    };
+    match scored {
         Ok(results) => {
             daemon_state.out.emit(serde_json::json!({
                 "type": "rerank_scores",
                 "id": id,
+                "mode": mode,
                 "results": results,
             }));
         }
