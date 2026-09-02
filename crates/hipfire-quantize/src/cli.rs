@@ -5625,6 +5625,7 @@ fn pack_qtip_real_tensors(
     let is_embed_table = |n: &str| n.contains("embed");
     let is_untied_head = |n: &str| n.contains("lm_head") || n.ends_with("output.weight");
     let mut n_q8 = 0usize;
+    let mut n_embed_override = 0usize;
     for t in tensors.iter_mut() {
         let force_q8 = is_embed_table(&t.name) || (is_untied_head(&t.name) && !trellis_lm_head);
         if !(matches!(t.quant_type, QuantType::BF16) && t.shape.len() == 2 && force_q8) {
@@ -5635,6 +5636,38 @@ fn pack_qtip_real_tensors(
             .chunks_exact(2)
             .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
             .collect();
+        // An EXPLICIT `--embed-precision` outranks the Q8 default for the embed
+        // TABLE. Q8 stays the default (it is a deliberate gather-friendliness
+        // choice, see above) and the untied head is unaffected — but silently
+        // discarding a width the operator asked for made "mixed body + 4-bit
+        // embed" inexpressible: `--tensor-format` only exists on the .hfq path,
+        // and this pass overrode `--embed-precision` on exactly that path while
+        // logging the flag as accepted.
+        if is_embed_table(&t.name) {
+            match embed_precision_code() {
+                // hfq4: 4-bit gather table, served by embedding_lookup_hfq4g256.
+                4 => {
+                    t.data = quantize_hfq4g256(&wf);
+                    t.quant_type = QuantType::HFQ4G256;
+                    t.group_size = 256;
+                    n_embed_override += 1;
+                    continue;
+                }
+                // bf16: already staged as BF16 — leave it.
+                1 => {
+                    n_embed_override += 1;
+                    continue;
+                }
+                2 => {
+                    t.data = f32_slice_to_f16_bytes(&wf);
+                    t.quant_type = QuantType::F16;
+                    t.group_size = 0;
+                    n_embed_override += 1;
+                    continue;
+                }
+                _ => {}
+            }
+        }
         t.data = quantize_q8f16(&wf);
         t.quant_type = QuantType::Q8F16;
         t.group_size = 32;
@@ -5642,6 +5675,11 @@ fn pack_qtip_real_tensors(
     }
     if n_q8 > 0 {
         eprintln!("  qtip{bits} (real): embed/lm_head → Q8F16 ({n_q8} tensors, gather-friendly)");
+    }
+    if n_embed_override > 0 {
+        eprintln!(
+            "  qtip{bits} (real): embed kept at --embed-precision ({n_embed_override} tensors)"
+        );
     }
     let (mut n_packed, mut max_err) = (0usize, 0.0f32);
     // Coarse per-phase wall-time (rotate / encode / pack), accumulated across tensors.
