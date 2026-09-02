@@ -937,7 +937,7 @@ fn recover_head_gamma(
         Ok(v.iter().sum::<f32>() / v.len() as f32)
     };
 
-    let mut step_once = |gpu: &mut Gpu| -> Result<f32, Box<dyn std::error::Error>> {
+    let step_once = |gpu: &mut Gpu| -> Result<f32, Box<dyn std::error::Error>> {
         rmsnorm_forward(gpu, &x_in, &gamma, &yn, &rinv, rows, dim, eps)?;
         linear_forward(gpu, &yn, &w_s, &logits, rows, dim, vocab)?;
         distill_kl(gpu, &logits, &teacher_p, &loss, &d_logits, rows, vocab)?;
