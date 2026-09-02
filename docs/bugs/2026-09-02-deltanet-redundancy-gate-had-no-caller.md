@@ -126,11 +126,31 @@ order of magnitude lower KLD than FP16. They still exceed the recorded budget
 because the baseline was captured under the old FP16 default, exactly as the
 four `tiny-state` hashes were.
 
-**Recommendation**: re-baseline the qwen3.5 KLD rows when accepting this change,
-the same way the four state hashes were, and treat the gemma4 oq8 drift as a
-separate pre-existing issue. It was NOT re-baselined here, because a KLD baseline
-encodes a quality expectation rather than a bit pattern and moving it deserves a
-deliberate decision rather than being folded into this change.
+**Re-baselined 2026-09-02**, six rows, by hand:
+
+    qwen3_5_moe         oq8         0.00280627 -> 0.00169520
+    qwen3_5_moe         oq8+-calib  0.00236909 -> 0.00491353
+    qwen3_5_moe         oq8++-calib 0.00236909 -> 0.00491353
+    qwen3_5_moe_indexed oq8         0.00220194 -> 0.00034086
+    qwen3_5_moe_indexed oq8+-calib  0.00225196 -> 0.00035375
+    qwen3_5_moe_indexed oq8++-calib 0.00215823 -> 0.00033924
+
+Five of the six improve, one (`qwen3_5_moe oq8+/oq8++`) roughly doubles. Both
+directions are the honest measurement under FP32 state; the guard is not a
+uniform win on every cell, and recording it as one would be wrong.
+
+`--record` was NOT used to write these. Scoped to the two families it rewrote
+**15** rows, including `oq4`/`mq3` cells that were PASSING within their 25%
+tolerance (e.g. `qwen3_5_moe oq4` 0.17587 -> 0.20043, a 14% move). Absorbing
+those would silently retire drift nobody has attributed and blunt the gate. The
+file was restored from a backup and only the six failing `oq8` rows applied.
+
+The three gemma4_moe cells are left alone: they are unchanged with the guard on
+or off, so they are a separate pre-existing issue and re-baselining them here
+would bury it.
+
+Verified: `HIPFIRE_TINYQUANT_FAMILIES=qwen3_5_moe,qwen3_5_moe_indexed
+./tests/tiny-quant-gate.sh` -> PASS.
 
 ## Precedence: an explicit env request wins
 
