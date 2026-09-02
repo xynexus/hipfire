@@ -475,6 +475,13 @@ pub enum DaemonResponse {
     /// (the server sorts for the response).
     RerankScores {
         results: Vec<RerankResult>,
+        /// How the scores were produced: `cosine` (bi-encoder, embed each side) or
+        /// `cross-encoder` (one forward per pair, `yes` against `no` at the answer
+        /// position). They are not interchangeable, so a caller must be able to tell
+        /// which it got rather than inferring it from the model name. Defaulted for
+        /// compatibility with a daemon that predates the field.
+        #[serde(default)]
+        mode: String,
     },
     Done(DoneEvent),
     Error(ErrorEvent),

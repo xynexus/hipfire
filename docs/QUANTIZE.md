@@ -149,6 +149,98 @@ cargo run --release -p hipfire-quantize -- \
   --imatrix <Qwen3-Embedding-0.6B.imatrix.gguf>
 ```
 
+### Cross-encoder rerankers (Qwen3-Reranker)
+
+A reranker is **not** an embedding model and must not be quantized through the
+SentenceTransformers path above. `Qwen3-Reranker-*` is a plain causal LM —
+`architectures: ["Qwen3ForCausalLM"]`, `model_type: qwen3` — that answers a yes/no
+question about a `(query, document)` pair. Quantize it as an ordinary Qwen3.
+
+**Restore the archive first.** These ship as `.hfa`; the quantizer takes a HuggingFace
+directory, a `.gguf` or a `.hfq`, not an archive.
+
+```bash
+hipfire repack --input /srv/hipfire/models/Qwen3-Reranker-0.6B.hfa --check
+hipfire repack --input /srv/hipfire/models/Qwen3-Reranker-0.6B.hfa \
+  --output /srv/hipfire/staging/qwen3-reranker-0.6b
+```
+
+**Two errors you will hit, in order, and why.** The quantizer treats the presence of
+`modules.json` as "this is a SentenceTransformers embedding checkpoint":
+
+```
+error: embedding metadata: unsupported SentenceTransformers module type
+       "sentence_transformers.cross_encoder.modules.logit_score.LogitScore"
+```
+
+Removing just that entry then produces:
+
+```
+error: embedding metadata: SentenceTransformers modules.json has no pooling module
+```
+
+which is the same assumption stated the other way — a cross-encoder has no pooling,
+because it scores from logits rather than from a pooled vector.
+
+**Move the SentenceTransformers sidecars aside and quantize normally.** They describe
+how the `sentence_transformers` library wraps the model; none of them is weight data.
+
+```bash
+cd /srv/hipfire/staging/qwen3-reranker-0.6b
+mkdir -p .st-sidecars
+mv modules.json config_sentence_transformers.json sentence_bert_config.json .st-sidecars/
+
+hipfire quantize \
+  --input /srv/hipfire/staging/qwen3-reranker-0.6b \
+  --output ~/.hipfire/models/Qwen3-Reranker-0.6B--oq8.hfq \
+  --format oq8
+```
+
+Nothing is lost by doing this. The `1_LogitScore` module carries **no weights** — it is
+a 57-byte config holding two token ids (`true_token_id: 9693`, `false_token_id: 2152`),
+which are the same constants `hipfire_serving_core::pooling::rerank_yes_no` documents.
+Confirmed on the 0.6B: 0 of its 310 tensors are a score/head/classifier.
+
+Result for `Qwen3-Reranker-0.6B` at `oq8`: 595.8M params, 100% quantized, **682 MB**.
+
+**Install it where the daemon looks.** `~/.hipfire/models/` is what is served, and the
+model id is the filename minus `.hfq` (so the file above is served as
+`Qwen3-Reranker-0.6B--oq8`). `/srv/hipfire/models/` is a build and archive store and is
+**not** served. A newly added artifact appears in `/v1/models` without restarting the
+daemon.
+
+**Verify.** Note the flag inconsistency: `quantize` and `repack` take `--input`, while
+`hfq` and `inspect` take a positional path.
+
+```bash
+hipfire hfq verify ~/.hipfire/models/Qwen3-Reranker-0.6B--oq8.hfq   # "all 310 tensors decode"
+hipfire inspect     ~/.hipfire/models/Qwen3-Reranker-0.6B--oq8.hfq
+```
+
+(`hipfire hfq verify --help` panics — it treats `--help` as the path.)
+
+**Using it.** `/v1/rerank` routes a non-embedding model through the cross-encoder path
+and reports which scorer ran:
+
+```bash
+curl -s localhost:11435/v1/rerank -H 'Content-Type: application/json' -d '{
+  "model": "Qwen3-Reranker-0.6B--oq8",
+  "query": "a queue for one producer and one consumer",
+  "documents": ["wait-free single-producer-single-consumer bounded queue",
+                "lock-free multi-producer-multi-consumer queue"]}'
+# {"mode":"cross-encoder","results":[{"index":0,"relevance_score":0.995}, ...]}
+```
+
+`mode` is `cross-encoder` here and `cosine` for an EmbeddingGemma or Qwen3-embedding
+model, which is scored by embedding each side independently. The two are not
+interchangeable — cosine blends a document into a single vector and cannot express
+"matches on two axes at once" — so check `mode` rather than inferring it from the model
+name.
+
+**Still missing:** the generation API exposes no `logprobs`, so a client cannot reproduce
+this scoring itself against an arbitrary causal LM. See
+`docs/todo/2026-09-02-logprobs-on-the-generation-api.md`.
+
 The plus marks are positional:
 
 - `+` means activation-aware clipping/scaling. The quantizer auto-enables AWQ
