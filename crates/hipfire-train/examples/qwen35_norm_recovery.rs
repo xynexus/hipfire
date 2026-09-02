@@ -36,7 +36,9 @@
 //! error of a different format recovers the wrong correction. This is what makes
 //! the result shippable rather than a mechanism probe.
 //!
-//! Capture (bf16 teacher, per-token decode path, files ACCUMULATE rows):
+//! Capture (bf16 teacher, per-token decode path, files ACCUMULATE rows). Prompt
+//! length is no longer constrained — the second-chunk corruption that once
+//! forced it under 2048 tokens was the FP16 DeltaNet recurrence, fixed upstream:
 //!   rm -f /tmp/residcap/qwen35.*
 //!   HIPFIRE_FORWARD_LOWERED=0 HIPFIRE_DUMP_HIDDEN=/tmp/residcap/qwen35 \
 //!   HIPFIRE_DUMP_HIDDEN_ALL=1 HIPFIRE_DUMP_HIDDEN_ALLLAYERS=1 HIPFIRE_MAX_GEN=512 \
@@ -203,13 +205,19 @@ fn read_cap(
         return Err(format!("{p}: {} bytes not a multiple of dim*4", raw.len()));
     }
     let all_rows = raw.len() / (dim * 4);
-    // Rows past the first prefill chunk come back non-finite for full-attention
-    // layers (measured: clean to position 2047, then ~every row bad, on both
-    // tags, on a 2805-token prefill). Whatever the dump is reading there, it is
-    // not the residual stream — the same run generated coherent text. Drop those
-    // rows rather than poison a whole layer's loss with them. Each recovery uses
-    // exactly ONE capture, so dropping cannot desynchronise an input from its
-    // target.
+    // A defensive filter, kept after its cause was fixed upstream.
+    //
+    // Rows past the first prefill chunk used to come back non-finite for
+    // full-attention layers (clean to position 2047, then ~every row bad on a
+    // 2805-token prefill). That was NOT the dump, as first supposed: it was the
+    // FP16 DeltaNet recurrence, which was not chunk-invariant, diverging in the
+    // second chunk (origin/master 63deba175, docs/bugs/2026-09-02-fp16-deltanet-
+    // recurrence-is-not-chunk-invariant.md). Re-measured on the same prompt
+    // after that fix: 0 bad rows out of 2809, every layer, both tags.
+    //
+    // The filter stays because a capture is cheap to take and expensive to
+    // silently train on. Each recovery uses exactly ONE capture, so dropping
+    // cannot desynchronise an input from its target.
     let good: Vec<usize> = (0..all_rows)
         .filter(|r| {
             let off = r * dim * 4;

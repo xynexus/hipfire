@@ -950,12 +950,16 @@ bf16 tensors carry a lossless recoding (`Bf16Huff`, the default), tuned values
 compress to a different byte length, so there is no in-place patch. This is why
 `--norm-patch` lives in the quantizer.
 
-**The residual capture is non-finite past the first prefill chunk.** Rows
-0..2047 are clean; from ~2048 to the end of a 2805-token prefill essentially
-every row is non-finite on both tags for full-attention layers — while the same
-run generates coherent text, so it is the dump, not the forward. The recovery
-tool filters and reports those rows; keep the capture prompt under 2048 tokens
-and the question does not arise.
+**The residual capture used to be non-finite past the first prefill chunk —
+and the obvious explanation was the wrong one.** Rows 0..2047 were clean; from
+~2048 to the end of a 2805-token prefill essentially every row was non-finite on
+both tags for full-attention layers. Since the same run generated coherent text,
+this was first written up as a dump bug. It was not: it was the **FP16 DeltaNet
+recurrence**, which was not chunk-invariant, diverging in the second prefill
+chunk (`docs/bugs/2026-09-02-fp16-deltanet-recurrence-is-not-chunk-invariant.md`,
+fixed in `origin/master` 63deba175). Re-measured on the identical prompt after
+that fix: **0 bad rows out of 2809**, every layer, both tags. Capture length is
+no longer constrained. The recovery tool keeps the filter as a cheap guard.
 
 ## Implementation Notes
 
