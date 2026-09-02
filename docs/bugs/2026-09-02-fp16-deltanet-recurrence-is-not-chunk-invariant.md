@@ -139,6 +139,27 @@ than one per token"). Sound in isolation, wrong in context: prefill and decode
 must agree with EACH OTHER, and `speculative.rs` already pays exactly this price
 on the rollback replay path for exactly this reason.
 
+### What the fix does and does not buy, measured
+
+**Does**: the pathological prompt-echo collapses. On the harness in
+`2026-09-02-ngram-speculation-drives-prompt-echo.md`, FP16 state with n-gram
+speculation went from `echo_frac 0.872` (87% of the output copied verbatim from
+the prompt, at an inflated 263 tok/s) to **0.195 / 0.243**. The feedback loop is
+broken.
+
+**Does not**: speculative output still differs from AR, at BOTH state precisions,
+under quantised KV:
+
+    state=FP16   AR 4257e0a8a3c1   spec 1b030299490f   differs
+    state=FP32   AR 77ab36b1ad5a   spec 675ebc8a5988   differs
+
+That matches the earlier finding that only `fp32` KV makes them byte-identical.
+So there are (at least) two independent contributors to spec/AR non-equivalence,
+and this fixes one of them. The KV-axis contributor is still open and is NOT
+explained by anything measured so far — `kvarn_attend`'s write and read paths are
+bit-exact batch-invariant, and the residual FP16-vs-FP32 echo gap (0.24 vs 0.00)
+is the ordinary cost of half-precision state, not a chunk-invariance defect.
+
 ### Coverage gap this leaves
 
 `tiny-state-gate` passing means little here — the restored redundancy guard forces
