@@ -149,14 +149,39 @@ fn read_cap(
         return Err(format!("{p}: {} bytes not a multiple of dim*4", raw.len()));
     }
     let all_rows = raw.len() / (dim * 4);
-    let stride = all_rows.div_ceil(max_rows.max(1)).max(1);
-    let rows = all_rows.div_ceil(stride);
+    // Rows past the first prefill chunk come back non-finite for full-attention
+    // layers (measured: clean to position 2047, then ~every row bad, on both
+    // tags, on a 2805-token prefill). Whatever the dump is reading there, it is
+    // not the residual stream — the same run generated coherent text. Drop those
+    // rows rather than poison a whole layer's loss with them. Each recovery uses
+    // exactly ONE capture, so dropping cannot desynchronise an input from its
+    // target.
+    let good: Vec<usize> = (0..all_rows)
+        .filter(|r| {
+            let off = r * dim * 4;
+            raw[off..off + dim * 4]
+                .chunks_exact(4)
+                .all(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]).is_finite())
+        })
+        .collect();
+    if good.is_empty() {
+        return Err(format!("{p}: every row is non-finite"));
+    }
+    let stride = good.len().div_ceil(max_rows.max(1)).max(1);
+    let taken: Vec<usize> = good.iter().copied().step_by(stride).collect();
+    let rows = taken.len();
     let mut out = Vec::with_capacity(rows * dim);
-    for r in (0..all_rows).step_by(stride) {
+    for r in taken {
         let off = r * dim * 4;
         for c in raw[off..off + dim * 4].chunks_exact(4) {
             out.push(f32::from_le_bytes([c[0], c[1], c[2], c[3]]));
         }
+    }
+    if good.len() < all_rows {
+        eprintln!(
+            "      {tag}.L{i}: dropped {} / {all_rows} non-finite capture rows",
+            all_rows - good.len()
+        );
     }
     Ok((out, rows))
 }
@@ -387,10 +412,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         format!("model.language_model.layers.{i}.{leaf}")
     };
+    // A non-finite decode poisons the whole layer's loss and looks like a
+    // training divergence, so name the tensor and side instead.
+    let finite = |v: &[f32], what: &str, name: &str| -> Result<(), String> {
+        let bad = v.iter().filter(|x| !x.is_finite()).count();
+        if bad > 0 {
+            let lo = v
+                .iter()
+                .cloned()
+                .filter(|x| x.is_finite())
+                .fold(f32::MAX, f32::min);
+            let hi = v
+                .iter()
+                .cloned()
+                .filter(|x| x.is_finite())
+                .fold(f32::MIN, f32::max);
+            return Err(format!(
+                "{what} {name}: {bad}/{} non-finite after decode (finite range {lo:.3e}..{hi:.3e})",
+                v.len()
+            ));
+        }
+        Ok(())
+    };
     let load_pair = |name: &str| -> Result<(usize, Vec<f32>, Vec<f32>), String> {
         let e = teacher.get(name).ok_or_else(|| format!("missing {name}"))?;
         let m = e.shape[0] as usize;
-        Ok((m, teacher.read(name)?, student.read(name)?))
+        let (t, st) = (teacher.read(name)?, student.read(name)?);
+        finite(&t, "teacher", name)?;
+        finite(&st, "student", name)?;
+        Ok((m, t, st))
     };
 
     let mut tuned: HashMap<String, Vec<f32>> = HashMap::new();
@@ -403,6 +453,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         if teacher.get(&gate_n).is_some() {
             let norm_n = prefix(i, "post_attention_layernorm.weight");
             let (xin, rows) = read_cap(&cap_dir, "premlp", i, dim, max_rows)?;
+            finite(&xin, "capture", &format!("premlp.L{i}"))?;
             let mut g0 = teacher.read(&norm_n)?;
             if unit_offset {
                 for v in g0.iter_mut() {
