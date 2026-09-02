@@ -1014,24 +1014,33 @@ pub fn generate_dflash(
     // controller, driven with per-window accept depth + wall time. Chain mode
     // only (the DDTree steps take no block override). max_block is clamped to
     // the trained block so every scratch stays validly sized (item 4 — sizing
-    // for B above trained — is not landed); an explicit HIPFIRE_DFLASH_BLOCK
+    // for B above trained — is not landed); an explicit `spec_block`
     // pin wins over the controller.
-    let mut block_controller = if df.adaptive_b
-        && df.ddtree.is_none()
-        && dflash_block_override().is_none()
-        && df.block_size > 2
-    {
-        Some(
-            hipfire_specdecode_dspark::dspark_block_controller::BlockController::new(
-                df.block_size,
-                2,
-                df.block_size,
-                0.18, // dormant cost prior; live window timing replaces it
-            ),
-        )
+    //
+    // Built ONCE and kept on `DflashState`, then `reset()` per request. It used
+    // to be constructed here, per `generate` call, which discarded the fitted
+    // cost curve every request -- the exact opposite of what `reset()`
+    // documents ("calibrate once, reuse across requests") and why two
+    // back-to-back generates fitted two different curves for one GPU.
+    let want_controller =
+        df.adaptive_b && df.ddtree.is_none() && df.spec_block.is_none() && df.block_size > 2;
+    if want_controller {
+        if df.block_controller.is_none() {
+            df.block_controller = Some(
+                hipfire_specdecode_dspark::dspark_block_controller::BlockController::new(
+                    df.block_size,
+                    2,
+                    df.block_size,
+                    0.18, // dormant cost prior; live window timing replaces it
+                ),
+            );
+        }
+        if let Some(c) = df.block_controller.as_mut() {
+            c.reset();
+        }
     } else {
-        None
-    };
+        df.block_controller = None;
+    }
 
     // Fast path exit conditions (mirrors the dflash_spec_demo outer loop).
     while !first_filter_stop && !first_token_is_eos && generated < max_tokens {
@@ -1103,22 +1112,22 @@ pub fn generate_dflash(
             // n-gram first: a hit shrinks the verify batch to the spine and
             // skips the drafter forward entirely; a miss leaves this `None`
             // and the drafter runs.
-            // Let the throughput controller drive the n-gram spine too. It
-            // already argmaxes committed-tokens / window-wall-time for the
-            // DFlash block from live timing, and it is drafter-agnostic by
-            // design — everything it needs is accept depth, proposal count and
-            // wall time, all of which this path already reports below. Driving
-            // one controller is the point: a second, n-gram-specific width
-            // estimator would re-derive the same quantity from the same clock,
-            // and re-learn the ramp and cap-trap fixes this one already carries.
-            // A TOKEN cap, not `cfg.max_spine`: that bounds probe steps, and a
-            // step carrying an inline `next2` emits two tokens, so setting it
-            // from `block()` would steer roughly double the intended width and
-            // fit the controller's cost model against the wrong number.
-            if let (Some(c), Some(n)) = (block_controller.as_ref(), ngram.as_mut()) {
-                n.set_spine_token_cap(Some(c.block()));
-            }
+            // The n-gram builds its natural spine; the VERIFY truncates it via
+            // `b = (1 + spine.len()).min(requested_b)`. Capping the spine itself
+            // to the controller's block was a mistake: the block is a verify
+            // WIDTH, while the cap bounds the n-gram's chain SEARCH, and a chain
+            // step can emit two tokens, so a 16-token cap is only ~8 steps --
+            // half the chain depth. Measured on a cold store it halved the
+            // spine (mean_draft_len 6.03 vs 11.27) and doubled the windows
+            // needed (402 vs 194), for the same 2000 tokens.
+            //
+            // Removing it costs the controller nothing: whatever the spine's
+            // length, `b` is still its own block, so `drafted.len()` and hence
+            // `observe`'s `n_proposed` are unchanged.
             ngram_spine = ngram.as_mut().and_then(|n| n.draft().map(|sp| sp.to_vec()));
+            // Read out before the call: `df` is mutably borrowed by the scratch
+            // and tape arguments below, so the controller cannot be borrowed there.
+            let controller_block = df.block_controller.as_ref().map(|c| c.block());
             spec_step_dflash(
                 gpu,
                 &mut target,
@@ -1136,7 +1145,7 @@ pub fn generate_dflash(
                 0.0_f32, // temperature
                 &mut rng_state,
                 // Block override: env pin, else the adaptive controller.
-                dflash_block_override().or_else(|| block_controller.as_ref().map(|c| c.block())),
+                df.spec_block.or(controller_block),
                 None, // ngram_cache
                 &emitted,
                 0.0_f32, // cactus_delta
@@ -1168,7 +1177,7 @@ pub fn generate_dflash(
                 n.record_acceptance(step.accepted);
             }
         }
-        if let Some(c) = block_controller.as_mut() {
+        if let Some(c) = df.block_controller.as_mut() {
             // Full-window wall time (draft+verify), the controller's calibration
             // signal; n_verify = 1 + drafted block, matching its indexing.
             let t_window_ms = window_started.elapsed().as_secs_f32() * 1000.0;
@@ -3640,27 +3649,6 @@ pub enum Qwen35Start {
 /// bands (14952 / 14917 / 14903 / 14918 ms on a two-session prompt), so the band
 /// size can be chosen from the latency target alone.
 /// Log which prefill arm each request takes (`HIPFIRE_PREFILL_PATH_TRACE`).
-/// Draft block size B for spec decode, overriding what the drafter was trained
-/// at (`HIPFIRE_DFLASH_BLOCK`).
-///
-/// Worth exposing because B and tau interact and the trained B is not
-/// necessarily the throughput optimum. At B=8 with tau 2.42 on
-/// Qwen3.8-27B/DFlash2, five of eight drafted positions are discarded every
-/// cycle, and the draft phase is charged for all of them (52 ms) while a
-/// rejection also pays the replay (67-336 ms). Shrinking B cuts both terms
-/// without touching acceptance per position; a batched verify costs about one
-/// weight sweep whether B is 3 or 8.
-///
-/// `spec_step_dflash` has taken a `block_size_override` all along -- its own
-/// comment anticipates "a caller doing adaptive-B based on rolling tau" -- but
-/// no serving caller ever passed one.
-fn dflash_block_override() -> Option<usize> {
-    std::env::var("HIPFIRE_DFLASH_BLOCK")
-        .ok()
-        .and_then(|v| v.parse::<usize>().ok())
-        .filter(|b| *b >= 2)
-}
-
 fn prefill_path_trace() -> bool {
     std::env::var("HIPFIRE_PREFILL_PATH_TRACE").is_ok()
 }

@@ -7381,6 +7381,139 @@ pub(crate) fn effective_block_size(
     }
 }
 
+/// Hash the KVarN sealed-record buffer and the trailing-window buffer for one
+/// layer, so a caller can compare them across a speculative step.
+///
+/// Layout-free on purpose. The records live in `k_gpu` as
+/// `n_blocks x n_kv_heads x record_bytes`, and getting the per-head index wrong
+/// would silently probe the wrong bytes — so this hashes the WHOLE buffer and
+/// relies on an invariant that needs no layout knowledge: within a step that
+/// does not complete a 128-token block, no record may be written at all, so the
+/// record hash must be unchanged. The window legitimately changes (it stages the
+/// partial block), but after a rejection it must hold only committed tokens.
+#[cfg(feature = "deltanet")]
+fn kvarn_probe_window_rows(gpu: &Gpu, kv: &hipfire_runtime::kv::KvCache) -> Vec<f32> {
+    // First real window buffer, raw. Row-level deltas tell whether a rejected
+    // draft's K was left staged; a hash only says "something moved".
+    for t in kv.k_window.iter() {
+        if t.shape.iter().product::<usize>() > 1 {
+            if let Ok(v) = gpu.download_f32(t) {
+                return v;
+            }
+        }
+    }
+    Vec::new()
+}
+
+#[cfg(feature = "deltanet")]
+fn kvarn_probe_hashes(gpu: &Gpu, kv: &hipfire_runtime::kv::KvCache, layer: usize) -> (u64, u64) {
+    fn fnv(v: &[f32]) -> u64 {
+        let mut h: u64 = 0xcbf29ce484222325;
+        for x in v {
+            for b in x.to_bits().to_le_bytes() {
+                h ^= b as u64;
+                h = h.wrapping_mul(0x100000001b3);
+            }
+        }
+        h
+    }
+    // `layer` is ignored: only ~6 of 24 layers carry KV on this family, and the
+    // rest are 1-element placeholders whose hash is a constant. Fold every
+    // buffer larger than one element instead, so the probe cannot silently
+    // sample a placeholder.
+    let _ = layer;
+    let mut rec: u64 = 0xcbf29ce484222325;
+    let mut win: u64 = 0xcbf29ce484222325;
+    for t in kv.k_gpu.iter() {
+        if t.shape.iter().product::<usize>() > 1 {
+            if let Ok(v) = gpu.download_f32(t) {
+                rec ^= fnv(&v);
+            }
+        }
+    }
+    for t in kv.k_window.iter() {
+        if t.shape.iter().product::<usize>() > 1 {
+            if let Ok(v) = gpu.download_f32(t) {
+                win ^= fnv(&v);
+            }
+        }
+    }
+    (rec, win)
+}
+
+/// `HIPFIRE_KVARN_ROLLBACK_PROBE=1`: is the KVarN record buffer restored after a
+/// speculative step whose drafts were rejected?
+#[cfg(feature = "deltanet")]
+fn kvarn_rollback_probe_enabled() -> bool {
+    // Resolved once: this is called per spec step, and `std::env::var` on the
+    // hot path is exactly the waste the DDTree path-C comment warns about.
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("HIPFIRE_KVARN_ROLLBACK_PROBE").as_deref() == Ok("1"))
+}
+
+/// `HIPFIRE_KVARN_POISON_STALE=1`: after a speculative step, overwrite the
+/// window rows belonging to REJECTED positions with zeros.
+///
+/// This is the causal test for "are the stale rows read?". The probe shows the
+/// window is written for all `b` positions while only `accept_len + 1` are
+/// committed, so `b - accept_len - 1` rows hold K for tokens the model did not
+/// emit. If attention never reads them, zeroing them cannot change the output;
+/// if it does, the output must change. No kernel reading required.
+#[cfg(feature = "deltanet")]
+fn kvarn_poison_stale_mode() -> u8 {
+    static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *ON.get_or_init(
+        || match std::env::var("HIPFIRE_KVARN_POISON_STALE").as_deref() {
+            Ok("1") => 1, // rejected rows only
+            Ok("2") => 2, // committed rows too -- falsification control
+            _ => 0,
+        },
+    )
+}
+
+/// Zero window rows for positions `[first_stale, end)`. The window is a flat
+/// `[GROUP * kv_dim]` ring, so a position's row is `pos % GROUP` and occupies
+/// `kv_dim * elem_bytes` bytes at that row index.
+#[cfg(feature = "deltanet")]
+fn kvarn_zero_stale_window_rows(
+    gpu: &Gpu,
+    kv: &hipfire_runtime::kv::KvCache,
+    kv_dim: usize,
+    first_stale: usize,
+    end: usize,
+) -> HipResult<usize> {
+    if first_stale >= end || kv_dim == 0 {
+        return Ok(0);
+    }
+    let group = hipfire_runtime::kv::KvCache::KVARN_GROUP;
+    let mut zeroed = 0usize;
+    for t in kv.k_window.iter() {
+        if t.shape.iter().product::<usize>() <= 1 {
+            continue;
+        }
+        let elem_bytes = match t.dtype {
+            hipfire_rdna::DType::F16 => 2usize,
+            hipfire_rdna::DType::F32 => 4usize,
+            _ => continue,
+        };
+        let row_bytes = kv_dim * elem_bytes;
+        let total = t.buf.size();
+        let mut host = vec![0u8; total];
+        gpu.hip.memcpy_dtoh(&mut host, &t.buf)?;
+        for pos in first_stale..end {
+            let row = pos % group;
+            let lo = row * row_bytes;
+            let hi = lo + row_bytes;
+            if hi <= total {
+                host[lo..hi].fill(0);
+                zeroed += 1;
+            }
+        }
+        gpu.hip.memcpy_htod(&t.buf, &host)?;
+    }
+    Ok(zeroed)
+}
+
 pub fn spec_step_dflash(
     gpu: &mut Gpu,
     target: &mut ModelSlot,
@@ -8086,6 +8219,14 @@ pub fn spec_step_dflash(
         gpu.hip.device_synchronize()?;
     }
     let t_verify_start = std::time::Instant::now();
+    let kvarn_probe = if kvarn_rollback_probe_enabled() {
+        Some((
+            kvarn_probe_hashes(gpu, &target.kv_cache, 0),
+            kvarn_probe_window_rows(gpu, &target.kv_cache),
+        ))
+    } else {
+        None
+    };
     let verify_out = verify_dflash_block(
         gpu,
         target,
@@ -11001,6 +11142,67 @@ pub fn spec_step_dflash(
         t_restore_end,
     );
 
+    if let Some(((rec0, win0), wrows0)) = kvarn_probe {
+        let (rec1, win1) = kvarn_probe_hashes(gpu, &target.kv_cache, 0);
+        let wrows1 = kvarn_probe_window_rows(gpu, &target.kv_cache);
+        let kvd = target.config.linear_key_head_dim.max(1) * target.config.n_kv_heads.max(1);
+        let changed_rows = if wrows0.len() == wrows1.len() && kvd > 0 {
+            (0..wrows0.len() / kvd)
+                .filter(|r| {
+                    let a = &wrows0[r * kvd..(r + 1) * kvd];
+                    let bb = &wrows1[r * kvd..(r + 1) * kvd];
+                    a != bb
+                })
+                .count()
+        } else {
+            usize::MAX
+        };
+        let group = hipfire_runtime::kv::KvCache::KVARN_GROUP;
+        // A block completes inside this step only if `position + b` crosses a
+        // multiple of GROUP. When it does not, `k_gpu` must be untouched.
+        // A block COMPLETES when a written position is the last of its block
+        // (`p % group == group - 1`). The earlier crossing test
+        // `(pos/group) != ((pos+b-1)/group)` cannot see that for b=1 and
+        // mislabelled two genuine completions as spurious record writes.
+        let sealed = (position..position + b.max(1)).any(|p| p % group == group - 1);
+        // Causal test: blank the rejected positions' rows. If output is
+        // unchanged across a whole generation, they were never read.
+        // CONTROL: `=2` poisons from `position` instead, so COMMITTED rows are
+        // blanked too. If that does not change the output either, the poison
+        // mechanism is broken and the negative result above means nothing.
+        let poison_mode = kvarn_poison_stale_mode();
+        let poisoned = if poison_mode > 0 {
+            let kv_dim = target.config.n_kv_heads * target.config.head_dim;
+            kvarn_zero_stale_window_rows(
+                gpu,
+                &target.kv_cache,
+                kv_dim,
+                if poison_mode == 2 {
+                    position
+                } else {
+                    position + accept_len + 1
+                },
+                position + b,
+            )
+            .unwrap_or(0)
+        } else {
+            0
+        };
+        let _ = poisoned;
+        eprintln!(
+            "[kvarn-probe] pos={position} b={b} accept={accept_len} rejected={} sealed_block={sealed} \
+             rec {} {:016x}->{:016x}  win {} {:016x}->{:016x} win_rows_changed={} poisoned={}",
+            b.saturating_sub(1) - accept_len.min(b.saturating_sub(1)),
+            if rec0 == rec1 { "same" } else { "CHANGED" },
+            rec0,
+            rec1,
+            if win0 == win1 { "same" } else { "changed" },
+            win0,
+            win1,
+            changed_rows,
+            poisoned,
+        );
+    }
     Ok(SpecStepResult {
         accepted: accept_len,
         bonus_token,

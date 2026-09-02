@@ -126,10 +126,24 @@ pub struct DflashState {
     /// Block size the draft was trained at.
     pub block_size: usize,
     /// Adaptive block sizing (cost-model argmax over [2, block_size]) in the
-    /// chain-mode decode loop. Per-load `dflash_adaptive_b` param; default OFF
-    /// (opt-in) — see the load-site comment for the measurement. A
-    /// `HIPFIRE_DFLASH_BLOCK` pin overrides it.
+    /// chain-mode decode loop. Set from the `spec_adaptive_block` setting by the
+    /// daemon after load; default OFF — see the load-site comments for the
+    /// measurement on both the drafter and drafter-free paths. A `spec_block`
+    /// pin overrides it.
     pub adaptive_b: bool,
+    /// The adaptive block controller, when `adaptive_b` is on. Lives HERE, not
+    /// in the decode loop: it was constructed per `generate` call, so its
+    /// calibration -- documented in `reset()` as "a thermal-invariant hardware
+    /// cost: calibrate once, reuse across requests" -- was thrown away every
+    /// request and `reset()` was unreachable. Two generates produced two
+    /// different fitted cost curves for the same hardware.
+    pub block_controller:
+        Option<hipfire_specdecode_dspark::dspark_block_controller::BlockController>,
+    /// Fixed verify block, or `None` for auto. From the `spec_block` setting;
+    /// was the raw `HIPFIRE_DFLASH_BLOCK` env read, which outranked config
+    /// silently. Auto means the trained block with a drafter, and the spine's
+    /// own length without one.
+    pub spec_block: Option<usize>,
     /// Optional DDTree state. Populated only when `HIPFIRE_DDTREE_BUDGET` is
     /// set to a positive integer at daemon startup. None = DDTree disabled,
     /// the decode loop falls through to `spec_step_dflash` (chain mode).

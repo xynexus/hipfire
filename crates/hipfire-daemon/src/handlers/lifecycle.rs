@@ -272,17 +272,6 @@ pub(crate) fn load(
         .and_then(|v| v.as_u64())
         .unwrap_or(2) as usize;
 
-    // DFlash tuning knobs forwarded from the CLI. `adaptive_b` drives the
-    // cost-model BlockController in the generate loop. Opt-in for now: with
-    // the block range clamped to the trained block, the controller measured a
-    // ~25% decode loss on gfx1103/27B (no upside in range to pay for its
-    // ramp) — see DflashState::adaptive_b.
-    let adaptive_b = msg
-        .get("params")
-        .and_then(|p| p.get("dflash_adaptive_b"))
-        .and_then(|v| v.as_bool())
-        .unwrap_or(false);
-
     // Opt-in n-gram spec decode. Per-load param wins, else the config default
     // (off). An empty `ngram_spec_store_root` keeps it RAM-only: nothing is written
     // to disk, so nothing outlives the request.
@@ -302,7 +291,22 @@ pub(crate) fn load(
         .get("params")
         .and_then(|p| p.get("ngram_spec"))
         .is_some();
-    let ngram_cfg = hipfire_config::load_config_bundle().config;
+    let ngram_bundle = hipfire_config::load_config_bundle();
+    // Surface the resolver's diagnostics. They were dropped here (`.config`
+    // discards `.diagnostics`), and the admin console was the only place that
+    // ever rendered them -- so every RENAMED_KEYS deprecation warning was
+    // invisible to a daemon operator. A setting that applies but says nothing is
+    // half of this area's recurring bug; the other half is one that says nothing
+    // and applies to nothing.
+    for d in &ngram_bundle.diagnostics {
+        match d.severity {
+            hipfire_config::ConfigDiagnosticSeverity::Warning => {
+                tracing::warn!("config: {}", d.message)
+            }
+            _ => tracing::info!("config: {}", d.message),
+        }
+    }
+    let ngram_cfg = ngram_bundle.config;
     if !ngram_params_present && ngram_cfg.ngram_spec {
         tracing::warn!(
             "ngram_spec is on in config.json but this load carried no ngram params, so the \
@@ -354,6 +358,27 @@ pub(crate) fn load(
         ngram_cfg.ngram_spec_max_spine as u64,
     )
     .max(1);
+    // Verify-block settings. Named `spec_`, not `dflash_`: they size the SHARED
+    // verify engine and apply with no drafter loaded, which is exactly the
+    // n-gram case below. Applied to `m.dflash` after the load so one edit covers
+    // both the drafter and drafter-free states; `load.rs` only sets fallbacks.
+    let spec_adaptive_block = msg
+        .get("params")
+        .and_then(|p| p.get("spec_adaptive_block"))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(ngram_cfg.spec_adaptive_block);
+    // 0 = auto. Below 2 means "do not speculate", which is never what a pin is
+    // for, so warn and fall back to auto rather than silently disabling.
+    let spec_block = match ngram_u64("spec_block", ngram_cfg.spec_block as u64) {
+        0 => None,
+        n if n < 2 => {
+            tracing::warn!(
+                "spec_block={n} is below 2, which would disable speculation entirely; ignoring it and using auto. Write 0 for auto."
+            );
+            None
+        }
+        n => Some(n as usize),
+    };
     let ngram_promote_count = ngram_u64(
         "ngram_spec_promote_count",
         ngram_cfg.ngram_spec_promote_count as u64,
@@ -382,7 +407,7 @@ pub(crate) fn load(
     if ngram_orders.is_empty() {
         if ngram_spec {
             tracing::warn!(
-                "ngram_spec_orders={ngram_orders_raw:?} parsed to nothing usable (need                  comma-separated integers >= 2); using the default ladder"
+                "ngram_spec_orders={ngram_orders_raw:?} parsed to nothing usable (need comma-separated integers >= 2); using the default ladder"
             );
         }
         ngram_orders = vec![8, 7, 6, 5, 4, 3, 2];
@@ -722,9 +747,6 @@ pub(crate) fn load(
                     ),
                 }
             });
-            if let Some(df) = m.dflash.as_mut() {
-                df.adaptive_b = adaptive_b;
-            }
             // The setup goes on the MODEL, unconditionally. It used to be
             // assigned into `DflashState`, which meant a model with no drafter
             // had nowhere to put it and the value built just above was dropped
@@ -775,6 +797,24 @@ pub(crate) fn load(
                          n-gram verify supports that family only"
                     ),
                 }
+            }
+            // Applied to whichever speculative state exists -- the drafter's or
+            // the drafter-free n-gram one. `load.rs` hardcodes fallbacks; this is
+            // the layer that reads config, so it is the layer that decides.
+            //
+            // `spec_adaptive_block` defaults OFF, but NOT for the reason first
+            // written here. The claim that the controller cost 10-30% on the
+            // n-gram path was withdrawn: speculative decode does not reproduce
+            // plain AR output on this stack, so runs at different block widths
+            // emit DIFFERENT token sequences and their tok/s compare different
+            // work. On the one valid comparison -- a warm request where both
+            // arms emitted a byte-identical sequence -- the controller matched
+            // the fixed block (338.7 vs 343.9 tok/s) at better verify
+            // efficiency. Off is the conservative default until the benchmark
+            // can hold output constant, not a measured verdict against it.
+            if let Some(df) = m.dflash.as_mut() {
+                df.adaptive_b = spec_adaptive_block;
+                df.spec_block = spec_block;
             }
             daemon_state
                 .resource_reservations

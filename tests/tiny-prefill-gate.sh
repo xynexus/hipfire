@@ -211,10 +211,32 @@ for raw_family in "${families[@]}"; do
         # MoE families all traced to one config leak, and the gate could not say
         # so. The reason is now printed with the failure.
         HID_ERR="$TMP/hidden-probe.err"
+        # `--n` MUST exceed the prefill chunk size (256). At or below it, prefill
+        # runs as ONE chunk, attention never reads the quantised KV cache, and the
+        # probe says so itself: "every --kv-mode / HIPFIRE_KVARN_BITS will return
+        # IDENTICAL numbers". This ran at `--n 32` for its whole life, so every
+        # per-KV-mode row below was measuring a configuration where the KV cache
+        # is not read: the `5e-2` ceiling could never fire and `hidden q8: worst
+        # 0.00e0` meant "not measured", not "no divergence". That is precisely the
+        # failure this file warns about three comments up — an unmeasured
+        # invariant reported as a pass — reached by a different route.
+        #
+        # Measured on the real 0.8B at --n 512: fp32 KV is IDENTICAL (0.00e0)
+        # while q8 diverges 5.24e-1 and kvarn 6.18e-1, both an order of magnitude
+        # over the ceiling. See
+        # docs/bugs/2026-09-01-spec-decode-not-output-equivalent-to-ar.md.
+        # 300: above the 256 chunk so the KV is actually read, and below the
+        # tiny fixtures' context — 512 panics them ("--n exceeds fixture ctx").
+        HID_N="${HIPFIRE_TINYPREFILL_HID_N:-300}"
         hid_worst() {
-            "$HID" --model "$2" --n 32 --kv-mode "$1" 2>"$HID_ERR" |
+            "$HID" --model "$2" --n "$HID_N" --kv-mode "$1" 2>"$HID_ERR" |
                 grep -oE '\(worst (overall )?[0-9.eE+-]+\)' |
                 sed -E 's/.*[[:space:]]([0-9.eE+-]+)\)/\1/' | tail -1
+        }
+        # A degenerate run must FAIL, not quietly report zeros. Without this the
+        # gate cannot tell "no divergence" from "nothing was compared".
+        hid_degenerate() {
+            grep -q 'WARNING: --n .* <= the prefill chunk size' "$HID_ERR"
         }
         # One line of why, from whatever the probe last complained about.
         hid_why() {
@@ -223,7 +245,13 @@ for raw_family in "${families[@]}"; do
                 cut -c1-160 || tail -1 "$HID_ERR" | cut -c1-160
         }
         w32="$(hid_worst fp32 "$hfq")"
-        if [ -z "$w32" ]; then
+        if hid_degenerate; then
+            echo "  FAIL hidden-state probe ran below the prefill chunk size"
+            echo "       (--n $HID_N): attention never reads the quantised KV, so"
+            echo "       every kv-mode returns IDENTICAL and the ceiling cannot fire."
+            echo "       Raise HIPFIRE_TINYPREFILL_HID_N above 256."
+            fail=$((fail + 1))
+        elif [ -z "$w32" ]; then
             echo "  FAIL hidden-state probe emitted no parseable summary at fp32 KV —"
             echo "       treating an unmeasured invariant as a pass is how this arm"
             echo "       went unnoticed before; fix the probe or this parser"

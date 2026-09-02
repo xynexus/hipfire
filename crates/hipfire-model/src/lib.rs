@@ -2729,7 +2729,9 @@ pub struct ModelLoadParams {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub dflash_mode: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub dflash_adaptive_b: Option<bool>,
+    pub spec_adaptive_block: Option<bool>,
+    /// Fixed speculative verify block; `None`/0 = auto. See `spec_block`.
+    pub spec_block: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub draft: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2836,7 +2838,8 @@ impl ModelLoadParams {
         params.ngram_spec_promote_count = Some(config.ngram_spec_promote_count);
         params.ngram_spec_write_target = Some(config.ngram_spec_write_target.clone());
         params.kv_adaptive = non_off_value(&config.kv_adaptive);
-        params.dflash_adaptive_b = Some(config.dflash_adaptive_b);
+        params.spec_adaptive_block = Some(config.spec_adaptive_block);
+        params.spec_block = Some(config.spec_block);
         params.gpu_slab_load = non_auto_value(&config.gpu_slab_load);
         params.mmq_screen = Some(config.mmq_screen != "off");
         params.mmq_screen_threshold = Some(config.mmq_screen_threshold);
@@ -3824,7 +3827,8 @@ mod tests {
             kv_adaptive: "balanced".to_string(),
             flash_mode: "auto".to_string(),
             dflash_draft: "off".to_string(),
-            dflash_adaptive_b: false,
+            spec_adaptive_block: false,
+            spec_block: 0,
             mtp_mode: "auto".to_string(),
             mtp_k: 3,
             cask_sidecar: Some("/models/qwen3.5-27b.triattn.hfq".to_string()),
@@ -3848,7 +3852,8 @@ mod tests {
         assert_eq!(params.kv_adaptive.as_deref(), Some("balanced"));
         assert_eq!(params.flash_mode, None);
         assert_eq!(params.dflash_mode.as_deref(), Some("off"));
-        assert_eq!(params.dflash_adaptive_b, Some(false));
+        assert_eq!(params.spec_adaptive_block, Some(false));
+        assert_eq!(params.spec_block, Some(0));
         assert_eq!(params.mtp_mode.as_deref(), Some("auto"));
         assert_eq!(params.mtp_k, Some(3));
         assert_eq!(

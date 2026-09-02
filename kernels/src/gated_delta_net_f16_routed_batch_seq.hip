@@ -158,8 +158,35 @@ __global__ void gated_delta_net_f16_routed_batch_seq(
         #pragma unroll
         for (int o = 4; o > 0; o >>= 1) out_v += __shfl_down(out_v, o, 8);
 
+        // Narrow ONCE PER TOKEN, in place, using the derivation now shared by all
+        // three f16 GDN kernels: `(row_start * HD + tile_flat) ^ (h << 19)`.
+        //
+        // Storing the raw f32 accumulator and narrowing only at the end of the
+        // call made an N-token launch disagree with N single-token launches, so
+        // batched prefill and the speculative verify advanced the state
+        // differently from per-token decode. Measured on 64 tokens at head_dim
+        // 128: one 64-token launch differed from 64 single-token launches in
+        // EVERY state element, worst |rel| 1.989. The FP32 kernel was already
+        // bit-exact across the same schedules. See
+        // docs/bugs/2026-09-02-fp16-deltanet-recurrence-is-not-chunk-invariant.md
+        //
+        // Fewer roundings is the better approximation of an FP32 reference, and
+        // that is what this used to optimise for. But prefill and decode must
+        // agree with EACH OTHER, and speculative.rs already pays this price on
+        // the rollback replay path for the same reason.
+        //
+        // The OUTPUT above is computed from the un-narrowed `sreg`, matching a
+        // single-token call, which narrows only on store. The final store is then
+        // an exact conversion, so n_tokens == 1 is unchanged.
         #pragma unroll
-        for (int i = 0; i < 16; i++) S_tile[row_in_tile * HD + col + i] = sreg[i];
+        for (int i = 0; i < 16; i++) {
+            const unsigned int nidx =
+                (unsigned int)(row_start * HD + row_in_tile * HD + col + i) ^ ((unsigned int)h << 19);
+            const _Float16 nv =
+                stochastic_round ? f32_to_f16_dither(sreg[i], nidx) : (_Float16)sreg[i];
+            sreg[i] = (float)nv;
+            S_tile[row_in_tile * HD + col + i] = sreg[i];
+        }
 
         // One lane per group stores its own row; the 4 rows are contiguous, so
         // this is a single coalesced segment instead of four single-lane
@@ -169,10 +196,23 @@ __global__ void gated_delta_net_f16_routed_batch_seq(
         // --- end identical step ---
     }
 
-    for (int i = tid; i < TILE_ROWS * HD; i += 32) {
-        S_global[i] = stochastic_round
-            ? f32_to_f16_dither(S_tile[i], (unsigned int)i ^ ((unsigned int)blockIdx.x << 19)
-                                            ^ ((unsigned int)blockIdx.y << 7))
-            : (_Float16)S_tile[i];
-    }
+    // Dither index UNIFIED with gated_delta_net_f16.hip and _f16_tree.hip:
+    // `(row_start * HD + tile_flat) ^ (h << 19)`.
+    //
+    // This used to read `i ^ (blockIdx.x << 19) ^ (blockIdx.y << 7)`. With
+    // `h == blockIdx.x` and `tile == blockIdx.y` that is `i ^ (h << 19) ^
+    // (tile << 7)`, which coincides with the linear derivation only at
+    // `tile == 0`: linear ADDS `row_start * HD` (= tile * 512) into the index
+    // where this XORed `tile << 7` (= tile * 128). So the same element of the
+    // same head could be dithered differently by the two kernels, and the
+    // header three lines up requires them to agree bit-for-bit.
+    //
+    // The session (`blockIdx.z`) is deliberately NOT in the index: each session
+    // has its own state buffer, and per-session linear replay — which the routed
+    // kernel must reproduce — has no session term to match.
+    // Exact conversion, NOT a second rounding: the per-token narrowing above
+    // already left every element f16-representable. Rounding again here would
+    // double-round the final token and break the equivalence.
+    for (int i = tid; i < TILE_ROWS * HD; i += 32)
+        S_global[i] = (_Float16)S_tile[i];
 }
