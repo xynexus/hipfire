@@ -7,6 +7,41 @@
 not the problem. The problem is that the chain **re-implements selection logic the
 dispatch registry already models**, and that a dtype missing from it fails *silently*.
 
+## HARD REQUIREMENT: the selector must REJECT an unknown dtype, never fall through
+
+This is the point of the whole change. Whatever replaces the chain — registry lookup,
+match, table — **must fail loudly on a dtype it does not know**. Not fall through to a
+default key. Not pick "closest". Not silently skip the rotation. Fail.
+
+Concretely:
+
+- The dtype -> kernel lookup returns `Option`/`Result`, and a miss is an **error**, not a
+  fallback. `run_plain_gemm_key`'s existing `OqCompactG256` refusal is the right
+  behaviour; it is just hand-written per dtype instead of structural.
+- Prefer an **exhaustive `match` on `DType` with no `_` wildcard**, so a newly added
+  format breaks the build at every site that must handle it. A wildcard arm reintroduces
+  exactly the silent fallthrough this is meant to delete.
+- The rotation flag must come from the **same row** as the kernel key, so "wired for
+  compute but not admitted for rotation" is unrepresentable.
+- A startup/registry self-check should assert that every `DType` reachable by the loader
+  has a row, so the failure surfaces at load rather than mid-forward.
+
+### Why this is not hypothetical
+
+Three instances, all in one session:
+
+1. `run_plain_gemm_key` already has to refuse `OqCompactG256` by hand — a missing arm
+   would decode the weight as another format on an unrotated activation.
+2. `Qtip3G256` had the identical latent exposure and no guard (fixed `577403444`).
+3. Wiring `Qtip3G256` into the `prefill_lowered` chain **correctly** (rotation admission
+   + arm together, KLD unchanged at 0.189103) still did not make it run: prefill stayed
+   at 234 tok/s, because a SEPARATE upstream gate routes the dtype away from the lowered
+   path entirely. A correct arm in one list, dead because of another list.
+
+(3) is the disease in one sentence: **the admission decision is spread across multiple
+independent lists, and being absent from any of them is silent.** A dtype that is wired,
+correct, and never called looks exactly like a dtype that is fast.
+
 ## The branches are three shapes, not 21 cases
 
 | shape | branches | body |
