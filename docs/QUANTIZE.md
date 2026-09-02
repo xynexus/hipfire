@@ -33,6 +33,54 @@ Qwen3.5-9B--mq4l.hfq
 Qwen3.5-9B--mq4+.gfx1103.hfq
 ```
 
+## Embedding Tables: Usually the Biggest Win
+
+**Check `--embed-precision` before tuning anything else on a large-vocab model.**
+On a tied-embedding model the embed table is *also* the lm_head, and at a large
+vocab it dominates both the artifact and the decode bandwidth. The default is
+`source`, which keeps it at the checkpoint's float width.
+
+Measured on Qwen3.5-0.8B (248320 x 1024 tied embed = 254.3M of 752.4M text params,
+**29%**), same `oq4.25++` body, only the embed varying. KLD is against a bf16
+reference on a held-out slice:
+
+| `--embed-precision` | artifact | bpw | KLD | decode tok/s |
+|---|---|---|---|---|
+| `source` (bf16, the default) | 647.3 MB | 6.88 | 0.0446 | 156.0 |
+| `q8` | 550.2 MB | 5.85 | 0.0449 | — |
+| `hfq4` | 415.1 MB | **4.41** | 0.0755 | **194.1** |
+
+Three things follow:
+
+- **`q8` is free here.** +0.0002 KLD is noise, for −1.03 bpw and −97 MB. The
+  `source` default was spending a whole bit per weight, model-wide, for nothing
+  measurable.
+- **`hfq4` is cheap and *faster*.** +0.031 KLD buys another −1.44 bpw, and decode
+  goes up **24%** because the tied lm_head GEMV reads 135 MB instead of 367 MB.
+  It is a throughput lever, not just a size one.
+- **A float embed can make a sub-4-bit target arithmetically impossible.** A bf16
+  embed on this model costs 4068 Mbit on its own, against the 3092 Mbit a 4.0 bpw
+  budget allows for the *entire* model.
+
+`hfq4` is opt-in and should stay that way: the embed seeds the residual
+*unnormalized*, so at 4 bits and below its error is the largest per-tensor KLD cost
+in an otherwise low-bit model. The standing advice to keep embeddings wide holds
+**at 4 bits and below** — it does not justify the gap between `q8` and `bf16`.
+
+Scale matters: this is a 248k vocab on a 0.8B model. On a 30B model with the same
+vocab the embed is a few percent of the weights and none of this is worth the risk.
+
+### Related knobs
+
+- `--no-coarse-lmhead` disables the two-pass coarse lm_head tier. That tier makes
+  decode's output projection ~4x cheaper but costs **+1.36 bpw** at a 248320-row
+  vocab, which can decide whether a build lands under 4 bits/weight. It is emitted
+  only on the `.hfq`-source path, not the `.hfa`/safetensors path.
+- The `qtip3` path force-quantizes the embed to `Q8F16` on its own; only an
+  explicit `--embed-precision hfq4` overrides it.
+- Tag the embed width in the artifact name so it is recoverable later:
+  `Qwen3.5-0.8B-e4--oq4.25++.hfq` (precedent: `Llama-3.2-1B-Instruct-e16--oq4++.hfq`).
+
 ## Quant Token Taxonomy
 
 Quant tokens describe weight encoding only:
@@ -603,6 +651,43 @@ they rotate the activation and multiply directly against dequantized signed
 weights (`W4A16` or `W8A16`). This reuses the same stored weights while avoiding
 the A4/A8 activation error and extra activation-quantization launch.
 
+## Going Below 4 Bits
+
+On-disk bits and resident bits are not the same number, and only one of them
+decides decode speed.
+
+| body format | on-disk | resident | batched GEMM? |
+|---|---|---|---|
+| `oq4.25++` (`OqPlusCompact`) | 4.31 b | **8 b** (widens to `Oq8G256` at load) | yes |
+| `oq3++` (`Oq3G256`) | 3.06 b | **8 b** (sign-extends to int8 at load) | yes |
+| `qtip3` (`Qtip3G256`) | 3.13 b | 3.13 b (native `gemv_qtip3g256`) | **no** |
+
+`qtip3` is the only genuinely low-bit-resident body here — and on gfx1151 that did
+not pay. Measured on Qwen3.5-0.8B, both with a 4-bit embed:
+
+| | bpw | KLD | decode | prefill | ttft |
+|---|---|---|---|---|---|
+| `oq4.25++` | 4.41 | 0.0755 | **194.1** | **2128** | 13.2 ms |
+| `qtip3` + greedy OBS | 3.66 | 0.2469 | 175.0 | 238 | 117.8 ms |
+| `oq3++` | 3.63 | 0.3367 | 151.1 | 1980 | 14.1 ms |
+
+- **There is no `gemm_qtip3`.** `Qtip3G256` does not appear in `tables/gemm_table.rs`,
+  so every batched consumer (prefill, KLD scoring) degenerates to a per-token GEMV
+  loop — hence the 9x prefill gap and the 117.8 ms TTFT.
+- **3-bit residency did not buy decode speed.** `qtip3` decoded *slower* than an
+  8-bit-resident body: the trellis decode cost exceeds the DRAM bytes it saves.
+  Do not assume "fewer weight bytes ⇒ linear tok/s" for trellis formats.
+- Between the two ~3.6 bpw options, `qtip3` wins quality (+27%) and decode (+16%);
+  `oq3++` wins prefill and TTFT by ~8x. Neither dominates.
+
+**Set `HIPFIRE_QTIP_COND=greedy` if you use `qtip3` at all.** It enables output-aware
+OBS conditioning (GPU exact Viterbi + a device-resident residual) and was worth 26%
+on its own — KLD 0.3335 to 0.2469 — at no size cost. It is off by default.
+
+Whether sub-4 is worth it is a size question. On a 0.8B model there is little
+redundancy to spend and 3-bit weights cost roughly 3x the KLD of a 4-bit body for
+0.75 bpw. Larger models tolerate it far better.
+
 ## Implementation Notes
 
 - MQ and OQ 256-group formats require `K % 256 == 0`. Ragged tensors fall back
@@ -615,6 +700,19 @@ the A4/A8 activation error and extra activation-quantization launch.
   KLD/PPL/coherence gates before promoting an artifact.
 - Older plan docs may mention `OQ+`, `Opus Plus`, `op4`, or `op8`; these are
   historical spellings and are not accepted by the current quantizer.
+- `--mixed-bpw` **cannot** serve a sub-4 target. Its floor is Oq4 by construction
+  ("only the oq4 -> oq8 step is available"): it promotes toward a higher average
+  and never demotes.
+- `HIPFIRE_LOWRANK_R` (LQER low-rank residual) writes `<base>.lr_u`/`.lr_v`
+  sidecars that are consumed **only by `hipfire-arch-minimax`**. On any other
+  architecture it is a silent no-op that still costs the bytes — on Qwen3.5-0.8B,
+  `r=32` added 84.2 MB (+0.90 bpw) and scored *identically to six decimals*.
+- `HIPFIRE_QTIP_CODEBOOK=3inst` tags its output `Qtip3G256I3` (qt 51). Confirm the
+  target architecture's loader has a qt-51 arm before using it; qwen35 does not.
+- Quantizing successfully is not evidence a model loads. Formats can be emitted
+  that the target architecture's loader rejects — `oq3` artifacts built cleanly and
+  then failed with "unsupported quant_type 38" until the qwen35 loader learned that
+  code. Always load the artifact once before trusting a build.
 
 ## Useful Flags
 
@@ -626,6 +724,22 @@ the A4/A8 activation error and extra activation-quantization launch.
 | `--awq` / `--awq-alpha <f>` | Enable the first `+`: activation-aware weight pre-scaling. Requires imatrix data or a Hessian-derived imatrix. |
 | `--ldlq` | Enable the second `+`: full-Hessian error-feedback packing. Requires `--hessian`. |
 | `--arch-id <id>` | Override the architecture id stamped in the `.hfq` header. |
+| `--embed-precision <p>` | `source` (default) / `q8` / `bf16` / `f16` / `hfq4`. See [Embedding Tables](#embedding-tables-usually-the-biggest-win) — usually the largest single lever on a large-vocab model. |
+| `--no-coarse-lmhead` | Drop the two-pass coarse lm_head tier (+1.36 bpw at a 248k vocab, but ~4x cheaper decode output projection). |
+| `--rotate <M.r1>` | SpinQuant R1 deploy pre-pass. **arch 0/1 only in practice** — see the caution below. |
+
+`--rotate` applies `FᵀM` and relies on the *codec's* per-256-group FWHT to cancel
+the `Fᵀ`. Two consequences that are easy to get wrong:
+
+- **It cannot be validated with `--format bf16`.** That path is a raw byte copy with
+  no FWHT, so the `Fᵀ` is left uncancelled and the model is broken by construction.
+  Gate it with a format whose codec does the FWHT (e.g. `oq8++`, which is otherwise
+  near-lossless and so makes a sharp control).
+- **It is not currently correct on qwen3.5 (arch 5)** and refuses unless
+  `HIPFIRE_ALLOW_ROTATE_QWEN35=1`. A `--emit-fixture llama` control shows the
+  feature is imperfect even on its native arch (oq8 KLD 0.000006 unrotated vs
+  0.058 rotated), so treat any rotated artifact as unvalidated until that fixture
+  loop is clean.
 
 After producing a portable OQ4 artifact, use `hipfire optimize` to pre-pack it
 for a specific GPU architecture (the `repack` alias is still accepted):
