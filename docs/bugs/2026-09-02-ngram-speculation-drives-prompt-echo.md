@@ -143,10 +143,52 @@ That is a concrete, reproducible asymmetry, and it is the only KV carrier left
 standing: the records are clean, and an exact (fp32) KV — which has neither
 records nor window — removes the corruption entirely.
 
-**Still not proven**: that those stale rows are READ. The window is a staging
-ring, so if attention is masked to the committed length they are inert. Proving
-the loop end-to-end means showing a read past the committed length — which is
-the next step, and is now a much narrower question than when this started.
+## PROVEN: the stale rows are NOT read
+
+`HIPFIRE_KVARN_POISON_STALE=1` blanks the window rows belonging to rejected
+positions after each speculative step, so the question is answered causally
+rather than by reading kernels: if attention never reads them, zeroing them
+cannot change the output.
+
+| poison | output hashes | rows zeroed |
+|---|---|---|
+| none | `07c3942cabee25be` / `9fe5b8f5155b4118` | 0 |
+| rejected rows only (`=1`) | `07c3942cabee25be` / `9fe5b8f5155b4118` — identical | 876 |
+| rejected + committed (`=2`, control) | `3fec6faa468c8494` / `c21bacbb27cab457` — changed | 6870 |
+
+The control is the part that makes the null result mean anything: the same
+poison, aimed to include committed rows, DOES change the output. So the
+mechanism works, and blanking 876 rejected-position rows changes nothing.
+
+**The stale rows are inert.** That matches the dispatch comment in
+`kvarn_attend` — "the kernel bounds each row by its OWN position
+(`positions[bid] + 1`)" — plus the write-run/attend/flush ordering: a row never
+reads a window slot beyond its own position, and the next step's writes
+overwrite the abandoned slots before any row's position reaches them.
+
+## What that leaves
+
+Three carriers have now been eliminated by measurement, not argument:
+
+- sealed KVarN records — change only when a block completes (0 exceptions in 137
+  speculating steps);
+- stale window rows — provably not read (above);
+- DeltaNet state precision — the whole sweep reproduces at FP32.
+
+And one fact stands unexplained: **fp32 KV removes the corruption and every
+quantised KV keeps it**, at any bit width.
+
+So the remaining hypothesis is not pollution by rejected tokens at all. It is
+that the COMMITTED tokens' stored K differs depending on how it was written —
+speculation writes `b` rows in one batched call where AR writes one row at a
+time, and under quantisation those two paths do not produce identical stored
+values. That is the same batch-vs-single-row disagreement measured directly in
+the prefill probe, which switches on at exactly the first multi-chunk prompt
+(`n=257`) and is bit-width independent.
+
+That is a much narrower target than this investigation began with: **is the
+KVarN K write path equivalent between a batched multi-row write and the same
+rows written one at a time?** Everything else has been ruled out.
 
 ## Why this matters more than the losslessness bug reads on its own
 

@@ -7451,6 +7451,69 @@ fn kvarn_rollback_probe_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("HIPFIRE_KVARN_ROLLBACK_PROBE").as_deref() == Ok("1"))
 }
 
+/// `HIPFIRE_KVARN_POISON_STALE=1`: after a speculative step, overwrite the
+/// window rows belonging to REJECTED positions with zeros.
+///
+/// This is the causal test for "are the stale rows read?". The probe shows the
+/// window is written for all `b` positions while only `accept_len + 1` are
+/// committed, so `b - accept_len - 1` rows hold K for tokens the model did not
+/// emit. If attention never reads them, zeroing them cannot change the output;
+/// if it does, the output must change. No kernel reading required.
+#[cfg(feature = "deltanet")]
+fn kvarn_poison_stale_mode() -> u8 {
+    static ON: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *ON.get_or_init(
+        || match std::env::var("HIPFIRE_KVARN_POISON_STALE").as_deref() {
+            Ok("1") => 1, // rejected rows only
+            Ok("2") => 2, // committed rows too -- falsification control
+            _ => 0,
+        },
+    )
+}
+
+/// Zero window rows for positions `[first_stale, end)`. The window is a flat
+/// `[GROUP * kv_dim]` ring, so a position's row is `pos % GROUP` and occupies
+/// `kv_dim * elem_bytes` bytes at that row index.
+#[cfg(feature = "deltanet")]
+fn kvarn_zero_stale_window_rows(
+    gpu: &Gpu,
+    kv: &hipfire_runtime::kv::KvCache,
+    kv_dim: usize,
+    first_stale: usize,
+    end: usize,
+) -> HipResult<usize> {
+    if first_stale >= end || kv_dim == 0 {
+        return Ok(0);
+    }
+    let group = hipfire_runtime::kv::KvCache::KVARN_GROUP;
+    let mut zeroed = 0usize;
+    for t in kv.k_window.iter() {
+        if t.shape.iter().product::<usize>() <= 1 {
+            continue;
+        }
+        let elem_bytes = match t.dtype {
+            hipfire_rdna::DType::F16 => 2usize,
+            hipfire_rdna::DType::F32 => 4usize,
+            _ => continue,
+        };
+        let row_bytes = kv_dim * elem_bytes;
+        let total = t.buf.size();
+        let mut host = vec![0u8; total];
+        gpu.hip.memcpy_dtoh(&mut host, &t.buf)?;
+        for pos in first_stale..end {
+            let row = pos % group;
+            let lo = row * row_bytes;
+            let hi = lo + row_bytes;
+            if hi <= total {
+                host[lo..hi].fill(0);
+                zeroed += 1;
+            }
+        }
+        gpu.hip.memcpy_htod(&t.buf, &host)?;
+    }
+    Ok(zeroed)
+}
+
 pub fn spec_step_dflash(
     gpu: &mut Gpu,
     target: &mut ModelSlot,
@@ -11102,9 +11165,33 @@ pub fn spec_step_dflash(
         // `(pos/group) != ((pos+b-1)/group)` cannot see that for b=1 and
         // mislabelled two genuine completions as spurious record writes.
         let sealed = (position..position + b.max(1)).any(|p| p % group == group - 1);
+        // Causal test: blank the rejected positions' rows. If output is
+        // unchanged across a whole generation, they were never read.
+        // CONTROL: `=2` poisons from `position` instead, so COMMITTED rows are
+        // blanked too. If that does not change the output either, the poison
+        // mechanism is broken and the negative result above means nothing.
+        let poison_mode = kvarn_poison_stale_mode();
+        let poisoned = if poison_mode > 0 {
+            let kv_dim = target.config.n_kv_heads * target.config.head_dim;
+            kvarn_zero_stale_window_rows(
+                gpu,
+                &target.kv_cache,
+                kv_dim,
+                if poison_mode == 2 {
+                    position
+                } else {
+                    position + accept_len + 1
+                },
+                position + b,
+            )
+            .unwrap_or(0)
+        } else {
+            0
+        };
+        let _ = poisoned;
         eprintln!(
             "[kvarn-probe] pos={position} b={b} accept={accept_len} rejected={} sealed_block={sealed} \
-             rec {} {:016x}->{:016x}  win {} {:016x}->{:016x} win_rows_changed={}",
+             rec {} {:016x}->{:016x}  win {} {:016x}->{:016x} win_rows_changed={} poisoned={}",
             b.saturating_sub(1) - accept_len.min(b.saturating_sub(1)),
             if rec0 == rec1 { "same" } else { "CHANGED" },
             rec0,
@@ -11113,6 +11200,7 @@ pub fn spec_step_dflash(
             win0,
             win1,
             changed_rows,
+            poisoned,
         );
     }
     Ok(SpecStepResult {
