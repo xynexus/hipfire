@@ -298,7 +298,8 @@ fn causal_lm_yes_no_rerank(
     query: &str,
     documents: &[String],
 ) -> Result<Vec<RerankResult>, String> {
-    const INSTRUCTION: &str = "Given a web search query, retrieve relevant passages that answer the query";
+    const INSTRUCTION: &str =
+        "Given a web search query, retrieve relevant passages that answer the query";
     // Qwen3-Reranker's true/false pair, the same ids its `1_LogitScore` sidecar ships.
     const YES_TOKEN: usize = 9693;
     const NO_TOKEN: usize = 2152;
@@ -350,14 +351,20 @@ fn causal_lm_yes_no_rerank(
         })?;
         let relevance_score =
             score.ok_or_else(|| "rerank: forward produced no scored position".to_string())?;
-        out.push(RerankResult { index, relevance_score });
+        out.push(RerankResult {
+            index,
+            relevance_score,
+        });
     }
     // Best first, matching the cosine path's contract.
     let mut scored: Vec<(usize, f32)> = out.iter().map(|r| (r.index, r.relevance_score)).collect();
     hipfire_serving_core::pooling::sort_desc(&mut scored);
     Ok(scored
         .into_iter()
-        .map(|(index, relevance_score)| RerankResult { index, relevance_score })
+        .map(|(index, relevance_score)| RerankResult {
+            index,
+            relevance_score,
+        })
         .collect())
 }
 
