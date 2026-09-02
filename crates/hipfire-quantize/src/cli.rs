@@ -5549,6 +5549,117 @@ fn qtip_trellis_lm_head_enabled() -> bool {
     hipfire_env::QTIP_LM_HEAD.flag()
 }
 
+/// `--norm-patch <file.json>`: fold recovered RMSNorm weights (`{"<tensor
+/// name>": [f32, ...]}`) into the staged tensors.
+///
+/// Light QAT (`hipfire-train`'s `qwen35_norm_recovery`) tunes γ for norms that
+/// are NOT quantized — they pass through at source precision — so this only
+/// substitutes their values. It has to happen during the BUILD rather than by
+/// rewriting a finished `.hfq`: once bf16 tensors carry a lossless recoding
+/// (`Bf16Huff`) the tuned values compress to a different byte length, and the
+/// container is written by exactly one writer.
+///
+/// Values are in the STORED convention — for a `(1+w)` family the recovery tool
+/// subtracts 1 before writing the file, so a gemma-style bake has already
+/// happened and is not applied twice.
+///
+/// Called from BOTH pipelines. The safetensors/`.hfa` ingest and
+/// `run_hfq_source_pipeline` are parallel implementations, and a flag wired into
+/// only one of them is silently inert on the other container — the exact shape of
+/// the `--embed-precision hfq4` bug this session already hit.
+fn apply_norm_patch(args: &[String], hfq_tensors: &mut [HfqTensor]) {
+    let Some(patch_path) = arg_value(args, "--norm-patch") else {
+        return;
+    };
+
+    let raw = match std::fs::read_to_string(patch_path) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("--norm-patch: {patch_path}: {e}");
+            std::process::exit(2);
+        }
+    };
+    let patch: std::collections::HashMap<String, Vec<f32>> = match serde_json::from_str(&raw) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("--norm-patch: {patch_path}: {e}");
+            std::process::exit(2);
+        }
+    };
+    let mut applied = 0usize;
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for t in hfq_tensors.iter_mut() {
+        let Some(vals) = patch.get(&t.name) else {
+            continue;
+        };
+        seen.insert(t.name.clone());
+        // A norm is a 1-D unquantized vector. Refuse anything else rather
+        // than overwrite a quantized weight's code bytes with raw floats.
+        if !t.name.ends_with("norm.weight") {
+            eprintln!("--norm-patch: FATAL {} is not a norm tensor", t.name);
+            std::process::exit(2);
+        }
+        if t.spilled_len > 0 {
+            eprintln!(
+                "--norm-patch: FATAL norm {} was spilled to disk before the patch",
+                t.name
+            );
+            std::process::exit(2);
+        }
+        // The `.hfq` pipeline pre-compresses bf16 as it stages, so a norm can
+        // already be a lossless recoding by the time we get here. Substitute the
+        // logical values and recode, rather than refusing.
+        let recoded = t.quant_type.is_lossless_recoding();
+        if recoded {
+            t.quant_type = QuantType::BF16;
+        }
+        match t.quant_type {
+            QuantType::F32 | QuantType::F16 | QuantType::BF16 => {}
+            other => {
+                eprintln!(
+                    "--norm-patch: FATAL norm {} has quant_type {} (expected F32/F16/BF16)",
+                    t.name, other as u8
+                );
+                std::process::exit(2);
+            }
+        };
+        let n: usize = t.shape.iter().map(|&d| d as usize).product();
+        if n != vals.len() {
+            eprintln!(
+                "--norm-patch: FATAL {} has {n} elements, patch has {}",
+                t.name,
+                vals.len()
+            );
+            std::process::exit(2);
+        }
+        t.data = match t.quant_type {
+            QuantType::F32 => vals.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            QuantType::F16 => f32_slice_to_f16_bytes(vals),
+            QuantType::BF16 => f32_slice_to_bf16_bytes(vals),
+            _ => unreachable!(),
+        };
+        if recoded {
+            let mut stats = Bf16CompressStats::default();
+            compress_bf16_tensor(t, bf16_codec(), &mut stats);
+        }
+        applied += 1;
+    }
+    // A patch entry that matches nothing is the failure mode this area keeps
+    // repeating: the flag parses, the run succeeds, and the recovery silently
+    // did not ship. Name every miss and refuse.
+    let missed: Vec<&String> = patch.keys().filter(|k| !seen.contains(*k)).collect();
+    if !missed.is_empty() {
+        eprintln!(
+            "--norm-patch: FATAL {} patch entries match no tensor in this artifact \
+             (first: {}); the recovery would ship silently unapplied",
+            missed.len(),
+            missed[0]
+        );
+        std::process::exit(2);
+    }
+    eprintln!("--norm-patch: folded {applied} recovered norm tensors from {patch_path}");
+}
+
 fn pack_qtip_real_tensors(
     tensors: &mut Vec<HfqTensor>,
     qtip_cb: &[f32],
@@ -6619,6 +6730,15 @@ fn run_hfq_source_pipeline(
         if let Some(ref mut output_spill) = spill {
             maybe_spill(&mut hfq_tensors, output_spill, 2 * 1024 * 1024 * 1024);
         }
+    }
+
+    // `run_hfq_source_pipeline` is a parallel implementation of the
+    // safetensors/`.hfa` ingest, not a wrapper over it — a flag wired into only
+    // one of them is silently inert on the other container. That is exactly how
+    // `--embed-precision hfq4` came to depend on the input container.
+    {
+        let argv: Vec<String> = std::env::args().collect();
+        apply_norm_patch(&argv, &mut hfq_tensors);
     }
 
     // Real QTIP-3 is a post-pass over the BF16-staged 2D weights, shared with
@@ -7734,8 +7854,9 @@ OPTIONS:
                                HFQ4-G256, 4.25 stored bits/weight): on a tied-embedding model at a
                                large vocab the table dominates the artifact, and this is the only
                                way to get an average under 4 bits/weight. Opt-in, measure first.
-    --norm-patch <file.json>   fold recovered RMSNorm weights in, `{"<tensor name>": [f32, ...]}`
-                               as written by `hipfire-train`'s qwen35_norm_recovery (light QAT:
+    --norm-patch <file.json>   fold recovered RMSNorm weights in, a JSON object mapping
+                               tensor name -> f32 array, as written by `hipfire-train`'s
+                               qwen35_norm_recovery (light QAT:
                                block-local norm recovery against the served artifact's own
                                dequantized weights). Norms are not quantized, so this only
                                substitutes their values -- but it must happen HERE rather than by
@@ -14369,100 +14490,7 @@ pub fn main() {
         );
     }
 
-    // ── --norm-patch: fold recovered RMSNorm weights in ────────────────
-    // Light QAT (block-local norm recovery, `hipfire-train`'s
-    // qwen35_norm_recovery) produces tuned γ for norms that are NOT quantized —
-    // they pass through at source precision. Applying them by rewriting the
-    // finished container in place does not work once the bf16 tensors carry a
-    // lossless recoding (`Bf16Huff`): the tuned values compress to a different
-    // byte length. So they are folded HERE, before the recode, and the artifact
-    // is written by the one writer that owns the container format.
-    //
-    // The values are in the STORED convention — for a `(1+w)` family the
-    // recovery tool subtracts 1 before writing the file, so a gemma-style bake
-    // above has already happened and is not applied twice.
-    if let Some(patch_path) = arg_value(&args, "--norm-patch") {
-        let raw = match std::fs::read_to_string(patch_path) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("--norm-patch: {patch_path}: {e}");
-                std::process::exit(2);
-            }
-        };
-        let patch: std::collections::HashMap<String, Vec<f32>> = match serde_json::from_str(&raw) {
-            Ok(p) => p,
-            Err(e) => {
-                eprintln!("--norm-patch: {patch_path}: {e}");
-                std::process::exit(2);
-            }
-        };
-        let mut applied = 0usize;
-        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
-        for t in hfq_tensors.iter_mut() {
-            let Some(vals) = patch.get(&t.name) else {
-                continue;
-            };
-            seen.insert(t.name.as_str());
-            // A norm is a 1-D unquantized vector. Refuse anything else rather
-            // than overwrite a quantized weight's code bytes with raw floats.
-            if !t.name.ends_with("norm.weight") {
-                eprintln!("--norm-patch: FATAL {} is not a norm tensor", t.name);
-                std::process::exit(2);
-            }
-            if t.spilled_len > 0 {
-                eprintln!(
-                    "--norm-patch: FATAL norm {} was spilled to disk before the patch",
-                    t.name
-                );
-                std::process::exit(2);
-            }
-            let dtype = match t.quant_type {
-                QuantType::F32 => "F32",
-                QuantType::F16 => "F16",
-                QuantType::BF16 => "BF16",
-                other => {
-                    eprintln!(
-                        "--norm-patch: FATAL norm {} has quant_type {} (expected F32/F16/BF16)",
-                        t.name, other as u8
-                    );
-                    std::process::exit(2);
-                }
-            };
-            let n = to_f32(&t.data, dtype).len();
-            if n != vals.len() {
-                eprintln!(
-                    "--norm-patch: FATAL {} has {n} elements, patch has {}",
-                    t.name,
-                    vals.len()
-                );
-                std::process::exit(2);
-            }
-            t.data = match t.quant_type {
-                QuantType::F32 => vals.iter().flat_map(|v| v.to_le_bytes()).collect(),
-                QuantType::F16 => f32_slice_to_f16_bytes(vals),
-                QuantType::BF16 => f32_slice_to_bf16_bytes(vals),
-                _ => unreachable!(),
-            };
-            applied += 1;
-        }
-        // A patch entry that matches nothing is the failure mode this area keeps
-        // repeating: the flag parses, the run succeeds, and the recovery silently
-        // did not ship. Name every miss and refuse.
-        let missed: Vec<&String> = patch
-            .keys()
-            .filter(|k| !seen.contains(k.as_str()))
-            .collect();
-        if !missed.is_empty() {
-            eprintln!(
-                "--norm-patch: FATAL {} patch entries match no tensor in this artifact \
-                 (first: {}); the recovery would ship silently unapplied",
-                missed.len(),
-                missed[0]
-            );
-            std::process::exit(2);
-        }
-        eprintln!("--norm-patch: folded {applied} recovered norm tensors from {patch_path}");
-    }
+    apply_norm_patch(&args, &mut hfq_tensors);
 
     // qtip3 (real) post-pass: pack every eligible 2D BF16 weight into
     // QuantType::Qtip3G256 records (rotated-frame 3-bit trellis symbols + scale,
