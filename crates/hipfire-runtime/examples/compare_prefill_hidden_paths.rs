@@ -277,7 +277,62 @@ fn main() {
             first_bad = Some(l);
         }
         if l < 4 || bad {
-            println!("  {l:>5}   {worst:>9.2e}   {wr:>6}   {nonfinite}");
+            // Shape of the divergence, not just its peak. A handful of rows far
+            // above the rest is a DISCRETE event -- an MoE router picking a
+            // different expert for those tokens because a near-tied logit fell
+            // the other way -- while a broad smear is accumulated arithmetic
+            // difference. The two need different fixes, and the peak alone
+            // cannot tell them apart.
+            let mut over = [0usize; 4];
+            let thresholds = [1e-3f32, 1e-2, 3e-2, 5e-2];
+            for r in 0..rows {
+                let (xs, ys) = (&x[r * dim..(r + 1) * dim], &y[r * dim..(r + 1) * dim]);
+                if xs.iter().any(|v| !v.is_finite()) {
+                    continue;
+                }
+                let scale = ys.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-30);
+                let d = xs
+                    .iter()
+                    .zip(ys)
+                    .fold(0f32, |m, (p, q)| m.max((p - q).abs()))
+                    / scale;
+                for (i, t) in thresholds.iter().enumerate() {
+                    if d > *t {
+                        over[i] += 1;
+                    }
+                }
+            }
+            println!(
+                "  {l:>5}   {worst:>9.2e}   {wr:>6}   {nonfinite}   rows>1e-3:{} >1e-2:{} >3e-2:{} >5e-2:{} of {rows}",
+                over[0], over[1], over[2], over[3]
+            );
+            // WHICH rows, not just how many. A run of bad rows starting exactly
+            // at a prefill-batch boundary points somewhere very different from a
+            // scatter of unrelated indices.
+            if over[1] > 0 {
+                let mut ranked: Vec<(usize, f32)> = (0..rows)
+                    .filter_map(|r| {
+                        let (xs, ys) = (&x[r * dim..(r + 1) * dim], &y[r * dim..(r + 1) * dim]);
+                        if xs.iter().any(|v| !v.is_finite()) {
+                            return None;
+                        }
+                        let scale = ys.iter().fold(0f32, |m, v| m.max(v.abs())).max(1e-30);
+                        let d = xs
+                            .iter()
+                            .zip(ys)
+                            .fold(0f32, |m, (p, q)| m.max((p - q).abs()))
+                            / scale;
+                        Some((r, d))
+                    })
+                    .collect();
+                ranked.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                let top: Vec<String> = ranked
+                    .iter()
+                    .take(8)
+                    .map(|(r, d)| format!("{r}:{d:.1e}"))
+                    .collect();
+                println!("          worst rows: {}", top.join("  "));
+            }
         }
     }
     match first_bad {
