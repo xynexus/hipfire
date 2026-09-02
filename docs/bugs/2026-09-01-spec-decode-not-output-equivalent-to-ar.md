@@ -203,13 +203,45 @@ and diffs them layer by layer. On the real model, above the prefill chunk size
 so attention actually reads the KV cache:
 
     --n 512, qwen3.5-0.8b--oq4++.hfq
-      kv-mode fp32    IDENTICAL across all layers (worst 0.00e0)
-      kv-mode q8      FIRST DIVERGING LAYER: 0   (worst overall 5.24e-1)
-      kv-mode kvarn   FIRST DIVERGING LAYER: 0   (worst overall 6.18e-1)
+      kv-mode fp32          IDENTICAL across all layers (worst 0.00e0)
+      kv-mode q8            FIRST DIVERGING LAYER: 0   (worst overall 5.24e-1)
+      kv-mode kvarn 2-bit   FIRST DIVERGING LAYER: 0   (worst overall 6.18e-1)
+      kv-mode kvarn 4-bit   FIRST DIVERGING LAYER: 0   (worst overall 6.18e-1)
+      kv-mode kvarn 8-bit   FIRST DIVERGING LAYER: 0   (worst overall 6.18e-1)
 
-With an unquantised KV the two paths are bit-identical. With either quantised
-mode they diverge **at layer 0** by 0.5-0.6 relative — an order of magnitude over
-the 5e-2 ceiling this repo's own prefill gate applies.
+With an unquantised KV the two paths are bit-identical. With any quantised mode
+they diverge **at layer 0** by 0.5-0.6 relative — an order of magnitude over the
+5e-2 ceiling this repo's own prefill gate applies.
+
+### It is NOT quantisation error
+
+The KVarN width is swept via `HIPFIRE_KVARN_BITS` (2/4/8; the probe reads
+`KvCache::kvarn_bits_from_env()`, and bare `--kv-mode kvarn` means **4-bit**, the
+shipping default — an earlier revision of that probe hardcoded 8 and silently
+compared 8-bit against 8-bit, so the width must always be stated).
+
+Quantisation error would fall by roughly 64x from 2-bit to 8-bit. It does not
+fall at all:
+
+| layer | KVarN 2-bit | KVarN 8-bit |
+|---|---|---|
+| 0 | 3.68e-1 | 3.68e-1 |
+| 1 | 3.11e-1 | 3.11e-1 |
+| 2 | 3.32e-1 | 3.32e-1 |
+| 3 | 4.89e-1 | **5.46e-1** (worse) |
+| 4 | 3.33e-1 @row 494 | **3.79e-1 @row 220** |
+| 5 | 6.18e-1 | 6.18e-1 |
+| 6 | 4.96e-1 | 4.96e-1 |
+
+The widths are genuinely taking effect — layers 3 and 4 move — so this is not a
+stuck env var; the identical headline is just the maximum landing on layer 5
+either way. But eight bits is no better than two, and layer 3 is *worse* at 8.
+
+So the batched and per-token paths are computing genuinely DIFFERENT QUANTITIES
+whenever the KV goes through a quantised cache, not the same quantity to
+different precision. That rules out the obvious workaround: **widening the KV
+does not restore losslessness.** Only `fp32` does, and `fp32` is not in the
+`kv_cache` enum.
 
 That is the mechanism, end to end:
 
