@@ -527,7 +527,22 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
     field!(
         "kv_cache",
         ConfigType::Enum {
-            values: &["auto", "q8", "asym2", "asym3", "asym4", "kvarn2", "kvarn", "kvarn4", "kvarn8"]
+            // `fp32` was MISSING while the loader accepts it and the deprecation
+            // message names it as one of the two supported families ("kvarn ...
+            // and unquantized (fp32)"). So the one exact, non-lossy mode — the
+            // reference every KV comparison needs — could not be written in
+            // config at all; only the undocumented `HIPFIRE_KV_MODE` reached it.
+            //
+            // The deprecated members stay in the enum on purpose. Removing them
+            // would make an existing config fail domain validation, and this
+            // area's rule is that a bad value is WARNED about, not rejected:
+            // `deprecated_kv_diagnostics` already emits the migration message
+            // naming HIPFIRE_KV_ALLOW_DEPRECATED, and the daemon now logs config
+            // diagnostics at load. See issue #386.
+            values: &[
+                "auto", "fp32", "q8", "asym2", "asym3", "asym4", "kvarn2", "kvarn", "kvarn4",
+                "kvarn8",
+            ]
         },
         Requirement::Optional,
         Some("auto"),

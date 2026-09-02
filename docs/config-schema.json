@@ -436,6 +436,7 @@
       "kind": "enum",
       "values": [
         "auto",
+        "fp32",
         "q8",
         "asym2",
         "asym3",
