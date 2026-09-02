@@ -1868,28 +1868,44 @@ impl Gpu {
         m: usize,
         k: usize,
         n: usize,
-        col_base: usize,
-        n_cols: usize,
     ) -> HipResult<()> {
+        assert_eq!(k % 256, 0, "gemm_qtip3g256 requires K % 256 == 0, got K={k}");
+        if n == 0 {
+            return Ok(());
+        }
         self.bind_thread()?;
         self.ensure_kernel(
             "gemm_qtip3g256",
             kernels::GEMM_QTIP3G256_SRC,
             "gemm_qtip3g256",
         )?;
+        const NT: usize = 32; // must match QTIP3_NT in the kernel
         let a_ptr = a_raw.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
         let y_ptr = y.buf.as_ptr();
         let (m_val, k_val, n_val) = (m as i32, k as i32, n as i32);
-        let (cb_val, nc_val) = (col_base as i32, n_cols as i32);
-        self.launch_kernargs(
-            "gemm_qtip3g256",
-            [m as u32, 1, 1],
-            [32, 1, 1],
-            0,
-            &kernargs![ptr a_ptr, ptr x_ptr, ptr y_ptr, i32 m_val, i32 k_val,
-                       i32 n_val, i32 cb_val, i32 nc_val],
-        )
+        let bytes = crate::profile::hfq4g256_weight_bytes(m, k);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qtip3g256", bytes);
+        let mut col = 0usize;
+        let mut result = Ok(());
+        while col < n {
+            let cols = NT.min(n - col);
+            let (cb, nc) = (col as i32, cols as i32);
+            result = self.launch_kernargs(
+                "gemm_qtip3g256",
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                &kernargs![ptr a_ptr, ptr x_ptr, ptr y_ptr, i32 m_val, i32 k_val,
+                           i32 n_val, i32 cb, i32 nc],
+            );
+            if result.is_err() {
+                break;
+            }
+            col += cols;
+        }
+        crate::profile::end_timer(&self.hip, timer);
+        result
     }
 
     /// QTIP-3 GEMV with fused residual add (y += W·x). Same decode as

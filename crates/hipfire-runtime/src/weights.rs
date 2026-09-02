@@ -1616,6 +1616,26 @@ pub fn weight_gemm(
             gpu.gemm_bf16l3_wmma_coop(&w.buf, x, y, w.m, w.k, batch_size)
         }
         DType::Bf16L3 => gpu.gemm_bf16l3_xf32(&w.buf, x, y, w.m, w.k, batch_size),
+        // Qtip3G256 had NO batched path at all -- it was absent from this match
+        // and from `gemm_table`, so every batched consumer fell through to the
+        // per-column fallback below and re-read the whole weight per column.
+        // Measured before this arm existed: prefill 237.7 tok/s against 2127.5
+        // for an oq4.25++ body of the same model.
+        //
+        // Weights are stored FWHT-rotated (the codec's incoherence transform),
+        // so x is rotated first, exactly as the Oq4/Oq8 arms do.
+        DType::Qtip3G256 => {
+            const GROUP: usize = 256;
+            assert_eq!(w.k % GROUP, 0, "Qtip3G256 weight_gemm: K must be % 256");
+            gpu.ensure_mq_signs()?;
+            let x_rot = gpu.alloc_tensor(&[batch_size * w.k], DType::F32)?;
+            let result = (|| {
+                rotate_x_mq_batched_for(gpu, w, x, &x_rot, w.k, batch_size)?;
+                gpu.gemm_qtip3g256(&w.buf, &x_rot, y, w.m, w.k, batch_size)
+            })();
+            gpu.free_tensor(x_rot)?;
+            result
+        }
         DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(&w.buf, x, y, w.m, w.k, batch_size),
         DType::HFQ4G256 => gpu.gemm_hfq4g256(&w.buf, x, y, w.m, w.k, batch_size),
         DType::HFQ4G128 => gpu.gemm_hfq4g128(&w.buf, x, y, w.m, w.k, batch_size),

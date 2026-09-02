@@ -19,6 +19,7 @@ use hipfire_rdna::Gpu;
 const BLK: usize = 100; // [f32 scale | 96 B of 3-bit symbols]
 const NT: usize = 32; // activation columns per pass (matches the kernel)
 
+
 fn lcg_u8(seed: u32, n: usize) -> Vec<u8> {
     let mut s = seed.max(1);
     (0..n)
@@ -93,12 +94,8 @@ fn main() {
 
     // Under test: the batched GEMM, walked in 32-column tiles.
     let yd = gpu.upload_raw(&vec![0u8; n * m * 4], &[n, m]).unwrap();
-    let mut base = 0usize;
-    while base < n {
-        let cols = NT.min(n - base);
-        gpu.gemm_qtip3g256(&ad, &xd, &yd, m, k, n, base, cols).unwrap();
-        base += cols;
-    }
+    // The wrapper tiles internally; N=70 still exercises the short final tile.
+    gpu.gemm_qtip3g256(&ad, &xd, &yd, m, k, n).unwrap();
     gpu.device_synchronize().unwrap();
     let yg = gpu.download_f32(&yd).unwrap();
 
