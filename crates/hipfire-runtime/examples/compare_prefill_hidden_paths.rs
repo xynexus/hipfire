@@ -332,6 +332,20 @@ fn main() {
                     .map(|(r, d)| format!("{r}:{d:.1e}"))
                     .collect();
                 println!("          worst rows: {}", top.join("  "));
+                // p99 alongside the max, because the max is the wrong statistic
+                // for this comparison and cannot be fixed by better KV.
+                //
+                // Sweeping KVarN width on qwen3_5_moe_indexed, the DISTRIBUTION
+                // responds exactly as quantisation error should — rows over
+                // 1e-2 go 38 (2-bit) -> 36 (4-bit) -> 2 (8-bit) — while the max
+                // barely moves, 2.20e-1 -> 7.40e-2 -> 6.80e-2, and the worst
+                // row's identity changes each time (207 -> 160 -> 154). A max
+                // over 300 heavy-tailed rows is dominated by whichever token
+                // happens to sit furthest out, so it stays ~7e-2 however good
+                // the cache is. p99 tracks the bulk and still fails 2-bit.
+                let p99_idx = ((ranked.len() as f32 * 0.01).ceil() as usize).min(ranked.len() - 1);
+                let p99 = ranked[p99_idx].1;
+                println!("          p99 |rel| {p99:.2e}   (max {worst:.2e})");
             }
         }
     }
