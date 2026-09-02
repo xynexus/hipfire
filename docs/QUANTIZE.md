@@ -887,13 +887,15 @@ DeltaNet/attention mixer is never run. A block's input is the previous block's
 ### What it is worth
 
 Measured on `Qwen3.5-0.8B-e4--qtip3g` (3.78 bpw) against a control rebuilt by
-the same recipe, and reproduced on a second independent capture:
+the same recipe. Three independent captures, all scored on the post-GDN-fix
+runtime (`origin/master` 63deba175 — see the retraction below):
 
 | | evalA kld | evalA ppl | evalB kld | evalB ppl | evalB p99 |
 |---|---|---|---|---|---|
-| control | 0.189131 | 17.9114 | 0.164618 | 15.6025 | 0.290300 |
-| layer norms, capture 1 | 0.189178 | **17.8037** | 0.164600 | **15.4958** | **0.284181** |
-| layer norms, capture 2 | 0.189146 | **17.8209** | 0.164658 | **15.4971** | **0.284799** |
+| control | 0.189130 | 17.9110 | 0.164674 | 15.6014 | 0.290186 |
+| capture 1 (2805 tok) | 0.189180 | **17.8043** | 0.164581 | **15.4936** | **0.283919** |
+| capture 2 (1596 tok) | 0.189115 | **17.8192** | 0.164621 | **15.4959** | **0.284335** |
+| capture 3 (post-fix) | 0.189151 | **17.7954** | 0.164525 | **15.4873** | **0.285312** |
 
 Block-local MSE recovers 11.6% (MLP norms) and 5.5% (attention norms), and it
 generalises — re-measured on a capture the recovery never trained on, the
