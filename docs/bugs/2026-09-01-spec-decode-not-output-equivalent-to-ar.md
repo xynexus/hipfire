@@ -104,6 +104,43 @@ That combination is diagnostic. A correct verify commits either the drafted
 token (only when it equals the target's own argmax) or the target's argmax — so
 the committed sequence cannot depend on what was drafted. Here it does.
 
+## Also ruled out: the rollback replay path
+
+`spec_step_dflash` has two rollback replay implementations and an env lever
+between them. The batched one carries a strong precedent — measured on
+Qwen3.8-27B/DFlash2 over a five-prompt greedy mix, it is **byte-identical to
+plain AR** while the serial one diverges (see the doc comment on
+`dflash_rollback_batched_prefill_from_env`). So the machinery demonstrably CAN
+be exact.
+
+Both settings were tried on the n-gram path. They diverge from AR **identically**
+— same token, 49 in request 1 and 1 in request 2:
+
+    HIPFIRE_DFLASH_ROLLBACK_BATCHED_PREFILL   (default, batched) -> diverges
+    HIPFIRE_DFLASH_ROLLBACK_BATCHED_PREFILL=0 (serial)           -> diverges, same tokens
+
+Since the choice of replay makes no difference, the divergence is upstream of
+the rollback, not in it.
+
+Note this run rejects heavily — `accepted=119` of `proposed=992`,
+`mean_accept_len=0.19` — so the rollback path is exercised constantly and is
+still not the discriminator. (`seed_oracle.rej_rate=0.0` in the same JSON is a
+different metric — seed-position matching — and must not be read as "no
+rejections".)
+
+## Why this was undiscoverable until now
+
+Worth stating, because it explains why a losslessness violation sat in a shipped
+feature. Before `2026-09-01-ngram-spine-discarded-by-block-fallback.md`, the
+drafter-free n-gram path never speculated at all: the spine was discarded every
+step and `b` collapsed to 1, a plain AR step. A path that only ever performs AR
+steps is trivially AR-equivalent. Fixing the spine turned on real speculation
+for the first time and exposed this immediately.
+
+The DFlash drafter path, which DID speculate, is the one with the AR-parity
+measurement quoted above. So the guarantee was verified where it was exercised
+and unverified where it was not.
+
 ## Most likely cause: the drafted positions are visible to earlier rows
 
 The batched verify evaluates seed + drafted positions in one forward. If the
