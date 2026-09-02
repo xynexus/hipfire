@@ -158,8 +158,28 @@ __global__ void gated_delta_net_f16_routed_batch_seq(
         #pragma unroll
         for (int o = 4; o > 0; o >>= 1) out_v += __shfl_down(out_v, o, 8);
 
+        // Narrow ONCE PER TOKEN, in place — the same change, for the same
+        // reason, as gated_delta_net_f16.hip: storing the raw f32 accumulator
+        // and narrowing only at the end of the call makes an N-token launch
+        // disagree with N single-token launches, so batched prefill advances the
+        // state differently from per-token decode. The header on that kernel
+        // requires all three f16 GDN kernels to agree bit-for-bit; the tree
+        // kernel already narrowed per token, so the two batch_seq kernels were
+        // the outliers.
+        //
+        // The dither index is this kernel's own derivation, unchanged, so the
+        // value stored is exactly what its final write would have produced for a
+        // single-token call. The final write below is then an exact conversion.
         #pragma unroll
-        for (int i = 0; i < 16; i++) S_tile[row_in_tile * HD + col + i] = sreg[i];
+        for (int i = 0; i < 16; i++) {
+            const unsigned int nidx = (unsigned int)(row_in_tile * HD + col + i)
+                                      ^ ((unsigned int)blockIdx.x << 19)
+                                      ^ ((unsigned int)blockIdx.y << 7);
+            const _Float16 nv =
+                stochastic_round ? f32_to_f16_dither(sreg[i], nidx) : (_Float16)sreg[i];
+            sreg[i] = (float)nv;
+            S_tile[row_in_tile * HD + col + i] = sreg[i];
+        }
 
         // One lane per group stores its own row; the 4 rows are contiguous, so
         // this is a single coalesced segment instead of four single-lane
@@ -169,10 +189,9 @@ __global__ void gated_delta_net_f16_routed_batch_seq(
         // --- end identical step ---
     }
 
+    // Exact conversion, not a second rounding: the per-token narrowing above
+    // already left every element f16-representable.
     for (int i = tid; i < TILE_ROWS * HD; i += 32) {
-        S_global[i] = stochastic_round
-            ? f32_to_f16_dither(S_tile[i], (unsigned int)i ^ ((unsigned int)blockIdx.x << 19)
-                                            ^ ((unsigned int)blockIdx.y << 7))
-            : (_Float16)S_tile[i];
+        S_global[i] = (_Float16)S_tile[i];
     }
 }

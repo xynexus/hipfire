@@ -120,9 +120,10 @@ __global__ void gated_delta_net_f16(
 
     _Float16* S_global = state + h * HD * HD + row_start * HD;
 
-    // Widen f16 -> f32 once for the whole batch. Every token in this call then
-    // works from the f32 tile, so a multi-token batch pays ONE narrowing at the
-    // end rather than one per token.
+    // Widen f16 -> f32 once for the whole batch. Every token works from the f32
+    // tile and narrows back into it on store, so an N-token batch pays N
+    // narrowings -- the same count, at the same points, as N single-token
+    // calls. That equivalence is the contract; see the store site below.
     for (int i = tid; i < TILE_ROWS * HD; i += 32)
         S_tile[i] = (float)S_global[i];
 
@@ -170,8 +171,38 @@ __global__ void gated_delta_net_f16(
         #pragma unroll
         for (int o = 4; o > 0; o >>= 1) out_v += __shfl_down(out_v, o, 8);
 
+        // Narrow to f16 precision ONCE PER TOKEN, in place.
+        //
+        // This used to store the raw f32 accumulator and narrow only at the end
+        // of the call, so an N-token launch paid one rounding where N
+        // single-token launches paid N. That made the kernel NOT chunk-
+        // invariant: batched prefill and the speculative verify advanced the
+        // state differently from plain decode. Measured before this change, on
+        // 64 tokens with head_dim 128: a single 64-token launch differed from 64
+        // single-token launches in EVERY state element, worst |rel| 1.989 --
+        // sign disagreement, not rounding noise. The FP32 kernel is bit-exact
+        // across the same schedules.
+        //
+        // Fewer roundings is the better approximation of an FP32 reference, and
+        // that is what the old comment optimised for. But prefill and decode
+        // must agree with EACH OTHER, and `speculative.rs` already pays this
+        // price on the rollback replay path for exactly this reason ("f16
+        // narrows the state once per launch, so replaying an accepted prefix
+        // must step token by token to match decode"). Consistency wins.
+        //
+        // The OUTPUT above is computed from the un-narrowed `sreg`, matching a
+        // single-token call, which narrows only on store. The final store below
+        // is then an exact conversion: `S_tile` already holds f16-representable
+        // values, so n_tokens == 1 behaves exactly as it did before.
         #pragma unroll
-        for (int i = 0; i < 16; i++) S_tile[row_in_tile * HD + col + i] = sreg[i];
+        for (int i = 0; i < 16; i++) {
+            const unsigned int nidx =
+                (unsigned int)(row_start * HD + row_in_tile * HD + col + i) ^ ((unsigned int)h << 19);
+            const _Float16 nv =
+                stochastic_round ? f32_to_f16_dither(sreg[i], nidx) : (_Float16)sreg[i];
+            sreg[i] = (float)nv;
+            S_tile[row_in_tile * HD + col + i] = sreg[i];
+        }
 
         // One lane per group stores its own row; the 4 rows are contiguous, so
         // this is a single coalesced segment instead of four single-lane
@@ -181,11 +212,10 @@ __global__ void gated_delta_net_f16(
         // --- end identical step ---
     }
 
-    // Narrow back to f16. Round-to-nearest, no stochastic term — deterministic,
-    // so repeated runs on identical input are bit-identical and a spec-decode
-    // rollback restores exactly what it saved.
+    // Exact conversion, NOT a second rounding: the per-token narrowing above
+    // already left every `S_tile` element f16-representable. Rounding here as
+    // well would double-round the last token and break the equivalence this
+    // kernel now guarantees.
     for (int i = tid; i < TILE_ROWS * HD; i += 32)
-        S_global[i] = stochastic_round
-            ? f32_to_f16_dither(S_tile[i], (unsigned int)(row_start * HD + i) ^ ((unsigned int)h << 19))
-            : (_Float16)S_tile[i];
+        S_global[i] = (_Float16)S_tile[i];
 }
