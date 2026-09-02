@@ -663,13 +663,38 @@ decides decode speed.
 | `qtip3` (`Qtip3G256`) | 3.13 b | 3.13 b (native `gemv_qtip3g256`) | **no** |
 
 `qtip3` is the only genuinely low-bit-resident body here — and on gfx1151 that did
-not pay. Measured on Qwen3.5-0.8B, both with a 4-bit embed:
+not pay.
 
-| | bpw | KLD | decode | prefill | ttft |
+### Body-only cost, embed excluded
+
+Comparing whole-artifact bpw across formats is misleading when a tied embed is 29%
+of the parameters: the embed choice swamps the format difference. These are
+**body-only** figures — 498,113,344 params (752.4M text minus the 254.3M tied
+embed) — with every artifact built at `--embed-precision q8`, so the embed is a
+constant 270.17 MB across all rows and cancels out of the comparison.
+
+| body format | body MB | **body bpw** | artifact @e8 | evalA KLD | evalB KLD |
 |---|---|---|---|---|---|
-| `oq4.25++` | 4.41 | 0.0755 | **194.1** | **2128** | 13.2 ms |
-| `qtip3` + greedy OBS | 3.66 | 0.2469 | 175.0 | 238 | 117.8 ms |
-| `oq3++` | 3.63 | 0.3367 | 151.1 | 1980 | 14.1 ms |
+| bf16 (reference) | 680.2 | 10.924 | 950.3 | 0 | 0 |
+| `oq8++` | 517.2 | 8.306 | 787.3 | 0.000715 | 0.000586 |
+| `oq4.25++` | 280.0 | **4.496** | 550.2 | 0.044853 | 0.036061 |
+| `qtip3` + greedy OBS | 209.4 | **3.363** | 479.6 | 0.213695 | 0.174532 |
+| `oq3++` | 206.1 | **3.310** | 476.3 | 0.302466 | 0.245296 |
+
+Two things this framing exposes that whole-model bpw hides:
+
+- **The bf16 body is 10.92 bpw, not 16.** The lossless bf16 codec
+  (`Bf16Huff`/`Bf16Lut3`) compresses it ~1.46x, so the honest baseline for "what
+  did quantization buy" is 10.9. `oq4.25++` is a 2.4x reduction on the body, not
+  the 3.6x that comparing against nominal bf16 would suggest.
+- **Every format carries ~0.2–0.25 bpw of overhead** above its nominal block rate
+  (oq8 8.06→8.31, oq4.25 4.31→4.50, qtip3 3.13→3.36, oq3 3.06→3.31) — norms, AWQ
+  sidecars and HFQ container. Budget for it when targeting a bpw number.
+
+The sub-4 formats are also closer together than their names suggest: `oq3++` is
+the *smaller* body (3.310 vs 3.363) while scoring meaningfully worse (0.302 vs
+0.214). Per bit, `qtip3` with conditioning is the better 3-bit body — but see the
+prefill numbers below before choosing it.
 
 - **There is no `gemm_qtip3`.** `Qtip3G256` does not appear in `tables/gemm_table.rs`,
   so every batched consumer (prefill, KLD scoring) degenerates to a per-token GEMV
