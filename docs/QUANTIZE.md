@@ -660,10 +660,23 @@ decides decode speed.
 |---|---|---|---|
 | `oq4.25++` (`OqPlusCompact`) | 4.31 b | **8 b** (widens to `Oq8G256` at load) | yes |
 | `oq3++` (`Oq3G256`) | 3.06 b | **8 b** (sign-extends to int8 at load) | yes |
-| `qtip3` (`Qtip3G256`) | 3.13 b | 3.13 b (native `gemv_qtip3g256`) | **no** |
+| `qtip3` (`Qtip3G256`) | 3.13 b | 3.13 b (native `gemv_qtip3g256`) | yes (`gemm_qtip3g256`) |
 
 `qtip3` is the only genuinely low-bit-resident body here — and on gfx1151 that did
-not pay.
+not pay: decode is bandwidth-bound on a body this small either way (174.5 tok/s for
+qtip3 at 3.78 bpw vs 194 for `oq4.25++` at 4.41), so the halved weight bytes buy
+nothing back.
+
+Batched prefill for `qtip3` used to be a 9× penalty (233 tok/s vs 2128) because
+`Qtip3G256` was missing from every batched-prefill admission list and fell through to
+the per-token layer path — one full weight sweep per token. `gemm_qtip3g256` closed
+that to 1588 tok/s. Adding a dtype to this path means **five** things, and missing any
+one of them is silent: the kernel + `KernelKey` + registry row + family arm + wrapper;
+membership in `is_batchable_la`; membership in each chain's `*_is_mq` rotation-admission
+list; an arm in all eight per-chain branch chains; and an exemption in the
+refuse-don't-fall-through guard. See
+`docs/todo/2026-09-02-prefill-lowered-dispatch-table.md` — this is why that selector
+should be a table that rejects unknown dtypes rather than a chain that falls through.
 
 ### Body-only cost, embed excluded
 
