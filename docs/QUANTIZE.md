@@ -760,6 +760,82 @@ Whether sub-4 is worth it is a size question. On a 0.8B model there is little
 redundancy to spend and 3-bit weights cost roughly 3x the KLD of a 4-bit body for
 0.75 bpw. Larger models tolerate it far better.
 
+## Light QAT: recovering the norms
+
+Norms are the one thing in a quantized artifact that is **not** quantized — they
+pass through at source precision. That makes them the cheapest possible
+post-quantization correction: tune γ so the quantized block reproduces the bf16
+block, and fold the tuned values in at build time. No codes change, no
+requantization, no format work.
+
+    # 1. capture the bf16 teacher's residual stream (keep the prompt under one
+    #    2048-token prefill chunk — see the caveat below)
+    rm -f /tmp/residcap/qwen35.*
+    HIPFIRE_FORWARD_LOWERED=0 HIPFIRE_DUMP_HIDDEN=/tmp/residcap/qwen35 \
+    HIPFIRE_DUMP_HIDDEN_ALL=1 HIPFIRE_DUMP_HIDDEN_ALLLAYERS=1 HIPFIRE_MAX_GEN=4 \
+      ./target/release/examples/infer_qwen35 model--bf16.hfq --guards off "<corpus text>"
+
+    # 2. recover both norms per layer against the ARTIFACT's own weights
+    cargo run -p hipfire-train --release --example qwen35_norm_recovery -- \
+      model-e4--qtip3g.hfq model--bf16.hfq /tmp/tuned.json
+
+    # 3. rebuild with the tuned norms folded in
+    hipfire-quantize --input model--bf16.hfq --output model-qat.hfq \
+      --format qtip3 ... --norm-patch /tmp/tuned.json
+
+Two things make this a tool rather than a probe. The student weights are
+**dequantized from the target artifact**, not re-simulated — γ compensates a
+specific quantization error, so a simulated error of a different format
+recovers the wrong correction. And `input_layernorm` is recovered as well as
+`post_attention_layernorm`, by training against the q/k/v (or `in_proj_qkv`)
+projections rather than the block output, so the non-differentiable
+DeltaNet/attention mixer is never run. A block's input is the previous block's
+`pertoken` capture, so no new capture tag is needed; layer 0 is skipped.
+
+### What it is worth
+
+Measured on `Qwen3.5-0.8B-e4--qtip3g` (3.78 bpw), 47 norms, ~30 min of GPU,
+against a control rebuilt by the same recipe:
+
+| | control | + norm QAT |
+|---|---|---|
+| evalA kld | 0.189131 | 0.189178 |
+| evalA ppl | 17.9114 | **17.8037** |
+| evalB kld | 0.164618 | 0.164600 |
+| evalB ppl | 15.6025 | **15.4958** |
+| evalB p99 kld | 0.290300 | **0.284181** |
+
+Block-local MSE recovers 11.4% (MLP norms) and 5.6% (attention norms), and
+that converts to: **mean KLD flat**, perplexity ~0.6–0.7% better, evalB's p99
+KLD 2.1% better. Block-local MSE against a bf16 teacher is not the same
+objective as KL-to-teacher, so a small perplexity gain with flat KLD is exactly
+the shape to expect.
+
+Verdict: real, cheap, and **not a lever on its own**. γ has `dim` free
+parameters against a `dim × inter` weight error; this is the ceiling of a
+per-channel input scale. The earlier Supra-50M probe's "52% recovered" came
+mostly from LoRA on q/v, not from norms. The value delivered here is the
+plumbing — artifact-accurate student weights, both norms, and a build-time
+fold — which a LoRA variant can reuse directly.
+
+Recovery is converged, not under-trained: identical block-local MSE at lr
+1e-3 / 3e-3 / 1e-2 / 3e-2 over 300 steps, with `|Δγ|max` scaling exactly 100×
+with lr.
+
+### Two traps
+
+**The patch must be folded at BUILD time, not into a finished `.hfq`.** Once
+bf16 tensors carry a lossless recoding (`Bf16Huff`, the default), tuned values
+compress to a different byte length, so there is no in-place patch. This is why
+`--norm-patch` lives in the quantizer.
+
+**The residual capture is non-finite past the first prefill chunk.** Rows
+0..2047 are clean; from ~2048 to the end of a 2805-token prefill essentially
+every row is non-finite on both tags for full-attention layers — while the same
+run generates coherent text, so it is the dump, not the forward. The recovery
+tool filters and reports those rows; keep the capture prompt under 2048 tokens
+and the question does not arise.
+
 ## Implementation Notes
 
 - MQ and OQ 256-group formats require `K % 256 == 0`. Ragged tensors fall back
