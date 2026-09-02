@@ -1,7 +1,7 @@
 # A prefill batch with exactly ONE trailing row computes that row's attention wrong
 
-Status: **OPEN, newly found 2026-09-02** while investigating #377. Distinct from
-#377's reported symptom; see "Relationship to #377".
+Status: **FIXED 2026-09-02**, found while investigating #377 and distinct from it;
+see "Relationship to #377".
 
 ## The defect
 
@@ -62,11 +62,61 @@ So #377 is plausibly "quantised-KV attention error on outlier tokens exceeds a
 tight ceiling", which is a different question from this document's batch-size
 defect, and may be a ceiling-calibration decision rather than a code fix.
 
-## Next
+## Root cause
 
-1. Read the batched prefill's handling of a 1-row batch — the degenerate case is
-   where a tile/wave-shaped kernel is most likely to fall back or mis-stride.
-   NOT attempted here. `forward_prefill_batch` is a 13k-line path whose own
+`forward_prefill_batch_with_pbs_opts` decides `eligible` ONCE for the whole
+prompt — `prefill_batch_pbs_eligible(..., n, ...)`, which requires
+`n >= MIN_BATCH` (2) — and then runs every chunk of the loop batched. A prompt of
+257 tokens is eligible on its total length, so the trailing chunk of 1 row goes
+through the batched path even though, judged on its own, it would have been
+refused.
+
+The multi-GPU sibling in `ep.rs` has the same `n_total >= 2` guard and the same
+structure, which is why the guard reads as sufficient until you notice it is
+evaluated on the prompt rather than on the chunk.
+
+## Fix
+
+The chunker no longer CREATES a one-row trailing chunk:
+
+    let mut chunk_end = (chunk_start + chunk_batch).min(n);
+    if n - chunk_end == 1 && chunk_end - chunk_start > MIN_BATCH {
+        chunk_end -= 1;
+    }
+
+A 257-token prompt now runs 255 + 2 instead of 256 + 1. Chunk boundaries already
+move with `n`, so nothing a caller can observe changes except the defect, and the
+guard cannot shrink a chunk below `MIN_BATCH` and recreate the problem.
+
+Fixing the boundary rather than the kernel was deliberate. `forward_prefill_batch`
+is a 13k-line path whose own comments record that widening its eligibility gates
+produced garbage (KLD 10.69 vs 0.0389 on a MoE model); not producing the
+degenerate batch is a change whose blast radius can be reasoned about completely.
+
+**Verified**, `--n 257 --kv-mode q8`:
+
+| fixture | before | after |
+|---|---|---|
+| dense qwen3_5 | row 256 at **4.18e-1** | no row over 1e-2; tail cell 5.75e-3 |
+| qwen3_5_moe_indexed | row 256 at **8.69e-1** | row 256 absent; worst is the pre-existing 205 |
+
+Through the gate, dense `qwen3_5`'s one-row-tail cell went from FAIL 4.18e-1 to
+5.75e-3 — identical to its n=300 value, which is what "the tail is no longer
+special" should look like. `qwen3_5_moe_indexed`'s tail cells now read 7.16e-2 /
+7.40e-2, exactly matching its n=300 cells: the blowup is gone and only #377's
+content-dependent divergence remains.
+
+No regressions: `tiny-state-gate` PASS 18/18 (token output unchanged), 171
+qwen35 unit tests pass.
+
+## Next## Next
+
+1. ~~Read the batched prefill's handling of a 1-row batch~~ — DONE; see "Root
+   cause" and "Fix" above. What remains unknown is WHY a 1-row batch computes
+   attention wrongly, as opposed to merely differently: the fix removes the
+   degenerate input rather than correcting the kernel that mishandles it. If a
+   caller ever constructs a 1-row batch by another route, it will still be
+   wrong. Worth a targeted kernel-level look. `forward_prefill_batch` is a 13k-line path whose own
    comments record that widening its eligibility gates produced garbage (KLD
    10.69 vs 0.0389 on a MoE model), and a speculative fix there without the
    ability to validate it broadly would be worse than the documented bug. The

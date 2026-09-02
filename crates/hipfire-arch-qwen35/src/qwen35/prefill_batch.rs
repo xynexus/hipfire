@@ -6845,7 +6845,28 @@ pub fn forward_prefill_batch_with_pbs_opts(
         let chunk_batch = pbs.max_batch;
         let mut chunk_start = 0usize;
         while chunk_start < n {
-            let chunk_end = (chunk_start + chunk_batch).min(n);
+            let mut chunk_end = (chunk_start + chunk_batch).min(n);
+            // Never leave a ONE-ROW trailing chunk.
+            //
+            // `eligible` is decided once for the whole prompt (n >= MIN_BATCH),
+            // then every chunk runs batched — including a remainder of 1, which
+            // would fail that guard on its own. That lone row's attention comes
+            // out badly wrong: measured against the per-token reference at
+            // n=257 (256 + 1), relative error 4.2e-1 on dense qwen3_5 and 8.7e-1
+            // on qwen3_5_moe_indexed, where neighbouring rows sit at ~5e-3.
+            // n=258 and n=260 (2- and 4-row tails) are clean, so it is the batch
+            // SIZE, not the position — any prompt of length 1 (mod chunk_batch)
+            // hit it.
+            //
+            // Shortening the preceding chunk by one makes the tail 2 rows.
+            // Chunk boundaries already move with `n`, so this changes nothing a
+            // caller can observe except the defect. Guarded so it can never
+            // shrink a chunk BELOW the minimum and recreate the problem it is
+            // fixing. See docs/bugs/2026-09-02-single-row-trailing-prefill-batch.md
+            if n - chunk_end == 1 && chunk_end - chunk_start > MIN_BATCH {
+                chunk_end -= 1;
+            }
+            let chunk_end = chunk_end;
             let chunk = &tokens[chunk_start..chunk_end];
             let chunk_n = chunk.len();
             // The chunk only reads the ring buffer's head/dims to place its
