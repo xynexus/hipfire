@@ -53,12 +53,37 @@
 //!   hipfire-quantize --input <bf16.hfq> --output <recovered.hfq> \
 //!       --format ... --norm-patch <tuned_norms.json>
 //!
+//! ## What this is worth, measured
+//!
+//! On Qwen3.5-0.8B-e4--qtip3g (3.78 bpw), against a control built by the same
+//! recipe, reproduced across two independent captures:
+//!
+//!   layers only      kld 0.189131 -> 0.18915   ppl 17.911 -> 17.82   p99 -1.9%
+//!   + final norm     kld 0.189131 -> 0.194610  ppl 17.911 -> 17.99
+//!   final norm only,
+//!   student input    kld 0.189131 -> 0.262497  ppl 17.911 -> 19.48
+//!
+//! Layer norms: mean KLD flat, perplexity ~0.6% better, p99 KLD ~2% better.
+//! Small, reproducible, real.
+//!
+//! The final norm is a TRAP, and an instructive one. It is the only norm whose
+//! error reaches the logits with no mixer in between, so it can be trained on
+//! the KL that is actually scored — and it posts by far the best local number
+//! (KL -59% against the bf16 hidden state, -68% against the model's own). Both
+//! deploy WORSE, the better-measuring one much worse. Fed the teacher's clean
+//! hidden state it solves a problem the deployed model does not have; fed the
+//! model's own (drifted to cos 0.96 of the teacher by layer 23) it is asked to
+//! absorb 24 layers of accumulated error with `dim` parameters, and overfits —
+//! in-sample KL -68%, held-out KLD +39%. Hence `HIPFIRE_RECOVER_HEAD` defaults
+//! off. Local win does not imply deployed win; always score the artifact.
+//!
 //! Env: HIPFIRE_CAP_DIR (default /tmp/residcap), HIPFIRE_RECOVER_LR (3e-4),
 //!      HIPFIRE_RECOVER_STEPS (200), HIPFIRE_RECOVER_ATTN (1 = also recover
 //!      input_layernorm; 0 = MLP norms only), HIPFIRE_RECOVER_LAYERS (cap the
 //!      layer sweep, for LR/step probes), HIPFIRE_RECOVER_ROWS (1024),
 //!      HIPFIRE_RECOVER_GAMMA (teacher|student — `student` + STEPS=0 measures a
-//!      patched artifact's own block-local error).
+//!      patched artifact's own block-local error), HIPFIRE_CAP_DIR_STUDENT (a
+//!      capture from the QUANTIZED artifact; defaults to the teacher's).
 
 use hipfire_rdna::{DType, Gpu, GpuTensor};
 use hipfire_train::hfq_patch::{bf16_bits_to_f32, effective_metadata, parse_hfq, HfqEntry};
@@ -114,6 +139,33 @@ fn read_f32(bytes: &[u8], e: &HfqEntry) -> Result<Vec<f32>, String> {
             Ok(bf16(&logical))
         }
         3 => Ok(hipfire_runtime::quant::dequant_q8f16(data, n)),
+        // HFQ4G256: 136 B/group — [f32 scale][f32 min][128 nibbles], plain
+        // affine (value = min + q*scale), no rotation. The tied head ships in
+        // this format on an `-e4` artifact.
+        6 => {
+            const G: usize = 256;
+            const BLK: usize = 136;
+            let mut out = vec![0.0f32; n];
+            for b in 0..n.div_ceil(G) {
+                let off = b * BLK;
+                if off + BLK > data.len() {
+                    break;
+                }
+                let rd =
+                    |o: usize| f32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
+                let (scale, min_val) = (rd(off), rd(off + 4));
+                for i in 0..128 {
+                    let byte = data[off + 8 + i];
+                    for (half, q) in [(0usize, byte & 0x0f), (1, byte >> 4)] {
+                        let idx = b * G + 2 * i + half;
+                        if idx < n {
+                            out[idx] = min_val + q as f32 * scale;
+                        }
+                    }
+                }
+            }
+            Ok(out)
+        }
         31 => Ok(hipfire_train::qtip_quant::dequant_qtip3g256(data, n)),
         34 => Ok(hipfire_runtime::quant::dequant_oq4g256(data, n)),
         35 => Ok(hipfire_runtime::quant::dequant_oq8g256(data, n)),
@@ -373,6 +425,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // artifact's real block-local error, so a fold that worked shows up as a
     // lower start than the unpatched control.
     let gamma_from_student = envs("HIPFIRE_RECOVER_GAMMA", "teacher") == "student";
+    // OFF by default: it MEASURES well and DEPLOYS badly. See the module docs.
+    let do_head = envs("HIPFIRE_RECOVER_HEAD", "0") == "1";
+    // The head GEMM is [rows x dim] x [dim x vocab] with vocab ~248k, so rows
+    // costs far more here than in a block. It only has to constrain `dim`
+    // parameters.
+    let head_rows = envu("HIPFIRE_RECOVER_HEAD_ROWS", 128);
+    // Residuals captured from the QUANTIZED model. Recovery against the bf16
+    // teacher's hidden states fits a correction for an input the deployed model
+    // never sees: by the final norm the quantized residual has drifted to cos
+    // 0.96 of the teacher's. Point this at a capture from the artifact being
+    // recovered and the student is fed its OWN input while the target stays the
+    // teacher's — which is the error deployment actually has. Defaults to the
+    // teacher capture, i.e. the old clean-input behaviour.
+    let cap_dir_student = envs("HIPFIRE_CAP_DIR_STUDENT", &cap_dir);
 
     let student = Artifact::open(&q_path)?;
     let teacher = Artifact::open(&bf_path)?;
@@ -588,6 +654,87 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         n_attn += 1;
     }
 
+    // ---- final norm, against the bf16 LOGITS ----
+    //
+    // Every other norm here is recovered against a block-local surrogate, and
+    // the measured cost of that is real: block MSE improves 1-10% and mean KLD
+    // does not move. This one is different. `model.norm` feeds the lm_head and
+    // nothing else, so its error reaches the logits with no mixer in between —
+    // and the loss can be the KL that is actually being scored, not a proxy for
+    // it. Its input is the LAST block's `pertoken` capture, already on disk.
+    //
+    // On a tied model the head is the embedding table, which on an `-e4`
+    // artifact is 4-bit: the single largest unshared quant error in the model,
+    // and the one sitting closest to the output.
+    if do_head {
+        let norm_n = ["model.language_model.norm.weight", "model.norm.weight"]
+            .iter()
+            .find(|n| teacher.get(n).is_some())
+            .map(|n| n.to_string());
+        let head_n = [
+            "model.language_model.lm_head.weight",
+            "lm_head.weight",
+            "model.language_model.embed_tokens.weight",
+            "model.embed_tokens.weight",
+        ]
+        .iter()
+        .find(|n| teacher.get(n).is_some() && student.get(n).is_some())
+        .map(|n| n.to_string());
+        match (norm_n, head_n) {
+            (Some(norm_n), Some(head_n)) => {
+                let vocab = teacher.get(&head_n).unwrap().shape[0] as usize;
+                let (xin_t, rows) = read_cap(&cap_dir, "pertoken", n_layers - 1, dim, head_rows)?;
+                let (xin_s, rows_s) =
+                    read_cap(&cap_dir_student, "pertoken", n_layers - 1, dim, head_rows)?;
+                if rows != rows_s {
+                    return Err(format!(
+                        "teacher/student captures disagree on row count ({rows} vs {rows_s}); \
+                         they must come from the same prompt"
+                    )
+                    .into());
+                }
+                finite(&xin_t, "capture", &format!("pertoken.L{}", n_layers - 1))?;
+                finite(
+                    &xin_s,
+                    "student capture",
+                    &format!("pertoken.L{}", n_layers - 1),
+                )?;
+                let mut g_teacher = teacher.read(&norm_n)?;
+                let mut g0 = if gamma_from_student {
+                    student.read(&norm_n)?
+                } else {
+                    g_teacher.clone()
+                };
+                // qwen3.5's FINAL norm goes through the same `load_norm_weight`
+                // as the per-layer ones (`load_norm_weight_raw` is dead code),
+                // so it carries the unit offset too.
+                if unit_offset {
+                    for v in g0.iter_mut() {
+                        *v += 1.0;
+                    }
+                    for v in g_teacher.iter_mut() {
+                        *v += 1.0;
+                    }
+                }
+                let (w_t, w_s) = (teacher.read(&head_n)?, student.read(&head_n)?);
+                finite(&w_t, "teacher", &head_n)?;
+                finite(&w_s, "student", &head_n)?;
+                println!(
+                    "head: {head_n} vocab={vocab} rows={rows} w_cos={:.4}",
+                    cos(&w_t, &w_s)
+                );
+                let (start, last, tv) = recover_head_gamma(
+                    &mut gpu, &xin_s, &xin_t, rows, dim, vocab, eps, &g0, &g_teacher, &w_s, &w_t,
+                    lr, steps,
+                )?;
+                let rec = 100.0 * (start - last) / start.max(1e-12);
+                println!("final norm: KL {start:.6e} -> {last:.6e} ({rec:5.1}%)");
+                tuned.insert(norm_n, store_back(tv, unit_offset));
+            }
+            _ => eprintln!("head recovery skipped: final norm or head tensor not found"),
+        }
+    }
+
     let pct = |a: f64, b: f64| 100.0 * (a - b) / a.max(1e-12);
     println!(
         "\n{n_mlp} mlp norms:  sum MSE {s_mlp:.4e} -> {f_mlp:.4e} ({:.1}% block-local)",
@@ -734,4 +881,101 @@ fn recover_mlp_gamma(
         gpu.free_tensor(t)?;
     }
     Ok((start, last, tv))
+}
+
+/// Final-norm recovery against the teacher's LOGITS, minimising the KL that is
+/// actually scored rather than a block-local MSE proxy.
+///
+/// `x_in` is the last block's output (the final norm's input). Forward is
+/// `rmsnorm(x, γ) → head → logits`; the teacher runs the same with its own
+/// pinned γ and bf16 head, softmaxed once into `teacher_p`. `distill_kl` returns
+/// the loss and `d_logits` together, which backprops through the head into γ.
+#[allow(clippy::too_many_arguments)]
+fn recover_head_gamma(
+    gpu: &mut Gpu,
+    x_in_student_h: &[f32],
+    x_in_teacher_h: &[f32],
+    rows: usize,
+    dim: usize,
+    vocab: usize,
+    eps: f32,
+    gamma_h: &[f32],
+    gamma_teacher_h: &[f32],
+    head_student_h: &[f32],
+    head_teacher_h: &[f32],
+    lr: f32,
+    steps: usize,
+) -> Result<(f32, f32, Vec<f32>), Box<dyn std::error::Error>> {
+    use hipfire_train::ops::distill::distill_kl;
+    use hipfire_train::ops::softmax::softmax_forward;
+
+    let x_in = gpu.upload_f32(x_in_student_h, &[rows * dim])?;
+    let x_in_t = gpu.upload_f32(x_in_teacher_h, &[rows * dim])?;
+    let gamma = gpu.upload_f32(gamma_h, &[dim])?;
+    let gamma_t = gpu.upload_f32(gamma_teacher_h, &[dim])?;
+    let mut opt = AdamW::new(gpu, &[dim], lr, 0.9, 0.999, 1e-8, 0.0)?;
+    let yn = gpu.zeros(&[rows * dim], DType::F32)?;
+    let rinv = gpu.zeros(&[rows], DType::F32)?;
+    let logits = gpu.zeros(&[rows * vocab], DType::F32)?;
+    let teacher_p = gpu.zeros(&[rows * vocab], DType::F32)?;
+    let d_logits = gpu.zeros(&[rows * vocab], DType::F32)?;
+    let loss = gpu.zeros(&[rows], DType::F32)?;
+    let d_yn = gpu.zeros(&[rows * dim], DType::F32)?;
+    let d_x_unused = gpu.zeros(&[rows * dim], DType::F32)?;
+    let d_gamma = gpu.zeros(&[dim], DType::F32)?;
+
+    let w_t = gpu.upload_f32(head_teacher_h, &[vocab, dim])?;
+    // Teacher probabilities: computed once, at the teacher's own γ.
+    rmsnorm_forward(gpu, &x_in_t, &gamma_t, &yn, &rinv, rows, dim, eps)?;
+    linear_forward(gpu, &yn, &w_t, &logits, rows, dim, vocab)?;
+    softmax_forward(gpu, &logits, &teacher_p, rows, vocab)?;
+    gpu.free_tensor(w_t)?;
+
+    let w_s = gpu.upload_f32(head_student_h, &[vocab, dim])?;
+    let mean_loss = |gpu: &mut Gpu, loss: &GpuTensor| -> Result<f32, Box<dyn std::error::Error>> {
+        let v = gpu.download_f32(loss)?;
+        Ok(v.iter().sum::<f32>() / v.len() as f32)
+    };
+
+    let mut step_once = |gpu: &mut Gpu| -> Result<f32, Box<dyn std::error::Error>> {
+        rmsnorm_forward(gpu, &x_in, &gamma, &yn, &rinv, rows, dim, eps)?;
+        linear_forward(gpu, &yn, &w_s, &logits, rows, dim, vocab)?;
+        distill_kl(gpu, &logits, &teacher_p, &loss, &d_logits, rows, vocab)?;
+        mean_loss(gpu, &loss)
+    };
+
+    let start = step_once(gpu)?;
+    let mut last = start;
+    for step in 0..steps {
+        let l = step_once(gpu)?;
+        if step + 1 == steps {
+            last = l;
+        }
+        linear_backward_x(gpu, &d_logits, &w_s, &d_yn, rows, dim, vocab, false)?;
+        zero(gpu, &d_gamma)?;
+        rmsnorm_backward(
+            gpu,
+            &d_yn,
+            &x_in,
+            &gamma,
+            &rinv,
+            &d_x_unused,
+            &d_gamma,
+            rows,
+            dim,
+        )?;
+        opt.step(gpu, &[&gamma], &[&d_gamma])?;
+    }
+    if steps > 0 {
+        last = step_once(gpu)?;
+    }
+
+    let tuned = gpu.download_f32(&gamma)?;
+    for t in [
+        x_in, x_in_t, gamma, gamma_t, yn, rinv, logits, teacher_p, d_logits, loss, d_yn,
+        d_x_unused, d_gamma, w_s,
+    ] {
+        gpu.free_tensor(t)?;
+    }
+    Ok((start, last, tuned))
 }
