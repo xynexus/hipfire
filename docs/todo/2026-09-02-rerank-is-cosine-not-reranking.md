@@ -49,8 +49,34 @@ involved is a worse outcome than no endpoint.
   daemon serves is `.hfq`, so they are downloaded and unconverted.
 - **No architecture support.** `reranker` matches nothing in `hipfire-model` or
   `hipfire-serving-core` beyond `rerank_yes_no` itself — there is no model kind, no
-  loader, and no arch id. This is the actual missing piece, and it is larger than the
-  scorer that is already written.
+  loader, and no arch id.
+
+## Demonstrated, not inferred
+
+`Qwen3-Reranker-0.6B` was quantized to `oq8` and served, and the gap is now measured
+rather than read out of the source. The quantization route is written up in
+[QUANTIZE.md](../QUANTIZE.md#cross-encoder-rerankers-qwen3-reranker).
+
+1. **It is an ordinary Qwen3.** `architectures: ["Qwen3ForCausalLM"]`,
+   `model_type: qwen3`, and its `1_LogitScore` sidecar holds
+   `{"true_token_id": 9693, "false_token_id": 2152}` — **the same constants
+   `rerank_yes_no` already documents.** So the loading path really is the existing Qwen3
+   path; it needs a prompt template and a logit read, not a new architecture.
+2. **It quantizes and serves.** 595.8M params at oq8, 682 MB, all 310 tensors decode,
+   and it appears in `/v1/models` without a daemon restart.
+3. **`/v1/rerank` refuses it**: `rerank: loaded model is arch_id=1, expected
+   embeddinggemma arch_id=19`.
+4. **The generation API cannot substitute.** Driving it through
+   `/v1/chat/completions` produces a sensible yes/no, but `logprobs` is silently
+   ignored — the token appears nowhere in `hipfire-server` or `hipfire-daemon-adapter`
+   — so only the *sampled* token is reachable. That carries no ranking signal: over four
+   near-identical documents it answers **all-yes or all-no, 0 of 4 uniquely correct**.
+
+Point 4 is the one worth keeping. The graded score is not a refinement of the yes/no
+answer, it **is** the signal; argmax discards all of it. That is precisely why
+`rerank_yes_no` takes logits, and it means a client cannot work around the missing
+endpoint by prompting the model itself. Exposing `logprobs` on the generation API would
+unblock the same measurement from outside, and is a smaller change than the loader.
 
 ## What's missing
 

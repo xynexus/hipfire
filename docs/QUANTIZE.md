@@ -149,6 +149,86 @@ cargo run --release -p hipfire-quantize -- \
   --imatrix <Qwen3-Embedding-0.6B.imatrix.gguf>
 ```
 
+### Cross-encoder rerankers (Qwen3-Reranker)
+
+A reranker is **not** an embedding model and must not be quantized through the
+SentenceTransformers path above. `Qwen3-Reranker-*` is a plain causal LM —
+`architectures: ["Qwen3ForCausalLM"]`, `model_type: qwen3` — that answers a yes/no
+question about a `(query, document)` pair. Quantize it as an ordinary Qwen3.
+
+**Restore the archive first.** These ship as `.hfa`; the quantizer takes a HuggingFace
+directory, a `.gguf` or a `.hfq`, not an archive.
+
+```bash
+hipfire repack --input /srv/hipfire/models/Qwen3-Reranker-0.6B.hfa --check
+hipfire repack --input /srv/hipfire/models/Qwen3-Reranker-0.6B.hfa \
+  --output /srv/hipfire/staging/qwen3-reranker-0.6b
+```
+
+**Two errors you will hit, in order, and why.** The quantizer treats the presence of
+`modules.json` as "this is a SentenceTransformers embedding checkpoint":
+
+```
+error: embedding metadata: unsupported SentenceTransformers module type
+       "sentence_transformers.cross_encoder.modules.logit_score.LogitScore"
+```
+
+Removing just that entry then produces:
+
+```
+error: embedding metadata: SentenceTransformers modules.json has no pooling module
+```
+
+which is the same assumption stated the other way — a cross-encoder has no pooling,
+because it scores from logits rather than from a pooled vector.
+
+**Move the SentenceTransformers sidecars aside and quantize normally.** They describe
+how the `sentence_transformers` library wraps the model; none of them is weight data.
+
+```bash
+cd /srv/hipfire/staging/qwen3-reranker-0.6b
+mkdir -p .st-sidecars
+mv modules.json config_sentence_transformers.json sentence_bert_config.json .st-sidecars/
+
+hipfire quantize \
+  --input /srv/hipfire/staging/qwen3-reranker-0.6b \
+  --output ~/.hipfire/models/Qwen3-Reranker-0.6B--oq8.hfq \
+  --format oq8
+```
+
+Nothing is lost by doing this. The `1_LogitScore` module carries **no weights** — it is
+a 57-byte config holding two token ids (`true_token_id: 9693`, `false_token_id: 2152`),
+which are the same constants `hipfire_serving_core::pooling::rerank_yes_no` documents.
+Confirmed on the 0.6B: 0 of its 310 tensors are a score/head/classifier.
+
+Result for `Qwen3-Reranker-0.6B` at `oq8`: 595.8M params, 100% quantized, **682 MB**.
+
+**Install it where the daemon looks.** `~/.hipfire/models/` is what is served, and the
+model id is the filename minus `.hfq` (so the file above is served as
+`Qwen3-Reranker-0.6B--oq8`). `/srv/hipfire/models/` is a build and archive store and is
+**not** served. A newly added artifact appears in `/v1/models` without restarting the
+daemon.
+
+**Verify.** Note the flag inconsistency: `quantize` and `repack` take `--input`, while
+`hfq` and `inspect` take a positional path.
+
+```bash
+hipfire hfq verify ~/.hipfire/models/Qwen3-Reranker-0.6B--oq8.hfq   # "all 310 tensors decode"
+hipfire inspect     ~/.hipfire/models/Qwen3-Reranker-0.6B--oq8.hfq
+```
+
+(`hipfire hfq verify --help` panics — it treats `--help` as the path.)
+
+**What a served reranker cannot do yet.** `/v1/rerank` refuses it —
+`rerank: loaded model is arch_id=1, expected embeddinggemma arch_id=19` — because the
+endpoint is wired to the embedding architecture. Driving it through
+`/v1/chat/completions` works and returns a sensible yes/no, but the API exposes no
+logprobs (`logprobs` is silently ignored; the token appears nowhere in the server or
+adapter), and the *sampled* token carries no ranking signal: measured over four
+near-identical documents it answers all-yes or all-no, scoring 0 of 4. The graded
+`softmax([logit_yes, logit_no])` is the entire signal, and it is currently unreachable.
+See `docs/todo/2026-09-02-rerank-is-cosine-not-reranking.md`.
+
 The plus marks are positional:
 
 - `+` means activation-aware clipping/scaling. The quantizer auto-enables AWQ
