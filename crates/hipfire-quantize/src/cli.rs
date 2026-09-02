@@ -59,7 +59,7 @@ use hipfire_quantize::hfq_out::parameter_counts_metadata;
 use hipfire_arch_api::{
     TensorRole, ARCH_ID_DEEPSEEK4_FLASH, ARCH_ID_DOTS_OCR, ARCH_ID_EMBEDDINGGEMMA,
     ARCH_ID_GEMMA3_TEXT, ARCH_ID_GEMMA3_VL, ARCH_ID_LFM2_MOE, ARCH_ID_LLAMA_MISTRAL,
-    ARCH_ID_MAMBA2, ARCH_ID_MINIMAX_M2, ARCH_ID_NEMOTRON_H, ARCH_ID_QWEN35_DENSE,
+    ARCH_ID_MAMBA2, ARCH_ID_MINIMAX_M2, ARCH_ID_NEMOTRON_H, ARCH_ID_QWEN2, ARCH_ID_QWEN35_DENSE,
     ARCH_ID_QWEN35_MOE, ARCH_ID_QWEN3_QWEN2_LEGACY, ARCH_ID_QWEN4EXP, ARCH_ID_ZAYA,
 };
 use hipfire_gguf as gguf_input;
@@ -9127,8 +9127,43 @@ pub fn main() {
     // (KLD 0.0105, beating plain oq4's 0.015). Neighbours: 0.05→0.0120,
     // 0.15→0.0108, 0.2→0.0175. So default nemotron_h to 0.1. An explicit
     // `--awq-alpha` always overrides.
+    // Architectures whose runtime does NOT divide the activation by `s`.
+    //
+    // AWQ pre-scales weights by `s` and the inference path must undo it —
+    // `(W·s)·(x/s) = W·x`. Where nothing applies the sidecar the model computes
+    // `(W·s)·x`, and the damage scales with how far `s` strays from 1: measured
+    // on the tiny fixtures, `oq8+` vs plain `oq8` is 1214x worse KLD on qwen2
+    // and 894x on dots_ocr, while architectures that DO consume the sidecars
+    // (qwen35, llama, gemma3/4) land between 0.56x and 1.03x.
+    //
+    // Proven to be AWQ and nothing else: `--awq-alpha 0` returns qwen2's `oq8+`
+    // to 0.00002762, which is plain `oq8` to the digit. Excluding only
+    // o_proj/down_proj (HIPFIRE_AWQ_F1_ONLY=1) halves it but leaves 257x, so the
+    // scales reach no projection on these paths.
+    //
+    // Defaulting alpha to 0 here produces an artifact the runtime can serve
+    // correctly, rather than one that is quietly wrong. An explicit
+    // `--awq-alpha` still overrides, so the experiment stays available for
+    // whoever wires the sidecars through these forward paths.
+    // See docs/bugs/2026-09-02-awq-prescaling-unconsumed.md.
+    const AWQ_UNCONSUMED_ARCHS: &[u32] = &[ARCH_ID_QWEN2, ARCH_ID_DOTS_OCR];
+    let awq_unconsumed = AWQ_UNCONSUMED_ARCHS.contains(&arch_id);
     if awq_enabled {
-        let default_alpha = if is_nemotron_h { 0.1f32 } else { 0.55f32 };
+        let default_alpha = if awq_unconsumed {
+            0.0f32
+        } else if is_nemotron_h {
+            0.1f32
+        } else {
+            0.55f32
+        };
+        if awq_unconsumed && awq_alpha_explicit.is_none() {
+            eprintln!(
+                "  AWQ: disabled for arch_id={arch_id} — this runtime does not apply the \
+                 `.awq_scale` sidecars, so pre-scaling would leave the model computing \
+                 (W*s)*x (measured 894-1214x worse KLD). Override with --awq-alpha <a> if \
+                 you are testing a build that consumes them."
+            );
+        }
         let awq_alpha = awq_alpha_explicit.unwrap_or(default_alpha);
         if !(0.0..=1.0).contains(&awq_alpha) {
             eprintln!(
