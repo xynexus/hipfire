@@ -38,7 +38,52 @@ spends real KLD for a size win that a lossless coding may match. **Measure
 `Bf16Lut3` against `Q8F16` for the embed on the same body** — if the sizes are
 close, the lossy fallback has no reason to exist.
 
-## 2. Build a conditioned embedding-gather quant
+## 1b. RESOLVED — Oq8G256 is the replacement (2026-09-04)
+
+`--embed-precision oq8` and `kernels/src/embedding_oq8g256.hip` ship it. Measured
+like-for-like on Qwen3.5-0.8B (`--no-coarse-lmhead` both sides):
+
+| embed | artifact | bpw | evalA kld | evalB kld |
+|---|---|---|---|---|
+| `q8f16` | 550.2 MB | 5.85 | 0.044851 | 0.036012 |
+| **`oq8`** | **536.3 MB** | **5.70** | 0.044887 | 0.036086 |
+
+13.9 MB smaller at indistinguishable quality, and the saving scales with
+vocab x dim (~56 MB at 9B). It also unifies the tied lm_head with the body's own
+W8A8 format, so a model no longer carries a second 8-bit encoding for the gather.
+
+The Bf16Lut3 idea in section 1 is NOT closed by this — that is the lossless
+option, and it is still worth measuring against `oq8` now that a rotated 8-bit
+gather exists to compare it to.
+
+## 2. ~~Build a conditioned embedding-gather quant~~ — RETRACTED
+
+**The prediction below was wrong and the measurement says so.** It read: "a
+rotated 4-bit gather format should therefore be materially cheaper than
+HFQ4G256, and the whole 27-42% penalty at 0.8B-2B is the headroom."
+
+Tested directly with `--embed-sim`, body fixed at oq4.25++ on Qwen3.5-0.8B:
+
+| codec | bpw | rel MSE | evalA kld | vs q8f16 |
+|---|---|---|---|---|
+| `hfq4` (unrotated) | 4.25 | 1.34e-2 | 0.075246 | +68.2% |
+| `mq4` (**rotated twin**, same layout) | 4.25 | 1.19e-2 | 0.077656 | +73.6% |
+| `oq4` (rotated symmetric) | 4.06 | 1.20e-2 | 0.074048 | +65.5% |
+
+Rotation buys 11% in reconstruction and **nothing in KLD** — `mq4` scores *worse*
+than the unrotated `hfq4` it was supposed to beat. All three 4-bit variants land
+at +65-74% regardless of conditioning, so the 4-bit tier is not a conditioning
+problem and a new 4-bit gather format would not fix it.
+
+What the sweep did find is that the useful tier is 6 bits: `oq6` costs +5.5% KLD
+for **2.44 fewer bits per weight** than q8f16 — a far better trade than anything
+at 4 bits. It is not shipped because it needs a GEMV as well as a gather (the
+tied head reads the same bytes), where `oq8` needed only the gather. That is the
+next candidate if the embed's share is worth more bits.
+
+### Old text, kept for the record
+
+### (superseded)
 
 The measured cost of dropping the embed from 8-bit to 4-bit, same `oq4.25` body,
 identical recipe across scale:
