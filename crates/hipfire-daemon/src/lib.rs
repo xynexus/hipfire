@@ -327,30 +327,17 @@ fn causal_lm_yes_no_rerank(
 
     let mut out = Vec::with_capacity(documents.len());
     for (index, document) in documents.iter().enumerate() {
-        let mut tokens = tokenizer.encode(&qwen3_reranker_prompt(INSTRUCTION, query, document));
+        let tokens = tokenizer.encode(&qwen3_reranker_prompt(INSTRUCTION, query, document));
         if tokens.is_empty() {
             return Err("rerank: prompt tokenized to nothing".to_string());
         }
-        // `forward_chunk_scored` scores `[scoring_start, len - 1)` — every position that
-        // has a next token INSIDE the chunk — so the last position is not scored. Append
-        // one token to give it a next, then score the position before it. The appended
-        // token is only a label: a causal model's logits at position n-1 cannot depend on
-        // position n.
-        let scoring_start = tokens.len() - 1;
-        tokens.push(YES_TOKEN as u32);
-
-        let mut score: Option<f32> = None;
-        scorer.forward_chunk_scored(gpu, &tokens, scoring_start, &mut |w| {
-            if score.is_none() && w.rows() > 0 {
-                score = Some(hipfire_serving_core::pooling::rerank_yes_no(
-                    w.row(0),
-                    YES_TOKEN,
-                    NO_TOKEN,
-                ));
-            }
-        })?;
+        // One batched prefill, then the logits it leaves at the final position. The
+        // earlier version drove `forward_chunk_scored`, whose teacher-forced walk costs a
+        // decode step per prompt token — measured at ~1.9 s per pair on a 0.6B, against
+        // the single forward this needs.
+        let logits = scorer.final_position_logits(gpu, &tokens)?;
         let relevance_score =
-            score.ok_or_else(|| "rerank: forward produced no scored position".to_string())?;
+            hipfire_serving_core::pooling::rerank_yes_no(&logits, YES_TOKEN, NO_TOKEN);
         out.push(RerankResult {
             index,
             relevance_score,
