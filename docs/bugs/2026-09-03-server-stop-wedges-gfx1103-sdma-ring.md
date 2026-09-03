@@ -69,6 +69,40 @@ reboot mid-session here.
   in-flight host↔device copies at SIGTERM. Whether the daemon can be made to
   quiesce SDMA before exiting — and whether that merely moves the timeout into
   the shutdown path — is untested.
+
+## A shutdown-ordering defect that is a candidate mechanism
+
+Found while looking for a drain; **not** proven to be today's cause, because
+nothing logged today's shutdown (`serve.log` was last written 08-31,
+`daemon.log` 09-02, and the running server's output went to neither).
+
+`hipfire stop` SIGTERMs the *server* pid, waits 5s, then SIGKILLs
+(`crates/hipfire-cli/src/commands/daemon.rs:221`). The server's own handler
+then unloads the daemon over the socket. `hipfire-daemon` installs **no**
+SIGTERM handler of its own, so it dies immediately if the signal reaches it.
+
+On 2026-08-31 the order came out inverted, and the graceful unload could not
+run at all:
+
+```
+05:06:48.052545 ERROR hipfire-daemon inference worker exited: signal: 15 (SIGTERM)
+05:06:48.052910 WARN  daemon resource_status failed: Broken pipe (os error 32)
+05:06:48.054456 INFO  shutdown signal received; unloading daemon and diffusion pipelines
+05:06:48.054492 WARN  daemon unload during shutdown failed: Broken pipe (os error 32)
+```
+
+The daemon was already gone 2ms before the server began unloading it, so the
+unload hit a broken pipe. If that is the general case rather than a one-off,
+then no `hipfire stop` ever completes a clean device teardown: the daemon is
+terminated with whatever DMA is in flight, which is the shape of the three
+unsignalled SDMA jobs above.
+
+Deliberately **not fixed here.** Two candidate fixes (a SIGTERM handler in the
+daemon that drains, or making the server's unload complete before the daemon
+can be signalled) both change shutdown ordering, and neither can be validated
+without reproducing a wedge that costs a reboot. Fixing shutdown blind, on a
+guess about a driver hang, is how a rare failure becomes a routine one. Recorded
+as the first thing to test once the mechanism can be reproduced cheaply.
 - **Whether `/srv` matters.** The wedged run loaded from the network mount, but
   the timeout preceded that process entirely, so there is no evidence either
   way. Naming it only so the next occurrence can be compared.
