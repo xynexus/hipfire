@@ -830,6 +830,10 @@ pub fn embed_token(
 ) -> HipResult<()> {
     let dim = cfg.hidden_size;
     match weights.embd_format {
+        EmbeddingFormat::Oq8G256 => panic!(
+            "Oq8G256 embedding gather is wired for qwen3.5 only; this arch has no oq8 \
+             gather path. Rebuild the artifact with --embed-precision q8."
+        ),
         EmbeddingFormat::HFQ4G256 => {
             gpu.embedding_lookup_hfq4g256(&weights.token_embd, dest, token, dim)?
         }

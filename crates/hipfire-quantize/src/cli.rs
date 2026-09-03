@@ -7699,6 +7699,7 @@ fn embed_precision_code_for(name: &str) -> Option<u8> {
         "f16" => 2,
         "hfq4" | "q4" => 4,
         "q8" => 5,
+        "oq8" => 6,
         _ => return None,
     })
 }
@@ -7711,6 +7712,65 @@ fn embed_precision_code_for(name: &str) -> Option<u8> {
 /// (ungrouped source precision) except for `hfq4`, which is 256-grouped. The
 /// runtime gathers these via the raw bf16/f16 embedding kernels (f32 in-kernel,
 /// portable across RDNA2/3/4), or `embedding_lookup_hfq4g256` for `hfq4`.
+/// `--embed-sim <codec>`: which candidate codec to round-trip the embed through.
+/// Experiment-only; the artifact stores bf16 either way, so this measures a
+/// candidate's QUALITY without anyone writing a gather kernel for it first.
+fn embed_sim_codec() -> Option<&'static str> {
+    static C: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        let args: Vec<String> = std::env::args().collect();
+        arg_value(&args, "--embed-sim").map(|s| s.to_string())
+    })
+    .as_deref()
+}
+
+/// Host dequant for Q8F16 (34 B per 32: f16 scale + 32 int8), plain affine.
+fn dequant_q8f16_host(data: &[u8], n: usize) -> Vec<f32> {
+    const G: usize = 32;
+    const BLK: usize = 34;
+    let mut out = vec![0.0f32; n];
+    for b in 0..n.div_ceil(G) {
+        let off = b * BLK;
+        if off + BLK > data.len() {
+            break;
+        }
+        let scale =
+            hipfire_primitives::conv::f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
+        for j in 0..G {
+            let idx = b * G + j;
+            if idx < n {
+                out[idx] = (data[off + 2 + j] as i8) as f32 * scale;
+            }
+        }
+    }
+    out
+}
+
+/// Host dequant for HFQ4G256 (136 B per 256: f32 scale + f32 min + 128 nibbles).
+fn dequant_hfq4g256_host(data: &[u8], n: usize) -> Vec<f32> {
+    const G: usize = 256;
+    const BLK: usize = 136;
+    let mut out = vec![0.0f32; n];
+    for b in 0..n.div_ceil(G) {
+        let off = b * BLK;
+        if off + BLK > data.len() {
+            break;
+        }
+        let rd = |o: usize| f32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
+        let (scale, min_val) = (rd(off), rd(off + 4));
+        for i in 0..128 {
+            let byte = data[off + 8 + i];
+            for (half_i, q) in [(0usize, byte & 0x0f), (1usize, byte >> 4)] {
+                let idx = b * G + 2 * i + half_i;
+                if idx < n {
+                    out[idx] = min_val + q as f32 * scale;
+                }
+            }
+        }
+    }
+    out
+}
+
 fn embed_precision_override(
     name: &str,
     raw_data: &[u8],
@@ -7730,6 +7790,55 @@ fn embed_precision_override(
             }
         }
     }
+    // `--embed-sim <codec>`: quantize the embedding table through a candidate
+    // codec, immediately DEQUANTIZE it, and store the result at bf16.
+    //
+    // The artifact is then bf16-sized but carries the exact reconstruction error
+    // of that codec, so a KLD score measures the codec's QUALITY end-to-end with
+    // no gather kernel written. Size is computed analytically from the block
+    // layout. This is how a candidate embed format earns a kernel before anyone
+    // writes one — see docs/todo/2026-09-03-the-embed-is-the-one-untreated-tensor.md.
+    if let Some(sim) = embed_sim_codec() {
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let n = f32_data.len();
+        let rt: Vec<f32> = match sim {
+            // Current default for Opus bodies: plain affine int8, group 32.
+            "q8f16" => dequant_q8f16_host(&quantize_q8f16(f32_data), n),
+            // Current 4-bit option: plain affine int4, group 256, UNROTATED.
+            "hfq4" => dequant_hfq4g256_host(&quantize_hfq4g256(f32_data), n),
+            // The rotated twin of hfq4 — identical 136 B/256 layout, FWHT applied.
+            "mq4" => dequant_mq4g256(&quantize_mq4g256(f32_data, &s1, &s2), n, &s1, &s2),
+            // Rotated symmetric int4, 130 B/256 (narrower than mq4).
+            "oq4" => dequant_oq4g256(&quantize_oq4g256(f32_data, &s1, &s2), n, &s1, &s2),
+            // Rotated symmetric int8 / int6 / int3, for the width sweep.
+            "oq8" => dequant_oq8g256(&quantize_oq8g256(f32_data, &s1, &s2), n, &s1, &s2),
+            "oq6" => dequant_oq6g256(&quantize_oq6g256(f32_data, &s1, &s2), n, &s1, &s2),
+            "oq3" => dequant_oq3g256(&quantize_oq3g256(f32_data, &s1, &s2), n, &s1, &s2),
+            other => {
+                eprintln!("--embed-sim: unknown codec {other:?} (q8f16|hfq4|mq4|oq4|oq6|oq8|oq3)");
+                std::process::exit(2);
+            }
+        };
+        let sq = |v: f64| v * v;
+        let err: f64 = f32_data
+            .iter()
+            .zip(&rt)
+            .map(|(a, b)| sq((*a - *b) as f64))
+            .sum::<f64>()
+            / n.max(1) as f64;
+        let energy: f64 = f32_data.iter().map(|a| sq(*a as f64)).sum::<f64>() / n.max(1) as f64;
+        eprintln!(
+            "  --embed-sim {sim}: {name} round-tripped, rel MSE {:.4e} (stored bf16)",
+            err / energy.max(1e-30)
+        );
+        return Some((
+            f32_slice_to_bf16_bytes(&rt),
+            QuantType::BF16,
+            0,
+            "EMBED_SIM",
+        ));
+    }
     match embed_precision_code() {
         // Unconfigured (library / unit-test callers that never run main): keep
         // whatever the caller would have done. NOT the same as an explicit
@@ -7747,7 +7856,27 @@ fn embed_precision_override(
         )),
         // f16 (force): always store as f16 (readers without a bf16 gather path).
         2 => Some((f32_slice_to_f16_bytes(f32_data), QuantType::F16, 0, "F16")),
-        // hfq4 (force): 4-bit FWHT-rotated gather table (HFQ4G256, 136 B/256 =
+        // oq8 (force): the Opus W8A8 gather table (Oq8G256, 258 B/256 = 8.06
+        // stored bits/weight). This is the measured replacement for the Q8F16
+        // default: on Qwen3.5-0.8B with the body held at oq4.25++, round-tripping
+        // the embed through each codec gave KLD 0.044724 for oq8 against 0.044742
+        // for q8f16 — the same quality at 0.44 fewer bits per weight, because
+        // Oq8 is symmetric with one f16 scale per 256 where Q8F16 spends one per
+        // 32. Served by `embedding_lookup_oq8g256`, which rotates back per group.
+        //
+        // It also unifies the tied lm_head with the body's own W8A8 format, so a
+        // model no longer carries a second 8-bit encoding just for the gather.
+        6 => {
+            let s1 = gen_fwht_signs(42, 256);
+            let s2 = gen_fwht_signs(1042, 256);
+            Some((
+                quantize_oq8g256(f32_data, &s1, &s2),
+                QuantType::Oq8G256,
+                256,
+                "OQ8G256",
+            ))
+        }
+        // hfq4 (force): 4-bit affine gather table (HFQ4G256, 136 B/256 =
         // 4.25 stored bits/weight). The ONE arm here that goes BELOW the Q8
         // default, and the reason it exists: on a tied-embedding model the embed
         // table is also the lm_head, and at a 248k vocab it dominates both the
@@ -7843,7 +7972,7 @@ OPTIONS:
     --beam <N>                 QTIP trellis beam-search width (default 128, near-Viterbi); lower =
                                much faster encode on big models, slight quality loss (env HIPFIRE_QTIP_BEAM)
     --arch-id <U32>            override the auto-detected arch id stamped in the .hfq header
-    --embed-precision <P>      embedding-table storage: source (default) | q8 | bf16 | f16 | hfq4.
+    --embed-precision <P>      embedding-table storage: source (default) | q8 | oq8 | bf16 | f16 | hfq4.
                                Default `source` keeps the gather table at the model's source
                                precision (bf16->bf16, f16->f16, f32->f32); `q8` drops it to the
                                ~500 MB-smaller Q8 table; bf16/f16 force a width. The embed seeds
@@ -7854,6 +7983,10 @@ OPTIONS:
                                HFQ4-G256, 4.25 stored bits/weight): on a tied-embedding model at a
                                large vocab the table dominates the artifact, and this is the only
                                way to get an average under 4 bits/weight. Opt-in, measure first.
+    --embed-sim <codec>        EXPERIMENT: round-trip the embed through a candidate codec
+                               (q8f16|hfq4|mq4|oq4|oq6|oq8|oq3) and store the result at bf16.
+                               Measures a candidate gather format's quality end-to-end
+                               without writing a gather kernel for it first.
     --norm-patch <file.json>   fold recovered RMSNorm weights in, a JSON object mapping
                                tensor name -> f32 array, as written by `hipfire-train`'s
                                qwen35_norm_recovery (light QAT:

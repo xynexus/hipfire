@@ -3449,6 +3449,12 @@ pub const EMBEDDING_Q4K_SRC: &str = include_str!("../../../kernels/src/embedding
 pub const EMBEDDING_HFQ4G256_SRC: &str =
     include_str!("../../../kernels/src/embedding_hfq4g256.hip");
 
+/// Oq8G256 (Opus W8A8) embedding gather. 258 B per 256 weights, symbols stored in
+/// the FWHT-rotated frame, so the kernel rotates back with the sign vectors
+/// swapped. Replaces Q8F16 for Opus bodies: measured same KLD at 0.44 fewer bits
+/// per weight (docs/reports/2026-09-03-qwen35-scale-study.html).
+pub const EMBEDDING_OQ8G256_SRC: &str = include_str!("../../../kernels/src/embedding_oq8g256.hip");
+
 /// Batched HFQ4-G256 embedding: dequantize N rows in one launch. Reads token ids
 /// from a device buffer so the launch is hipGraph-captureable — update the buffer
 /// between replays, replay the same graph. Writes into row-major `[N × dim]`.

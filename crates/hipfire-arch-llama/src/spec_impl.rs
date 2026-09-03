@@ -433,6 +433,9 @@ impl SpecTarget for LlamaBackend {
             EmbeddingFormat::Q8_0 => {
                 gpu.embedding_lookup_q8(&self.weights.token_embd, &dst, token_id, dim)
             }
+            EmbeddingFormat::Oq8G256 => {
+                gpu.embedding_lookup_oq8g256(&self.weights.token_embd, &dst, token_id, dim)
+            }
             EmbeddingFormat::BF16 => {
                 gpu.embedding_lookup_bf16(&self.weights.token_embd, &dst, token_id, dim)
             }

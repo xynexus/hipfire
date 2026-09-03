@@ -159,6 +159,86 @@ impl Gpu {
         }
         result
     }
+    /// Gather one row of an Oq8G256 embedding table.
+    ///
+    /// Unlike the other gather formats this one is stored FWHT-rotated, so the
+    /// caller must supply the same sign vectors the quantizer used (seeds 42 and
+    /// 1042); the kernel applies the inverse rotation per 256-group.
+    pub fn embedding_lookup_oq8g256(
+        &mut self,
+        table: &GpuTensor,
+        output: &GpuTensor,
+        token_id: u32,
+        dim: usize,
+    ) -> HipResult<()> {
+        assert_eq!(
+            dim % 256,
+            0,
+            "Oq8G256 embedding gather requires dim % 256 == 0"
+        );
+        self.bind_thread()?;
+        // Engine-fixed sign vectors, uploaded once and cached on the device.
+        if self.fwht_signs_256.is_none() {
+            let h1 = hipfire_primitives::fwht::gen_fwht_signs(42, 256);
+            let h2 = hipfire_primitives::fwht::gen_fwht_signs(1042, 256);
+            let d1 = self.upload_f32(&h1, &[256])?;
+            let d2 = self.upload_f32(&h2, &[256])?;
+            self.fwht_signs_256 = Some((d1, d2));
+        }
+        // Copy the pointers out before any &mut self call below.
+        let (mut s1, mut s2) = {
+            let (a, b) = self.fwht_signs_256.as_ref().expect("signs just cached");
+            (a.buf.as_ptr(), b.buf.as_ptr())
+        };
+        self.ensure_kernel(
+            "embedding_oq8g256",
+            kernels::EMBEDDING_OQ8G256_SRC,
+            "embedding_oq8g256",
+        )?;
+        let func = &self.functions["embedding_oq8g256"];
+        let mut tp = table.buf.as_ptr();
+        // The scales plane begins after the m*k int8 codes. `vocab` is recovered
+        // from the buffer itself rather than threaded through 16 call sites: the
+        // planar form is exactly m*(dim + dim/256*4) bytes, so m divides out.
+        let row_bytes = dim + (dim / 256) * 4;
+        let vocab = table.byte_size() / row_bytes;
+        debug_assert_eq!(
+            vocab * row_bytes,
+            table.byte_size(),
+            "Oq8 planar embedding table is not a whole number of rows"
+        );
+        let mut sp = unsafe { (tp as *const u8).add(vocab * dim) as *mut std::ffi::c_void };
+        let mut op = output.buf.as_ptr();
+        let mut tid = token_id as i32;
+        let mut d = dim as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut tp as *mut _ as *mut c_void,
+            &mut sp as *mut _ as *mut c_void,
+            &mut s1 as *mut _ as *mut c_void,
+            &mut s2 as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut tid as *mut _ as *mut c_void,
+            &mut d as *mut _ as *mut c_void,
+        ];
+        let bytes = dim + (dim / 256) * 4;
+        let timer =
+            crate::profile::begin_timer(&self.hip, "embedding", "embedding_lookup_oq8g256", bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [1, 1, 1],
+                [256, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Batched Q8_0 embedding lookup. Same hipGraph-captureable pattern as
     /// the HFQ4G256 variant. `output` shape: `[n × dim]` row-major.
     pub fn embedding_lookup_q8_batched(

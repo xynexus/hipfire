@@ -2509,6 +2509,15 @@ pub(crate) fn forward_prefill_chunk(
                     dim,
                 )?;
             }
+            EmbeddingFormat::Oq8G256 => {
+                gpu.embedding_lookup_q8_batched(
+                    &weights.token_embd,
+                    &pbs.x_batch,
+                    &pbs.tokens,
+                    n,
+                    dim,
+                )?;
+            }
             EmbeddingFormat::F32 => {
                 gpu.embedding_lookup_f32_batched(
                     &weights.token_embd,
@@ -2551,6 +2560,9 @@ pub(crate) fn forward_prefill_chunk(
                 }
                 EmbeddingFormat::Q8_0 => {
                     gpu.embedding_lookup_q8(&weights.token_embd, &s.x, tok, dim)?
+                }
+                EmbeddingFormat::Oq8G256 => {
+                    gpu.embedding_lookup_oq8g256(&weights.token_embd, &s.x, tok, dim)?
                 }
                 EmbeddingFormat::BF16 => {
                     gpu.embedding_lookup_bf16(&weights.token_embd, &s.x, tok, dim)?

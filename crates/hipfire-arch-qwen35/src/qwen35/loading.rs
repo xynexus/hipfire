@@ -4412,13 +4412,20 @@ pub fn load_weights(
                 .map(|t| t.quant_type)
         })
         .expect("embed_tokens not found");
-    let (token_embd, embd_fmt) = if let Some((qt, tensor)) =
-        load_gpu_tensor_from_slabs(slabs, "embed_tokens.weight")
+    // Same reason as the tied head below: the slab path yields raw interleaved
+    // Oq8 blocks, but the gather (and the head) read the planar layout.
+    let (token_embd, embd_fmt) = if let Some((qt, tensor)) = (embd_qt != 35)
+        .then(|| load_gpu_tensor_from_slabs(slabs, "embed_tokens.weight"))
+        .flatten()
     {
         match qt {
             6 => (tensor, EmbeddingFormat::HFQ4G256),
             7 => (tensor, EmbeddingFormat::HFQ4G128),
             3 => (tensor, EmbeddingFormat::Q8_0),
+            // Opus W8A8 gather table. The tied lm_head reads the same bytes
+            // through the ordinary Oq8G256 GEMV, so one encoding now serves both
+            // instead of Q8F16 for the gather and Opus for everything else.
+            35 => (tensor, EmbeddingFormat::Oq8G256),
             // Lossless BF16 recodings (Bf16Lut3=49 / Bf16Huff=50). These decode
             // to plain bf16, so expanding them to F32 doubles the resident
             // table for nothing: on Qwen3.8-27B's [248320, 5120] embedding
@@ -4491,6 +4498,25 @@ pub fn load_weights(
         (
             gpu.upload_raw(&embd_data, &[embd_data.len()])?,
             EmbeddingFormat::Q8_0,
+        )
+    } else if embd_qt == 35 {
+        // Opus W8A8 gather table, served raw by `embedding_lookup_oq8g256`.
+        // Must mirror the slab arm above: without it the qt falls through to the
+        // "expand to F32" path, which reads the blocks as plain floats and panics
+        // with `expected F16/F32/BF16 ... got qt=35`.
+        let (_, embd_data) =
+            qwen35_tensor_data_vec(hfq, "embed_tokens.weight").expect("embed_tokens not found");
+        loaded_bytes += embd_data.len();
+        // Convert to the PLANAR form the Opus kernels read — the same
+        // `oq8_combined` layout the body's Oq8 weights use, so the gather and the
+        // tied lm_head GEMV agree on the bytes. Uploading the interleaved on-disk
+        // blocks instead faults `gemv_oq8_grouped_v2`.
+        let combined =
+            hipfire_runtime::oq8_arch::oq8_combined(&embd_data, config.vocab_size, config.dim);
+        eprintln!("    (Oq8G256 planar, {} MB)", combined.len() / 1_000_000);
+        (
+            gpu.upload_raw(&combined, &[combined.len()])?,
+            EmbeddingFormat::Oq8G256,
         )
     } else if embd_qt == 49 || embd_qt == 50 {
         // Lossless BF16 recodings — see the slab arm above for the full
@@ -4610,12 +4636,22 @@ pub fn load_weights(
         }
     } else {
         eprintln!("  loading output (tied embeddings, qt={})...", embd_qt);
-        if let Some((matched_name, mut wt)) = load_weight_tensor_from_slabs(
-            slabs,
-            "embed_tokens.weight",
-            config.vocab_size,
-            config.dim,
-        ) {
+        // Oq8G256 must NOT take the slab path: the slab hands back the raw
+        // interleaved on-disk blocks, while every Opus kernel — including the
+        // tied head's `gemv_oq8_grouped_v2` — reads the planar `oq8_combined`
+        // layout. Uploading the interleaved form loads and then faults at the
+        // first head GEMV, which is exactly how this was found.
+        if let Some((matched_name, mut wt)) = (embd_qt != 35)
+            .then(|| {
+                load_weight_tensor_from_slabs(
+                    slabs,
+                    "embed_tokens.weight",
+                    config.vocab_size,
+                    config.dim,
+                )
+            })
+            .flatten()
+        {
             if wt.gpu_dtype.supports_awq_sidecar() {
                 wt.awq_scale = load_awq_scale_for(hfq, gpu, &matched_name, config.dim)
                     .or_else(|| load_awq_scale_for(hfq, gpu, "embed_tokens.weight", config.dim));
@@ -4727,6 +4763,28 @@ pub fn load_weights(
                 WeightTensor {
                     buf,
                     gpu_dtype: DType::Q8_0,
+                    m: config.vocab_size,
+                    k: config.dim,
+                    row_stride: 0,
+                    paro: None,
+                    awq_scale: None,
+                }
+            } else if embd_qt == 35 {
+                // Tied head over an Oq8G256 gather table. This is the payoff of
+                // using the body's own W8A8 format for the embed: the head needs
+                // no second encoding and no f32 expansion — the same bytes the
+                // gather reads are a valid Opus weight, served by the existing
+                // Oq8G256 GEMV. Without this arm it lands in the f32 fallback
+                // below, which the comment there measures at 24.8% of GPU time.
+                let combined = hipfire_runtime::oq8_arch::oq8_combined(
+                    &tied_data,
+                    config.vocab_size,
+                    config.dim,
+                );
+                let buf = gpu.upload_raw(&combined, &[combined.len()])?;
+                WeightTensor {
+                    buf,
+                    gpu_dtype: DType::Oq8G256,
                     m: config.vocab_size,
                     k: config.dim,
                     row_stride: 0,

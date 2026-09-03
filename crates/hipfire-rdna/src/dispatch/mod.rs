@@ -552,6 +552,11 @@ pub struct Gpu {
     /// infallible); `reclaim_pending()` returns them to `pool` at explicit,
     /// capture-gated forward boundaries. Belongs to this `Gpu` only.
     free_mailbox: FreeMailbox,
+    /// FWHT sign vectors (seeds 42 / 1042, 256 each) for the Oq8G256 embedding
+    /// gather, uploaded on first use. They are engine-fixed constants, so caching
+    /// them here keeps every gather call site free of the two extra tensors —
+    /// unlike the body's Opus path, a gather has no natural place to carry them.
+    fwht_signs_256: Option<(GpuTensor, GpuTensor)>,
     /// Calibration activation capture (Tier-1 collector). When `Some`, the
     /// instrumented linear dispatch arms (`gemv_f16_xf32`, `fused_qkvza_f16_xf32`,
     /// `fused_gate_up_f16_xf32`) resolve their weight buffer pointer to a tensor
@@ -1028,6 +1033,7 @@ impl Gpu {
             functions: HashMap::new(),
             pool: crate::pool::GpuPool::new(),
             free_mailbox: Arc::new(Mutex::new(Vec::new())),
+            fwht_signs_256: None,
             active_capture: None,
             capture_names: HashMap::new(),
             active_stream: None,
