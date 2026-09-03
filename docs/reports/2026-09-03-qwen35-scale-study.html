@@ -1,0 +1,260 @@
+<title>Quantization at Four Scales</title>
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;600&family=IBM+Plex+Serif:ital,wght@0,400;1,400&family=IBM+Plex+Mono:wght@400;600&display=swap">
+<style>
+:root{
+  --ink:#12161c; --ink2:#39434f; --muted:#66707d; --faint:#aab3bd;
+  --bg:#f7f8fa; --panel:#ffffff; --rule:#dfe4ea;
+  --accent:#00808f; --accent2:#b8730b; --warn:#a8552a;
+  --grid:#e7ebef;
+}
+:root:not([data-theme="light"]){ @media (prefers-color-scheme: dark){
+  --ink:#e9edf2; --ink2:#b9c3cd; --muted:#8b96a3; --faint:#5a636e;
+  --bg:#12161a; --panel:#171c22; --rule:#28313a;
+  --accent:#2ba9bd; --accent2:#cf9235; --warn:#d98a5e;
+  --grid:#242d36;
+}}
+:root[data-theme="dark"]{
+  --ink:#e9edf2; --ink2:#b9c3cd; --muted:#8b96a3; --faint:#5a636e;
+  --bg:#12161a; --panel:#171c22; --rule:#28313a;
+  --accent:#2ba9bd; --accent2:#cf9235; --warn:#d98a5e;
+  --grid:#242d36;
+}
+*{box-sizing:border-box}
+body{background:var(--bg); color:var(--ink);
+  font-family:"IBM Plex Serif",Georgia,serif; line-height:1.65; margin:0;}
+.wrap{max-width:860px; margin:0 auto; padding:56px 28px 96px;
+  display:flex; flex-direction:column; gap:38px;}
+h1,h2,h3,.eyebrow,.ax,.axsub,.ptitle,.val,.mono,th,.tag{font-family:"IBM Plex Sans",system-ui,sans-serif}
+h1{font-size:2.5rem; line-height:1.12; font-weight:600; margin:0; letter-spacing:-.02em; text-wrap:balance}
+h2{font-size:1.32rem; font-weight:600; margin:0 0 2px; letter-spacing:-.01em; text-wrap:balance}
+h3{font-size:1rem; font-weight:600; margin:0 0 4px}
+p{margin:0 0 14px; max-width:68ch}
+.eyebrow{font-size:.72rem; letter-spacing:.13em; text-transform:uppercase;
+  color:var(--muted); font-weight:600}
+.lede{font-size:1.12rem; color:var(--ink2); max-width:64ch}
+section{display:flex; flex-direction:column; gap:12px}
+.rule{height:1px; background:var(--rule); border:0; margin:0}
+figure{margin:0; background:var(--panel); border:1px solid var(--rule);
+  border-radius:6px; padding:20px 18px 14px; overflow-x:auto}
+figcaption{font-family:"IBM Plex Sans",sans-serif; font-size:.8rem; color:var(--muted);
+  margin-top:10px; max-width:70ch}
+svg{display:block; width:100%; height:auto}
+.grid{stroke:var(--grid); stroke-width:1}
+.ax{font-size:11px; fill:var(--muted)}
+.axsub{font-size:10px; fill:var(--faint)}
+.ptitle{font-size:12px; font-weight:600; fill:var(--ink2)}
+.miss{font-size:10px; fill:var(--warn); font-family:"IBM Plex Sans",sans-serif}
+.s1{fill:none; stroke:var(--accent); stroke-width:2}
+.s2{fill:none; stroke:var(--accent2); stroke-width:2; stroke-dasharray:5 3}
+.m1{fill:var(--accent); stroke:var(--panel); stroke-width:2}
+.m2{fill:var(--accent2); stroke:var(--panel); stroke-width:2}
+.lab1{font-size:11px; fill:var(--accent); font-family:"IBM Plex Sans",sans-serif}
+.lab2{font-size:11px; fill:var(--accent2); font-family:"IBM Plex Sans",sans-serif}
+.bar{fill:var(--accent)}
+.val{font-size:12px; font-weight:600; fill:var(--ink2)}
+.panels{display:grid; grid-template-columns:repeat(auto-fit,minmax(258px,1fr)); gap:12px}
+.panels figure{padding:12px 10px 6px}
+table{border-collapse:collapse; width:100%; font-size:.83rem;
+  font-family:"IBM Plex Mono",monospace; font-variant-numeric:tabular-nums}
+th{font-size:.7rem; text-transform:uppercase; letter-spacing:.07em; color:var(--muted);
+  text-align:left; padding:6px 10px; border-bottom:1px solid var(--rule); font-weight:600}
+td{padding:5px 10px; border-bottom:1px solid var(--rule); color:var(--ink2)}
+td:first-child{color:var(--ink); font-weight:600; font-family:"IBM Plex Sans",sans-serif}
+.num{text-align:right}
+.mono{font-family:"IBM Plex Mono",monospace}
+.key{border-left:2px solid var(--accent); padding:2px 0 2px 16px; margin:4px 0 10px}
+.key p{margin:0}
+.finding{display:flex; gap:14px; align-items:baseline}
+.finding .tag{font-size:.68rem; letter-spacing:.1em; text-transform:uppercase;
+  color:var(--accent); font-weight:600; white-space:nowrap; padding-top:3px}
+.note{font-size:.86rem; color:var(--muted); font-style:italic}
+code{font-family:"IBM Plex Mono",monospace; font-size:.88em;
+  background:var(--panel); border:1px solid var(--rule); border-radius:3px; padding:.5px 4px}
+.meta{font-family:"IBM Plex Mono",monospace; font-size:.76rem; color:var(--muted);
+  display:flex; flex-wrap:wrap; gap:6px 18px}
+@media (prefers-reduced-motion:no-preference){a,button{transition:color .15s}}
+:focus-visible{outline:2px solid var(--accent); outline-offset:2px}
+</style>
+
+<div class="wrap">
+
+<header style="display:flex;flex-direction:column;gap:14px">
+  <span class="eyebrow">hipfire · Qwen3.5 · measured 3–4 Sept 2026</span>
+  <h1>What survives when the model gets bigger</h1>
+  <p class="lede">Eighteen quantized artifacts across 0.8B, 2B, 4B and 9B, scored against
+  bf16 references on two held-out corpora. One finding from the 0.8B work does not
+  generalize — and it fails in a way that names the fix.</p>
+  <div class="meta">
+    <span>18 artifacts</span><span>4 model sizes</span>
+    <span>2 eval corpora · 32×2048 positions each</span><span>gfx1151 / 128 GB UMA</span>
+  </div>
+</header>
+
+<hr class="rule">
+
+<section>
+  <span class="eyebrow">The headline result</span>
+  <h2>The embedding lever is a small-model phenomenon</h2>
+  <p>Dropping the embedding table from 8-bit to 4-bit is the single largest size win
+  available on a small model — at 0.8B it removes 1.44 bits per weight from the whole
+  artifact. The 0.8B study concluded it was worth measuring before shipping. Across
+  scale, that conclusion inverts: the same substitution costs
+  <strong>6.5× less KLD at 9B than at 0.8B</strong>, and saves 3× fewer bits.</p>
+  <figure>
+    <svg viewBox="0 0 660 300" role="img" aria-label="Extra KLD from a 4-bit embedding table, by model size"><line x1="62" y1="254.0" x2="540" y2="254.0" class="grid"/><text x="52" y="258.0" class="ax" text-anchor="end">0.000</text><line x1="62" y1="187.1" x2="540" y2="187.1" class="grid"/><text x="52" y="191.1" class="ax" text-anchor="end">0.010</text><line x1="62" y1="120.3" x2="540" y2="120.3" class="grid"/><text x="52" y="124.3" class="ax" text-anchor="end">0.020</text><line x1="62" y1="53.4" x2="540" y2="53.4" class="grid"/><text x="52" y="57.4" class="ax" text-anchor="end">0.030</text><text x="62.0" y="276" class="ax" text-anchor="middle">0.8B</text><text x="62.0" y="292" class="axsub" text-anchor="middle">33.8% embed</text><text x="221.3" y="276" class="ax" text-anchor="middle">2B</text><text x="221.3" y="292" class="axsub" text-anchor="middle">27.0% embed</text><text x="380.7" y="276" class="ax" text-anchor="middle">4B</text><text x="380.7" y="292" class="axsub" text-anchor="middle">15.1% embed</text><text x="540.0" y="276" class="ax" text-anchor="middle">9B</text><text x="540.0" y="292" class="axsub" text-anchor="middle">11.4% embed</text><path d="M 62.0 64.0 L 221.3 48.2 L 380.7 140.7 L 540.0 224.7" class="s1"/><path d="M 62.0 53.6 L 221.3 61.8 L 380.7 144.6 L 540.0 206.3" class="s2"/><circle cx="62.0" cy="64.0" r="4.5" class="m1"/><circle cx="62.0" cy="53.6" r="4.5" class="m2"/><circle cx="221.3" cy="48.2" r="4.5" class="m1"/><circle cx="221.3" cy="61.8" r="4.5" class="m2"/><circle cx="380.7" cy="140.7" r="4.5" class="m1"/><circle cx="380.7" cy="144.6" r="4.5" class="m2"/><circle cx="540.0" cy="224.7" r="4.5" class="m1"/><circle cx="540.0" cy="206.3" r="4.5" class="m2"/><text x="552.0" y="228.7" class="lab1">wikitext</text><text x="552.0" y="210.3" class="lab2">multilingual</text><text x="52" y="16" class="axsub" text-anchor="end">Δ KLD</text></svg>
+    <figcaption>Extra KLD from a 4-bit (HFQ4G256) embedding table versus an 8-bit
+    (Q8F16) one, with the body held at an identical <code>oq4.25</code> recipe. Both
+    eval corpora agree. The x-axis is annotated with the embedding table's share of
+    total parameters — it falls from a third of the model to a ninth.</figcaption>
+  </figure>
+  <div class="key">
+    <p>Measured against each body's own KLD, the 4-bit embed costs <strong>+27%</strong>
+    at 0.8B, <strong>+42%</strong> at 2B, <strong>+23%</strong> at 4B and
+    <strong>+4.8%</strong> at 9B. At 9B it is very nearly free. Below 2B it is the
+    dominant error term in the artifact.</p>
+  </div>
+  <p class="note">The 0.8B→2B step rises before it falls. Parameter share alone does not
+  explain the curve — 2B holds 27% of its parameters in the embed but pays more than
+  0.8B's 34% does. Whatever sets the cost, it is not share alone.</p>
+</section>
+
+<hr class="rule">
+
+<section>
+  <span class="eyebrow">Why</span>
+  <h2>The embedding table is the only tensor that gets no treatment</h2>
+  <p>Every weight in the body is conditioned before it is quantized: an FWHT rotation to
+  spread outliers, AWQ activation-aware scaling, then Hessian/LDLQ error feedback. The
+  embedding table receives none of it. Asking for any Opus body routes the embed to plain
+  affine <code>Q8F16</code>, in one explicit branch:</p>
+  <figure style="padding:14px 16px"><pre style="margin:0;font-family:'IBM Plex Mono',monospace;font-size:.78rem;line-height:1.6;color:var(--ink2);overflow-x:auto">} <span style="color:var(--accent)">else if</span> (use_oq4 || use_opus_mixed || use_oq8 || use_oq8_plus) &amp;&amp; is_embed {
+    <span style="color:var(--muted)">// Embedding lookup has its own loader path. It supports Q8
+    // directly, while OQ4/OQ8 are GEMV/GEMM weight formats.</span>
+    <span style="color:var(--accent)">let</span> q = quantize_q8f16(&amp;f32_data);</pre></figure>
+  <p>Three independent confirmations that this is structural, not an oversight: the
+  eleven gather kernels in <code>kernels/src/</code> cover bf16, f16, f32, hfq4g128,
+  hfq4g256, q4k and q8 and include no Opus member; <code>--embed-precision</code> accepts
+  only <code>source | q8 | bf16 | f16 | hfq4</code>; and neither
+  <code>quantize_q8f16</code> nor <code>quantize_hfq4g256</code> calls
+  <code>cpu_fwht_256</code>. A gather reads one arbitrary row, while Opus formats are
+  rotated in 256-element groups along <em>k</em> — decodable, but by no kernel that exists.</p>
+  <div class="key">
+    <p>So this study measured <strong>untreated 8-bit against untreated 4-bit</strong>.
+    It is not a comparison of <code>oq8+</code> against <code>oq4+</code>, and the numbers
+    should not be read as one. The embed is also the tensor whose error matters most: it
+    seeds the residual stream unnormalized.</p>
+  </div>
+  <p>That combination — the largest untreated tensor, in the position where error is most
+  costly — is the headroom. The whole 27–42% penalty at 0.8B–2B sits on a table that has
+  never been rotated. The work is a gather kernel, not a codec.</p>
+</section>
+
+<hr class="rule">
+
+<section>
+  <span class="eyebrow">What generalizes</span>
+  <h2>Calibration holds its value at every size</h2>
+  <p>The opposite of the embedding result. Adding AWQ and Hessian/LDLQ to the same
+  <code>oq4.25</code> body cuts KLD by roughly half regardless of scale, with no downward
+  trend — and at 4B and 9B it is <em>free</em>, landing at identical bits per weight
+  (5.53 and 5.20) as the uncalibrated build.</p>
+  <figure>
+    <svg viewBox="0 0 660 230" role="img" aria-label="KLD reduction from AWQ plus LDLQ, by model size"><line x1="62" y1="186.0" x2="636" y2="186.0" class="grid"/><text x="52" y="190.0" class="ax" text-anchor="end">0%</text><line x1="62" y1="138.0" x2="636" y2="138.0" class="grid"/><text x="52" y="142.0" class="ax" text-anchor="end">20%</text><line x1="62" y1="90.0" x2="636" y2="90.0" class="grid"/><text x="52" y="94.0" class="ax" text-anchor="end">40%</text><line x1="62" y1="42.0" x2="636" y2="42.0" class="grid"/><text x="52" y="46.0" class="ax" text-anchor="end">60%</text><rect x="76.0" y="48.6" width="115.5" height="137.4" rx="4" class="bar"/><text x="133.8" y="39.6" class="val" text-anchor="middle">57%</text><text x="133.8" y="208" class="ax" text-anchor="middle">0.8B</text><rect x="219.5" y="46.7" width="115.5" height="139.3" rx="4" class="bar"/><text x="277.2" y="37.7" class="val" text-anchor="middle">58%</text><text x="277.2" y="208" class="ax" text-anchor="middle">2B</text><rect x="363.0" y="74.5" width="115.5" height="111.5" rx="4" class="bar"/><text x="420.8" y="65.5" class="val" text-anchor="middle">46%</text><text x="420.8" y="208" class="ax" text-anchor="middle">4B</text><rect x="506.5" y="45.6" width="115.5" height="140.4" rx="4" class="bar"/><text x="564.2" y="36.6" class="val" text-anchor="middle">59%</text><text x="564.2" y="208" class="ax" text-anchor="middle">9B</text><text x="52" y="16" class="axsub" text-anchor="end">KLD cut</text></svg>
+    <figcaption>KLD reduction from <code>--awq --ldlq</code> against a Hessian, versus the
+    same body without them. The dip at 4B is within the spread of the other three; there
+    is no trend with size.</figcaption>
+  </figure>
+  <p>This is worth stating plainly because it is the more useful half of the study: the
+  expensive part of the pipeline — building a calibration artifact and running error
+  feedback — pays the same dividend on a 9B model as on a 0.8B one. The cheap trick is
+  what stopped scaling, not the principled one.</p>
+</section>
+
+<hr class="rule">
+
+<section>
+  <span class="eyebrow">The ladder</span>
+  <h2>Quality against size, per model</h2>
+  <figure style="border:0;background:none;padding:0">
+    <div class="panels"><figure><svg viewBox="0 0 300 215" role="img" aria-label="KLD versus bits per weight for 0.8B"><line x1="46" y1="152.4" x2="284" y2="152.4" class="grid"/><text x="38" y="156.4" class="ax" text-anchor="end">0.001</text><line x1="46" y1="95.5" x2="284" y2="95.5" class="grid"/><text x="38" y="99.5" class="ax" text-anchor="end">0.01</text><line x1="46" y1="38.6" x2="284" y2="38.6" class="grid"/><text x="38" y="42.6" class="ax" text-anchor="end">0.1</text><text x="77.4" y="195" class="ax" text-anchor="middle">5</text><text x="122.3" y="195" class="ax" text-anchor="middle">6</text><text x="167.2" y="195" class="ax" text-anchor="middle">7</text><text x="212.2" y="195" class="ax" text-anchor="middle">8</text><text x="257.1" y="195" class="ax" text-anchor="middle">9</text><path d="M 81.9 19.9 L 111.6 31.5 L 115.6 58.4 L 176.2 37.4 L 228.8 160.7" class="s1"/><circle cx="81.9" cy="19.9" r="4" class="m1"/><circle cx="111.6" cy="31.5" r="4" class="m1"/><circle cx="115.6" cy="58.4" r="4" class="m1"/><circle cx="176.2" cy="37.4" r="4" class="m1"/><circle cx="228.8" cy="160.7" r="4" class="m1"/><text x="284" y="18" class="ptitle" text-anchor="end">0.8B</text></svg></figure><figure><svg viewBox="0 0 300 215" role="img" aria-label="KLD versus bits per weight for 2B"><line x1="46" y1="152.4" x2="284" y2="152.4" class="grid"/><text x="38" y="156.4" class="ax" text-anchor="end">0.001</text><line x1="46" y1="95.5" x2="284" y2="95.5" class="grid"/><text x="38" y="99.5" class="ax" text-anchor="end">0.01</text><line x1="46" y1="38.6" x2="284" y2="38.6" class="grid"/><text x="38" y="42.6" class="ax" text-anchor="end">0.1</text><text x="77.4" y="195" class="ax" text-anchor="middle">5</text><text x="122.3" y="195" class="ax" text-anchor="middle">6</text><text x="167.2" y="195" class="ax" text-anchor="middle">7</text><text x="212.2" y="195" class="ax" text-anchor="middle">8</text><text x="257.1" y="195" class="ax" text-anchor="middle">9</text><path d="M 61.7 42.8 L 95.4 37.5 L 146.6 46.1 L 147.0 67.5 L 271.9 171.8" class="s1"/><circle cx="61.7" cy="42.8" r="4" class="m1"/><circle cx="95.4" cy="37.5" r="4" class="m1"/><circle cx="146.6" cy="46.1" r="4" class="m1"/><circle cx="147.0" cy="67.5" r="4" class="m1"/><circle cx="271.9" cy="171.8" r="4" class="m1"/><text x="284" y="18" class="ptitle" text-anchor="end">2B</text></svg></figure><figure><svg viewBox="0 0 300 215" role="img" aria-label="KLD versus bits per weight for 4B"><line x1="46" y1="152.4" x2="284" y2="152.4" class="grid"/><text x="38" y="156.4" class="ax" text-anchor="end">0.001</text><line x1="46" y1="95.5" x2="284" y2="95.5" class="grid"/><text x="38" y="99.5" class="ax" text-anchor="end">0.01</text><line x1="46" y1="38.6" x2="284" y2="38.6" class="grid"/><text x="38" y="42.6" class="ax" text-anchor="end">0.1</text><text x="77.4" y="195" class="ax" text-anchor="middle">5</text><text x="122.3" y="195" class="ax" text-anchor="middle">6</text><text x="167.2" y="195" class="ax" text-anchor="middle">7</text><text x="212.2" y="195" class="ax" text-anchor="middle">8</text><text x="257.1" y="195" class="ax" text-anchor="middle">9</text><path d="M 72.0 41.5 L 101.2 62.1 L 101.2 46.7 L 246.7 147.4" class="s1"/><circle cx="72.0" cy="41.5" r="4" class="m1"/><circle cx="101.2" cy="62.1" r="4" class="m1"/><circle cx="101.2" cy="46.7" r="4" class="m1"/><circle cx="246.7" cy="147.4" r="4" class="m1"/><text x="284" y="18" class="ptitle" text-anchor="end">4B</text><text x="46" y="209" class="miss">qtip3 not built — OOM</text></svg></figure><figure><svg viewBox="0 0 300 215" role="img" aria-label="KLD versus bits per weight for 9B"><line x1="46" y1="152.4" x2="284" y2="152.4" class="grid"/><text x="38" y="156.4" class="ax" text-anchor="end">0.001</text><line x1="46" y1="95.5" x2="284" y2="95.5" class="grid"/><text x="38" y="99.5" class="ax" text-anchor="end">0.01</text><line x1="46" y1="38.6" x2="284" y2="38.6" class="grid"/><text x="38" y="42.6" class="ax" text-anchor="end">0.1</text><text x="77.4" y="195" class="ax" text-anchor="middle">5</text><text x="122.3" y="195" class="ax" text-anchor="middle">6</text><text x="167.2" y="195" class="ax" text-anchor="middle">7</text><text x="212.2" y="195" class="ax" text-anchor="middle">8</text><text x="257.1" y="195" class="ax" text-anchor="middle">9</text><path d="M 64.9 40.0 L 86.4 62.9 L 86.4 41.1 L 238.2 134.3" class="s1"/><circle cx="64.9" cy="40.0" r="4" class="m1"/><circle cx="86.4" cy="62.9" r="4" class="m1"/><circle cx="86.4" cy="41.1" r="4" class="m1"/><circle cx="238.2" cy="134.3" r="4" class="m1"/><text x="284" y="18" class="ptitle" text-anchor="end">9B</text><text x="46" y="209" class="miss">qtip3 not built — OOM</text></svg></figure></div>
+    <figcaption style="margin-top:12px">KLD (log scale, wikitext) against bits per weight.
+    Each panel is one model; the axes are shared, so panels are directly comparable. Lower
+    and further left is better. <code>oq8++</code> anchors the top of every ladder at
+    0.0005–0.002 KLD — effectively lossless at every scale tested.</figcaption>
+  </figure>
+  <p>Two panels are short a point. The <code>qtip3</code> builds for 4B and 9B were killed
+  by the OOM guard described below, and are the one gap in the matrix. Where qtip3 does
+  appear it improves with scale — 0.2137 at 0.8B against 0.0845 at 2B, at
+  <em>lower</em> bits per weight — which is the opposite of the embedding trend and worth
+  finishing.</p>
+</section>
+
+<hr class="rule">
+
+<section>
+  <span class="eyebrow">Infrastructure</span>
+  <h2>Two things the study broke</h2>
+  <div class="finding"><span class="tag">OOM</span><div>
+    <h3>The quantizer has no memory guard and takes the desktop with it</h3>
+    <p>Quantizing 4B to <code>qtip3</code> with greedy conditioning exhausted the shared
+    UMA pool and triggered a <em>global</em> OOM: wireplumber, pipewire, dbus-daemon and
+    the user session manager were all killed, twice, each time requiring a reboot. On this
+    part GPU memory and system RAM are one pool, so a KFD allocation evicts the desktop.
+    The loader already has exactly the right guard — <code>load_mem_reserve_gib</code>,
+    documented as existing so a too-large load "fails as a refusal rather than a reaping" —
+    and the quantizer has no equivalent. Running the remaining builds under
+    <code>choom -n 1000</code> made the job the OOM victim instead; both later failures
+    were clean <code>exit=137</code> with the session intact.</p>
+  </div></div>
+  <div class="finding"><span class="tag">Scheduling</span><div>
+    <h3>Quantization and QAT are not daemon operations</h3>
+    <p>The daemon already schedules <code>kld_eval</code>, <code>calibrate</code>,
+    <code>train_drafter</code> and <code>train_lora</code>. Quantization is a standalone
+    binary and QAT is a training example, so neither queues behind the scheduler — they
+    contend with it for one advisory lock. The daemon <em>refuses</em> rather than waits
+    on a held lock, which silently produced empty scores for seven of eight artifacts in
+    an early pass; the service takes the lock at boot, so offline builds fail until it is
+    stopped by hand; and two pipelines raced on one output file because nothing arbitrates
+    one-quantize-at-a-time.</p>
+  </div></div>
+</section>
+
+<hr class="rule">
+
+<section>
+  <span class="eyebrow">Full results</span>
+  <h2>Every artifact scored</h2>
+  <figure style="padding:8px 4px">
+  <table>
+    <thead><tr><th>Model</th><th>Variant</th><th class="num">bpw</th><th class="num">MB</th>
+    <th class="num">KLD wikitext</th><th class="num">KLD multi</th><th class="num">ppl</th></tr></thead>
+    <tbody><tr><td>0.8B</td><td class="mono">oq8++</td><td class="num">8.37</td><td class="num">787</td><td class="num">0.000713</td><td class="num">0.000580</td><td class="num">15.392</td></tr><tr><td>0.8B</td><td class="mono">oq4.25++</td><td class="num">5.85</td><td class="num">550</td><td class="num">0.044851</td><td class="num">0.036012</td><td class="num">15.604</td></tr><tr><td>0.8B</td><td class="mono">oq4.25</td><td class="num">7.20</td><td class="num">677</td><td class="num">0.104902</td><td class="num">0.086163</td><td class="num">15.811</td></tr><tr><td>0.8B</td><td class="mono">oq4.25 e4</td><td class="num">5.76</td><td class="num">542</td><td class="num">0.133318</td><td class="num">0.116135</td><td class="num">16.243</td></tr><tr><td>0.8B</td><td class="mono">qtip3</td><td class="num">5.10</td><td class="num">480</td><td class="num">0.213688</td><td class="num">0.174551</td><td class="num">18.642</td></tr><tr><td>2B</td><td class="mono">oq8++</td><td class="num">9.33</td><td class="num">2,195</td><td class="num">0.000455</td><td class="num">0.000382</td><td class="num">10.467</td></tr><tr><td>2B</td><td class="mono">oq4.25++</td><td class="num">6.55</td><td class="num">1,540</td><td class="num">0.031044</td><td class="num">0.024064</td><td class="num">10.591</td></tr><tr><td>2B</td><td class="mono">oq4.25</td><td class="num">6.54</td><td class="num">1,540</td><td class="num">0.073999</td><td class="num">0.064235</td><td class="num">11.610</td></tr><tr><td>2B</td><td class="mono">oq4.25 e4</td><td class="num">5.40</td><td class="num">1,269</td><td class="num">0.104788</td><td class="num">0.092986</td><td class="num">12.093</td></tr><tr><td>2B</td><td class="mono">qtip3</td><td class="num">4.65</td><td class="num">1,093</td><td class="num">0.084532</td><td class="num">0.068539</td><td class="num">11.290</td></tr><tr><td>4B</td><td class="mono">oq8++</td><td class="num">8.77</td><td class="num">4,608</td><td class="num">0.001223</td><td class="num">0.001073</td><td class="num">8.657</td></tr><tr><td>4B</td><td class="mono">oq4.25++</td><td class="num">5.53</td><td class="num">2,907</td><td class="num">0.038689</td><td class="num">0.029433</td><td class="num">8.643</td></tr><tr><td>4B</td><td class="mono">oq4.25</td><td class="num">5.53</td><td class="num">2,906</td><td class="num">0.072249</td><td class="num">0.075170</td><td class="num">9.123</td></tr><tr><td>4B</td><td class="mono">oq4.25 e4</td><td class="num">4.88</td><td class="num">2,568</td><td class="num">0.089189</td><td class="num">0.091536</td><td class="num">9.321</td></tr><tr><td>9B</td><td class="mono">oq8++</td><td class="num">8.58</td><td class="num">9,606</td><td class="num">0.002082</td><td class="num">0.002410</td><td class="num">7.352</td></tr><tr><td>9B</td><td class="mono">oq4.25++</td><td class="num">5.20</td><td class="num">5,824</td><td class="num">0.037494</td><td class="num">0.053485</td><td class="num">7.477</td></tr><tr><td>9B</td><td class="mono">oq4.25</td><td class="num">5.20</td><td class="num">5,821</td><td class="num">0.090381</td><td class="num">0.098933</td><td class="num">7.707</td></tr><tr><td>9B</td><td class="mono">oq4.25 e4</td><td class="num">4.72</td><td class="num">5,281</td><td class="num">0.094761</td><td class="num">0.106075</td><td class="num">7.792</td></tr></tbody>
+  </table>
+  </figure>
+  <p class="note">All bodies at <code>--embed-precision q8</code> unless marked
+  <code>e4</code>. <code>oq4.25</code> without a Hessian does not reach 4.25 bpw — the
+  compact mixed packing needs the calibration path — which is why its bits per weight run
+  high. The embedding comparison is unaffected: it is a within-model delta at a fixed body.</p>
+</section>
+
+<hr class="rule">
+
+<section>
+  <span class="eyebrow">What to do</span>
+  <h2>Three consequences</h2>
+  <p><strong>Build a conditioned embedding gather.</strong> The embed is the largest
+  untreated tensor and sits where error costs most. A rotated 4-bit gather format should
+  be materially cheaper than HFQ4, and the payoff is concentrated below 4B, which is
+  exactly where a 4-bit embed is currently unaffordable.</p>
+  <p><strong>Replace the Q8F16 fallback with Bf16Lut3.</strong> <code>Q8F16</code> is
+  lossy; <code>Bf16Lut3</code> is a lossless recoding already plumbed for this tensor —
+  <code>expand_bf16_index</code> keeps a LUT3 head packed by default and its own comment
+  notes the tied gather decodes it at load. Routing Opus bodies to a lossy fallback spends
+  real KLD for a size win a lossless coding may match.</p>
+  <p><strong>Don't spend the small-model embedding trick on large models.</strong> At 9B
+  the 4-bit embed buys 0.48 bpw for +4.8% KLD, which is a reasonable trade; at 2B it buys
+  1.14 bpw for +42%, which is not. The recommendation in <code>QUANTIZE.md</code> should
+  carry the scale caveat.</p>
+</section>
+
+</div>

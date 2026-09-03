@@ -1,0 +1,380 @@
+[
+ {
+  "model": "0.8B",
+  "variant": "e8--oq4.25",
+  "mb": 677.2,
+  "bpw": 7.2,
+  "evalA-wikitext": {
+   "kld": 0.104902,
+   "p99": 0.143565,
+   "ppl": 15.8107
+  },
+  "evalB-multi": {
+   "kld": 0.086163,
+   "p99": 0.14715,
+   "ppl": 13.9947
+  },
+  "params_m": 752.4,
+  "dim": 1024,
+  "layers": 24,
+  "embed_m": 254.3,
+  "embed_frac": 0.3379851143009038
+ },
+ {
+  "model": "0.8B",
+  "variant": "e4--oq4.25",
+  "mb": 542.2,
+  "bpw": 5.76,
+  "evalA-wikitext": {
+   "kld": 0.133318,
+   "p99": 0.179739,
+   "ppl": 16.2431
+  },
+  "evalB-multi": {
+   "kld": 0.116135,
+   "p99": 0.187077,
+   "ppl": 14.4654
+  },
+  "params_m": 752.4,
+  "dim": 1024,
+  "layers": 24,
+  "embed_m": 254.3,
+  "embed_frac": 0.3379851143009038
+ },
+ {
+  "model": "0.8B",
+  "variant": "e8--oq8++",
+  "mb": 787.3,
+  "bpw": 8.37,
+  "evalA-wikitext": {
+   "kld": 0.000713,
+   "p99": 0.000907,
+   "ppl": 15.3924
+  },
+  "evalB-multi": {
+   "kld": 0.00058,
+   "p99": 0.001262,
+   "ppl": 12.8647
+  },
+  "params_m": 752.4,
+  "dim": 1024,
+  "layers": 24,
+  "embed_m": 254.3,
+  "embed_frac": 0.3379851143009038
+ },
+ {
+  "model": "0.8B",
+  "variant": "e8--oq4.25++",
+  "mb": 550.2,
+  "bpw": 5.85,
+  "evalA-wikitext": {
+   "kld": 0.044851,
+   "p99": 0.067777,
+   "ppl": 15.6039
+  },
+  "evalB-multi": {
+   "kld": 0.036012,
+   "p99": 0.105039,
+   "ppl": 13.4803
+  },
+  "params_m": 752.4,
+  "dim": 1024,
+  "layers": 24,
+  "embed_m": 254.3,
+  "embed_frac": 0.3379851143009038
+ },
+ {
+  "model": "0.8B",
+  "variant": "e8--qtip3",
+  "mb": 479.6,
+  "bpw": 5.1,
+  "evalA-wikitext": {
+   "kld": 0.213688,
+   "p99": 0.303075,
+   "ppl": 18.6416
+  },
+  "evalB-multi": {
+   "kld": 0.174551,
+   "p99": 0.321158,
+   "ppl": 15.7673
+  },
+  "params_m": 752.4,
+  "dim": 1024,
+  "layers": 24,
+  "embed_m": 254.3,
+  "embed_frac": 0.3379851143009038
+ },
+ {
+  "model": "2B",
+  "variant": "e8--oq4.25",
+  "mb": 1539.5,
+  "bpw": 6.54,
+  "evalA-wikitext": {
+   "kld": 0.073999,
+   "p99": 0.095955,
+   "ppl": 11.6101
+  },
+  "evalB-multi": {
+   "kld": 0.064235,
+   "p99": 0.089347,
+   "ppl": 11.2235
+  },
+  "params_m": 1881.8,
+  "dim": 2048,
+  "layers": 24,
+  "embed_m": 508.6,
+  "embed_frac": 0.27027314273567865
+ },
+ {
+  "model": "2B",
+  "variant": "e4--oq4.25",
+  "mb": 1269.3,
+  "bpw": 5.4,
+  "evalA-wikitext": {
+   "kld": 0.104788,
+   "p99": 0.132317,
+   "ppl": 12.093
+  },
+  "evalB-multi": {
+   "kld": 0.092986,
+   "p99": 0.128062,
+   "ppl": 11.5879
+  },
+  "params_m": 1881.8,
+  "dim": 2048,
+  "layers": 24,
+  "embed_m": 508.6,
+  "embed_frac": 0.27027314273567865
+ },
+ {
+  "model": "2B",
+  "variant": "e8--oq8++",
+  "mb": 2194.7,
+  "bpw": 9.33,
+  "evalA-wikitext": {
+   "kld": 0.000455,
+   "p99": 0.000807,
+   "ppl": 10.4669
+  },
+  "evalB-multi": {
+   "kld": 0.000382,
+   "p99": 0.000866,
+   "ppl": 10.3754
+  },
+  "params_m": 1881.8,
+  "dim": 2048,
+  "layers": 24,
+  "embed_m": 508.6,
+  "embed_frac": 0.27027314273567865
+ },
+ {
+  "model": "2B",
+  "variant": "e8--oq4.25++",
+  "mb": 1540.5,
+  "bpw": 6.55,
+  "evalA-wikitext": {
+   "kld": 0.031044,
+   "p99": 0.041505,
+   "ppl": 10.591
+  },
+  "evalB-multi": {
+   "kld": 0.024064,
+   "p99": 0.088294,
+   "ppl": 10.6462
+  },
+  "params_m": 1881.8,
+  "dim": 2048,
+  "layers": 24,
+  "embed_m": 508.6,
+  "embed_frac": 0.27027314273567865
+ },
+ {
+  "model": "2B",
+  "variant": "e8--qtip3",
+  "mb": 1092.7,
+  "bpw": 4.65,
+  "evalA-wikitext": {
+   "kld": 0.084532,
+   "p99": 0.117405,
+   "ppl": 11.2905
+  },
+  "evalB-multi": {
+   "kld": 0.068539,
+   "p99": 0.198227,
+   "ppl": 11.1456
+  },
+  "params_m": 1881.8,
+  "dim": 2048,
+  "layers": 24,
+  "embed_m": 508.6,
+  "embed_frac": 0.27027314273567865
+ },
+ {
+  "model": "4B",
+  "variant": "e8--oq4.25",
+  "mb": 2905.6,
+  "bpw": 5.53,
+  "evalA-wikitext": {
+   "kld": 0.072249,
+   "p99": 0.29226,
+   "ppl": 9.1226
+  },
+  "evalB-multi": {
+   "kld": 0.07517,
+   "p99": 0.275524,
+   "ppl": 9.6495
+  },
+  "params_m": 4205.8,
+  "dim": 2560,
+  "layers": 32,
+  "embed_m": 635.7,
+  "embed_frac": 0.15114841409482144
+ },
+ {
+  "model": "4B",
+  "variant": "e4--oq4.25",
+  "mb": 2567.9,
+  "bpw": 4.88,
+  "evalA-wikitext": {
+   "kld": 0.089189,
+   "p99": 0.295515,
+   "ppl": 9.3213
+  },
+  "evalB-multi": {
+   "kld": 0.091536,
+   "p99": 0.275292,
+   "ppl": 9.8208
+  },
+  "params_m": 4205.8,
+  "dim": 2560,
+  "layers": 32,
+  "embed_m": 635.7,
+  "embed_frac": 0.15114841409482144
+ },
+ {
+  "model": "4B",
+  "variant": "e8--oq8++",
+  "mb": 4608.3,
+  "bpw": 8.77,
+  "evalA-wikitext": {
+   "kld": 0.001223,
+   "p99": 0.012932,
+   "ppl": 8.6574
+  },
+  "evalB-multi": {
+   "kld": 0.001073,
+   "p99": 0.013701,
+   "ppl": 9.1251
+  },
+  "params_m": 4205.8,
+  "dim": 2560,
+  "layers": 32,
+  "embed_m": 635.7,
+  "embed_frac": 0.15114841409482144
+ },
+ {
+  "model": "4B",
+  "variant": "e8--oq4.25++",
+  "mb": 2907.4,
+  "bpw": 5.53,
+  "evalA-wikitext": {
+   "kld": 0.038689,
+   "p99": 0.129798,
+   "ppl": 8.6429
+  },
+  "evalB-multi": {
+   "kld": 0.029433,
+   "p99": 0.161489,
+   "ppl": 9.2107
+  },
+  "params_m": 4205.8,
+  "dim": 2560,
+  "layers": 32,
+  "embed_m": 635.7,
+  "embed_frac": 0.15114841409482144
+ },
+ {
+  "model": "9B",
+  "variant": "e8--oq4.25",
+  "mb": 5821.4,
+  "bpw": 5.2,
+  "evalA-wikitext": {
+   "kld": 0.090381,
+   "p99": 0.420499,
+   "ppl": 7.7075
+  },
+  "evalB-multi": {
+   "kld": 0.098933,
+   "p99": 0.523864,
+   "ppl": 8.7879
+  },
+  "params_m": 8953.8,
+  "dim": 4096,
+  "layers": 32,
+  "embed_m": 1017.1,
+  "embed_frac": 0.11359422814894236
+ },
+ {
+  "model": "9B",
+  "variant": "e4--oq4.25",
+  "mb": 5281.1,
+  "bpw": 4.72,
+  "evalA-wikitext": {
+   "kld": 0.094761,
+   "p99": 0.446629,
+   "ppl": 7.7917
+  },
+  "evalB-multi": {
+   "kld": 0.106075,
+   "p99": 0.529925,
+   "ppl": 8.8218
+  },
+  "params_m": 8953.8,
+  "dim": 4096,
+  "layers": 32,
+  "embed_m": 1017.1,
+  "embed_frac": 0.11359422814894236
+ },
+ {
+  "model": "9B",
+  "variant": "e8--oq8++",
+  "mb": 9605.8,
+  "bpw": 8.58,
+  "evalA-wikitext": {
+   "kld": 0.002082,
+   "p99": 0.027207,
+   "ppl": 7.3524
+  },
+  "evalB-multi": {
+   "kld": 0.00241,
+   "p99": 0.031365,
+   "ppl": 8.4112
+  },
+  "params_m": 8953.8,
+  "dim": 4096,
+  "layers": 32,
+  "embed_m": 1017.1,
+  "embed_frac": 0.11359422814894236
+ },
+ {
+  "model": "9B",
+  "variant": "e8--oq4.25++",
+  "mb": 5824.0,
+  "bpw": 5.2,
+  "evalA-wikitext": {
+   "kld": 0.037494,
+   "p99": 0.243712,
+   "ppl": 7.4768
+  },
+  "evalB-multi": {
+   "kld": 0.053485,
+   "p99": 0.296925,
+   "ppl": 8.6092
+  },
+  "params_m": 8953.8,
+  "dim": 4096,
+  "layers": 32,
+  "embed_m": 1017.1,
+  "embed_frac": 0.11359422814894236
+ }
+]
