@@ -669,9 +669,6 @@ pub fn prefill_forward(
                 EmbeddingFormat::Oq8G256 => {
                     gpu.embedding_lookup_oq8g256(&weights.token_embd, &x_single, token, dim)?
                 }
-                EmbeddingFormat::Oq8G256 => {
-                    gpu.embedding_lookup_oq8g256(&weights.token_embd, &x_single, token, dim)?
-                }
                 EmbeddingFormat::BF16 => {
                     gpu.embedding_lookup_bf16(&weights.token_embd, &x_single, token, dim)?
                 }
@@ -2534,9 +2531,6 @@ pub fn forward_scratch_embed(
         }
         EmbeddingFormat::Q8_0 => {
             gpu.embedding_lookup_q8(&weights.token_embd, &scratch.x, token, dim)?
-        }
-        EmbeddingFormat::Oq8G256 => {
-            gpu.embedding_lookup_oq8g256(&weights.token_embd, &scratch.x, token, dim)?
         }
         EmbeddingFormat::Oq8G256 => {
             gpu.embedding_lookup_oq8g256(&weights.token_embd, &scratch.x, token, dim)?
