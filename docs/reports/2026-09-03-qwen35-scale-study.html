@@ -145,8 +145,8 @@ code{font-family:"IBM Plex Mono",monospace; font-size:.88em;
     seeds the residual stream unnormalized.</p>
   </div>
   <p>That combination — the largest untreated tensor, in the position where error is most
-  costly — is the headroom. The whole 27–42% penalty at 0.8B–2B sits on a table that has
-  never been rotated. The work is a gather kernel, not a codec.</p>
+  costly — looked like headroom, so it was tested directly rather than left as an
+  inference. It is not, at 4 bits: see the follow-up below.</p>
 </section>
 
 <hr class="rule">
@@ -240,12 +240,58 @@ code{font-family:"IBM Plex Mono",monospace; font-size:.88em;
 <hr class="rule">
 
 <section>
+  <span class="eyebrow">Follow-up · measured after publication</span>
+  <h2>The prediction above was wrong. Rotation does not rescue a 4-bit embed.</h2>
+  <p>Rather than infer it, each candidate was round-tripped through its codec with the
+  result stored at bf16 — the artifact is bf16-sized but carries that codec's exact
+  reconstruction error, so a KLD score measures a candidate's quality with no gather kernel
+  written for it. The method validates by construction: the <code>q8f16</code> simulation
+  scores 0.044742 against the real q8-embed artifact's 0.044851, same body.</p>
+  <figure style="padding:8px 4px">
+  <table>
+    <thead><tr><th>Candidate</th><th class="num">bpw</th><th class="num">rel MSE</th>
+    <th class="num">KLD wikitext</th><th class="num">vs q8f16</th></tr></thead>
+    <tbody>
+      <tr><td>q8f16</td><td class="num">8.50</td><td class="num">3.10e-5</td><td class="num">0.044742</td><td class="num">—</td></tr>
+      <tr><td>oq8</td><td class="num">8.06</td><td class="num">4.85e-5</td><td class="num">0.044724</td><td class="num">−0.0%</td></tr>
+      <tr><td>oq6</td><td class="num">6.06</td><td class="num">7.96e-4</td><td class="num">0.047184</td><td class="num">+5.5%</td></tr>
+      <tr><td>oq4</td><td class="num">4.06</td><td class="num">1.20e-2</td><td class="num">0.074048</td><td class="num">+65.5%</td></tr>
+      <tr><td>mq4 <span style="color:var(--warn)">(rotated hfq4)</span></td><td class="num">4.25</td><td class="num">1.19e-2</td><td class="num">0.077656</td><td class="num">+73.6%</td></tr>
+      <tr><td>hfq4</td><td class="num">4.25</td><td class="num">1.34e-2</td><td class="num">0.075246</td><td class="num">+68.2%</td></tr>
+      <tr><td>oq3</td><td class="num">3.12</td><td class="num">—</td><td class="num">0.171120</td><td class="num">+282.5%</td></tr>
+    </tbody>
+  </table>
+  </figure>
+  <p><code>mq4</code> is the FWHT-rotated twin of <code>hfq4</code> at identical width and
+  layout, so it isolates rotation as the only variable. It reconstructs 11% better and
+  scores <strong>worse</strong> — 0.0777 against 0.0752. All three 4-bit variants land at
+  +65–74% regardless of conditioning, so the 4-bit tier is not a conditioning problem and a
+  new 4-bit gather format would not have fixed it.</p>
+  <div class="key">
+    <p>Shipped instead: <code>Oq8G256</code> as the embedding gather.
+    Like-for-like on Qwen3.5-0.8B, <strong>550.2 MB → 536.3 MB</strong> (5.85 → 5.70 bpw)
+    at indistinguishable quality (kld 0.044851 → 0.044887). The saving is 0.44 bpw of the
+    embed table, so it grows with vocab × dim — roughly 56 MB at 9B. It also unifies the
+    tied lm_head with the body's own W8A8 format, so a model stops carrying a second 8-bit
+    encoding just for the gather.</p>
+  </div>
+  <p class="note">The useful untested tier is 6 bits: <code>oq6</code> costs +5.5% KLD for
+  <strong>2.44 fewer bits per weight</strong>, a far better trade than anything at 4 bits.
+  It is unbuilt because it needs a GEMV as well as a gather — the tied head reads the same
+  bytes — where <code>oq8</code> needed only the gather.</p>
+</section>
+
+<hr class="rule">
+
+<section>
   <span class="eyebrow">What to do</span>
   <h2>Three consequences</h2>
-  <p><strong>Build a conditioned embedding gather.</strong> The embed is the largest
-  untreated tensor and sits where error costs most. A rotated 4-bit gather format should
-  be materially cheaper than HFQ4, and the payoff is concentrated below 4B, which is
-  exactly where a 4-bit embed is currently unaffordable.</p>
+  <p><strong>A conditioned embedding gather — built, and it landed at 8 bits, not 4.</strong>
+  This section originally predicted that a rotated 4-bit gather would be materially cheaper
+  than HFQ4. That was tested and is <em>false</em>; the correction is the section above.
+  What the sweep did find is a free win one tier up: <code>Oq8G256</code> matches Q8F16's
+  quality at 0.44 fewer bits per weight, and now ships as
+  <code>--embed-precision oq8</code>.</p>
   <p><strong>Replace the Q8F16 fallback with Bf16Lut3.</strong> <code>Q8F16</code> is
   lossy; <code>Bf16Lut3</code> is a lossless recoding already plumbed for this tensor —
   <code>expand_bf16_index</code> keeps a LUT3 head packed by default and its own comment
