@@ -14,6 +14,48 @@ The 2026-08-29 multi-agent hunt is summarized in
 `docs/bugs/2026-08-29-bug-hunt-summary.md` — including one finding it REFUTED and
 the eight search dimensions that never ran.
 
+## `[chat_template] using …` was logged for templates that never reached the prompt
+
+**RESOLVED by #411 (logging).** Found 2026-09-04 while testing whether a shared chat
+template unifies Qwen tool-call shapes across 3.5/3.6/3.8. Kept in full rather than
+tombstoned, because the wrong conclusions it caused are the reusable part.
+
+**What it looked like.** Setting `HIPFIRE_CHAT_TEMPLATE_FILE` printed
+`[chat_template] using HIPFIRE_CHAT_TEMPLATE_FILE={path}` and changed nothing the model
+saw. Baking the same template into the artifact with `hfq meta-set --key tokenizer_config`
+did not either. Measured for `Qwen3.5-9B--oq4.25++`: a canary system turn in the template
+(*"reply with exactly ZQCANARY7431"*) was ignored, and `usage.prompt_tokens` was **17**
+under the env override, under the baked-in template, and under the stock artifact alike.
+
+**What it actually was — not a rendering bug.** Jinja chat rendering is gated on
+`HIPFIRE_JINJA_CHAT=1` (`qwen35_prefill.rs:300`, `generate.rs:101/541/1609`), which is off
+by default; the prompt is otherwise built by the hand-rolled `prompt_frame::ChatFrame`,
+and the resolved template feeds only stop-policy profiling. With the flag on, the same
+canary is obeyed exactly and `prompt_tokens` goes 17 → 37. The mechanism was never broken.
+
+**Deliberately not "fixed" by flipping the default.**
+`crates/hipfire-runtime/templates/eval/DURABILITY-2026-06-09.md` records Jinja rendering as
+"not yet flip-the-default ready" for reasons orthogonal to any template — the
+cache-under-jinja wiring does not exist, and a `| tojson` tool-render skew should be fixed
+first. #411 makes the log state what the template will affect and warns when an explicit
+override cannot reach the prompt.
+
+**The part worth keeping: three wrong conclusions, each from trusting a log line.**
+
+1. *"Forcing the template changed nothing, so the shape is not template-determined."*
+   The template was never applied. Recorded downstream in Corrode as a finding.
+2. *"Baking into the artifact DOES take effect."* Written into an earlier revision of
+   THIS entry, from the log line `using HFQ-embedded tokenizer_config.chat_template` —
+   i.e. the same error, inside the report of it. Disproved by baking a canary in and
+   watching it be ignored.
+3. *"The Jinja template does not drive prompt rendering on this path at all."* Also
+   written here, also wrong: it drives rendering whenever the flag is set.
+
+The daemon environment and the log line both confirmed adoption in every case. Only a
+canary **inside the template** distinguished loaded from used, which is the general
+lesson: to test whether a config reaches a model, put something in it the model must
+echo.
+
 ## Hunt coverage gaps — what the method could NOT reach
 
 **Written 2026-08-29 by the completeness critic (planned for wave 1, died with its
