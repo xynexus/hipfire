@@ -984,19 +984,25 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
     ),
     field!(
         "jinja_chat",
-        ConfigType::Bool,
+        ConfigType::Enum {
+            values: &["auto", "off", "on"]
+        },
         Requirement::Optional,
-        Some("false"),
+        Some("auto"),
         GLOBAL_MODEL_RUNTIME,
         ConfigMutability::LoadTime,
         "Render prompts with the model's Jinja chat template instead of the hand-rolled \
-         ChatFrame scaffold. OFF by default: templates/eval/DURABILITY-2026-06-09.md \
-         records Jinja rendering as not yet flip-the-default ready, pending the \
-         cache-under-jinja wiring and a `| tojson` tool-render skew fix. Worth setting \
-         per model under `model_overrides` where tool calling matters — with it off the \
-         template's `{% if tools %}` branch never fires, so the model is never told a \
-         tool exists and improvises call syntax as free text. Was reachable only as \
-         HIPFIRE_JINJA_CHAT, which still overrides this when set."
+         ChatFrame scaffold. `auto` (the default) lets the model's architecture decide, \
+         which is not one answer: Qwen3.5 uses the scaffold — \
+         templates/eval/DURABILITY-2026-06-09.md records Jinja as not yet \
+         flip-the-default ready there, pending cache-under-jinja wiring and a `| tojson` \
+         tool-render skew fix — while every other family renders the template it ships. \
+         `on` is worth setting per model under `model_overrides` where tool calling \
+         matters: with the scaffold the template's `{% if tools %}` branch never fires, \
+         so the model is never told a tool exists and improvises call syntax as free \
+         text. `off` forces the scaffold. A model shipping no chat template always gets \
+         the scaffold. Was reachable only as HIPFIRE_JINJA_CHAT, which still overrides \
+         this when set."
     ),
     field!(
         "chat_template_file",

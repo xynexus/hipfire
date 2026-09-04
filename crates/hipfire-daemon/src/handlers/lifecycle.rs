@@ -724,17 +724,22 @@ pub(crate) fn load(
             // are already folded in. Reading the environment inside the render sites, as
             // this used to, cannot see a per-model override at all.
             let params = msg.get("params");
-            m.jinja_chat = hipfire_serving_core::load::resolve_jinja_chat(
+            let configured_jinja = hipfire_serving_core::load::resolve_jinja_chat(
                 params
                     .and_then(|p| p.get("jinja_chat"))
                     .and_then(|v| v.as_bool()),
             );
+            // Asked before the template is (possibly) replaced below, so the question is
+            // "would this model render a template if it had one" — hence the `true`.
+            let renders_template =
+                hipfire_model::chat_prompt_policy(m.arch_id, true, configured_jinja)
+                    == hipfire_model::ChatPromptPolicy::Jinja;
             // A configured template replaces the embedded one, and the stop-policy
             // profile is recomputed from it — a profile derived from the template that
             // was replaced would drive stop handling for text the model never emits.
             // Only meaningful while jinja rendering is on, which is the sole path where a
             // template renders the prompt.
-            if m.jinja_chat {
+            if renders_template {
                 if let Some(path) = params
                     .and_then(|p| p.get("chat_template_file"))
                     .and_then(|v| v.as_str())
@@ -756,6 +761,14 @@ pub(crate) fn load(
                     }
                 }
             }
+            // Resolved last: the template-file override above can hand a model a
+            // template it did not ship, and a model with no template renders no
+            // template whatever the setting says.
+            m.chat_prompt = hipfire_model::chat_prompt_policy(
+                m.arch_id,
+                m.chat_template.is_some(),
+                configured_jinja,
+            );
             // Default the scope to the model's own filename: two models share a
             // table only when an operator says so, because token ids mean
             // nothing across tokenizers.

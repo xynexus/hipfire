@@ -31,10 +31,10 @@ use hipfire_arch_qwen35::speculative::{
 };
 use hipfire_arch_qwen35_vl::qwen35_vl;
 use hipfire_model::{
-    arch_features, is_qwen35_dense_arch_id, is_qwen35_family_arch_id, FeatureSupport,
-    ARCH_ID_DEEPSEEK4_FLASH, ARCH_ID_DOTS_OCR, ARCH_ID_EMBEDDINGGEMMA, ARCH_ID_GEMMA3_TEXT,
-    ARCH_ID_GEMMA3_VL, ARCH_ID_LFM2_MOE, ARCH_ID_MAMBA2, ARCH_ID_MINIMAX_M2, ARCH_ID_NEMOTRON_H,
-    ARCH_ID_ZAYA,
+    arch_features, is_qwen35_dense_arch_id, is_qwen35_family_arch_id, ChatPromptPolicy,
+    FeatureSupport, ARCH_ID_DEEPSEEK4_FLASH, ARCH_ID_DOTS_OCR, ARCH_ID_EMBEDDINGGEMMA,
+    ARCH_ID_GEMMA3_TEXT, ARCH_ID_GEMMA3_VL, ARCH_ID_LFM2_MOE, ARCH_ID_MAMBA2, ARCH_ID_MINIMAX_M2,
+    ARCH_ID_NEMOTRON_H, ARCH_ID_ZAYA,
 };
 use hipfire_prompt as prompt_frame;
 use hipfire_runtime::cask::CaskCtx;
@@ -258,18 +258,31 @@ fn lfm2_triattn_kv_layer_ids(config: &lfm2moe::config::Lfm2MoeConfig) -> Vec<usi
     (0..config.num_attention_layers()).collect()
 }
 
-/// Is Jinja chat rendering on for this model?
+/// The operator's explicit answer on Jinja chat rendering, or `None` for "auto —
+/// let the arch decide" ([`hipfire_model::chat_prompt_policy`]).
 ///
 /// Env wins so an operator can force it without editing config; otherwise the resolved
-/// `jinja_chat` setting, which `model_overrides` can set per model. `None` means the
-/// caller had no resolved config to offer, which reproduces the previous env-only
-/// behaviour exactly.
-pub fn resolve_jinja_chat(configured: Option<bool>) -> bool {
+/// `jinja_chat` setting, which `model_overrides` can set per model. `None` in means the
+/// caller had no resolved config to offer.
+///
+/// `HIPFIRE_JINJA_CHAT` used to be read at each render site, where it meant opposite
+/// things: `== "1"` on the qwen35 paths (opt in) and `!= "0"` everywhere else (opt out).
+/// Both spellings still do what they did; anything else is not an answer and falls
+/// through to config, where it used to mean "off" on one set of paths and "on" on the
+/// other.
+pub fn resolve_jinja_chat(configured: Option<bool>) -> Option<bool> {
     match std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() {
-        Some("1") => true,
-        Some(_) => false,
-        None => configured.unwrap_or(false),
+        Some("1") => Some(true),
+        Some("0") => Some(false),
+        _ => configured,
     }
+}
+
+/// Framing for a freshly-loaded model, before the daemon has applied the per-model
+/// config it resolved. Daemon loads recompute this in `handlers::lifecycle`; every
+/// other caller (eval, examples, tests) keeps this answer.
+pub fn seed_chat_prompt(arch_id: u32, chat_template: &Option<String>) -> ChatPromptPolicy {
+    hipfire_model::chat_prompt_policy(arch_id, chat_template.is_some(), resolve_jinja_chat(None))
 }
 
 /// Resolve the effective chat template for a model: the HFQ-embedded
@@ -1252,7 +1265,7 @@ pub fn load_model(
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
-            jinja_chat: resolve_jinja_chat(None),
+            chat_prompt: seed_chat_prompt(hfq.arch_id, &chat_template),
             arch_id: hfq.arch_id,
             registered_backend: None,
             pp: 1,
@@ -1404,7 +1417,7 @@ pub fn load_model(
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
-            jinja_chat: resolve_jinja_chat(None),
+            chat_prompt: seed_chat_prompt(hfq.arch_id, &chat_template),
             arch_id: hfq.arch_id,
             registered_backend: None,
             pp: 1,
@@ -1524,7 +1537,7 @@ pub fn load_model(
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
-            jinja_chat: resolve_jinja_chat(None),
+            chat_prompt: seed_chat_prompt(hfq.arch_id, &chat_template),
             arch_id: hfq.arch_id,
             registered_backend: Some(registered_backend),
             pp: 1,
@@ -1624,7 +1637,7 @@ pub fn load_model(
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
-            jinja_chat: resolve_jinja_chat(None),
+            chat_prompt: seed_chat_prompt(hfq.arch_id, &chat_template),
             arch_id: hfq.arch_id,
             registered_backend: None,
             pp: 1,
@@ -1755,7 +1768,7 @@ pub fn load_model(
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
-            jinja_chat: resolve_jinja_chat(None),
+            chat_prompt: seed_chat_prompt(hfq.arch_id, &chat_template),
             arch_id: hfq.arch_id,
             registered_backend: None,
             pp: 1,
@@ -1858,7 +1871,7 @@ pub fn load_model(
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
-            jinja_chat: resolve_jinja_chat(None),
+            chat_prompt: seed_chat_prompt(hfq.arch_id, &chat_template),
             arch_id: hfq.arch_id,
             registered_backend: None,
             pp: 1,
@@ -1974,7 +1987,7 @@ pub fn load_model(
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
-            jinja_chat: resolve_jinja_chat(None),
+            chat_prompt: seed_chat_prompt(hfq.arch_id, &chat_template),
             arch_id: hfq.arch_id,
             registered_backend: None,
             pp: 1,
@@ -2077,7 +2090,7 @@ pub fn load_model(
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
-            jinja_chat: resolve_jinja_chat(None),
+            chat_prompt: seed_chat_prompt(hfq.arch_id, &chat_template),
             arch_id: hfq.arch_id,
             registered_backend: None,
             pp: 1,
@@ -2201,7 +2214,7 @@ pub fn load_model(
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
-            jinja_chat: resolve_jinja_chat(None),
+            chat_prompt: seed_chat_prompt(hfq.arch_id, &chat_template),
             arch_id: hfq.arch_id,
             registered_backend: None,
             pp: 1,
@@ -2331,7 +2344,7 @@ pub fn load_model(
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
-            jinja_chat: resolve_jinja_chat(None),
+            chat_prompt: seed_chat_prompt(hfq.arch_id, &chat_template),
             arch_id: hfq.arch_id,
             registered_backend: None,
             pp: 1,
@@ -2574,7 +2587,7 @@ pub fn load_model(
             let (chat_template, chat_template_profile) =
                 profile_chat_template(chat_template, Some(&tokenizer));
             return Ok(LoadedModel {
-                jinja_chat: resolve_jinja_chat(None),
+                chat_prompt: seed_chat_prompt(hfq.arch_id, &chat_template),
                 arch_id: hfq.arch_id,
                 registered_backend: None,
                 pp: 1,
@@ -2973,7 +2986,7 @@ pub fn load_model(
             Some(Box::new(dn)),
         ));
         Ok(LoadedModel {
-            jinja_chat: resolve_jinja_chat(None),
+            chat_prompt: seed_chat_prompt(hfq.arch_id, &chat_template),
             arch_id: hfq.arch_id,
             registered_backend: None,
             pp: 1,
@@ -3134,7 +3147,7 @@ pub fn load_model(
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
         Ok(LoadedModel {
-            jinja_chat: resolve_jinja_chat(None),
+            chat_prompt: seed_chat_prompt(hfq.arch_id, &chat_template),
             arch_id: hfq.arch_id,
             registered_backend: None,
             pp: 1,
@@ -3614,7 +3627,7 @@ pub fn load_model_pp(
         Some(Box::new(dn)),
     ));
     Ok(LoadedModel {
-        jinja_chat: resolve_jinja_chat(None),
+        chat_prompt: seed_chat_prompt(hfq.arch_id, &chat_template),
         arch_id: hfq.arch_id,
         registered_backend: None,
         pp,
@@ -4621,5 +4634,26 @@ mod admission_tests {
 
         assert_eq!(config.num_attention_layers(), 2);
         assert_eq!(lfm2_triattn_kv_layer_ids(&config), vec![0, 1]);
+    }
+
+    /// Both env spellings that were live at the render sites still mean what they
+    /// meant, and only those two are an answer — anything else defers to config.
+    /// Serial because it mutates the process environment.
+    #[test]
+    fn resolve_jinja_chat_honours_both_legacy_env_spellings() {
+        let saved = std::env::var("HIPFIRE_JINJA_CHAT").ok();
+        std::env::set_var("HIPFIRE_JINJA_CHAT", "1");
+        assert_eq!(resolve_jinja_chat(Some(false)), Some(true));
+        std::env::set_var("HIPFIRE_JINJA_CHAT", "0");
+        assert_eq!(resolve_jinja_chat(Some(true)), Some(false));
+        std::env::set_var("HIPFIRE_JINJA_CHAT", "yes");
+        assert_eq!(resolve_jinja_chat(Some(true)), Some(true));
+        assert_eq!(resolve_jinja_chat(None), None);
+        std::env::remove_var("HIPFIRE_JINJA_CHAT");
+        assert_eq!(resolve_jinja_chat(Some(true)), Some(true));
+        assert_eq!(resolve_jinja_chat(None), None);
+        if let Some(v) = saved {
+            std::env::set_var("HIPFIRE_JINJA_CHAT", v);
+        }
     }
 }

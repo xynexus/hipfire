@@ -222,8 +222,8 @@ fn default_thinking() -> String {
 fn default_gpu_slab_load() -> String {
     "auto".to_string()
 }
-fn default_jinja_chat() -> bool {
-    false
+fn default_jinja_chat() -> String {
+    "auto".to_string()
 }
 
 fn default_prompt_normalize() -> bool {
@@ -510,10 +510,12 @@ pub struct HipfireConfig {
     #[serde(default = "default_gpu_slab_load")]
     pub gpu_slab_load: String,
     /// Render prompts through the model's Jinja chat template rather than the
-    /// hand-rolled ChatFrame. Off by default (see the schema entry); the env var
+    /// hand-rolled ChatFrame: `auto` | `on` | `off`. `auto` (the default) defers to
+    /// the model's architecture, which does not answer the same way for every
+    /// family — see `hipfire_model::chat_prompt_policy`. The env var
     /// `HIPFIRE_JINJA_CHAT` still overrides it.
     #[serde(default = "default_jinja_chat")]
-    pub jinja_chat: bool,
+    pub jinja_chat: String,
     /// Chat template to use instead of the artifact's embedded one. Only meaningful
     /// while `jinja_chat` is on, since that is the only path where a template renders
     /// the prompt.

@@ -108,6 +108,17 @@ secret = false
 restart_impact = "none"
 
 [[field]]
+key = "chat_template_file"
+type = "path(Exists)"
+requirement = "optional"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Jinja chat template to use instead of the one embedded in the artifact. Takes effect only when `jinja_chat` is on, since the template drives prompt rendering only there — otherwise it feeds stop-policy profiling alone. Set it per model under `model_overrides` to fix one model without touching the rest. Was reachable only as HIPFIRE_CHAT_TEMPLATE_FILE, which still overrides this."
+secret = false
+restart_impact = "none"
+
+[[field]]
 key = "cors_allowed_origins"
 type = "json"
 requirement = "optional"
@@ -201,6 +212,18 @@ mutability = "static"
 owner = "hipfire-config"
 description = "Bind host for the OpenAI-compatible HTTP server. Defaults to loopback; set to 0.0.0.0 to expose on all interfaces."
 validation = "valid IP address or hostname"
+secret = false
+restart_impact = "none"
+
+[[field]]
+key = "jinja_chat"
+type = "enum(auto|off|on)"
+requirement = "optional"
+default = "auto"
+scopes = ["global", "model", "runtime"]
+mutability = "load_time"
+owner = "hipfire-config"
+description = "Render prompts with the model's Jinja chat template instead of the hand-rolled ChatFrame scaffold. `auto` (the default) lets the model's architecture decide, which is not one answer: Qwen3.5 uses the scaffold — templates/eval/DURABILITY-2026-06-09.md records Jinja as not yet flip-the-default ready there, pending cache-under-jinja wiring and a `| tojson` tool-render skew fix — while every other family renders the template it ships. `on` is worth setting per model under `model_overrides` where tool calling matters: with the scaffold the template's `{% if tools %}` branch never fires, so the model is never told a tool exists and improvises call syntax as free text. `off` forces the scaffold. A model shipping no chat template always gets the scaffold. Was reachable only as HIPFIRE_JINJA_CHAT, which still overrides this when set."
 secret = false
 restart_impact = "none"
 
