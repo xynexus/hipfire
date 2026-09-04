@@ -204,6 +204,29 @@
     "env": []
   },
   {
+    "key": "chat_template_file",
+    "type": {
+      "kind": "path",
+      "existence": "exists"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": null,
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Jinja chat template to use instead of the one embedded in the artifact. Takes effect only when `jinja_chat` is on, since the template drives prompt rendering only there — otherwise it feeds stop-policy profiling alone. Set it per model under `model_overrides` to fix one model without touching the rest. Was reachable only as HIPFIRE_CHAT_TEMPLATE_FILE, which still overrides this.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
     "key": "cors_allowed_origins",
     "type": {
       "kind": "json"
@@ -400,6 +423,28 @@
     "owner": "hipfire-config",
     "description": "Bind host for the OpenAI-compatible HTTP server. Defaults to loopback; set to 0.0.0.0 to expose on all interfaces.",
     "validation": "valid IP address or hostname",
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
+    "key": "jinja_chat",
+    "type": {
+      "kind": "bool"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "false",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Render prompts with the model's Jinja chat template instead of the hand-rolled ChatFrame scaffold. OFF by default: templates/eval/DURABILITY-2026-06-09.md records Jinja rendering as not yet flip-the-default ready, pending the cache-under-jinja wiring and a `| tojson` tool-render skew fix. Worth setting per model under `model_overrides` where tool calling matters — with it off the template's `{% if tools %}` branch never fires, so the model is never told a tool exists and improvises call syntax as free text. Was reachable only as HIPFIRE_JINJA_CHAT, which still overrides this when set.",
+    "validation": null,
     "secret": false,
     "restart_impact": "none",
     "env": []
