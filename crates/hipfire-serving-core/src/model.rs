@@ -646,6 +646,12 @@ pub struct LoadedModel {
     // VL paths still hit the Plain scaffold.
     pub chat_template: Option<String>,
     pub chat_template_profile: Option<prompt_frame::ChatTemplateProfile>,
+    /// Whether this model renders prompts through its Jinja chat template, resolved from
+    /// config (`jinja_chat`, settable per model under `model_overrides`) with
+    /// `HIPFIRE_JINJA_CHAT` still winning when set. Carried on the model rather than read
+    /// from the environment at each render site, so a per-model override actually
+    /// reaches the decision — an env read cannot see one.
+    pub jinja_chat: bool,
 }
 
 impl LoadedModel {
