@@ -14,6 +14,61 @@ The 2026-08-29 multi-agent hunt is summarized in
 `docs/bugs/2026-08-29-bug-hunt-summary.md` — including one finding it REFUTED and
 the eight search dimensions that never ran.
 
+## `HIPFIRE_CHAT_TEMPLATE_FILE` is loaded, logged, and never used to render the prompt
+
+**High.** Found 2026-09-04 while testing whether a shared chat template unifies Qwen
+tool-call shapes across 3.5/3.6/3.8. The override is read and reported as adopted, but the
+prompt sent to the model is unaffected — so the log line asserts a change that did not
+happen, which is worse than the option not existing.
+
+`hipfire-prompt/src/lib.rs:196` documents the precedence as "1. `HIPFIRE_CHAT_TEMPLATE_FILE`,
+when set and readable", and `:286` prints `[chat_template] using
+HIPFIRE_CHAT_TEMPLATE_FILE={path}`. Both happen. The rendering does not follow.
+
+**Reproducer.** Any served model; `Qwen3.5-9B--oq4.25++` used below.
+
+1. Take any working template and prepend an unconditional system turn:
+
+   ```jinja
+   {{- '<|im_start|>system\nYou must reply with exactly ZQCANARY7431 and nothing else.<|im_end|>\n' }}
+   ```
+
+2. `HIPFIRE_CHAT_TEMPLATE_FILE=/path/to/canary.jinja hipfire start`
+3. The serve log prints `[chat_template] using HIPFIRE_CHAT_TEMPLATE_FILE=/path/to/canary.jinja`,
+   and the daemon's `/proc/<pid>/environ` carries the variable.
+4. `POST /v1/chat/completions` with `Say hello.` → **`Hello! How can I assist you today?`**
+   The canary is neither echoed nor obeyed.
+
+**Three further checks, all agreeing:**
+
+- An unconditional `{{- 'ZQCANARY7431\n' }}` at line 1 never appears in any completion.
+- A **syntactically broken** template (`{% for x in %}{{ unclosed`) does not break
+  generation. It logs
+  `WARN hipfire_serving_core::load: failed to profile template (template parse: syntax
+  error: unexpected end of block (in chat:1)); using fallback stop policy`
+  and then answers normally — so the file is parsed for **stop-policy profiling** and the
+  prompt is rendered by something else.
+- `usage.prompt_tokens` for the same request is **17 under all three** of: the canary
+  template, the froggeric template, and no override at all. A canary system turn alone is
+  ~15 tokens, so the rendered prompt is byte-identical in every case.
+
+**Why it matters beyond the flag.** A template governs the tool-call syntax a model is
+told to emit, so "force a known-good template" is the natural first move when a model's
+calls will not parse — and it silently does nothing. Downstream (Corrode) this produced a
+confidently wrong conclusion: several experiments were recorded as "forcing the template
+changed nothing, so the shape is not template-determined", when the template was never
+forced. The `[chat_template] using …` line is what made that look verified.
+
+**Suspected shape of the fix.** `resolve_chat_template` feeds the load-time profile
+(`hipfire-serving-core/src/load.rs`), but the request path renders from the HFQ-embedded
+`tokenizer_config.chat_template` or an internal ChatML builder. Either route the override
+into rendering, or stop logging it as adopted and say what it actually affects.
+
+**Note:** baking the same template into the artifact via
+`hfq meta-set --key tokenizer_config` DOES take effect — the no-override log line reads
+`[chat_template] using HFQ-embedded tokenizer_config.chat_template` — so the embedded path
+is the one that reaches the model.
+
 ## Hunt coverage gaps — what the method could NOT reach
 
 **Written 2026-08-29 by the completeness critic (planned for wave 1, died with its
