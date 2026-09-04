@@ -280,17 +280,45 @@ pub fn resolve_chat_template(
     })
 }
 
+/// Is Jinja chat rendering enabled? Mirrors the check at every render site
+/// (`generate.rs`, `qwen35_prefill.rs`); a resolved template drives the PROMPT only when
+/// this is on, and otherwise feeds stop-policy profiling alone.
+fn jinja_chat_enabled() -> bool {
+    std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1")
+}
+
 pub fn log_resolved_chat_template_source(source: &ChatTemplateSource) {
+    // "using X" used to be printed whatever `HIPFIRE_JINJA_CHAT` said, so a template that
+    // could not reach the prompt was reported as adopted. That is a worse failure than
+    // the flag being off: it makes "force a known-good template" look verified when the
+    // template was never applied, and the only way to notice is a canary in the template
+    // itself. The line now says what the template will actually do.
+    let rendering = jinja_chat_enabled();
+    let effect = if rendering {
+        "prompt rendering + stop policy"
+    } else {
+        "stop policy ONLY (prompt rendering needs HIPFIRE_JINJA_CHAT=1)"
+    };
     match source {
         ChatTemplateSource::EnvFile(path) => {
-            eprintln!("[chat_template] using HIPFIRE_CHAT_TEMPLATE_FILE={path}");
+            eprintln!("[chat_template] HIPFIRE_CHAT_TEMPLATE_FILE={path} -> {effect}");
         }
         ChatTemplateSource::PerModelFile(path) => {
-            eprintln!("[chat_template] using per-model override {path}");
+            eprintln!("[chat_template] per-model override {path} -> {effect}");
         }
         ChatTemplateSource::Embedded => {
-            eprintln!("[chat_template] using HFQ-embedded tokenizer_config.chat_template");
+            eprintln!("[chat_template] HFQ-embedded tokenizer_config.chat_template -> {effect}");
         }
+    }
+    // An EXPLICIT override is a stated intent to change the prompt. Silently reducing it
+    // to stop-policy tuning is the case worth shouting about; the embedded default is
+    // not, since nobody asked for it.
+    if !rendering && !matches!(source, ChatTemplateSource::Embedded) {
+        eprintln!(
+            "[chat_template] WARNING: an override is set but HIPFIRE_JINJA_CHAT is not 1, \
+             so the prompt is built by the hand-rolled ChatFrame and the override does NOT \
+             affect what the model sees."
+        );
     }
 }
 
