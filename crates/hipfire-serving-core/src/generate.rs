@@ -98,7 +98,7 @@ pub fn generate_mtp(
 
     // Prompt build mirrors generate_dflash: Jinja chat template when enabled,
     // else the hand-rolled ChatFrame::Plain scaffold.
-    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
+    let jinja_enabled = m.jinja_chat;
     let try_jinja = jinja_enabled && m.chat_template.is_some();
     let prompt_tokens: Vec<u32> = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
@@ -538,7 +538,7 @@ pub fn generate_dflash(
     // below before seed_target_hidden_from_prompt runs — so we never
     // need to guard on `seq_pos == 0` here.
     let tokenizer = m.tokenizer.as_ref().unwrap();
-    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
+    let jinja_enabled = m.jinja_chat;
     let try_jinja = jinja_enabled && m.chat_template.is_some();
     let prompt_tokens: Vec<u32> = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
@@ -1606,7 +1606,7 @@ pub fn generate_multi(
     //   2) Default: hand-rolled ChatFrame::Plain scaffold, byte-
     //      identical to the pp=1 default path so multi-turn behavior
     //      matches between pp=1 and pp>1 when both run the same prompt.
-    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
+    let jinja_enabled = m.jinja_chat;
     let try_jinja = jinja_enabled && m.active.cursor.seq_pos == 0 && m.chat_template.is_some();
     let new_tokens = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
@@ -4496,7 +4496,7 @@ pub fn generate_start(
     // honors `assistant_prefix` directly (ClosedThink emits a closed
     // `<think></think>` block after the assistant prefix). Each path
     // picks up the signal it needs.
-    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1");
+    let jinja_enabled = m.jinja_chat;
     let seq_pos_for_prompt = if prefill_already_done {
         0
     } else {
