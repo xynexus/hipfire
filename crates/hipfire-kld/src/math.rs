@@ -104,6 +104,31 @@ pub struct PositionScore {
     pub kld: f32,
     /// `−log Q_cand(actual_next)`, or `None` if `actual_next` is out of range.
     pub nll: Option<f32>,
+    /// Whether the candidate's argmax is the reference's argmax — the "did the
+    /// greedily-decoded token survive quantization" question, which mean KLD
+    /// cannot answer: a distribution can move a long way without the top token
+    /// changing, and can barely move while flipping a near-tie.
+    ///
+    /// `None` when the reference block has no usable top-1 (empty or padded
+    /// top-K, or a top-1 id outside the candidate's vocabulary), so "no
+    /// reference to agree with" never counts as a disagreement.
+    pub argmax_match: Option<bool>,
+}
+
+/// Index of the largest logit, ties broken by lowest id.
+///
+/// The tie-break MUST match [`top_k_log_softmax`]'s ordering (`total_cmp`
+/// descending, then id ascending) or a model scored against its own reference
+/// would report less than 100% agreement wherever two logits are exactly equal.
+fn argmax_lowest_id(logits: &[f32]) -> Option<usize> {
+    let mut best: Option<(usize, f32)> = None;
+    for (i, &v) in logits.iter().enumerate() {
+        // Strictly-greater only: iterating ascending, the first of a tie wins.
+        if best.is_none_or(|(_, b)| v.total_cmp(&b).is_gt()) {
+            best = Some((i, v));
+        }
+    }
+    best.map(|(i, _)| i)
 }
 
 /// Score candidate logits against a reference block for one position.
@@ -156,12 +181,125 @@ pub fn score_position(
     } else {
         None
     };
-    PositionScore { kld, nll }
+    // Top-1 agreement. The reference's argmax is slot 0 of its top-K (built
+    // logit-descending), so this costs one linear pass over the candidate
+    // logits — the same order as the `log_z` above, and far cheaper than the
+    // top-K selection the reference build already pays per position.
+    let argmax_match = match (
+        ref_block.top_indices.first(),
+        ref_block.top_log_probs.first(),
+    ) {
+        (Some(&ref_top), Some(&lp)) if lp.is_finite() && (ref_top as usize) < cand_logits.len() => {
+            argmax_lowest_id(cand_logits).map(|c| c == ref_top as usize)
+        }
+        _ => None,
+    };
+    PositionScore {
+        kld,
+        nll,
+        argmax_match,
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The property the metric lives or dies by: scored against its OWN
+    /// reference a model must agree with itself at every position, including
+    /// where two logits tie. If the tie-break here ever drifts from
+    /// `top_k_log_softmax`'s, a self-score silently reports < 100% and every
+    /// comparison built on it is off by that amount.
+    #[test]
+    fn self_score_agrees_everywhere_including_exact_ties() {
+        // Two exact ties at the top (ids 1 and 3), which the shared ordering
+        // must resolve to the LOWER id on both sides.
+        let logits = [0.5f32, 4.0, -1.0, 4.0, 2.0];
+        let red = top_k_log_softmax(&logits, 3);
+        assert_eq!(
+            red.indices[0], 1,
+            "reference argmax must be the lower tied id"
+        );
+        let rb = RefBlock {
+            top_indices: &red.indices,
+            top_log_probs: &red.log_probs,
+            residual_mass: red.residual_mass,
+        };
+        let s = score_position(&rb, &logits, 0);
+        assert_eq!(s.argmax_match, Some(true));
+        assert!(s.kld.abs() < 1e-6, "self KLD should be ~0, got {}", s.kld);
+    }
+
+    /// A distribution that moves a long way without changing the argmax scores
+    /// as a match; one that barely moves but flips a near-tie does not. This is
+    /// the whole reason the metric exists next to mean KLD rather than instead
+    /// of it.
+    #[test]
+    fn argmax_match_is_independent_of_how_far_the_distribution_moved() {
+        let reference = [3.0f32, 1.0, 0.0, -1.0];
+        let red = top_k_log_softmax(&reference, 4);
+        let rb = RefBlock {
+            top_indices: &red.indices,
+            top_log_probs: &red.log_probs,
+            residual_mass: red.residual_mass,
+        };
+
+        // Mass redistributed hard, top token unchanged: big KLD, still a match.
+        let flattened = [1.2f32, 1.0, 0.9, 0.5];
+        let moved = score_position(&rb, &flattened, 0);
+        assert_eq!(moved.argmax_match, Some(true));
+        assert!(moved.kld > 0.1, "expected a large KLD, got {}", moved.kld);
+
+        // Near-tie flipped: small KLD, not a match.
+        let flipped = [2.99f32, 3.0, 0.0, -1.0];
+        let flip = score_position(&rb, &flipped, 0);
+        assert_eq!(flip.argmax_match, Some(false));
+        assert!(
+            flip.kld < moved.kld,
+            "flip {} should move less than {}",
+            flip.kld,
+            moved.kld
+        );
+    }
+
+    /// "No reference to agree with" must not be counted as a disagreement:
+    /// padded top-K slots and out-of-vocabulary ids yield None, not Some(false).
+    #[test]
+    fn an_unusable_reference_top1_reports_none() {
+        let cand = [1.0f32, 2.0, 3.0];
+        let padded = score_position(
+            &RefBlock {
+                top_indices: &[0],
+                top_log_probs: &[f32::NEG_INFINITY],
+                residual_mass: 1.0,
+            },
+            &cand,
+            0,
+        );
+        assert_eq!(padded.argmax_match, None);
+
+        let out_of_range = score_position(
+            &RefBlock {
+                top_indices: &[99],
+                top_log_probs: &[-0.1],
+                residual_mass: 0.0,
+            },
+            &cand,
+            0,
+        );
+        assert_eq!(out_of_range.argmax_match, None);
+
+        let empty = score_position(
+            &RefBlock {
+                top_indices: &[],
+                top_log_probs: &[],
+                residual_mass: 1.0,
+            },
+            &cand,
+            0,
+        );
+        assert_eq!(empty.argmax_match, None);
+    }
 
     /// Selection must reproduce the full sort's prefix exactly — references
     /// built before and after the change have to stay byte-identical, so the

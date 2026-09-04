@@ -183,6 +183,16 @@ pub struct KldEvalOutcome {
     pub mean_kld: f32,
     pub p99_kld: f32,
     pub mean_nll: f32,
+    /// Fraction of scored positions where the candidate's argmax equals the
+    /// reference's, over the positions that had a usable reference top-1.
+    /// `None` when none did.
+    ///
+    /// Mean KLD cannot stand in for this: greedy decoding reads only the
+    /// argmax, so agreement is what says whether a quantized model emits the
+    /// same text, while KLD says how far the whole distribution moved. A model
+    /// can shift 90/5 to 75/10 — a visible KLD — and decode identically; it can
+    /// also barely move and flip a near-tie.
+    pub argmax_match_rate: Option<f32>,
     pub per_chunk: Vec<hipfire_kld::ChunkResult>,
 }
 
@@ -244,6 +254,8 @@ pub fn kld_self_score(
     let mut total_scored = 0usize;
     let mut global_nll_sum = 0.0f64;
     let mut global_nll_n = 0usize;
+    let mut agree_hits = 0usize;
+    let mut agree_n = 0usize;
 
     for c in 0..n_chunk {
         let chunk = &tokens[c * n_ctx..c * n_ctx + n_ctx];
@@ -280,6 +292,10 @@ pub fn kld_self_score(
                 if let Some(n) = s.nll {
                     nlls.push(n);
                 }
+                if let Some(a) = s.argmax_match {
+                    agree_n += 1;
+                    agree_hits += usize::from(a);
+                }
             }
         })?;
 
@@ -314,6 +330,7 @@ pub fn kld_self_score(
         mean_kld,
         p99_kld: kld_p99_f32(&chunk_means),
         mean_nll,
+        argmax_match_rate: (agree_n > 0).then(|| agree_hits as f32 / agree_n as f32),
         per_chunk,
     })
 }
@@ -397,6 +414,8 @@ pub fn kld_score(
     let mut total_scored = 0usize;
     let mut global_nll_sum = 0.0f64;
     let mut global_nll_n = 0usize;
+    let mut agree_hits = 0usize;
+    let mut agree_n = 0usize;
 
     for c in 0..n_chunk {
         let chunk = &archive.tokens[c * n_ctx..c * n_ctx + n_ctx];
@@ -413,6 +432,10 @@ pub fn kld_score(
                 klds.push(s.kld);
                 if let Some(n) = s.nll {
                     nlls.push(n);
+                }
+                if let Some(a) = s.argmax_match {
+                    agree_n += 1;
+                    agree_hits += usize::from(a);
                 }
             }
         })?;
@@ -448,6 +471,7 @@ pub fn kld_score(
         mean_kld,
         p99_kld: kld_p99_f32(&chunk_means),
         mean_nll,
+        argmax_match_rate: (agree_n > 0).then(|| agree_hits as f32 / agree_n as f32),
         per_chunk,
     })
 }

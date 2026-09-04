@@ -105,6 +105,16 @@ pub struct KldEvalResponse {
     pub p99_kld: Option<f32>,
     pub mean_nll: Option<f32>,
     pub ppl: Option<f32>,
+    /// Fraction of scored positions where the candidate's argmax matched the
+    /// reference's (score / self_score); `None` for `build_ref`, and `None` on
+    /// a daemon too old to report it.
+    ///
+    /// The metric an operator actually reads a quant decision off: greedy
+    /// decoding sees only the argmax, so this says whether the text changes
+    /// while `mean_kld` says how far the distribution moved. A self_score must
+    /// return 1.0.
+    #[serde(default)]
+    pub argmax_match_rate: Option<f32>,
     /// Written reference path (`build_ref` / `self_score` if persisted).
     pub ref_output: Option<String>,
     /// Written `.kldseq` path (score / self_score).

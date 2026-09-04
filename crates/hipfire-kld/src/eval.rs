@@ -21,6 +21,14 @@ pub struct KldEvalOutcome {
     pub mean_kld: f32,
     pub p99_kld: f32,
     pub mean_nll: f32,
+    /// Fraction of scored positions where the candidate's argmax equals the
+    /// reference's, over the positions that had a usable reference top-1.
+    /// `None` when none did.
+    ///
+    /// The metric mean KLD cannot stand in for: greedy decoding only reads the
+    /// argmax, so this is what says whether a quantized model produces the same
+    /// text, while KLD says how far the whole distribution moved.
+    pub argmax_match_rate: Option<f32>,
     pub per_chunk: Vec<ChunkResult>,
 }
 
@@ -78,6 +86,8 @@ pub fn self_score<E>(
     let mut total_scored = 0usize;
     let mut global_nll_sum = 0.0f64;
     let mut global_nll_n = 0usize;
+    let mut agree_hits = 0usize;
+    let mut agree_n = 0usize;
 
     for c in 0..n_chunk {
         let chunk = &tokens[c * n_ctx..c * n_ctx + n_ctx];
@@ -103,6 +113,10 @@ pub fn self_score<E>(
             if let Some(n) = s.nll {
                 nlls.push(n);
             }
+            if let Some(a) = s.argmax_match {
+                agree_n += 1;
+                agree_hits += usize::from(a);
+            }
         })?;
 
         let mean_kld = mean_f32(&klds);
@@ -124,6 +138,8 @@ pub fn self_score<E>(
         global_kld_sum,
         global_nll_sum,
         global_nll_n,
+        agree_hits,
+        agree_n,
         per_chunk,
     ))
 }
@@ -194,6 +210,8 @@ pub fn score<E>(
     let mut total_scored = 0usize;
     let mut global_nll_sum = 0.0f64;
     let mut global_nll_n = 0usize;
+    let mut agree_hits = 0usize;
+    let mut agree_n = 0usize;
 
     for c in 0..n_chunk {
         let chunk = &archive.tokens[c * n_ctx..c * n_ctx + n_ctx];
@@ -204,6 +222,10 @@ pub fn score<E>(
             klds.push(s.kld);
             if let Some(n) = s.nll {
                 nlls.push(n);
+            }
+            if let Some(a) = s.argmax_match {
+                agree_n += 1;
+                agree_hits += usize::from(a);
             }
         })?;
 
@@ -226,16 +248,21 @@ pub fn score<E>(
         global_kld_sum,
         global_nll_sum,
         global_nll_n,
+        agree_hits,
+        agree_n,
         per_chunk,
     ))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn finish(
     n_chunk: usize,
     total_scored: usize,
     global_kld_sum: f64,
     global_nll_sum: f64,
     global_nll_n: usize,
+    agree_hits: usize,
+    agree_n: usize,
     per_chunk: Vec<ChunkResult>,
 ) -> KldEvalOutcome {
     let mean_kld = if total_scored > 0 {
@@ -255,6 +282,7 @@ fn finish(
         mean_kld,
         p99_kld: p99_f32(&chunk_means),
         mean_nll,
+        argmax_match_rate: (agree_n > 0).then(|| agree_hits as f32 / agree_n as f32),
         per_chunk,
     }
 }

@@ -367,6 +367,9 @@ fn daemon_quality_row_from_resp(
             if let Some(v) = resp.ppl {
                 metrics.insert("ppl".to_string(), json!(v));
             }
+            if let Some(v) = resp.argmax_match_rate {
+                metrics.insert("argmax_match_rate".to_string(), json!(v));
+            }
             let finite = resp.mean_kld.map(|v| v.is_finite()).unwrap_or(false);
             let (status, reason) = if !finite {
                 (
