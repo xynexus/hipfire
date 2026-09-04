@@ -1204,7 +1204,7 @@ mod tests {
 
     /// The DoneEvent the response-shape tests share.
     fn done_event() -> hipfire_generate::DoneEvent {
-    hipfire_generate::DoneEvent {
+        hipfire_generate::DoneEvent {
             id: "req".to_string(),
             tokens: 3,
             tok_s: None,
@@ -1216,7 +1216,7 @@ mod tests {
             finish_reason: Some("stop".to_string()),
             response_id: None,
             extra: Default::default(),
-    }
+        }
     }
 
     // only the split test needs this — the route itself no longer strips
