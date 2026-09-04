@@ -125,6 +125,10 @@ fn summarize(root: &Path, id: &str, state: &str) -> JobSummary {
     let label = str_field(&status, "label")
         .or_else(|| str_field(&spec, "repo"))
         .or_else(|| str_field(&spec, "source"))
+        // Quantize and QAT have no `repo`/`source`: name the artefact being
+        // recovered, else the one being written.
+        .or_else(|| str_field(&spec, "quantized"))
+        .or_else(|| str_field(&spec, "output"))
         .unwrap_or_default();
     JobSummary {
         id: id.to_string(),

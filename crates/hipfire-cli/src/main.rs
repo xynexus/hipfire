@@ -74,6 +74,8 @@ enum Command {
     Inspect(commands::inspect::InspectArgs),
     /// Quantize a model artefact
     Quantize(commands::quantize::QuantizeArgs),
+    /// Light QAT: recover a quantized artefact's norms against its bf16 teacher
+    Qat(commands::quantize::QatArgs),
     /// Convert model artefacts (drafters, MTP heads)
     Convert {
         #[command(subcommand)]
@@ -304,6 +306,7 @@ fn main() -> anyhow::Result<()> {
         Some(Command::List(args)) => commands::list::run(args, loaded_config),
         Some(Command::Inspect(args)) => commands::inspect::run(args, loaded_config),
         Some(Command::Quantize(args)) => commands::quantize::run(args),
+        Some(Command::Qat(args)) => commands::quantize::run_qat(args),
         Some(Command::Convert { command }) => commands::quantize::run_convert(command),
         Some(Command::Eval(args)) => commands::forward::run_eval(args, loaded_config),
         Some(Command::Monitor) => commands::tools::run_monitor(),

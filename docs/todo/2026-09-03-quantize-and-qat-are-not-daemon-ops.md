@@ -1,69 +1,73 @@
 # The daemon schedules calibration and training, but not quantization or QAT
 
-Status: **OPEN**, 2026-09-03. Operator intent, stated directly: *"the service
-should provide everything needed, including eval, calib, quantization, and QAT."*
+Status: **PARTLY RESOLVED**, 2026-09-04. Quantization and QAT are now service
+ops, but as *deferred jobs* the server hands the GPU to, not as preemptible
+daemon requests. Operator intent, stated directly: *"the service should provide
+everything needed, including eval, calib, quantization, and QAT."*
 
 ## Where the surface stands today
 
-`DaemonRequest` (crates/hipfire-daemon-protocol/src/lib.rs) already carries the
-forward/backward-pass jobs:
+`DaemonRequest` (crates/hipfire-daemon-protocol/src/lib.rs) carries the
+forward/backward-pass jobs; the server's deferred queue
+(crates/hipfire-server/src/deferred_jobs.rs) carries the offline GPU tools:
 
-| op | wire tag | status |
+| op | where | status |
 |---|---|---|
-| KLD evaluation | `kld_eval` | ✅ |
-| Calibration | `calibrate` | ✅ one layer per request, session parked by `run_id` |
-| Drafter training | — | ✅ `TrainDrafter` |
-| LoRA training | `train_lora` | ✅ |
-| **Quantization** | — | ❌ **absent** |
-| **QAT / norm recovery** | — | ❌ **absent** |
+| KLD evaluation | daemon `kld_eval` | ✅ |
+| Calibration | daemon `calibrate` | ✅ one layer per request, session parked by `run_id` |
+| Drafter training | daemon `TrainDrafter` | ✅ |
+| LoRA training | daemon `train_lora` | ✅ |
+| Induction | job `induct` | ✅ |
+| Quantization | job `quantize` | ✅ `hipfire quantize --detach …` |
+| QAT / norm recovery | job `qat` | ✅ `hipfire qat --detach …` |
 
-Quantization runs as the standalone `hipfire-quantize` binary. QAT (block-local
-RMSNorm recovery) is a `hipfire-train` *example*, `qwen35_norm_recovery`.
+## What was actually wrong, and what fixed it
 
-## Why the gap has teeth
+The original complaint was arbitration, not surface: three GPU consumers shared
+one advisory lock and only one had a queue. The queue turned out to already
+exist — `~/.hipfire/jobs/deferred`, drained sequentially by the server, with
+`hipfire jobs {list,status,watch,cancel}`, HTTP routes and a TUI on top. What
+was missing was two job kinds and, more importantly, a way for any of them to
+actually get the GPU.
 
-Both are GPU binaries that do not go through the scheduler, so they contend for
-`hip-gpu-0` with the daemon rather than queueing behind it. Concretely, during
-the scale study on 2026-09-03:
+**The load-bearing bug: `hipfire lock run` cannot win against the daemon.** The
+daemon takes its `hip-gpu-0` lease in `acquire_resource_lease_or_exit()` — before
+HIP init — and holds it for the whole process lifetime. An offline job wrapped in
+`hipfire lock run` therefore polls until its 1800s timeout and lands in `failed/`.
+`induct --detach` was already broken this way on any machine running the server;
+adding two more kinds would have shipped two more broken paths.
 
-- The daemon **refuses** rather than waits when the lock is held
-  (`FATAL: ... is locked by <pid> hipfire-coexistence calibrate`), so a scoring
-  run launched next to a calibration silently produced no rows for 7 of 8
-  artifacts — the header printed, the KLD lines did not.
-- `hipfire.service` grabs the lock at boot, so every offline build on a machine
-  running the server fails until the service is stopped by hand.
-- Two independently launched pipelines raced on the same output artifact,
-  because nothing arbitrates "one quantize at a time" the way the scheduler
-  would.
+The fix is `is_gpu_exclusive` in `deferred_jobs.rs`: before an offline GPU job the
+server unloads and stops the daemon (releasing both its VRAM and its lease), runs
+the job, then restarts it and lets models reload on the next request. Handing over
+the lock without the memory would only trade a lock timeout for an OOM — the
+resident model has to go either way. This is the operator's documented manual
+workaround made automatic and bounded, and it covers `induct` too.
 
-None of these are bugs in the tools. They are what happens when three GPU
-consumers share one advisory lock and only one of them has a queue.
+## What did NOT get built, and why
 
-## What the AGENTS.md invariant says to do
+- **Quantization is not an in-process daemon op.** The doc's original shape —
+  schedule the encode passes, hand finished tensors to the existing writer —
+  means refactoring `hipfire_quantize::cli::main()`, an 8k-line function that
+  reads `std::env::args()` and calls `process::exit` throughout. The subprocess
+  form gets the queueing, the arbitration, the status/cancel/logs and the
+  one-at-a-time guarantee at a fraction of the risk on the repo's most
+  byte-sensitive path. The container write stays offline either way, which is
+  what the AGENTS.md line asks for.
+- **Serving is DOWN for the duration of a GPU job**, not time-sliced with it.
+  The upgrade path is a daemon that can unload, yield its lease, and reclaim it
+  across a `run_id` — which needs a state machine that refuses GPU frames while
+  yielded, and is worth doing on its own rather than alongside two new job kinds.
+  Marked `ponytail:` at the site.
+- **QAT is thin.** `hipfire-qat` (was `hipfire-train`'s `qwen35_norm_recovery`
+  example, now a real binary) is qwen3.5-only and needs the teacher's residual
+  captures dumped to disk by a separate env-var-driven inference run. Its
+  measured win is ~0.6% perplexity, and its best-*measuring* variant deploys
+  worse (see `project_light_qat_recovery`). It is reachable from the service now;
+  it is not yet a thing to point an operator at.
 
-> if it runs kernels over model weights it may be scheduled by the daemon; if it
-> rewrites bytes between container formats it belongs in `hipfire-coexistence`.
+## Still true
 
-Quantization is **both**, and the split falls naturally:
-
-- **Daemon-shaped (schedulable):** the Hessian/imatrix passes, AWQ scale search,
-  LDLQ/OBS error propagation, the QTIP trellis encoder — all kernels over
-  weights, all preemptible against serving traffic, all already sharing the
-  runtime the daemon owns.
-- **Stays offline:** the container write itself (`hfq_out`), index/offset
-  bookkeeping, spill, the lossless bf16 recode. Byte translation, not GPU work.
-
-So the shape is a `Quantize` op that schedules the encode passes and hands the
-finished tensors to the existing writer — not a second container writer inside
-the daemon.
-
-QAT is the easier of the two: it is a forward+backward over captured residuals
-plus an AdamW step, which is exactly what `TrainLora` already does. The pieces
-(`hipfire_train::qtip_quant` dequant, the recovery loop, `--norm-patch` fold)
-exist; what is missing is the request type and a session parked by `run_id` the
-way `Calibrate` parks one.
-
-## Interim, until that lands
-
-`hipfire lock status` before every offline GPU step, and stop `hipfire.service`
-for the duration of a build campaign. Both are workarounds for the missing queue.
+Non-daemon GPU binaries run outside the queue do not self-lock, so a hand-run
+`hipfire-quantize` still needs `hipfire lock status` first. Going through
+`--detach` is what removes that step.

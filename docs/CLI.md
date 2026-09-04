@@ -40,6 +40,7 @@ This document contains the help content for the `hipfire` command-line program.
 * [`hipfire list`↴](#hipfire-list)
 * [`hipfire inspect`↴](#hipfire-inspect)
 * [`hipfire quantize`↴](#hipfire-quantize)
+* [`hipfire qat`↴](#hipfire-qat)
 * [`hipfire convert`↴](#hipfire-convert)
 * [`hipfire convert dflash`↴](#hipfire-convert-dflash)
 * [`hipfire convert dspark`↴](#hipfire-convert-dspark)
@@ -126,6 +127,7 @@ Use `hipfire <command> help` or `hipfire <command> --help` for detailed command 
 * `list` — List locally available models
 * `inspect` — Detail the contents of a .hfq artefact (arch, shape, quant histogram, tensors)
 * `quantize` — Quantize a model artefact
+* `qat` — Light QAT: recover a quantized artefact's norms against its bf16 teacher
 * `convert` — Convert model artefacts (drafters, MTP heads)
 * `eval` — Run the quant admission/model evaluation harness
 * `monitor` — Live terminal monitor for GPU, memory, and daemon state
@@ -786,12 +788,41 @@ Quantize a model artefact
 
 Examples:
   hipfire quantize --input model.hfa --output model--oq4.hfq --quant oq4
+  hipfire quantize --detach --input model.hfa --output model--oq4.hfq --quant oq4
   hipfire quantize --help
 
 
 ###### **Arguments:**
 
-* `<ARGS>` — Arguments forwarded verbatim to the quantizer
+* `<ARGS>` — Arguments forwarded verbatim to the quantizer.
+
+   `--detach` is the one flag read here rather than forwarded: it queues the run as a service job instead of doing it now.
+
+
+
+## `hipfire qat`
+
+Light QAT: recover a quantized artefact's norms against its bf16 teacher
+
+**Usage:** `hipfire qat [OPTIONS] <QUANTIZED> <BF16> <OUTPUT>`
+
+Light QAT: block-local RMSNorm recovery against a quantized artefact's own weights.
+
+Feed the result back with:
+  hipfire quantize --input <bf16.hfq> --output <recovered.hfq> --norm-patch <tuned_norms.json>
+
+Needs the teacher's residual captures on disk first (see the hipfire-qat header for the capture command). qwen3.5 only today.
+
+
+###### **Arguments:**
+
+* `<QUANTIZED>` — Quantized artefact whose norms are recovered
+* `<BF16>` — bf16 teacher artefact
+* `<OUTPUT>` — Where to write the tuned-norms JSON
+
+###### **Options:**
+
+* `--detach` — Queue it as a service job instead of running it now
 
 
 

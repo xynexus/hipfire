@@ -868,8 +868,8 @@ requantization, no format work.
       ./target/release/examples/infer_qwen35 model--bf16.hfq --guards off "<corpus text>"
 
     # 2. recover both norms per layer against the ARTIFACT's own weights
-    cargo run -p hipfire-train --release --example qwen35_norm_recovery -- \
-      model-e4--qtip3g.hfq model--bf16.hfq /tmp/tuned.json
+    #    (--detach queues it as a service job instead; `hipfire jobs watch <id>`)
+    hipfire qat model-e4--qtip3g.hfq model--bf16.hfq /tmp/tuned.json
 
     # 3. rebuild with the tuned norms folded in
     hipfire-quantize --input model--bf16.hfq --output model-qat.hfq \

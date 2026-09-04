@@ -400,7 +400,7 @@ fn collect_sidecars() -> anyhow::Result<Vec<PathBuf>> {
 
 /// Locate a sibling hipfire binary: `$ENV_VAR`, next to the current exe,
 /// `target/{release,debug}`, then `~/.hipfire/bin` (mirrors forward.rs).
-fn sibling_binary(release_name: &str, env_var: &str) -> Option<PathBuf> {
+pub(crate) fn sibling_binary(release_name: &str, env_var: &str) -> Option<PathBuf> {
     if let Some(p) = std::env::var_os(env_var).filter(|p| !p.is_empty()) {
         let pb = PathBuf::from(p);
         if pb.exists() {
@@ -428,7 +428,7 @@ fn sibling_binary(release_name: &str, env_var: &str) -> Option<PathBuf> {
     cands.into_iter().find(|p| p.exists())
 }
 
-fn run_tool(bin: &Path, args: &[OsString], build_hint: &str) -> anyhow::Result<()> {
+pub(crate) fn run_tool(bin: &Path, args: &[OsString], build_hint: &str) -> anyhow::Result<()> {
     println!(
         "\n$ {} {}\n",
         bin.display(),

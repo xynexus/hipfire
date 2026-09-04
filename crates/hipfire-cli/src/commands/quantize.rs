@@ -4,7 +4,7 @@
 //! `hipfire quantize` and `hipfire convert` — the former `hipfire-quantize`
 //! binary and its five satellite executables, called in-process.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Args, Subcommand};
 
 #[derive(Debug, Args)]
@@ -13,23 +13,110 @@ use clap::{Args, Subcommand};
     // flags must reach it untouched. Same passthrough shape as `hipfire eval`.
     disable_help_flag = true,
     trailing_var_arg = true,
-    after_help = "Examples:\n  hipfire quantize --input model.hfa --output model--oq4.hfq --quant oq4\n  hipfire quantize --help\n"
+    after_help = "Examples:\n  hipfire quantize --input model.hfa --output model--oq4.hfq --quant oq4\n  hipfire quantize --detach --input model.hfa --output model--oq4.hfq --quant oq4\n  hipfire quantize --help\n"
 )]
 pub struct QuantizeArgs {
     /// Arguments forwarded verbatim to the quantizer.
+    ///
+    /// `--detach` is the one flag read here rather than forwarded: it queues the
+    /// run as a service job instead of doing it now.
     #[arg(allow_hyphen_values = true)]
     pub args: Vec<std::ffi::OsString>,
 }
 
-/// Run the quantizer in this process.
+/// Run the quantizer in this process, or hand it to the service.
 ///
-/// It reads `std::env::args()` itself, so the captured `args` are deliberately
-/// unused — capturing them is only what stops clap claiming the flags first.
-/// The quantizer exits the process when it finishes or fails, which is correct:
-/// quantizing is the whole job of the invocation.
-pub fn run(_args: QuantizeArgs) -> Result<()> {
+/// In the foreground it reads `std::env::args()` itself, so the captured `args`
+/// are deliberately unused — capturing them is only what stops clap claiming the
+/// flags first. The quantizer exits the process when it finishes or fails, which
+/// is correct: quantizing is the whole job of the invocation.
+///
+/// With `--detach` the args ARE used: they become the job spec the server's
+/// deferred runner replays, which is what gets a build queued behind serving
+/// instead of racing it for `hip-gpu-0`.
+pub fn run(args: QuantizeArgs) -> Result<()> {
+    if let Some(forwarded) = detached_args(&args.args) {
+        // `output` duplicates what is inside `args`; it is there so a QUEUED job
+        // lists the artefact it will build. The runner ignores it.
+        let id = crate::commands::jobs::submit(serde_json::json!({
+            "kind": "quantize",
+            "output": flag_value(&forwarded, "--output"),
+            "args": forwarded,
+        }))?;
+        println!("queued quantize job {id}");
+        println!("  hipfire jobs watch {id}");
+        return Ok(());
+    }
     hipfire_quantize::cli::main();
     Ok(())
+}
+
+/// The value following `flag`, for the job's display label.
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+}
+
+/// `Some(args without --detach)` when `--detach` was passed, else `None`.
+fn detached_args(args: &[std::ffi::OsString]) -> Option<Vec<String>> {
+    args.iter().any(|a| a == "--detach").then(|| {
+        args.iter()
+            .filter(|a| *a != "--detach")
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect()
+    })
+}
+
+#[derive(Debug, Args)]
+#[command(
+    after_help = "Light QAT: block-local RMSNorm recovery against a quantized artefact's own weights.\n\nFeed the result back with:\n  hipfire quantize --input <bf16.hfq> --output <recovered.hfq> --norm-patch <tuned_norms.json>\n\nNeeds the teacher's residual captures on disk first (see the hipfire-qat header for the capture command). qwen3.5 only today.\n"
+)]
+pub struct QatArgs {
+    /// Quantized artefact whose norms are recovered.
+    pub quantized: String,
+    /// bf16 teacher artefact.
+    pub bf16: String,
+    /// Where to write the tuned-norms JSON.
+    pub output: String,
+    /// Queue it as a service job instead of running it now.
+    #[arg(long)]
+    pub detach: bool,
+}
+
+pub fn run_qat(args: QatArgs) -> Result<()> {
+    if args.detach {
+        let id = crate::commands::jobs::submit(serde_json::json!({
+            "kind": "qat",
+            "quantized": args.quantized,
+            "bf16": args.bf16,
+            "output": args.output,
+        }))?;
+        println!("queued qat job {id}");
+        println!("  hipfire jobs watch {id}");
+        return Ok(());
+    }
+    // Foreground: a sibling binary rather than an in-process call, because the
+    // CLI does not (and should not) link the training crate. Under the GPU lock,
+    // since hipfire-qat is a non-daemon GPU binary and does not self-lock.
+    let bin = crate::commands::induct::sibling_binary("hipfire-qat", "HIPFIRE_QAT_BIN")
+        .context("hipfire-qat not found (cargo build --release -p hipfire-train)")?;
+    let hipfire = std::env::current_exe().unwrap_or_else(|_| "hipfire".into());
+    crate::commands::induct::run_tool(
+        &hipfire,
+        &[
+            "lock".into(),
+            "run".into(),
+            "qat".into(),
+            "--".into(),
+            bin.into_os_string(),
+            args.quantized.into(),
+            args.bf16.into(),
+            args.output.into(),
+        ],
+        "cargo build --release -p hipfire-train",
+    )
 }
 
 /// Artefact conversions that used to be five separate executables.

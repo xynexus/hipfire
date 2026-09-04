@@ -5552,7 +5552,7 @@ fn qtip_trellis_lm_head_enabled() -> bool {
 /// `--norm-patch <file.json>`: fold recovered RMSNorm weights (`{"<tensor
 /// name>": [f32, ...]}`) into the staged tensors.
 ///
-/// Light QAT (`hipfire-train`'s `qwen35_norm_recovery`) tunes γ for norms that
+/// Light QAT (`hipfire qat`, the `hipfire-qat` binary) tunes γ for norms that
 /// are NOT quantized — they pass through at source precision — so this only
 /// substitutes their values. It has to happen during the BUILD rather than by
 /// rewriting a finished `.hfq`: once bf16 tensors carry a lossless recoding
@@ -7988,8 +7988,8 @@ OPTIONS:
                                Measures a candidate gather format's quality end-to-end
                                without writing a gather kernel for it first.
     --norm-patch <file.json>   fold recovered RMSNorm weights in, a JSON object mapping
-                               tensor name -> f32 array, as written by `hipfire-train`'s
-                               qwen35_norm_recovery (light QAT:
+                               tensor name -> f32 array, as written by `hipfire qat`
+                               (light QAT:
                                block-local norm recovery against the served artifact's own
                                dequantized weights). Norms are not quantized, so this only
                                substitutes their values -- but it must happen HERE rather than by

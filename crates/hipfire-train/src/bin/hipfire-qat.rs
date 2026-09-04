@@ -6,7 +6,8 @@
     clippy::too_many_arguments,
     clippy::type_complexity
 )]
-// hipfire example clippy sweep: examples are GPU probes/benches, not reusable APIs.
+// Inherited from this file's life as a GPU-probe example; it is now the
+// `hipfire-qat` binary but the body is unchanged.
 
 //! Light QAT for qwen3.5: block-local RMSNorm recovery against the **served
 //! artifact's own weights**.
@@ -45,11 +46,12 @@
 //!   cargo run -p hipfire-runtime --release --example infer_qwen35 -- \
 //!       ~/.hipfire/models/Qwen3.5-0.8B--bf16.hfq --guards off "<text>"
 //!
-//! Run:
-//!   hipfire lock acquire "qwen35-norm-recovery" --watch-pid $$
-//!   cargo run -p hipfire-train --release --example qwen35_norm_recovery -- \
-//!       <quantized.hfq> <bf16.hfq> <tuned_norms.json>
-//!   hipfire lock release
+//! Run it in the foreground (the CLI takes the GPU lock for you):
+//!   hipfire qat <quantized.hfq> <bf16.hfq> <tuned_norms.json>
+//!
+//! or hand it to the service, which queues it and hands it the GPU:
+//!   hipfire qat --detach <quantized.hfq> <bf16.hfq> <tuned_norms.json>
+//!   hipfire jobs watch <id>
 //!
 //! Then rebuild the artifact with the tuned norms folded in:
 //!   hipfire-quantize --input <bf16.hfq> --output <recovered.hfq> \
@@ -416,7 +418,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut args = std::env::args().skip(1);
     let q_path = args
         .next()
-        .ok_or("usage: qwen35_norm_recovery <quantized.hfq> <bf16.hfq> <tuned_norms.json>")?;
+        .ok_or("usage: hipfire-qat <quantized.hfq> <bf16.hfq> <tuned_norms.json>")?;
     let bf_path = args.next().ok_or("missing <bf16.hfq>")?;
     let out_json = args.next().ok_or("missing <tuned_norms.json>")?;
 

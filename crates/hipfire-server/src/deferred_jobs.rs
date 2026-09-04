@@ -82,12 +82,34 @@ pub enum DeferredJobKind {
     /// not self-lock (it shells out to `hipfire-quantize`, and per AGENTS.md
     /// non-daemon GPU binaries are the caller's job to coordinate). The job
     /// therefore runs it under `hipfire lock run`, which holds the lock for
-    /// exactly the child's lifetime, so a background induction serialises
-    /// against the daemon instead of racing it.
+    /// exactly the child's lifetime, so it serialises against anything else
+    /// that takes `hip-gpu-0`. The daemon is not one of those things — see
+    /// `is_gpu_exclusive`, which is what actually frees the GPU for this.
     Induct {
         source: String,
         #[serde(default)]
         format: Option<String>,
+    },
+    /// Quantize an artefact in the background.
+    ///
+    /// `args` are forwarded verbatim to `hipfire quantize` — the quantizer scans
+    /// argv by hand and has ~50 flags, so mirroring them here would be a second
+    /// copy to keep in sync. Like `TrainingCommand` this is therefore file-backed
+    /// only (no HTTP route creates deferred jobs at all); the trust boundary is
+    /// write access to `~/.hipfire/jobs/deferred/queued`.
+    ///
+    /// Only the encode passes run here. The container write stays where it is —
+    /// inside the offline quantizer — which is what AGENTS.md asks for.
+    Quantize { args: Vec<String> },
+    /// Light QAT: block-local RMSNorm recovery against a quantized artefact.
+    ///
+    /// Runs the `hipfire-qat` binary, which reads the residual captures the
+    /// teacher dumped and writes a tuned-norms JSON to feed back to
+    /// `hipfire quantize --norm-patch`.
+    Qat {
+        quantized: String,
+        bf16: String,
+        output: String,
     },
     /// Launch a no-shell training command from a local deferred job file.
     ///
@@ -156,6 +178,10 @@ fn deferred_jobs_health_json_at(root: &Path) -> Value {
             "sdapi_txt2img",
             "sdapi_img2img",
             "http_post",
+            "download",
+            "induct",
+            "quantize",
+            "qat",
             "training_command"
         ],
     })
@@ -380,7 +406,49 @@ fn fail_unparsed_job(
     finish_job_file(root, FAILED_DIR, id, running_path)
 }
 
+/// Kinds that shell out to an offline GPU tool under `hipfire lock run`.
+///
+/// They cannot win that lock while a daemon is up: the daemon takes its
+/// `hip-gpu-0` lease at startup and holds it for the whole process lifetime, so
+/// `lock run` polls until its 1800s timeout and the job lands in `failed/`. That
+/// is why they get the hand-off below rather than just a lock wrapper.
+fn is_gpu_exclusive(kind: &DeferredJobKind) -> bool {
+    matches!(
+        kind,
+        DeferredJobKind::Induct { .. }
+            | DeferredJobKind::Quantize { .. }
+            | DeferredJobKind::Qat { .. }
+    )
+}
+
 async fn execute_deferred_job(
+    state: SharedState,
+    root: &Path,
+    id: &str,
+    kind: &DeferredJobKind,
+) -> Result<Value, String> {
+    if !is_gpu_exclusive(kind) {
+        return execute_deferred_job_inner(state, root, id, kind).await;
+    }
+    // Hand the GPU to the offline tool for exactly the job's duration: stop the
+    // daemon (which releases both its VRAM and its lease — an offline quantize
+    // needs the memory as much as the lock), run, then bring serving back. This
+    // is the operator's documented manual workaround ("stop hipfire.service for
+    // the duration of a build campaign") made automatic and bounded.
+    //
+    // ponytail: serving is DOWN for the job, not time-sliced with it. Teaching
+    // the daemon to unload + yield + reclaim its lease across a run_id is the
+    // upgrade path; it needs a state machine that refuses GPU frames while
+    // yielded, which is a change worth making on its own.
+    let had_daemon = crate::release_gpu_for_offline_job(&state).await;
+    let out = execute_deferred_job_inner(state.clone(), root, id, kind).await;
+    if had_daemon {
+        crate::reclaim_gpu_after_offline_job(&state).await;
+    }
+    out
+}
+
+async fn execute_deferred_job_inner(
     state: SharedState,
     root: &Path,
     id: &str,
@@ -427,22 +495,35 @@ async fn execute_deferred_job(
             execute_child_job(root, id, "download", repo, &argv).await
         }
         DeferredJobKind::Induct { source, format } => {
-            let bin = hipfire_binary();
-            let mut argv = vec![
-                bin.clone(),
-                "lock".to_string(),
-                "run".to_string(),
-                format!("induct-{id}"),
-                "--".to_string(),
-                bin,
-                "induct".to_string(),
-                source.clone(),
-            ];
+            let mut argv = gpu_lock_argv(&format!("induct-{id}"));
+            argv.push(hipfire_binary());
+            argv.push("induct".to_string());
+            argv.push(source.clone());
             if let Some(f) = format {
                 argv.push("--format".to_string());
                 argv.push(f.clone());
             }
             execute_child_job(root, id, "induct", source, &argv).await
+        }
+        DeferredJobKind::Quantize { args } => {
+            let mut argv = gpu_lock_argv(&format!("quantize-{id}"));
+            argv.push(hipfire_binary());
+            argv.push("quantize".to_string());
+            argv.extend(args.iter().cloned());
+            let label = flag_value(args, "--output").unwrap_or_default();
+            execute_child_job(root, id, "quantize", &label, &argv).await
+        }
+        DeferredJobKind::Qat {
+            quantized,
+            bf16,
+            output,
+        } => {
+            let mut argv = gpu_lock_argv(&format!("qat-{id}"));
+            argv.push(sibling_binary("hipfire-qat"));
+            argv.push(quantized.clone());
+            argv.push(bf16.clone());
+            argv.push(output.clone());
+            execute_child_job(root, id, "qat", quantized, &argv).await
         }
         DeferredJobKind::TrainingCommand {
             argv,
@@ -758,6 +839,37 @@ fn hipfire_binary() -> String {
         .unwrap_or_else(|| "hipfire".to_string())
 }
 
+/// `hipfire lock run <label> --` prefix, so an offline GPU tool still serialises
+/// against anything else holding `hip-gpu-0` even after the daemon has stepped
+/// aside (another shell, a second job runner).
+fn gpu_lock_argv(label: &str) -> Vec<String> {
+    vec![
+        hipfire_binary(),
+        "lock".to_string(),
+        "run".to_string(),
+        label.to_string(),
+        "--".to_string(),
+    ]
+}
+
+/// A hipfire tool that ships next to the running binary. Falls back to the bare
+/// name so PATH still resolves it in an installed layout.
+fn sibling_binary(name: &str) -> String {
+    live_exe_path()
+        .and_then(|p| p.parent().map(|d| d.join(name)))
+        .filter(|p| p.exists())
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|| name.to_string())
+}
+
+/// The value following `flag` in a forwarded argv, for a job's display label.
+fn flag_value(args: &[String], flag: &str) -> Option<String> {
+    args.iter()
+        .position(|a| a == flag)
+        .and_then(|i| args.get(i + 1))
+        .cloned()
+}
+
 fn live_exe_path() -> Option<PathBuf> {
     let path = std::env::current_exe().ok()?;
     match path.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
@@ -933,6 +1045,8 @@ fn kind_name(kind: &DeferredJobKind) -> &'static str {
         DeferredJobKind::HttpPost { .. } => "http_post",
         DeferredJobKind::Download { .. } => "download",
         DeferredJobKind::Induct { .. } => "induct",
+        DeferredJobKind::Quantize { .. } => "quantize",
+        DeferredJobKind::Qat { .. } => "qat",
         DeferredJobKind::TrainingCommand { .. } => "training_command",
     }
 }
@@ -1044,6 +1158,50 @@ mod tests {
         .unwrap();
         assert_eq!(spec.id.as_deref(), Some("image-1"));
         assert!(matches!(spec.kind, DeferredJobKind::SdapiTxt2img { .. }));
+    }
+
+    #[test]
+    fn parses_and_classifies_the_offline_gpu_kinds() {
+        let quantize: DeferredJobSpec = serde_json::from_value(json!({
+            "id": "quantize-1",
+            "kind": "quantize",
+            // The CLI also writes a top-level `output` so a QUEUED job has a
+            // label; the runner must keep ignoring it.
+            "output": "m--oq4.hfq",
+            "args": ["--input", "m.hfa", "--output", "m--oq4.hfq", "--format", "oq4"],
+        }))
+        .unwrap();
+        assert_eq!(kind_name(&quantize.kind), "quantize");
+
+        let qat: DeferredJobSpec = serde_json::from_value(json!({
+            "kind": "qat",
+            "quantized": "m--oq4.hfq",
+            "bf16": "m--bf16.hfq",
+            "output": "norms.json",
+        }))
+        .unwrap();
+        assert_eq!(kind_name(&qat.kind), "qat");
+
+        // The classification is what frees the GPU; getting it wrong is a 1800s
+        // lock timeout for the job, or a needless daemon restart for the rest.
+        assert!(is_gpu_exclusive(&quantize.kind));
+        assert!(is_gpu_exclusive(&qat.kind));
+        assert!(is_gpu_exclusive(&DeferredJobKind::Induct {
+            source: "org/model".into(),
+            format: None,
+        }));
+        assert!(!is_gpu_exclusive(&DeferredJobKind::HttpPost {
+            endpoint: "/v1/chat/completions".into(),
+            body: json!({}),
+        }));
+
+        // Every forwarded arg survives, and the label is the artefact being built.
+        let DeferredJobKind::Quantize { args } = &quantize.kind else {
+            unreachable!()
+        };
+        assert_eq!(flag_value(args, "--output").as_deref(), Some("m--oq4.hfq"));
+        assert_eq!(flag_value(args, "--missing"), None);
+        assert_eq!(gpu_lock_argv("quantize-1").last().unwrap(), "--");
     }
 
     #[test]
