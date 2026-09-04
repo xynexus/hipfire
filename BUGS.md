@@ -59,15 +59,34 @@ confidently wrong conclusion: several experiments were recorded as "forcing the 
 changed nothing, so the shape is not template-determined", when the template was never
 forced. The `[chat_template] using …` line is what made that look verified.
 
-**Suspected shape of the fix.** `resolve_chat_template` feeds the load-time profile
-(`hipfire-serving-core/src/load.rs`), but the request path renders from the HFQ-embedded
-`tokenizer_config.chat_template` or an internal ChatML builder. Either route the override
-into rendering, or stop logging it as adopted and say what it actually affects.
+**It is not just the env var — the EMBEDDED template is not rendered either.** An earlier
+draft of this entry claimed the artifact path worked, on the strength of the log line
+`[chat_template] using HFQ-embedded tokenizer_config.chat_template`. That was the same
+mistake this entry reports. Tested: the canary template was baked into a copy of the
+artifact with `hfq meta-set --key tokenizer_config --json`, verified present by reading it
+back (28,326 bytes, `template_version = "qwen3.8-froggeric-v22.5"`), and served under its
+own name. The canary is **still ignored**, and `usage.prompt_tokens` is **17** — the same
+as the stock artifact, and the same as every template tried.
 
-**Note:** baking the same template into the artifact via
-`hfq meta-set --key tokenizer_config` DOES take effect — the no-override log line reads
-`[chat_template] using HFQ-embedded tokenizer_config.chat_template` — so the embedded path
-is the one that reaches the model.
+So for `Qwen3.5-9B` (arch qwen35), neither route reaches the prompt:
+
+| template source | canary | prompt_tokens |
+|---|---|---|
+| `HIPFIRE_CHAT_TEMPLATE_FILE` | ignored | 17 |
+| embedded `tokenizer_config.chat_template` | ignored | 17 |
+| stock, untouched | n/a | 17 |
+
+17 tokens is consistent with a plain internal ChatML frame: the froggeric template renders
+a `<think>\n\n</think>` block for non-thinking turns, which would add several tokens and
+does not appear. **The Jinja template appears not to drive prompt rendering on this path at
+all**, which makes both the env override and `hfq meta-set` silently ineffective for
+anything a template controls — including the tool-call syntax a model is instructed to
+emit.
+
+**Suspected shape of the fix.** `resolve_chat_template` feeds the load-time profile
+(`hipfire-serving-core/src/load.rs`) and the stop policy; the request path builds the
+prompt elsewhere (`prompt_frame` / an internal ChatML builder). Either route the resolved
+template into rendering, or stop reporting it as adopted and say what it actually affects.
 
 ## Hunt coverage gaps — what the method could NOT reach
 
