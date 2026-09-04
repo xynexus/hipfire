@@ -315,6 +315,7 @@ async fn execute_responses_owned(
         &text,
         &reasoning,
         &generated.done,
+        &generated.tool_calls,
     ))
 }
 
@@ -350,12 +351,52 @@ async fn prepare_response_messages(
     Ok(messages)
 }
 
+/// Convert OpenAI *chat* tool calls into Responses `function_call` output items.
+///
+/// The two APIs carry the same call in different shapes: chat nests it under
+/// `function: {name, arguments}` inside an assistant message, Responses makes each call a
+/// top-level output item. `call_id` is what a caller echoes back on the follow-up turn,
+/// so it is preserved from the chat id rather than minted fresh.
+fn function_call_items(tool_calls: &[Value]) -> Vec<Value> {
+    tool_calls
+        .iter()
+        .enumerate()
+        .map(|(idx, call)| {
+            let f = call.get("function");
+            let name = f
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            // Arguments stay a JSON *string*, as both APIs specify — parsing and
+            // re-serialising here would silently reformat what the model emitted.
+            let arguments = f
+                .and_then(|f| f.get("arguments"))
+                .and_then(Value::as_str)
+                .unwrap_or("{}");
+            let call_id = call
+                .get("id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("call_{idx}"));
+            json!({
+                "type": "function_call",
+                "id": format!("fc_{call_id}"),
+                "call_id": call_id,
+                "name": name,
+                "arguments": arguments,
+                "status": "completed",
+            })
+        })
+        .collect()
+}
+
 fn response_json(
     response_id: &str,
     model: &str,
     text: &str,
     reasoning: &str,
     done: &hipfire_generate::DoneEvent,
+    tool_calls: &[Value],
 ) -> Value {
     let prompt_tokens = done.prefill_tokens.unwrap_or(0);
     let completion_tokens = done.tokens;
@@ -376,12 +417,24 @@ fn response_json(
     if !reasoning.is_empty() {
         message["reasoning_content"] = Value::String(reasoning.to_string());
     }
+    // Tool calls are output ITEMS beside the message, not fields on it. Dropping them
+    // (as this did) leaves a caller unable to tell "the model chose not to call a tool"
+    // from "the model called one and it was discarded" — both arrive as an empty
+    // assistant message, and the generation cost is identical.
+    let calls = function_call_items(tool_calls);
+    let mut output = Vec::with_capacity(1 + calls.len());
+    // The message leads only when it carries something; a pure tool-call turn has empty
+    // text and would otherwise open with a blank message.
+    if !text.is_empty() || calls.is_empty() {
+        output.push(message);
+    }
+    output.extend(calls);
     json!({
         "id": response_id,
         "object": "response",
         "model": model,
         "status": "completed",
-        "output": [message],
+        "output": output,
         "output_text": text,
         "usage": {
             "input_tokens": prompt_tokens,
@@ -670,6 +723,13 @@ async fn stream_responses(
                             &output_text,
                             &reasoning_text,
                             &done,
+                            // Streaming does not gather tool calls: this path accumulates
+                            // text deltas, and a call would have to arrive as its own
+                            // event sequence (`response.output_item.added` for a
+                            // `function_call`, then argument deltas). Not wired here, so
+                            // the non-streaming path is fixed and this one is unchanged
+                            // rather than half-emitting.
+                            &[],
                         ),
                     )))
                     .await;
@@ -1141,6 +1201,24 @@ fn responses_state_max() -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The DoneEvent the response-shape tests share.
+    fn done_event() -> hipfire_generate::DoneEvent {
+        hipfire_generate::DoneEvent {
+            id: "req".to_string(),
+            tokens: 3,
+            tok_s: None,
+            prefill_tokens: Some(7),
+            prefill_ms: None,
+            prefill_tok_s: None,
+            decode_tok_s: None,
+            ttft_ms: None,
+            finish_reason: Some("stop".to_string()),
+            response_id: None,
+            extra: Default::default(),
+        }
+    }
+
     // only the split test needs this — the route itself no longer strips
     use crate::routes::chat::strip_visible_thinking;
     use std::collections::BTreeSet;
@@ -1332,18 +1410,64 @@ mod tests {
             response_id: None,
             extra: Default::default(),
         };
-        let body = response_json("resp_1", "qwen", "hi", "", &done);
+        let body = response_json("resp_1", "qwen", "hi", "", &done, &[]);
         assert_eq!(body["id"], "resp_1");
         assert_eq!(body["object"], "response");
         assert_eq!(body["output_text"], "hi");
         // no reasoning -> the field is absent entirely, not an empty string
         assert!(body["output"][0].get("reasoning_content").is_none());
         // with reasoning -> carried alongside the answer, answer unchanged
-        let body = response_json("resp_1", "qwen", "hi", "because 2+2=4", &done);
+        let body = response_json("resp_1", "qwen", "hi", "because 2+2=4", &done, &[]);
         assert_eq!(body["output_text"], "hi");
         assert_eq!(body["output"][0]["reasoning_content"], "because 2+2=4");
         assert_eq!(body["usage"]["input_tokens"], 7);
         assert_eq!(body["usage"]["output_tokens"], 3);
+    }
+
+    #[test]
+    fn a_tool_call_becomes_a_function_call_output_item() {
+        let done = done_event();
+        let calls = vec![json!({
+            "id": "call_abc",
+            "type": "function",
+            "function": {"name": "read_file", "arguments": "{\"path\":\"src/lib.rs\"}"}
+        })];
+        let body = response_json("resp_1", "qwen", "", "", &done, &calls);
+        let output = body["output"].as_array().unwrap();
+        // A pure tool-call turn carries the call and no empty leading message.
+        assert_eq!(output.len(), 1, "{output:?}");
+        assert_eq!(output[0]["type"], "function_call");
+        assert_eq!(output[0]["name"], "read_file");
+        // Arguments stay a JSON string, as both APIs specify.
+        assert_eq!(output[0]["arguments"], "{\"path\":\"src/lib.rs\"}");
+        // `call_id` is what a caller echoes back, so it is preserved, not minted.
+        assert_eq!(output[0]["call_id"], "call_abc");
+    }
+
+    #[test]
+    fn text_and_a_tool_call_both_appear() {
+        let done = done_event();
+        let calls = vec![json!({
+            "id": "call_1",
+            "function": {"name": "list_dir", "arguments": "{}"}
+        })];
+        let body = response_json("resp_2", "qwen", "let me look", "", &done, &calls);
+        let output = body["output"].as_array().unwrap();
+        assert_eq!(output.len(), 2);
+        assert_eq!(output[0]["type"], "message");
+        assert_eq!(output[1]["type"], "function_call");
+        assert_eq!(body["output_text"], "let me look");
+    }
+
+    #[test]
+    fn no_tool_calls_leaves_the_shape_untouched() {
+        // The regression guard: every existing caller sees exactly what it saw before.
+        let done = done_event();
+        let body = response_json("resp_3", "qwen", "hi", "", &done, &[]);
+        let output = body["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["type"], "message");
+        assert_eq!(body["output_text"], "hi");
     }
 
     #[test]
