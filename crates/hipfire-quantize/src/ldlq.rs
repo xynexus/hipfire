@@ -1146,6 +1146,117 @@ mod chol_tests {
     /// same matrix. Tolerance is f32-scale, not f64: the trailing update runs in
     /// f32 by design, so exact agreement is not the claim — agreement to within
     /// single precision is, and that is what decides whether this is usable.
+    /// The tiled trailing update must agree with the scalar one it replaces,
+    /// and be faster. Same f32 arithmetic, so the only expected difference is
+    /// reassociation over the BK chunks — bounded by a few ULP times jb, not by
+    /// a precision change. A tolerance that passes a garbage kernel would make
+    /// this test worthless, so it is tight.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_tiled_syrk_matches_scalar_and_is_faster() {
+        let Ok(mut gpu) = hipfire_rdna::Gpu::init() else {
+            eprintln!("no GPU; skipping");
+            return;
+        };
+        syrk_compare_at(&mut gpu, 512);
+    }
+
+    /// The same comparison at sizes that actually rank the tiles: 4096 is a 9B
+    /// hidden dim, 12288 a 27B `down_proj`. Separate and `#[ignore]`d because
+    /// each size allocates k*k f32 on the device (604 MB at 12288) and the run
+    /// is minutes, which does not belong in a routine `cargo test`.
+    ///
+    ///   cargo test -p hipfire-quantize --features gpu syrk_tile_sweep -- --ignored --nocapture
+    #[cfg(feature = "gpu")]
+    #[test]
+    #[ignore = "allocates up to 604 MB of VRAM per size; run deliberately"]
+    fn gpu_tiled_syrk_tile_sweep() {
+        let Ok(mut gpu) = hipfire_rdna::Gpu::init() else {
+            eprintln!("no GPU; skipping");
+            return;
+        };
+        for k in [4096usize, 8192, 12288] {
+            eprintln!("k={k}");
+            syrk_compare_at(&mut gpu, k);
+        }
+    }
+
+    /// Run all three trailing-update kernels over the same input, report timings,
+    /// and assert both tiled variants match the scalar one.
+    ///
+    /// At k=512 the trailing region is only 384 wide, so the 64-tile launches
+    /// ~18 working blocks and is occupancy-starved — fine for CORRECTNESS,
+    /// useless for ranking speed. Use the sweep above for that.
+    #[cfg(feature = "gpu")]
+    fn syrk_compare_at(gpu: &mut hipfire_rdna::Gpu, k: usize) {
+        let (j0, jb) = (0usize, 128usize);
+        // Deterministic, well-scaled, and NOT symmetric-trivial: a constant
+        // matrix would hide an indexing bug that swaps i and j.
+        let mut host = vec![0.0f32; k * k];
+        for r in 0..k {
+            for c in 0..k {
+                host[r * k + c] = (((r * 7 + c * 13) % 97) as f32 - 48.0) / 64.0;
+            }
+        }
+        let mut run = |gpu: &mut hipfire_rdna::Gpu, which: u8| -> Vec<f32> {
+            let d = gpu.upload_owned_f32(&host, &[k, k]).expect("upload");
+            let t = std::time::Instant::now();
+            for _ in 0..8 {
+                match which {
+                    0 => gpu.chol_syrk_trailing(&d, k, j0, jb).expect("scalar"),
+                    1 => gpu.chol_syrk_trailing_tiled(&d, k, j0, jb).expect("t64"),
+                    _ => gpu
+                        .chol_syrk_trailing_tiled128(&d, k, j0, jb)
+                        .expect("t128"),
+                }
+            }
+            gpu.device_synchronize().expect("sync");
+            let ms = t.elapsed().as_secs_f64() * 1000.0 / 8.0;
+            let lbl = match which {
+                0 => "scalar   ",
+                1 => "tiled 64 ",
+                _ => "tiled 128",
+            };
+            eprintln!("  {lbl} {ms:.3} ms/call");
+            let out = gpu.download_f32(&d).expect("download");
+            gpu.reclaim_pending();
+            out
+        };
+        let scalar = run(gpu, 0);
+        let tiled = run(gpu, 1);
+        let tiled128 = run(gpu, 2);
+
+        let mut worst = 0.0f32;
+        for r in (j0 + jb)..k {
+            // Lower triangle only: the kernels leave the upper half alone, and
+            // comparing it would pass regardless of what either wrote.
+            for c in (j0 + jb)..=r {
+                let d = (scalar[r * k + c] - tiled[r * k + c]).abs();
+                if d > worst {
+                    worst = d;
+                }
+            }
+        }
+        let mut worst128 = 0.0f32;
+        for r in (j0 + jb)..k {
+            for c in (j0 + jb)..=r {
+                let d = (scalar[r * k + c] - tiled128[r * k + c]).abs();
+                if d > worst128 {
+                    worst128 = d;
+                }
+            }
+        }
+        eprintln!("  worst |scalar - tiled64| = {worst:.3e}  |scalar - tiled128| = {worst128:.3e}");
+        assert!(
+            worst < 1e-3,
+            "tiled64 SYRK diverged from scalar: {worst:.3e}"
+        );
+        assert!(
+            worst128 < 1e-3,
+            "tiled128 SYRK diverged from scalar: {worst128:.3e}"
+        );
+    }
+
     #[cfg(feature = "gpu")]
     #[test]
     fn gpu_right_looking_matches_faer_llt() {

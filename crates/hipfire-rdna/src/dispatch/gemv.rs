@@ -2067,6 +2067,76 @@ impl Gpu {
             &kernargs![ptr a_ptr, i32 ki, i32 j0i, i32 jbi],
         )
     }
+    /// LDS-tiled trailing update: same math as [`Self::chol_syrk_trailing`],
+    /// same f32 precision class, but each 64x64 output tile reads the panel rows
+    /// once instead of once per element.
+    ///
+    /// The scalar kernel is bandwidth-starved (0.125 FLOP/byte); this is ~16.
+    /// Results differ from the scalar version only by summation order.
+    pub fn chol_syrk_trailing_tiled(
+        &mut self,
+        a: &GpuTensor,
+        k: usize,
+        j0: usize,
+        jb: usize,
+    ) -> HipResult<()> {
+        let start = j0 + jb;
+        if start >= k {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "chol_syrk_trailing_tiled",
+            kernels::CHOL_SYRK_TRAILING_SRC,
+            "chol_syrk_trailing_tiled",
+        )?;
+        let a_ptr = a.buf.as_ptr();
+        let (ki, j0i, jbi) = (k as i32, j0 as i32, jb as i32);
+        let n = k - start;
+        // One block per 64x64 tile. Blocks strictly above the diagonal exit
+        // immediately, which is cheaper than computing a triangular grid.
+        let g = n.div_ceil(64) as u32;
+        self.launch_kernargs(
+            "chol_syrk_trailing_tiled",
+            [g, g, 1],
+            [16, 16, 1],
+            0,
+            &kernargs![ptr a_ptr, i32 ki, i32 j0i, i32 jbi],
+        )
+    }
+
+    /// 128x128-tile variant: halves the panel re-read traffic against the
+    /// 64x64 tile, at 64 accumulator VGPRs instead of 16.
+    pub fn chol_syrk_trailing_tiled128(
+        &mut self,
+        a: &GpuTensor,
+        k: usize,
+        j0: usize,
+        jb: usize,
+    ) -> HipResult<()> {
+        let start = j0 + jb;
+        if start >= k {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "chol_syrk_trailing_tiled128",
+            kernels::CHOL_SYRK_TRAILING_SRC,
+            "chol_syrk_trailing_tiled128",
+        )?;
+        let a_ptr = a.buf.as_ptr();
+        let (ki, j0i, jbi) = (k as i32, j0 as i32, jb as i32);
+        let n = k - start;
+        let g = n.div_ceil(128) as u32;
+        self.launch_kernargs(
+            "chol_syrk_trailing_tiled128",
+            [g, g, 1],
+            [16, 16, 1],
+            0,
+            &kernargs![ptr a_ptr, i32 ki, i32 j0i, i32 jbi],
+        )
+    }
+
     /// Gather the Cholesky panel (rows `j0..k`, cols `j0..j0+jb`) into a
     /// contiguous `[rows, jb]` buffer.
     pub fn chol_panel_gather(
