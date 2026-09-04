@@ -14,6 +14,46 @@ The 2026-08-29 multi-agent hunt is summarized in
 `docs/bugs/2026-08-29-bug-hunt-summary.md` — including one finding it REFUTED and
 the eight search dimensions that never ran.
 
+## `/v1/responses` silently drops tool calls
+
+**High.** Found 2026-09-04. With `HIPFIRE_JINJA_CHAT=1` and tools declared, the model
+generates a tool call and `/v1/chat/completions` returns it correctly — while
+`/v1/responses`, given the identical request, returns an empty message and no call. The
+generation is the same; only the serialisation differs.
+
+**Reproducer.** `HIPFIRE_JINJA_CHAT=1 hipfire start`, then the same tools + prompt to both
+endpoints. Verified on `Qwen3.5-9B--oq4.25++` and `Qwen3.8-27B--oq4.25++`:
+
+| endpoint | result | tokens |
+|---|---|---|
+| `/v1/chat/completions` | `tool_calls: [{function: {name: "read_file", arguments: "{\"path\":\"src/lib.rs\"}"}}]`, `finish_reason: "tool_calls"` | 294 in / **27 out** |
+| `/v1/responses` | `output_text: ""`, `output: [{type: "message", content: [{type: "output_text", text: ""}]}]` | 294 in / **27 out** |
+
+**Identical token counts are the point.** The model emitted the same 27 tokens on both
+paths, so the call was generated and parsed — `output_text` is empty precisely *because*
+the parser consumed it — and then nothing carried it into the response. The OpenAI
+Responses shape for this is an output item of `type: "function_call"` carrying `name` and
+`arguments`; hipfire emits no such item.
+
+**Why it is worse than a missing feature.** A client on `/v1/responses` cannot tell "the
+model chose not to call a tool" from "the model called one and it was discarded" — both
+are an empty assistant message. Downstream (Corrode, which uses `/v1/responses`) this
+looked like a family of models that could not emit tool calls, and produced a long chain
+of wrong conclusions: per-artifact "shape" tables, a `ParseFormat` per observed syntax, and
+a conclusion that Qwen 3.8 was incapable of calling tools. The models were calling tools
+correctly the whole time.
+
+**Two conditions interact.** With `HIPFIRE_JINJA_CHAT` off (the default) the tools block is
+never rendered into the prompt, so models improvise call syntax as free text and it lands
+in `output_text` — visible, but unparsed and inconsistent. With it on, calls are parsed
+properly and then dropped by `/v1/responses`. Neither state gives a `/v1/responses` client
+a usable tool call.
+
+**Suspected shape of the fix.** The chat path builds `tool_calls` from the parsed result;
+the responses path (`hipfire-server/src/routes/`) needs the equivalent — emit a
+`function_call` output item per parsed call and set the response status/`finish_reason`
+accordingly, rather than serialising an empty `output_text` message.
+
 ## Hunt coverage gaps — what the method could NOT reach
 
 **Written 2026-08-29 by the completeness critic (planned for wave 1, died with its
