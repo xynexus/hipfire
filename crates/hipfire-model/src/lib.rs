@@ -2734,6 +2734,15 @@ pub struct ModelLoadParams {
     pub spec_block: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub draft: Option<String>,
+    /// Render prompts through the model's Jinja chat template. `None` leaves the
+    /// existing env-var behaviour untouched, so an older caller that sends no params is
+    /// unaffected.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub jinja_chat: Option<bool>,
+    /// Chat template overriding the artifact's embedded one. Only consulted while
+    /// `jinja_chat` is on — that is the sole path where a template renders the prompt.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_template_file: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cask_sidecar: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2837,6 +2846,8 @@ impl ModelLoadParams {
         params.ngram_spec_max_spine = Some(config.ngram_spec_max_spine);
         params.ngram_spec_promote_count = Some(config.ngram_spec_promote_count);
         params.ngram_spec_write_target = Some(config.ngram_spec_write_target.clone());
+        params.jinja_chat = Some(config.jinja_chat);
+        params.chat_template_file = config.chat_template_file.clone();
         params.kv_adaptive = non_off_value(&config.kv_adaptive);
         params.spec_adaptive_block = Some(config.spec_adaptive_block);
         params.spec_block = Some(config.spec_block);

@@ -258,6 +258,20 @@ fn lfm2_triattn_kv_layer_ids(config: &lfm2moe::config::Lfm2MoeConfig) -> Vec<usi
     (0..config.num_attention_layers()).collect()
 }
 
+/// Is Jinja chat rendering on for this model?
+///
+/// Env wins so an operator can force it without editing config; otherwise the resolved
+/// `jinja_chat` setting, which `model_overrides` can set per model. `None` means the
+/// caller had no resolved config to offer, which reproduces the previous env-only
+/// behaviour exactly.
+pub fn resolve_jinja_chat(configured: Option<bool>) -> bool {
+    match std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() {
+        Some("1") => true,
+        Some(_) => false,
+        None => configured.unwrap_or(false),
+    }
+}
+
 /// Resolve the effective chat template for a model: the HFQ-embedded
 /// `tokenizer_config.chat_template`, with sidecar/path fallbacks. `None` when
 /// the model ships no template (base/completion model).
@@ -1238,6 +1252,7 @@ pub fn load_model(
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
+            jinja_chat: resolve_jinja_chat(None),
             arch_id: hfq.arch_id,
             registered_backend: None,
             pp: 1,
@@ -1389,6 +1404,7 @@ pub fn load_model(
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
+            jinja_chat: resolve_jinja_chat(None),
             arch_id: hfq.arch_id,
             registered_backend: None,
             pp: 1,
@@ -1508,6 +1524,7 @@ pub fn load_model(
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
+            jinja_chat: resolve_jinja_chat(None),
             arch_id: hfq.arch_id,
             registered_backend: Some(registered_backend),
             pp: 1,
@@ -1607,6 +1624,7 @@ pub fn load_model(
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
+            jinja_chat: resolve_jinja_chat(None),
             arch_id: hfq.arch_id,
             registered_backend: None,
             pp: 1,
@@ -1737,6 +1755,7 @@ pub fn load_model(
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
+            jinja_chat: resolve_jinja_chat(None),
             arch_id: hfq.arch_id,
             registered_backend: None,
             pp: 1,
@@ -1839,6 +1858,7 @@ pub fn load_model(
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
+            jinja_chat: resolve_jinja_chat(None),
             arch_id: hfq.arch_id,
             registered_backend: None,
             pp: 1,
@@ -1954,6 +1974,7 @@ pub fn load_model(
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
+            jinja_chat: resolve_jinja_chat(None),
             arch_id: hfq.arch_id,
             registered_backend: None,
             pp: 1,
@@ -2056,6 +2077,7 @@ pub fn load_model(
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
+            jinja_chat: resolve_jinja_chat(None),
             arch_id: hfq.arch_id,
             registered_backend: None,
             pp: 1,
@@ -2179,6 +2201,7 @@ pub fn load_model(
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
+            jinja_chat: resolve_jinja_chat(None),
             arch_id: hfq.arch_id,
             registered_backend: None,
             pp: 1,
@@ -2308,6 +2331,7 @@ pub fn load_model(
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
         return Ok(LoadedModel {
+            jinja_chat: resolve_jinja_chat(None),
             arch_id: hfq.arch_id,
             registered_backend: None,
             pp: 1,
@@ -2550,6 +2574,7 @@ pub fn load_model(
             let (chat_template, chat_template_profile) =
                 profile_chat_template(chat_template, Some(&tokenizer));
             return Ok(LoadedModel {
+                jinja_chat: resolve_jinja_chat(None),
                 arch_id: hfq.arch_id,
                 registered_backend: None,
                 pp: 1,
@@ -2948,6 +2973,7 @@ pub fn load_model(
             Some(Box::new(dn)),
         ));
         Ok(LoadedModel {
+            jinja_chat: resolve_jinja_chat(None),
             arch_id: hfq.arch_id,
             registered_backend: None,
             pp: 1,
@@ -3108,6 +3134,7 @@ pub fn load_model(
         let (chat_template, chat_template_profile) =
             profile_chat_template(chat_template, Some(&tokenizer));
         Ok(LoadedModel {
+            jinja_chat: resolve_jinja_chat(None),
             arch_id: hfq.arch_id,
             registered_backend: None,
             pp: 1,
@@ -3587,6 +3614,7 @@ pub fn load_model_pp(
         Some(Box::new(dn)),
     ));
     Ok(LoadedModel {
+        jinja_chat: resolve_jinja_chat(None),
         arch_id: hfq.arch_id,
         registered_backend: None,
         pp,
