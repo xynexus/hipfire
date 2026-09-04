@@ -241,7 +241,9 @@ env_vars! {
 
     NO_COARSE_LMHEAD = "HIPFIRE_NO_COARSE_LMHEAD", Developer,
         "Set to any value to stop the quantizer emitting the `<embed>.coarse.weight` \
-         shortlist tier. Equivalent to `--no-coarse-lmhead`. Default is to emit it.";
+         shortlist tier. Redundant since 2026-09-04: emission is now OFF by default \
+         because nothing reads the sidecar, and `--coarse-lmhead` opts back in. Still \
+         honoured, and it beats the flag.";
 
     // ── Dispatch diagnostics (hipfire-dispatch) ─────────────────────────────
     DUMP_HIDDEN = "HIPFIRE_DUMP_HIDDEN", Developer,

@@ -635,14 +635,47 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// `--no-coarse-lmhead` (or `HIPFIRE_NO_COARSE_LMHEAD`) disables emission of the
-/// two-pass lm_head coarse tier. Default is ON: the coarse tier is ~0.5 b/weight
-/// on top of the fine embed and makes decode's output projection ~4× cheaper
-/// while the fine pass keeps the logits exact for the shortlisted rows. A model
-/// built without it still serves — the runtime falls back to a single fine pass.
+/// `--coarse-lmhead` opts IN to emitting the two-pass lm_head coarse tier.
+///
+/// **Default is OFF, and was ON until 2026-09-04.** Nothing reads the sidecar:
+/// the runtime's two-stage path builds its coarse tier at load from the head it
+/// will actually shortlist for (`llama::lmhead_project` ->
+/// `build_coarse_from_compact`), so `<embed>.coarse.weight` was pure artifact
+/// weight — 636 MB on a 27B (4.0% of the file), 255 MB on a 35B-A3B. See
+/// `docs/bugs/2026-09-04-coarse-lmhead-sidecar-unread.md`.
+///
+/// It is opt-in rather than deleted because the tier itself is sound and cheap
+/// to rebuild (`docs/kernel_work/two-stage-lmhead.md`); what is missing is a
+/// loader. Wire one and this becomes a default again — but fix the untied case
+/// first: the tier is built in the `is_embed` arm, and `is_embedding_table_name`
+/// does not match `lm_head.weight`, so on an untied model it ranks rows of the
+/// EMBEDDING to shortlist for a different trained output head.
+///
+/// `HIPFIRE_NO_COARSE_LMHEAD` is still honoured and now redundant; it wins over
+/// the flag, so a script that sets it keeps getting no sidecar.
 fn coarse_lmhead_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| !hipfire_env::NO_COARSE_LMHEAD.is_set())
+    *ON.get_or_init(|| {
+        !hipfire_env::NO_COARSE_LMHEAD.is_set() && COARSE_LMHEAD_OPT_IN.get().copied() == Some(true)
+    })
+}
+
+/// Set once from [`coarse_lmhead_arg`] at argument-parse time; see
+/// [`coarse_lmhead_enabled`].
+static COARSE_LMHEAD_OPT_IN: OnceLock<bool> = OnceLock::new();
+
+/// What the command line says about the coarse tier: `Some(true)` for
+/// `--coarse-lmhead`, `Some(false)` for `--no-coarse-lmhead`, `None` when
+/// neither appears (the off default stands).
+///
+/// The negative wins when both are given — refusing to emit is the safe way to
+/// read a contradictory command line, and it matches
+/// `HIPFIRE_NO_COARSE_LMHEAD` beating the flag.
+fn coarse_lmhead_arg(args: &[String]) -> Option<bool> {
+    if args.iter().any(|a| a == "--no-coarse-lmhead") {
+        return Some(false);
+    }
+    args.iter().any(|a| a == "--coarse-lmhead").then_some(true)
 }
 
 /// Drain the pending coarse tier (if the just-pushed tensor produced one) and
@@ -7421,6 +7454,8 @@ OPTIONS:
     --no-kmap, --uniform       disable K-map promotion entirely
     --q8-router                quantize the MoE router/gate to Q8
     --no-q8-conv1d             keep DeltaNet conv1d at the --format quant (default: forced Q8)
+    --coarse-lmhead            emit the two-pass lm_head coarse tier as <embed>.coarse.weight
+                               (default: off -- no loader reads it; 4% of a 27B artifact)
     --tier-ratio <F>           MQ tier split for tiered routed formats (default 0.30; env HIPFIRE_TIER_RATIO)
 
   Tensor selection:
@@ -8358,6 +8393,13 @@ pub fn main() {
     // keep conv1d at the same quant as the rest of the model.
     let q8_conv1d_default = !args.iter().any(|a| a == "--no-q8-conv1d");
     let no_kmap = args.iter().any(|a| a == "--no-kmap" || a == "--uniform");
+    // Opt in to the two-pass lm_head coarse tier. `--no-coarse-lmhead` was
+    // DOCUMENTED here and in hipfire-env but never parsed, so only the env var
+    // ever turned it off; it is accepted now so the documented spelling stops
+    // being a lie, and is a no-op against an off default.
+    if let Some(on) = coarse_lmhead_arg(&args) {
+        let _ = COARSE_LMHEAD_OPT_IN.set(on);
+    }
 
     // ── imatrix loader (consumed by AWQ pre-scaling) ──
     // --imatrix <path>: load an llama-imatrix-produced GGUF (per `examples/
@@ -16237,6 +16279,22 @@ mod hfq_block_diag {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The coarse tier is off unless asked for, and a contradictory command line
+    /// resolves to off. Guards the 2026-09-04 default flip: an artifact that
+    /// silently regrows a 636 MB unread sidecar is the regression to catch.
+    #[test]
+    fn coarse_lmhead_is_opt_in_and_the_negative_wins() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(coarse_lmhead_arg(&a(&["--format", "oq4.25++"])), None);
+        assert_eq!(coarse_lmhead_arg(&a(&["--coarse-lmhead"])), Some(true));
+        assert_eq!(coarse_lmhead_arg(&a(&["--no-coarse-lmhead"])), Some(false));
+        assert_eq!(
+            coarse_lmhead_arg(&a(&["--coarse-lmhead", "--no-coarse-lmhead"])),
+            Some(false),
+            "a contradictory command line must not emit the sidecar"
+        );
+    }
 
     #[test]
     fn pooled_donors_only_for_shared_input_expert_projections() {
