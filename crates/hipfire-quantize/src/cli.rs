@@ -356,6 +356,7 @@ static LDLQ_SUCCESS: AtomicUsize = AtomicUsize::new(0);
 static LDLQ_MISSING: AtomicUsize = AtomicUsize::new(0);
 static LDLQ_K_MISMATCH: AtomicUsize = AtomicUsize::new(0);
 static LDLQ_PACK_FAILED: AtomicUsize = AtomicUsize::new(0);
+static LDLQ_DAMP_ESCALATED: AtomicUsize = AtomicUsize::new(0);
 
 /// Layer-pooled Hessian donor for a routed-expert projection that reads the
 /// layer-shared FFN input. Routed experts are captured imatrix-only, so without
@@ -453,8 +454,32 @@ fn ldlq_hessian_for_tensor(idx: &Oq4LdlqHessian, name: &str, k: usize) -> Option
     })
 }
 
-fn ldlq_record_success() {
+/// Count a successful LDLQ tensor, and NAME it when its factorization only
+/// succeeded at escalated damping.
+///
+/// `inv_cholesky_lower_rotated_fast` retries at lambda x{1,10,100,1000,10000}.
+/// A tensor that only factorized at the top of that ladder has lambda swamping
+/// its Hessian -- H+lambda I is effectively lambda I, so the OBS solution
+/// collapses toward plain RTN while the AWQ scales were still rebased against
+/// it. That used to be indistinguishable from a clean success: the ladder
+/// `continue`d silently and this counter incremented either way, so `success=496`
+/// said nothing about whether LDLQ had helped 496 tensors or 4.
+///
+/// Printed per tensor rather than only aggregated because WHICH tensors escalate
+/// is the diagnostic: it tracks conditioning, so it concentrates in the
+/// largest-K tensors, and an aggregate count cannot show that.
+fn ldlq_record_success(name: &str, k: usize) {
     LDLQ_SUCCESS.fetch_add(1, Ordering::Relaxed);
+    if let Some(rung) = ldlq::last_damp_rung() {
+        if rung > 0 {
+            LDLQ_DAMP_ESCALATED.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "  ldlq: DAMPED {name} [k={k}] factorized only at {}x the requested lambda \
+                 -- the OBS solution is that much closer to RTN",
+                ldlq::DAMP_LADDER[rung]
+            );
+        }
+    }
 }
 
 fn ldlq_record_pack_failed(name: &str) {
@@ -480,6 +505,33 @@ fn ldlq_report_and_validate(strict: bool) -> Result<(), String> {
     eprintln!(
         "  LDLQ tensors:     success={success} attempts={attempts} missing={missing} k_mismatch={k_mismatch} pack_failed={pack_failed}"
     );
+    // Reported unconditionally, next to the success count it qualifies. A run
+    // where every tensor sits on rung 0 is the one where `success` means what it
+    // looks like; anything else is a partial result wearing a `++` name.
+    let (rungs, exhausted) = ldlq::damp_rung_histogram();
+    let escalated = LDLQ_DAMP_ESCALATED.load(Ordering::Relaxed);
+    let ladder: Vec<String> = ldlq::DAMP_LADDER
+        .iter()
+        .zip(rungs.iter())
+        .filter(|(_, &n)| n > 0)
+        .map(|(mult, n)| format!("{mult:.0}x={n}"))
+        .collect();
+    eprintln!(
+        "  LDLQ damping:     {} (escalated={escalated} exhausted={exhausted})",
+        if ladder.is_empty() {
+            "none".to_string()
+        } else {
+            ladder.join(" ")
+        }
+    );
+    if escalated > 0 {
+        eprintln!(
+            "  LDLQ damping:     {escalated} tensor(s) needed escalated damping, so their OBS \
+             feedback is degraded toward RTN. Conditioning, not coverage: bf16 Hessian storage \
+             forces ~13% of the mean diagonal on its own, and rank deficiency sets the floor \
+             (calibrate more sequences, or store the Hessian at f16 -- same bytes)."
+        );
+    }
     // Never let a pooled build be mistaken for one where every expert had its
     // own Hessian — the two are different experiments.
     let pooled = POOLED_HESSIAN_HITS.load(Ordering::Relaxed);
@@ -4645,7 +4697,7 @@ fn quantize_hfq_source_tensor(
                 let damp = 0.01 * (diag_sum / k as f64).max(1e-12);
                 let out = ldlq::oq3_ldlq_pack(&wbuf, m_dim, k, &h, &signs1, &signs2, damp);
                 if out.is_some() {
-                    ldlq_record_success();
+                    ldlq_record_success(name, k);
                     if let Some(s) = awq_scales {
                         OQ4_AWQ_SIDECAR.with(|c| *c.borrow_mut() = Some(s));
                         eprintln!("  ldlq+awq: {name} [{m_dim}x{k}] OBS int3 + smooth");
@@ -4703,7 +4755,7 @@ fn quantize_hfq_source_tensor(
                 let damp = 0.01 * (diag_sum / k as f64).max(1e-12);
                 let out = ldlq::oq2_ldlq_pack(&wbuf, m_dim, k, &h, &signs1, &signs2, damp);
                 if out.is_some() {
-                    ldlq_record_success();
+                    ldlq_record_success(name, k);
                     if let Some(s) = awq_scales {
                         OQ4_AWQ_SIDECAR.with(|c| *c.borrow_mut() = Some(s));
                         eprintln!("  ldlq+awq: {name} [{m_dim}x{k}] OBS int2 + smooth");
@@ -4779,7 +4831,7 @@ fn quantize_hfq_source_tensor(
                     damp,
                 );
                 if out.is_some() {
-                    ldlq_record_success();
+                    ldlq_record_success(name, k);
                     if let Some(s) = awq_scales {
                         OQ4_AWQ_SIDECAR.with(|c| *c.borrow_mut() = Some(s));
                         eprintln!("  ldlq+awq: {name} [{m_dim}x{k}] OBS int4 + smooth");
@@ -4845,7 +4897,7 @@ fn quantize_hfq_source_tensor(
                         damp,
                     );
                     if out.is_some() {
-                        ldlq_record_success();
+                        ldlq_record_success(name, k);
                         if let Some(s) = awq_scales {
                             OQ4_AWQ_SIDECAR.with(|c| *c.borrow_mut() = Some(s));
                             eprintln!("  ldlq+awq: {name} [{m_dim}x{k}] OBS int8 + smooth");
@@ -4936,7 +4988,7 @@ fn quantize_hfq_source_tensor(
                     w8_frac,
                 );
                 if out.is_some() {
-                    ldlq_record_success();
+                    ldlq_record_success(name, k);
                     if let Some(s) = awq_scales {
                         OQ4_AWQ_SIDECAR.with(|c| *c.borrow_mut() = Some(s));
                         eprintln!("  ldlq+awq: {name} [{m_dim}x{k}] tiered OBS int4/int8 + smooth");

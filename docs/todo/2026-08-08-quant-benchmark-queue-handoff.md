@@ -284,10 +284,63 @@ coverage defect — the dense models got *near-total* LDLQ (496/497, only
 1. Both CIs are wide and both are driven by a single ~0.4 outlier chunk against
    a ~0.03 minimum — heavy-tailed, so the mean is not a good summary. n=16
    cannot resolve this; re-score with more chunks before drawing conclusions.
-2. Both 27Bs are **VL** checkpoints (nested `text_config`, `image_token_id`).
-   The calibration and the eval are text-only, so vision-adjacent weights are
-   quantized with no relevant activation evidence. That is the obvious suspect
-   and it is untested.
+   **Still open.**
+2. ~~Both 27Bs are **VL** checkpoints...~~ — **RULED OUT 2026-09-04.** Checked
+   against the artifacts rather than the config habit:
+   - It is not a dense-vs-MoE difference. **All four** models are VL —
+     identical `text_config`, `vision_config`, `image_token_id: 248056`,
+     `Qwen3_5(Moe)ForConditionalGeneration`. The MoE pair carries the same
+     nesting and scored 2-3x BETTER.
+   - There are **zero vision tensors** in any of the four artifacts
+     (`visual|vision|image|patch_embed`: 0 hits).
+   - By design: `hipfire-quantize --include-vision` is documented as "include
+     vision-tower tensors (default: skipped)". The tower was never a candidate,
+     so the proposed mechanism has nothing to act on. The VL-ness is
+     config-only.
+
+**The coverage framing in the paragraph above is also backwards, and that is the
+live lead.** "Near-total LDLQ (496/497)" counts TENSORS, and LDLQ "success" was
+never evidence that LDLQ helped: `inv_cholesky_lower_rotated_fast` retries at
+lambda x{1,10,100,1000,10000} and, until 2026-09-04, `continue`d on failure with
+nothing recorded. A tensor that only factorized at the top of that ladder has
+lambda swamping its Hessian — H+lambda I is effectively lambda I, so the OBS
+solution collapses toward RTN — and it incremented the same counter as a clean
+success.
+
+With the ladder instrumented (`feat/ldlq-damping-telemetry`), a real
+`oq4.25++ --ldlq` build of the Qwen3.5-9B DFlash drafter reports:
+
+    LDLQ tensors:     success=36 attempts=36 missing=0 k_mismatch=0 pack_failed=0
+    LDLQ damping:     1x=2 10x=29 100x=4 1000x=1 (escalated=34 exhausted=0)
+
+**34 of 36 tensors needed escalated damping.** The old line — `success=36
+attempts=36`, everything else zero — reads as a flawless build. Only two tensors
+(`layers.{2,3}.self_attn.o_proj`) factorized at the damping actually asked for.
+
+The rung tracks K, which is what makes it a conditioning problem and not a
+coverage one:
+
+| K | rung |
+|---|---|
+| 4096 | 10x (27 tensors), 100x (1) |
+| 12288 (`down_proj`) | 10x (2), 100x (3) |
+| 20480 (`fc`) | **1000x** (1) |
+
+That is the asymmetry, and it points the opposite way from the paragraph above.
+The dense 27B ran LDLQ on 64 x `mlp.down_proj` at **K=17408** — the largest and
+worst-conditioned Hessians in either model, ~72% of its 31.5 GB calib. The MoE
+pair SKIPPED its 10240 expert `down_proj` (K=512) entirely. So the MoE may have
+been spared the tensors LDLQ was hurting, not handicapped by missing them.
+
+Mechanism is measured and independent: `88a5b192c` ("Hessian PSD: bf16 STORAGE
+is the dominant error, and f16 would cut damping 8x", on
+`origin/feat/npu-oq4-decode`, NOT on master) shows bf16 on-disk storage forces
+damping to ~13% of the mean diagonal where f16 would need ~1.6% — at the same
+2 bytes/element — and that rank deficiency sets the floor. Our calibs store
+`HessianBf16TrilDiagF32`.
+
+Not proven for the 27B specifically: nobody has re-run it with the telemetry.
+That run is now cheap and needs no re-calibration — every input is on halo.
 
 Calibration route was forced by shape, not preference: a dense 27B has
 `intermediate_size=17408`, so ONE `down_proj` Hessian is 17408²·4 = 1.13 GiB and
