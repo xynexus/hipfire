@@ -983,6 +983,37 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         "GPU slab loading policy for model weights."
     ),
     field!(
+        "jinja_chat",
+        ConfigType::Bool,
+        Requirement::Optional,
+        Some("false"),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Render prompts with the model's Jinja chat template instead of the hand-rolled \
+         ChatFrame scaffold. OFF by default: templates/eval/DURABILITY-2026-06-09.md \
+         records Jinja rendering as not yet flip-the-default ready, pending the \
+         cache-under-jinja wiring and a `| tojson` tool-render skew fix. Worth setting \
+         per model under `model_overrides` where tool calling matters — with it off the \
+         template's `{% if tools %}` branch never fires, so the model is never told a \
+         tool exists and improvises call syntax as free text. Was reachable only as \
+         HIPFIRE_JINJA_CHAT, which still overrides this when set."
+    ),
+    field!(
+        "chat_template_file",
+        ConfigType::Path {
+            existence: PathExistence::Exists,
+        },
+        Requirement::Optional,
+        None,
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Jinja chat template to use instead of the one embedded in the artifact. Takes \
+         effect only when `jinja_chat` is on, since the template drives prompt rendering \
+         only there — otherwise it feeds stop-policy profiling alone. Set it per model \
+         under `model_overrides` to fix one model without touching the rest. Was \
+         reachable only as HIPFIRE_CHAT_TEMPLATE_FILE, which still overrides this."
+    ),
+    field!(
         "prompt_normalize",
         ConfigType::Bool,
         Requirement::Optional,

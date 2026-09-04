@@ -718,6 +718,44 @@ pub(crate) fn load(
     }
     match load_result {
         Ok(mut m) => {
+            // Apply the chat-template settings the SERVER resolved. They arrive in
+            // `params`, which `ModelLoadParams::from_hipfire_config` filled from a config
+            // that went through `resolve_for_model` — so `model_overrides` for this model
+            // are already folded in. Reading the environment inside the render sites, as
+            // this used to, cannot see a per-model override at all.
+            let params = msg.get("params");
+            m.jinja_chat = hipfire_serving_core::load::resolve_jinja_chat(
+                params
+                    .and_then(|p| p.get("jinja_chat"))
+                    .and_then(|v| v.as_bool()),
+            );
+            // A configured template replaces the embedded one, and the stop-policy
+            // profile is recomputed from it — a profile derived from the template that
+            // was replaced would drive stop handling for text the model never emits.
+            // Only meaningful while jinja rendering is on, which is the sole path where a
+            // template renders the prompt.
+            if m.jinja_chat {
+                if let Some(path) = params
+                    .and_then(|p| p.get("chat_template_file"))
+                    .and_then(|v| v.as_str())
+                    .filter(|p| !p.is_empty())
+                {
+                    match std::fs::read_to_string(path) {
+                        Ok(t) => {
+                            eprintln!("[chat_template] config chat_template_file={path}");
+                            let (tmpl, profile) = hipfire_serving_core::load::profile_chat_template(
+                                Some(t),
+                                m.tokenizer.as_ref(),
+                            );
+                            m.chat_template = tmpl;
+                            m.chat_template_profile = profile;
+                        }
+                        Err(e) => eprintln!(
+                            "[chat_template] config chat_template_file={path} unreadable ({e}); keeping the embedded template"
+                        ),
+                    }
+                }
+            }
             // Default the scope to the model's own filename: two models share a
             // table only when an operator says so, because token ids mean
             // nothing across tokenizers.
