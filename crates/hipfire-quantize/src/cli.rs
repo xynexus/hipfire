@@ -5395,7 +5395,12 @@ fn qtip_greedy_encode_gpu(
 #[cfg(feature = "gpu")]
 struct QtipEncodeScratch {
     chunk: usize,
-    backptr: hipfire_rdna::GpuTensor,
+    /// OWNED, not a bare `GpuTensor`. `GpuTensor`'s drop is a no-op, so a
+    /// scratch cell that goes out of scope used to strand its half-gigabyte
+    /// buffer for the life of the process — see `gpu_encode_symbols`, which
+    /// mints a fresh cell per tensor. Owned means the drop enqueues the buffer
+    /// for reclaim, and the next tensor's identically-sized request reuses it.
+    backptr: hipfire_rdna::OwnedTensor,
 }
 
 #[cfg(feature = "gpu")]
@@ -5406,7 +5411,21 @@ fn gpu_encode_symbols(
     bits: u32,
 ) -> Result<Vec<u8>, String> {
     let mut own: Option<QtipEncodeScratch> = None;
-    gpu_encode_symbols_scratch(gpu, rotated, n_groups, bits, &mut own)
+    let out = gpu_encode_symbols_scratch(gpu, rotated, n_groups, bits, &mut own);
+    // This wrapper is called once per TENSOR (the unconditioned `--format qtip3`
+    // path), so the scratch cell it owns is born and dies per tensor. Dropping an
+    // `OwnedTensor` only enqueues the buffer; it reaches the pool at an explicit
+    // reclaim. Without these two lines the backptr was stranded per tensor —
+    // ~512 MB × every quantized tensor, which is ~95 GB on a 2B model and is what
+    // drove halo into a global OOM on 2026-09-04 (measured: system memory climbed
+    // 5.6 → 106.3 GB on a 2B qtip3 build, monotonically, while the process cgroup
+    // stayed flat at 7.36 GB because KFD buffers are charged to no memcg).
+    //
+    // Reclaiming here bounds the whole run at ONE backptr: every allocation is
+    // the same capped size, so the pooled buffer is reused by the next tensor.
+    drop(own);
+    gpu.reclaim_pending();
+    out
 }
 
 /// As [`gpu_encode_symbols`], but reuses `scratch` across calls. Pass the same
@@ -5437,7 +5456,7 @@ fn gpu_encode_symbols_scratch(
         // `cn` entries so an oversized scratch costs nothing per call.
         let mut chunk = 1024usize;
         let backptr = loop {
-            match gpu.alloc_tensor(&[chunk * 256 * 256 * 2], DType::F32) {
+            match gpu.alloc_owned(&[chunk * 256 * 256 * 2], DType::F32) {
                 Ok(b) => break b,
                 Err(_) if chunk > 64 => chunk /= 2,
                 Err(e) => return Err(format!("backptr alloc (chunk={chunk}): {e}")),
