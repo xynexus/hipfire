@@ -269,6 +269,59 @@ pub fn is_qwen35_family_arch_id(arch_id: u32) -> bool {
     )
 }
 
+/// How a model's chat prompt is framed: render the model's own Jinja
+/// `chat_template`, or emit `prompt_frame::ChatFrame`'s hand-rolled ChatML
+/// scaffold.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChatPromptPolicy {
+    /// Render the model's `chat_template`.
+    Jinja,
+    /// Hand-rolled `<|im_start|>` scaffold.
+    PlainScaffold,
+}
+
+impl ModelArchFamily {
+    /// The family's own framing default, before any operator setting.
+    ///
+    /// Qwen3.5 is the outlier: its serving paths opt **in** to Jinja
+    /// (`templates/eval/DURABILITY-2026-06-09.md` records the flip as not
+    /// ready), while every other family renders the template it ships and opts
+    /// **out**. That difference used to be spelled as two opposite environment
+    /// comparisons at eleven separate render sites, which is why a Qwen-only
+    /// defect read as "chat templates do not render" for every model.
+    pub fn default_chat_prompt(self) -> ChatPromptPolicy {
+        match self {
+            ModelArchFamily::Qwen35Dense | ModelArchFamily::Qwen35Moe => {
+                ChatPromptPolicy::PlainScaffold
+            }
+            _ => ChatPromptPolicy::Jinja,
+        }
+    }
+}
+
+/// Resolve the framing one loaded model actually uses — the single place the
+/// answer is decided.
+///
+/// `configured` is the operator's explicit answer (`jinja_chat = on|off`);
+/// `None` is `auto`, which leaves the family default standing. A model that
+/// ships no chat template has nothing to render, so it always gets the
+/// scaffold — which is what lets a call site treat [`ChatPromptPolicy::Jinja`]
+/// as proof that `chat_template` is `Some`.
+pub fn chat_prompt_policy(
+    arch_id: u32,
+    has_chat_template: bool,
+    configured: Option<bool>,
+) -> ChatPromptPolicy {
+    if !has_chat_template {
+        return ChatPromptPolicy::PlainScaffold;
+    }
+    match configured {
+        Some(true) => ChatPromptPolicy::Jinja,
+        Some(false) => ChatPromptPolicy::PlainScaffold,
+        None => model_arch_family(arch_id).default_chat_prompt(),
+    }
+}
+
 /// Resolve an `arch_id` *string* to its canonical [`ModelArchFamily`].
 ///
 /// Accepts either form the control plane actually carries:
@@ -2734,9 +2787,9 @@ pub struct ModelLoadParams {
     pub spec_block: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub draft: Option<String>,
-    /// Render prompts through the model's Jinja chat template. `None` leaves the
-    /// existing env-var behaviour untouched, so an older caller that sends no params is
-    /// unaffected.
+    /// Render prompts through the model's Jinja chat template. `None` is `auto` —
+    /// the arch's own default stands (see [`chat_prompt_policy`]) — which is also what
+    /// an older caller that sends no params gets.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub jinja_chat: Option<bool>,
     /// Chat template overriding the artifact's embedded one. Only consulted while
@@ -2846,7 +2899,13 @@ impl ModelLoadParams {
         params.ngram_spec_max_spine = Some(config.ngram_spec_max_spine);
         params.ngram_spec_promote_count = Some(config.ngram_spec_promote_count);
         params.ngram_spec_write_target = Some(config.ngram_spec_write_target.clone());
-        params.jinja_chat = Some(config.jinja_chat);
+        // `auto` stays `None` so the arch default survives the trip; only an
+        // explicit `on`/`off` overrides it.
+        params.jinja_chat = match config.jinja_chat.as_str() {
+            "on" => Some(true),
+            "off" => Some(false),
+            _ => None,
+        };
         params.chat_template_file = config.chat_template_file.clone();
         params.kv_adaptive = non_off_value(&config.kv_adaptive);
         params.spec_adaptive_block = Some(config.spec_adaptive_block);
@@ -3050,6 +3109,33 @@ mod tests {
         assert_eq!(json["devices"][0]["runtime"], "HIP 6.4");
         assert_eq!(json["devices"][0]["available"], true);
         assert_eq!(json["devices"][0]["selected"], true);
+    }
+
+    #[test]
+    fn chat_prompt_policy_keeps_each_family_default_until_told_otherwise() {
+        use ChatPromptPolicy::{Jinja, PlainScaffold};
+        // auto: qwen35 opts in to Jinja, everyone else opts out.
+        assert_eq!(
+            chat_prompt_policy(ARCH_ID_QWEN35_MOE, true, None),
+            PlainScaffold
+        );
+        assert_eq!(chat_prompt_policy(ARCH_ID_LLAMA_MISTRAL, true, None), Jinja);
+        assert_eq!(chat_prompt_policy(ARCH_ID_ZAYA, true, None), Jinja);
+        // An explicit setting overrides the family default in both directions.
+        assert_eq!(
+            chat_prompt_policy(ARCH_ID_QWEN35_MOE, true, Some(true)),
+            Jinja
+        );
+        assert_eq!(
+            chat_prompt_policy(ARCH_ID_LLAMA_MISTRAL, true, Some(false)),
+            PlainScaffold
+        );
+        // No template to render: scaffold regardless, so `Jinja` at a call site
+        // proves `chat_template` is Some.
+        assert_eq!(
+            chat_prompt_policy(ARCH_ID_LLAMA_MISTRAL, false, Some(true)),
+            PlainScaffold
+        );
     }
 
     #[test]
