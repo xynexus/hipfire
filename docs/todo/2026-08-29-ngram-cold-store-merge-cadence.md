@@ -1,7 +1,9 @@
 # TODO — n-gram cold store: merge cadence and rebalancing
 
-Status: **not started**. The store works and persists correctly; this is about
-what happens to its *layout* over a long-lived load.
+Status: **partly done**. The unload question below is DECIDED AND DONE
+(2026-09-04); the cadence work — triggers (1)/(2)/(3) — and crash safety are
+still open. The store works and persists correctly; this is about what happens
+to its *layout* over a long-lived load.
 
 ## Why
 
@@ -64,14 +66,22 @@ pressure is high *and* the daemon is idle.
 
 Also decide:
 
-- **Unload.** A merge on unload would flush the backlog and leave the file tidy
-  for the next load. Cheap, and currently missing — `merge_backlog` is dropped
-  with the `NgramSpec`.
-- **Crash safety.** `merge` zeroes the data region before rewriting it, so a
-  crash mid-merge leaves a store with a valid superblock and a partly zeroed
-  body. Reads would return misses, which is survivable, but a tmp-file +
-  rename would make it atomic and is the same pattern
-  `hipfire-vision-cache` already uses for its manifest.
+- ~~**Unload.**~~ **DONE 2026-09-04** — `impl Drop for NgramState` merges the live
+  tables when the load goes away, which covers `unload_model`'s seven call sites,
+  a worker swap, and daemon exit without any of them having to remember.
+
+  The gap was bigger than "the file is left untidy". `take_live_for` merges on a
+  scope SWAP, so the single-user, single-topic daemon described at the top of
+  this doc — the one that never merges — also never flushed its backlog. Every
+  gram that lost an in-place insert was dropped with the `NgramSpec`.
+- **Crash safety.** Still open, and slightly more reachable now that unload
+  merges: unload is also what shutdown does. `merge` zeroes the data region of a
+  live mmap before rewriting it, so a kill mid-merge leaves a store with a valid
+  superblock and a partly zeroed body. Reads return misses, which is survivable.
+  A tmp-file + rename would make it atomic and is the pattern
+  `hipfire-vision-cache` already uses for its manifest — but on an mmap'd store
+  that means building the replacement and re-mapping it, not just renaming a
+  path, so it is real work rather than a one-line change.
 
 ## Not this
 

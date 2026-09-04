@@ -203,6 +203,34 @@ impl NgramState {
     }
 }
 
+/// Merge the live tables when the load goes away.
+///
+/// `take_live_for` already merges on a scope swap; this is the other half, and
+/// without it a single-user, single-topic daemon never merged at all — the
+/// backlog was simply dropped with the `NgramSpec`, and every gram that had lost
+/// an in-place insert was lost with it.
+///
+/// On `Drop` rather than in `unload_model` because `unload_model` is not the only
+/// way a model goes away: it has seven call sites, a worker swap moves models in
+/// and out of `resident_models`, and the next unload path added would have to
+/// remember. A drop cannot be forgotten.
+///
+/// The merge also rebalances — `insert_in_place` writes reach disk without
+/// passing through the backlog, so an empty backlog does not mean an unchanged
+/// file — which is what leaves the store tidy for the next load. Cost is one
+/// full-file rewrite, measured ~7 s/GiB against a 256 MiB default store; it is
+/// the same cost the scope-swap path has always paid. A RAM-only store has no
+/// write store and merges nothing.
+impl Drop for NgramState {
+    fn drop(&mut self) {
+        if let Some((_, spec)) = self.live.as_mut() {
+            if let Err(e) = spec.merge() {
+                eprintln!("[ngram] merge on unload failed, staged grams not persisted: {e}");
+            }
+        }
+    }
+}
+
 /// Per-request identity used to pick n-gram tables.
 ///
 /// Threaded rather than read from a global, for the same reason `raw_override`
@@ -738,6 +766,56 @@ mod ngram_setup_tests {
             "the same scope must carry its own tables across requests, or the hot \
              tier is rebuilt per request and the feature is decorative"
         );
+    }
+
+    /// A dropped load must flush what it staged. Before this, `merge_backlog` went
+    /// out of scope with the `NgramSpec` and every gram that had lost an in-place
+    /// insert was lost with it — which, for a single-user single-topic daemon that
+    /// never swaps scope, was every merge the store would ever get.
+    ///
+    /// Asserts that dropping rewrote the store, not that a particular gram landed:
+    /// `merge` bumps and persists the epoch, so the file cannot come out identical
+    /// if it ran, and cannot differ if it did not. What `merge` itself keeps is
+    /// `cold_store_roundtrips_and_rebalances`'s job, in the crate that owns it.
+    #[test]
+    fn dropping_a_load_flushes_the_staged_grams_to_disk() {
+        use hipfire_specdecode_ngram::{NgramConfig, NgramSpec};
+
+        let dir = std::env::temp_dir().join(format!("hng-unload-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("t.hng");
+        let _ = std::fs::remove_file(&path);
+
+        // Fewer blocks than distinct keys, so keys touched late cannot be handed
+        // one and spill to the backlog — the state this is about.
+        let mut ng = NgramSpec::new(NgramConfig {
+            promote_count: 1,
+            orders: vec![2],
+            ..Default::default()
+        });
+        ng.attach_user(&path, 256, 8).unwrap();
+        let period = 64u32;
+        let stream: Vec<u32> = (0..period * 16).map(|i| i % period).collect();
+        ng.observe(&stream);
+        assert!(
+            ng.merge_backlog_len() > 0,
+            "test needs a non-empty backlog to prove anything was flushed"
+        );
+
+        // In-place inserts are already in the mmap, so this snapshot differs from
+        // the next one only if the drop merged.
+        let before = std::fs::read(&path).unwrap();
+
+        let mut st = NgramState::new(setup());
+        st.live = Some(("alice\u{1}chat".into(), ng));
+        drop(st);
+
+        let after = std::fs::read(&path).unwrap();
+        assert_ne!(
+            before, after,
+            "dropping a load left the store untouched — the staged grams went with it"
+        );
+        let _ = std::fs::remove_file(&path);
     }
 
     /// `persists()` reads the `ngram_store_root` schema field's arm rather than
