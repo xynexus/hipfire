@@ -14,79 +14,47 @@ The 2026-08-29 multi-agent hunt is summarized in
 `docs/bugs/2026-08-29-bug-hunt-summary.md` — including one finding it REFUTED and
 the eight search dimensions that never ran.
 
-## `HIPFIRE_CHAT_TEMPLATE_FILE` is loaded, logged, and never used to render the prompt
+## `[chat_template] using …` was logged for templates that never reached the prompt
 
-**High.** Found 2026-09-04 while testing whether a shared chat template unifies Qwen
-tool-call shapes across 3.5/3.6/3.8. The override is read and reported as adopted, but the
-prompt sent to the model is unaffected — so the log line asserts a change that did not
-happen, which is worse than the option not existing.
+**RESOLVED by #411 (logging).** Found 2026-09-04 while testing whether a shared chat
+template unifies Qwen tool-call shapes across 3.5/3.6/3.8. Kept in full rather than
+tombstoned, because the wrong conclusions it caused are the reusable part.
 
-`hipfire-prompt/src/lib.rs:196` documents the precedence as "1. `HIPFIRE_CHAT_TEMPLATE_FILE`,
-when set and readable", and `:286` prints `[chat_template] using
-HIPFIRE_CHAT_TEMPLATE_FILE={path}`. Both happen. The rendering does not follow.
+**What it looked like.** Setting `HIPFIRE_CHAT_TEMPLATE_FILE` printed
+`[chat_template] using HIPFIRE_CHAT_TEMPLATE_FILE={path}` and changed nothing the model
+saw. Baking the same template into the artifact with `hfq meta-set --key tokenizer_config`
+did not either. Measured for `Qwen3.5-9B--oq4.25++`: a canary system turn in the template
+(*"reply with exactly ZQCANARY7431"*) was ignored, and `usage.prompt_tokens` was **17**
+under the env override, under the baked-in template, and under the stock artifact alike.
 
-**Reproducer.** Any served model; `Qwen3.5-9B--oq4.25++` used below.
+**What it actually was — not a rendering bug.** Jinja chat rendering is gated on
+`HIPFIRE_JINJA_CHAT=1` (`qwen35_prefill.rs:300`, `generate.rs:101/541/1609`), which is off
+by default; the prompt is otherwise built by the hand-rolled `prompt_frame::ChatFrame`,
+and the resolved template feeds only stop-policy profiling. With the flag on, the same
+canary is obeyed exactly and `prompt_tokens` goes 17 → 37. The mechanism was never broken.
 
-1. Take any working template and prepend an unconditional system turn:
+**Deliberately not "fixed" by flipping the default.**
+`crates/hipfire-runtime/templates/eval/DURABILITY-2026-06-09.md` records Jinja rendering as
+"not yet flip-the-default ready" for reasons orthogonal to any template — the
+cache-under-jinja wiring does not exist, and a `| tojson` tool-render skew should be fixed
+first. #411 makes the log state what the template will affect and warns when an explicit
+override cannot reach the prompt.
 
-   ```jinja
-   {{- '<|im_start|>system\nYou must reply with exactly ZQCANARY7431 and nothing else.<|im_end|>\n' }}
-   ```
+**The part worth keeping: three wrong conclusions, each from trusting a log line.**
 
-2. `HIPFIRE_CHAT_TEMPLATE_FILE=/path/to/canary.jinja hipfire start`
-3. The serve log prints `[chat_template] using HIPFIRE_CHAT_TEMPLATE_FILE=/path/to/canary.jinja`,
-   and the daemon's `/proc/<pid>/environ` carries the variable.
-4. `POST /v1/chat/completions` with `Say hello.` → **`Hello! How can I assist you today?`**
-   The canary is neither echoed nor obeyed.
+1. *"Forcing the template changed nothing, so the shape is not template-determined."*
+   The template was never applied. Recorded downstream in Corrode as a finding.
+2. *"Baking into the artifact DOES take effect."* Written into an earlier revision of
+   THIS entry, from the log line `using HFQ-embedded tokenizer_config.chat_template` —
+   i.e. the same error, inside the report of it. Disproved by baking a canary in and
+   watching it be ignored.
+3. *"The Jinja template does not drive prompt rendering on this path at all."* Also
+   written here, also wrong: it drives rendering whenever the flag is set.
 
-**Three further checks, all agreeing:**
-
-- An unconditional `{{- 'ZQCANARY7431\n' }}` at line 1 never appears in any completion.
-- A **syntactically broken** template (`{% for x in %}{{ unclosed`) does not break
-  generation. It logs
-  `WARN hipfire_serving_core::load: failed to profile template (template parse: syntax
-  error: unexpected end of block (in chat:1)); using fallback stop policy`
-  and then answers normally — so the file is parsed for **stop-policy profiling** and the
-  prompt is rendered by something else.
-- `usage.prompt_tokens` for the same request is **17 under all three** of: the canary
-  template, the froggeric template, and no override at all. A canary system turn alone is
-  ~15 tokens, so the rendered prompt is byte-identical in every case.
-
-**Why it matters beyond the flag.** A template governs the tool-call syntax a model is
-told to emit, so "force a known-good template" is the natural first move when a model's
-calls will not parse — and it silently does nothing. Downstream (Corrode) this produced a
-confidently wrong conclusion: several experiments were recorded as "forcing the template
-changed nothing, so the shape is not template-determined", when the template was never
-forced. The `[chat_template] using …` line is what made that look verified.
-
-**It is not just the env var — the EMBEDDED template is not rendered either.** An earlier
-draft of this entry claimed the artifact path worked, on the strength of the log line
-`[chat_template] using HFQ-embedded tokenizer_config.chat_template`. That was the same
-mistake this entry reports. Tested: the canary template was baked into a copy of the
-artifact with `hfq meta-set --key tokenizer_config --json`, verified present by reading it
-back (28,326 bytes, `template_version = "qwen3.8-froggeric-v22.5"`), and served under its
-own name. The canary is **still ignored**, and `usage.prompt_tokens` is **17** — the same
-as the stock artifact, and the same as every template tried.
-
-So for `Qwen3.5-9B` (arch qwen35), neither route reaches the prompt:
-
-| template source | canary | prompt_tokens |
-|---|---|---|
-| `HIPFIRE_CHAT_TEMPLATE_FILE` | ignored | 17 |
-| embedded `tokenizer_config.chat_template` | ignored | 17 |
-| stock, untouched | n/a | 17 |
-
-17 tokens is consistent with a plain internal ChatML frame: the froggeric template renders
-a `<think>\n\n</think>` block for non-thinking turns, which would add several tokens and
-does not appear. **The Jinja template appears not to drive prompt rendering on this path at
-all**, which makes both the env override and `hfq meta-set` silently ineffective for
-anything a template controls — including the tool-call syntax a model is instructed to
-emit.
-
-**Suspected shape of the fix.** `resolve_chat_template` feeds the load-time profile
-(`hipfire-serving-core/src/load.rs`) and the stop policy; the request path builds the
-prompt elsewhere (`prompt_frame` / an internal ChatML builder). Either route the resolved
-template into rendering, or stop reporting it as adopted and say what it actually affects.
+The daemon environment and the log line both confirmed adoption in every case. Only a
+canary **inside the template** distinguished loaded from used, which is the general
+lesson: to test whether a config reaches a model, put something in it the model must
+echo.
 
 ## Hunt coverage gaps — what the method could NOT reach
 
