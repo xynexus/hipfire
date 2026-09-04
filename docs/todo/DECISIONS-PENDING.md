@@ -81,15 +81,21 @@ Promotion is also specified there: replace the raw `ngram_spec_promote_count`
 threshold with a Beta-Bernoulli lower confidence bound on measured ACCEPTANCE,
 so a 1-for-1 gram stops outranking a 40-for-50 one.
 
-## 3. Coexistence flag spelling — a deliberate compatibility break
+## 3. ~~Coexistence flag spelling — a deliberate compatibility break~~ — DECIDED 2026-09-04: BREAK
 
 `2026-08-30-coexistence-subcommand-promotion.md`
 
-`import gguf` spells its paths `--in`/`--out`; every other promoted command uses
-`--input`/`--output`. Options: unify (breaks scripts that use the old spelling),
-add a clap `alias` (accepts both, at the cost of two documented names for one
-flag), or leave the split. The doc says explicitly this "wants its own
-decision".
+Unify on `--input`/`--output`. The alias was rejected: two documented names for
+one flag is a cost carried forever, and the inconsistency is the thing being
+removed.
+
+**Already shipped.** The work landed 2026-09-01, before the call was made — this
+entry was simply never struck. `crates/hipfire-coexistence/src/cli.rs:189`
+rejects `--in`/`--out` BY NAME ("`--in` was renamed to `--input` ... Use
+`--input <path>`"), mirroring `RENAMED_KEYS` on the config side; the promoted
+`hipfire import gguf` path needs no shim because clap already suggests the near
+match. Blast radius was documentation only — no script in the tree passed the
+old spellings.
 
 Note the promotion already made one behaviour change on purpose: `ArgBag`
 silently ignored unknown flags, so `two-pass --typo 1` used to be accepted and
@@ -105,18 +111,33 @@ offline, dispatch via amdxdna) is worth productionizing for the long-context
 path". That is a strategic commitment to a second authoring toolchain, not a
 technical unknown.
 
-## 5. n-gram cold store — merge on unload?
+## 5. ~~n-gram cold store — merge on unload?~~ — DECIDED 2026-09-04: MERGE ON UNLOAD
 
 `2026-08-29-ngram-cold-store-merge-cadence.md`
 
-Should unload trigger a merge? It would flush the backlog and leave the file
-tidy for the next load; today `merge_backlog` is simply dropped with the
-`NgramSpec`. Cheap either way, but it is a policy call about when work happens.
+Yes. Implemented as `impl Drop for NgramState`
+(`crates/hipfire-serving-core/src/model.rs`) rather than a line in
+`unload_model`: that function has seven call sites, a worker swap moves models
+in and out of `resident_models` without going through it, and the next unload
+path added would have to remember. A drop cannot be forgotten.
 
-The crash-safety item raised beside it is NOT a decision — `merge` zeroes the
-data region before rewriting, so a crash mid-merge leaves a partly zeroed body;
-tmp-file + rename makes it atomic and is the pattern `hipfire-vision-cache`
-already uses for its manifest. That one is just work.
+Worth recording what this was worth: `take_live_for` already merged on a scope
+SWAP, so the gap was exactly the single-user, single-topic daemon — which never
+swaps, and therefore never merged at all. Not "the backlog was usually flushed
+and sometimes not"; for that deployment it was never flushed.
+
+Cost is one full-file rewrite per unload, ~7 s/GiB against the 256 MiB default,
+which is the cost the swap path has always paid. RAM-only stores have no write
+store and merge nothing.
+
+The crash-safety item raised beside it is still NOT a decision, and is still
+open — but note this decision makes it slightly more reachable, since unload is
+also what happens at shutdown. `merge` zeroes the data region of a live mmap
+before rewriting it, so a kill mid-merge leaves a valid superblock over a partly
+zeroed body (reads return misses; nothing else is corrupted). tmp-file + rename
+is the fix and the pattern `hipfire-vision-cache` already uses, but on an mmap'd
+store it means rebuilding the mapping, so it is real work rather than the
+one-liner the original note implies.
 
 ---
 
