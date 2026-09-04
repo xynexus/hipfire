@@ -35,7 +35,11 @@ done
 
 avail_gb() { awk '/^MemAvailable:/{printf "%d", $2/1048576}' /proc/meminfo; }
 
-"$@" &
+# `<&0` is load-bearing: backgrounding with `&` in a non-interactive shell
+# redirects the child's stdin to /dev/null, so any command that READS stdin
+# (`hipfire-daemon < requests.jsonl`) saw EOF immediately and exited 0 having
+# done nothing. Inherit the caller's stdin explicitly.
+"$@" <&0 &
 child=$!
 # An explicit recorded pid, never a pattern: `pkill -f` matches this script's own
 # command line via its arguments and kills the caller's shell (AGENTS.md).
