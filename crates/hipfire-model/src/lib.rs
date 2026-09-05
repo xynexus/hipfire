@@ -2934,6 +2934,13 @@ pub struct ModelLoadedResponse {
     /// server keeps its previous behaviour.
     #[serde(default)]
     pub batch_prefill_capable: Option<bool>,
+    /// Whether a DFlash DRAFTER model is loaded — not merely whether a `DflashState`
+    /// exists, which is also true of drafter-free n-gram speculation. The server needs
+    /// it to choose between the speculative legacy path and the batch path by
+    /// concurrency; `None` from an older daemon reads as "no drafter", which keeps the
+    /// previous routing.
+    #[serde(default)]
+    pub has_draft_model: Option<bool>,
     #[serde(default)]
     pub response_id: Option<String>,
 }

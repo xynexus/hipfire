@@ -38,23 +38,6 @@ use crate::session::{
 // what the fused-dense / grouped-MoE decode kernels require, else fall back to
 // the serial path or reject with a clear error.
 
-/// EXPERIMENT (2026-09-05): let a drafter-loaded model into the batched decode.
-///
-/// The batched decode never speculates — it advances every resident session by one real
-/// token — and nothing in this file touches `DflashState`. The refusal above therefore
-/// reads as "never validated" rather than "known to corrupt". This switch exists to test
-/// that reading before any of it is trusted.
-pub fn batch_decode_allows_drafter_pub() -> bool {
-    batch_decode_allows_drafter()
-}
-
-fn batch_decode_allows_drafter() -> bool {
-    matches!(
-        std::env::var("HIPFIRE_QWEN35_BATCH_WITH_DRAFTER").ok().as_deref(),
-        Some("1") | Some("on") | Some("true")
-    )
-}
-
 /// Gate: batched decode is single-GPU qwen35/qwen35-moe only, and incompatible
 /// with DFlash or active eviction.
 pub fn validate_qwen35_decode_batch_runtime_surface(
@@ -68,11 +51,16 @@ pub fn validate_qwen35_decode_batch_runtime_surface(
             "generate_batch_decode_step currently supports single-GPU qwen35/qwen35-moe only (arch_id={arch_id} pp={pp})"
         ));
     }
-    if dflash_loaded && !batch_decode_allows_drafter() {
-        return Err(
-            "generate_batch_decode_step is not supported on DFlash-loaded models".to_string(),
-        );
-    }
+    // A loaded drafter no longer refuses the batched decode. The batched path never
+    // speculates — it advances every resident session by one real token — and nothing
+    // here touches `DflashState`, so the old refusal was "never validated" rather than
+    // "known to corrupt". Verified 2026-09-05: with a sibling drafter loaded, batched
+    // decode produces correct output at N=1..8.
+    //
+    // WHETHER to batch a drafter-loaded model is a routing question, not a capability
+    // one, and it is answered in the server by `spec_batch_threshold` — speculation
+    // lives on the legacy path, so the choice is between paths, not inside this one.
+    let _ = dflash_loaded;
     if eviction_active {
         return Err(
             "generate_batch_decode_step is not supported with active eviction state".to_string(),

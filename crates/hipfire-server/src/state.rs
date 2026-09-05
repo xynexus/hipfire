@@ -71,6 +71,8 @@ pub struct LoadedModelState {
     /// The daemon's probe of this loaded model: can it take the fused batch
     /// prefill? Cached alongside `arch` because routing needs both.
     pub batch_prefill_capable: Option<bool>,
+    /// A DFlash drafter is loaded, so this model can speculate on the legacy path.
+    pub has_draft_model: bool,
 }
 
 pub struct AppState {
@@ -106,6 +108,11 @@ pub struct AppState {
     /// await the runner instead of taking `engine` directly. Only populated
     /// when `HIPFIRE_SERVER_PREFILL_BATCH` is enabled and the runner is spawned.
     pub batch_inbox: crate::batch_runner::BatchInbox,
+    /// Text requests currently between the route decision and their reply. The only
+    /// concurrency signal available where the batch-vs-speculation choice is made: a
+    /// request cannot see the batch it will land in, and the scheduler exposes no queue
+    /// depth. Approximate by construction — it counts arrivals, not formed batches.
+    pub text_inflight: std::sync::atomic::AtomicUsize,
     /// True once [`crate::batch_runner::spawn_batch_runner`] has started the
     /// runner loop. Routes that enqueue + await a runner result (image gen) must
     /// only do so when this is set — otherwise (e.g. unit tests that build an
@@ -307,6 +314,7 @@ impl AppState {
             prefill_dispatch: Mutex::new(()),
             prefill_notify: Notify::new(),
             batch_inbox: Mutex::new(HashMap::new()),
+            text_inflight: std::sync::atomic::AtomicUsize::new(0),
             batch_runner_active: std::sync::atomic::AtomicBool::new(false),
             bind: StdMutex::new(None),
             batch_telemetry: Mutex::new(crate::batch_runner::BatchTelemetry::default()),

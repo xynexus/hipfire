@@ -1074,6 +1074,7 @@ pub(crate) fn load(
                     "arch": arch,
                     "cache_capable": cache_capable,
                     "batch_prefill_capable": batch_prefill_capable,
+                    "has_draft_model": hipfire_serving_core::batch_executor::has_draft_model(&m),
                     "dim": dim,
                     "layers": layers,
                     "vocab": vocab,

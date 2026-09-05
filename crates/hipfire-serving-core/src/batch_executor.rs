@@ -141,15 +141,10 @@ impl BatchExecutor for Qwen35BatchExecutor {
         // Kept in step with `run_generate_batch_prefill_serial_qwen35`, which carries the
         // same predicate: a probe that admits what the operation refuses turns a fallback
         // into `fail_all` for every session in the cycle.
-        if has_draft_model(m) && !crate::qwen35_decode::batch_decode_allows_drafter_pub() {
-            if std::env::var("HIPFIRE_DEBUG_BATCH_ROUTE").as_deref() == Ok("1") {
-                eprintln!("[batch-probe] REFUSED: draft model present");
-            }
-            return Err(
-                "generate_batch_prefill does not support drafter-based speculative decode yet"
-                    .to_string(),
-            );
-        }
+        // A loaded drafter is no longer a refusal here either: the batched prefill does
+        // not speculate, and admitting it is what lets the server choose between the
+        // batch path and the speculative legacy path by concurrency. See
+        // `spec_batch_threshold` in routes/chat.rs.
         if m.eviction.is_some() {
             if std::env::var("HIPFIRE_DEBUG_BATCH_ROUTE").as_deref() == Ok("1") {
                 eprintln!("[batch-probe] REFUSED: eviction active");
