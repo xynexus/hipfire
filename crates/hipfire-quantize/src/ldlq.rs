@@ -300,9 +300,40 @@ thread_local! {
 ///
 /// Opt-in rather than default: the device factorizations run in f32, and the
 /// agreement with the f64 reference degrades as the Hessian gets worse
-/// (3.6e-5 relative at k=256/ridge 1e-1, 4.4e-4 at k=512/ridge 1e-2). Whether
-/// that matters is a KLD question, not a norm question, so it ships behind a
-/// flag until measured on a real artifact.
+/// (3.6e-5 relative at k=256/ridge 1e-1, 4.4e-4 at k=512/ridge 1e-2).
+///
+/// MEASURED 2026-09-05 on halo (gfx1151, 32 cores), and the answer is: leave it
+/// off. Both halves of the question are now settled.
+///
+/// QUALITY is a non-issue. Qwen3.5-0.8B oq4.25++ built each way and scored
+/// against its own 32-chunk bf16 references:
+///
+///   wikitext   f64 kld 0.044851  ppl 15.604  argmax 88.62%
+///              f32 kld 0.044752  ppl 15.618  argmax 88.56%
+///   multi      f64 kld 0.036012  ppl 13.480  argmax 90.43%
+///              f32 kld 0.035990  ppl 13.483  argmax 90.32%
+///
+/// KLD moves -0.22%/-0.06% (i.e. slightly BETTER), ppl +0.09%/+0.02%, argmax
+/// within 0.11 points. The signs disagree across metrics, which is noise rather
+/// than degradation.
+///
+/// SPEED is why it stays off: the device path is SLOWER on an idle box, and the
+/// deficit grows with size.
+///
+///   0.8B oq4.25++   cpu f64  50s   gpu f32  71s   (1.42x slower)
+///   4B   oq4.25++   cpu f64 647s   gpu f32 1063s  (1.64x slower)
+///
+/// An earlier measurement showed the GPU path 1.26x FASTER, and it was an
+/// artifact: it was taken while a 27B quantize held all 32 cores, starving
+/// faer. Give the CPU its cores back and faer wins. Any future comparison here
+/// must state the machine's load, not just its name.
+///
+/// The trailing SYRK is not the bottleneck — `chol_syrk_trailing_tiled` made
+/// that kernel 2.2x faster at k=8192/12288 and the end-to-end numbers above
+/// already include it. What costs is the per-block structure: gather, download
+/// the panel, factor it on the host in f64, upload, scatter, synchronise, once
+/// per 128 columns. Making this win needs the round-trips removed (panel
+/// factorization on device, or several panels in flight), not a faster SYRK.
 fn inv_cholesky_dispatch(h: &[f64], k: usize, damp: f64) -> Option<Mat<f64>> {
     #[cfg(feature = "gpu")]
     {
@@ -2020,7 +2051,14 @@ pub fn llt_lower_right_looking_gpu(
         let back_dev = gpu.upload_owned_f32(&back, &[rows, jb]).ok()?;
         gpu.chol_panel_scatter(&dev, &back_dev, k, j0, jb, rows)
             .ok()?;
-        gpu.chol_syrk_trailing(&dev, k, j0, jb).ok()?;
+        // 64-tile, not the scalar kernel and not the 128-tile. Measured on an
+        // idle box: 1.69x / 2.27x / 2.23x over scalar at k = 4096 / 8192 / 12288,
+        // where the 128-tile manages 1.35x / 2.41x / 1.95x — it wins only at
+        // 8192, by 6%, and loses at the size that matters most (12288 is a 27B
+        // down_proj). Its acc[8][8] is 64 accumulator VGPRs against 16, which
+        // costs a block per CU; `reference_gfx1151_iu4_gemm_tuning` records the
+        // same register-blocking dead end on this part.
+        gpu.chol_syrk_trailing_tiled(&dev, k, j0, jb).ok()?;
         gpu.device_synchronize().ok()?;
         j0 += jb;
     }
