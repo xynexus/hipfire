@@ -298,49 +298,51 @@ coverage defect — the dense models got *near-total* LDLQ (496/497, only
      so the proposed mechanism has nothing to act on. The VL-ness is
      config-only.
 
-**The coverage framing in the paragraph above is also backwards, and that is the
-live lead.** "Near-total LDLQ (496/497)" counts TENSORS, and LDLQ "success" was
-never evidence that LDLQ helped: `inv_cholesky_lower_rotated_fast` retries at
-lambda x{1,10,100,1000,10000} and, until 2026-09-04, `continue`d on failure with
-nothing recorded. A tensor that only factorized at the top of that ladder has
-lambda swamping its Hessian — H+lambda I is effectively lambda I, so the OBS
-solution collapses toward RTN — and it incremented the same counter as a clean
-success.
+**A damping hypothesis was raised here and then MEASURED AND REFUTED
+(2026-09-05).** Recorded in full because the refutation is the useful part.
 
-With the ladder instrumented (`feat/ldlq-damping-telemetry`), a real
-`oq4.25++ --ldlq` build of the Qwen3.5-9B DFlash drafter reports:
+LDLQ "success" was never evidence that LDLQ helped:
+`inv_cholesky_lower_rotated_fast` retries at lambda x{1,10,100,1000,10000} and,
+until 2026-09-04, `continue`d on failure with nothing recorded, so a tensor that
+only factorized at the top of the ladder — lambda swamping the Hessian, the OBS
+solution collapsing toward RTN — incremented the same counter as a clean
+success. That is real, and it is now instrumented (`feat/ldlq-damping-telemetry`).
 
-    LDLQ tensors:     success=36 attempts=36 missing=0 k_mismatch=0 pack_failed=0
-    LDLQ damping:     1x=2 10x=29 100x=4 1000x=1 (escalated=34 exhausted=0)
+The hypothesis built on it was that the dense pair ran LDLQ on 64 x
+`mlp.down_proj` at K=17408 — the biggest, most rank-marginal Hessians, ~72% of
+its 31.5 GB calib — while the MoE pair skipped its 10240 expert `down_proj` at
+K=512, so the MoE was SPARED tensors LDLQ was hurting rather than handicapped by
+missing them. It came from a Qwen3.5-9B DFlash drafter probe where 34 of 36
+tensors escalated, up to 1000x, and the rung appeared to track K.
 
-**34 of 36 tensors needed escalated damping.** The old line — `success=36
-attempts=36`, everything else zero — reads as a flawless build. Only two tensors
-(`layers.{2,3}.self_attn.o_proj`) factorized at the damping actually asked for.
+**It does not hold.** Re-quantizing `Qwen3.5-27B--bf16.hfq` against its own calib
+with the telemetry (halo, 2026-09-05, 496 LDLQ tensors):
 
-The rung tracks K, which is what makes it a conditioning problem and not a
-coverage one:
+    LDLQ tensors:     success=496 attempts=497 missing=1 k_mismatch=0 pack_failed=0
+    LDLQ damping:     1x=290 10x=204 100x=2 (escalated=206 exhausted=0)
 
-| K | rung |
-|---|---|
-| 4096 | 10x (27 tensors), 100x (1) |
-| 12288 (`down_proj`) | 10x (2), 100x (3) |
-| 20480 (`fc`) | **1000x** (1) |
+- **58% land on rung 0.** Of the 206 that escalate, 204 stop at 10x and 2 at
+  100x. Nothing reaches 1000x or 10000x.
+- `mlp.down_proj` (K=17408): **64 tensors, 7 escalated** (6 at 10x, 1 at 100x).
+  57 of 64 are clean — the opposite of the prediction.
+- **K does not predict the rung.** Escalation concentrates at K=5120 (191
+  tensors at 10x), the SMALLEST of the three widths present, not the largest.
 
-That is the asymmetry, and it points the opposite way from the paragraph above.
-The dense 27B ran LDLQ on 64 x `mlp.down_proj` at **K=17408** — the largest and
-worst-conditioned Hessians in either model, ~72% of its 31.5 GB calib. The MoE
-pair SKIPPED its 10240 expert `down_proj` (K=512) entirely. So the MoE may have
-been spared the tensors LDLQ was hurting, not handicapped by missing them.
+So the 9B drafter is an outlier, not the pattern, and damping does not explain
+the dense/MoE gap. The telemetry stays worth having — it caught the drafter
+reporting `success=36 attempts=36` while 34 of 36 tensors were silently damped —
+but this line of explanation is closed.
 
-Mechanism is measured and independent: `88a5b192c` ("Hessian PSD: bf16 STORAGE
-is the dominant error, and f16 would cut damping 8x", on
-`origin/feat/npu-oq4-decode`, NOT on master) shows bf16 on-disk storage forces
-damping to ~13% of the mean diagonal where f16 would need ~1.6% — at the same
-2 bytes/element — and that rank deficiency sets the floor. Our calibs store
-`HessianBf16TrilDiagF32`.
+Incidental, and it settles a separate doubt: the re-quantized artifact came out
+at **16,111,131,053 bytes, byte-for-byte the size of the original** built a month
+earlier from the dirty tree at `95b30d829`. That corroborates §2's "every one of
+the 19 .rs files is formatting-only" claim — the `git_dirty: true` stamp on these
+artifacts is not a reproducibility hazard.
 
-Not proven for the 27B specifically: nobody has re-run it with the telemetry.
-That run is now cheap and needs no re-calibration — every input is on halo.
+**What is left is point 1 above, and it is now the leading explanation rather
+than the fallback:** both CIs are wide and both are driven by a single ~0.4
+outlier chunk against a ~0.03 minimum, at n=16. The gap may simply be noise.
+Re-score at higher n before anything else.
 
 Calibration route was forced by shape, not preference: a dense 27B has
 `intermediate_size=17408`, so ONE `down_proj` Hessian is 17408²·4 = 1.13 GiB and
