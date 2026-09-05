@@ -133,7 +133,11 @@ impl BatchExecutor for Qwen35BatchExecutor {
         // `run_generate_batch_prefill_serial_qwen35`.
         if m.dflash.is_some() {
             if std::env::var("HIPFIRE_DEBUG_BATCH_ROUTE").as_deref() == Ok("1") {
-                eprintln!("[batch-probe] REFUSED: dflash drafter present");
+                eprintln!(
+                    "[batch-probe] REFUSED: dflash drafter present (ngram={} dspark={})",
+                    m.ngram.is_some(),
+                    m.dspark.is_some()
+                );
             }
             return Err(
                 "generate_batch_prefill does not support speculative-decode models yet".to_string(),
@@ -150,9 +154,11 @@ impl BatchExecutor for Qwen35BatchExecutor {
         }
         if std::env::var("HIPFIRE_DEBUG_BATCH_ROUTE").as_deref() == Ok("1") {
             eprintln!(
-                "[batch-probe] OK pp={} dflash={} eviction={}",
+                "[batch-probe] OK pp={} dflash={} ngram={} dspark={} eviction={}",
                 m.pp,
                 m.dflash.is_some(),
+                m.ngram.is_some(),
+                m.dspark.is_some(),
                 m.eviction.is_some()
             );
         }

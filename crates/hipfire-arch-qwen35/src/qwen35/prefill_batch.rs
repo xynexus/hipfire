@@ -1569,7 +1569,20 @@ fn dense_prefill_weight_unsupported_reason(weight: &WeightTensor) -> Option<&'st
     // with the `_for` call sites below — adding a rotated arm without adding it
     // here silently routes an AWQ model to serial, which is how the Opus arms
     // were caught during bring-up.
-    if weight.awq_scale.is_some() && !matches!(weight.gpu_dtype, DType::MQ4G256 | DType::Oq8G256) {
+    // OqCompactG256 belongs here with the other two: all three of its dispatch sites —
+    // lm_head, the non-residual GEMM, and the residual GEMM — call
+    // `rotate_x_mq_batched_for`, which applies `x /= awq_scale` when the sidecar is
+    // present. The list had drifted from the call sites in exactly the direction this
+    // comment warns about, and the refusal string above already named OqCompactG256 as
+    // supported, so the message and the guard disagreed. The cost was silent: every
+    // oq4.25++ artifact (OqPlusCompact on disk) refused the fused body and ran
+    // serial_reference, which is why continuous batching delivered no throughput at all.
+    if weight.awq_scale.is_some()
+        && !matches!(
+            weight.gpu_dtype,
+            DType::MQ4G256 | DType::Oq8G256 | DType::OqCompactG256
+        )
+    {
         return Some(
             "AWQ pre-scaled weights: the fused body applies awq_scale only on the FWHT-rotated arms (MQ4G256, Oq8G256, OqCompactG256)",
         );
@@ -1602,6 +1615,17 @@ fn dense_prefill_weight_unsupported_reason(weight: &WeightTensor) -> Option<&'st
         return Some("unsupported weight dtype");
     }
     None
+}
+
+
+/// [`dense_prefill_weight_unsupported_reason`] plus the dtype that refused.
+///
+/// The reason string names the arms that ARE supported; without the dtype in hand a
+/// reader still cannot tell which arm this weight is, and the lm_head arm already
+/// reports it. Leaked as an owned String because the reason is `&'static str`.
+fn dense_prefill_weight_named_reason(weight: &WeightTensor) -> Option<String> {
+    dense_prefill_weight_unsupported_reason(weight)
+        .map(|reason| format!("{reason}; dtype {:?}", weight.gpu_dtype))
 }
 
 pub fn validate_dense_prefill_session_batch_fused_prefix_full_precision_weights(
@@ -1639,7 +1663,7 @@ pub fn validate_dense_prefill_session_batch_fused_prefix_full_precision_weights(
                 &layer.w_down,
             ]
             .into_iter()
-            .find_map(dense_prefill_weight_unsupported_reason),
+            .find_map(dense_prefill_weight_named_reason),
             LayerWeights::FullAttn(layer) => [
                 &layer.wq,
                 &layer.wk,
@@ -1650,9 +1674,9 @@ pub fn validate_dense_prefill_session_batch_fused_prefix_full_precision_weights(
                 &layer.w_down,
             ]
             .into_iter()
-            .find_map(dense_prefill_weight_unsupported_reason),
+            .find_map(dense_prefill_weight_named_reason),
             LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_) => {
-                Some("MoE layer weights; the dense fused prefix is dense-only")
+                Some("MoE layer weights; the dense fused prefix is dense-only".to_string())
             }
         };
         if let Some(reason) = unsupported {

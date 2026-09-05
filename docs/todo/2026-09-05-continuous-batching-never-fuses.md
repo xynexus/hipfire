@@ -69,3 +69,64 @@ refusal reason where an operator sees it — `/health` already has `fallback_rea
 that counter is uninstrumented, as its own sibling `counters` field says. The trustworthy
 signals are `[prefill-eligible]` (one line per prefill), the runner's `coalesced N` debug
 line, and daemon session-creation timestamps.
+
+
+## Update: the AWQ guard had drifted from its own call sites
+
+`dense_prefill_weight_unsupported_reason` refused any AWQ-sidecar weight whose dtype was
+not `MQ4G256 | Oq8G256` — while the refusal string it returns names **three** arms,
+including `OqCompactG256`. The guard and its own message disagreed.
+
+`OqCompactG256` belongs in the list: all three of its dispatch sites (lm_head,
+non-residual GEMM, residual GEMM) call `rotate_x_mq_batched_for`, which applies
+`x /= awq_scale` when the sidecar is present — the same path `Oq8G256` and `MQ4G256`
+take. This is exactly the drift the comment above the guard warns about.
+
+It matters because `oq4.25++` is `OqPlusCompact` on disk and loads as `OqCompactG256`,
+so **every** locally served Qwen artifact hit this and silently ran `serial_reference`.
+Adding the dtype (one line) makes the fused body run on them. Measured, same KV=q8 /
+DeltaNet=FP32 config, only the backend differing:
+
+| N | serial | fused |
+|---|---|---|
+| 1 | 4.5 s (4.51 s/req) | 4.7 s (4.70 s/req) |
+| 2 | 9.1 s (4.54 s/req) | 8.4 s (4.18 s/req) |
+| 3 | 14.1 s (4.69 s/req) | 10.4 s (3.45 s/req) |
+
+Serial is flat at ~4.5 s/req — no batching benefit at all. Fused improves with N: 1.36x
+throughput at N=3. N=4 OOMs (`hipMalloc` 136 MB) at `max_seq: 131072`, so residency, not
+the kernel, caps the batch here.
+
+### It does not meet the parity bar
+
+**6/9 sessions byte-identical to serial** across three repeats. Divergences are near-tie
+flips (`$n-1$` vs `$n/2$`; a reordered clause), not gross corruption — the same signature
+that keeps `Oq4G256` on serial two comments below this guard ("3 of 8 sessions produced a
+different first token ... most likely an activation-precision difference"). Parity is this
+file's stated bar, so **this change should not land as-is**: the fix is correct about
+which arms apply the scale, and it exposes the same numerical gap that is already known
+and unexplained for the neighbouring dtype. Same investigation, now with a second dtype
+reproducing it.
+
+## Speculative decode does not have to exclude batching
+
+The probe refuses on `m.dflash.is_some()`, and the wording in `run_generate_batch_prefill_serial_qwen35`
+is "does not support DFlash-loaded models **yet**" — unimplemented, not impossible. vLLM and
+TRT-LLM run both together; the real tension is batch-size dependent. At small batch the GPU
+is underutilised and speculation is close to free; as batch grows the GPU saturates and
+rejected draft tokens start costing more than they save. That argues for a batch-size
+threshold, not a hard refusal.
+
+The n-gram case is stronger still, and is currently a plain defect:
+
+```
+[batch-probe] REFUSED: dflash drafter present (ngram=true dspark=false)
+```
+
+`ngram_spec: true` with `dflash_draft: off` still refuses. `NgramState` is a separate
+field whose own comment says it is "**deliberately NOT inside `dflash`**: it needs no
+drafter" — yet enabling it populates `m.dflash` (the shared `spec_step_dflash` verify
+engine), so the drafter-free path is refused by a check written for draft models. N-gram
+drafting costs a table lookup, no second forward pass, so it should compose with batching
+at any batch size. Fixing this is narrower than the general spec-decode question: the
+probe should test for an actual drafter, not for the verify engine they share.
