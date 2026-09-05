@@ -1886,7 +1886,9 @@ pub fn run_generate_batch_prefill_serial_qwen35(
     // Drafter, not `DflashState` — see `batch_executor::has_draft_model`. The n-gram path
     // carries a DflashState with no drafter, and refusing it here (while the probe admits
     // it) would turn a fallback into `fail_all` for the whole cycle.
-    if crate::batch_executor::has_draft_model(m) {
+    if crate::batch_executor::has_draft_model(m)
+        && !crate::qwen35_decode::batch_decode_allows_drafter_pub()
+    {
         return Err(
             "generate_batch_prefill does not support drafter-based speculative decode yet"
                 .to_string(),
