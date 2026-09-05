@@ -141,7 +141,7 @@ impl BatchExecutor for Qwen35BatchExecutor {
         // Kept in step with `run_generate_batch_prefill_serial_qwen35`, which carries the
         // same predicate: a probe that admits what the operation refuses turns a fallback
         // into `fail_all` for every session in the cycle.
-        if has_draft_model(m) {
+        if has_draft_model(m) && !crate::qwen35_decode::batch_decode_allows_drafter_pub() {
             if std::env::var("HIPFIRE_DEBUG_BATCH_ROUTE").as_deref() == Ok("1") {
                 eprintln!("[batch-probe] REFUSED: draft model present");
             }

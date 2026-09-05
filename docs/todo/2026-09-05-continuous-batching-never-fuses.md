@@ -288,3 +288,52 @@ protecting against.
 the 9B, and drafter-based speculation with batching remains unimplemented. That is now the
 only remaining blocker, and it is the one the batch-size-threshold argument in Update 2
 applies to.
+
+
+## Update 5: drafter + batching CAN coexist — and speculation wins to at least N=4
+
+The refusal was "never validated", not "known to corrupt": nothing in `qwen35_decode.rs`
+touches `DflashState` outside the gate itself, and the batched decode never speculates —
+it advances every resident session by one real token. `HIPFIRE_QWEN35_BATCH_WITH_DRAFTER=1`
+lifts the gate so the reading can be tested rather than assumed.
+
+It holds. With a real sibling drafter loaded, the probe admits the model
+(`draft_model=true -> BATCH`) and the batched path produces correct output.
+
+The first attempt OOM'd (`hipMalloc(69 MB)` on a SINGLE request) — but that was headroom,
+not incompatibility: `max_seq: 131072` reserves enough KV that the drafter leaves no room
+for batch scratch. At `max_seq: 8192` the two coexist comfortably.
+
+### The crossover is further out than expected
+
+Drafter loaded, KVarN KV, FP16 state, max_seq 8192, 60-token completions:
+
+| N | batch path (no speculation) | legacy path (speculation) |
+|---|---|---|
+| 1 | 4.45 s/req | **2.05 s/req** |
+| 2 | 4.02 s/req | **2.04 s/req** |
+| 3 | 3.31 s/req | **2.03 s/req** |
+| 4 | 2.78 s/req | (concurrency-capped) |
+
+Speculation wins by 39-54% across the measurable range, and the legacy path is FLAT —
+2.03-2.05 s/req from N=1 to N=3. A flat curve means the GPU is not saturated at N=3, which
+is the condition under which speculation is nearly free and the argument for a threshold
+holds exactly as stated: small batch keeps the drafter.
+
+Batching improves steadily (4.45 -> 2.78) but had not crossed by N=4. Linear extrapolation
+puts the crossover near N=6, and that number is NOT measured — a `text_concurrency` rate
+limit caps in-flight text requests at 4, and setting `local_rate_policy.max_in_flight_text`
+in config.json did not lift it (another override that validates and does nothing, like
+`deltanet_state_precision` and `dflash_draft`).
+
+**No threshold is hard-coded here, deliberately.** The default would have to be the
+crossover, and the crossover is the one number this could not measure. Picking ~6 from a
+two-point extrapolation would be a guess wearing a measurement's clothes. What to do next,
+in order:
+
+1. Find why `local_rate_policy` is ignored and lift the cap, then measure N=6..16.
+2. Set the threshold from that curve, as a config key, defaulting to the measured crossover.
+3. The routing decision belongs at the server, not the daemon gate: speculation lives on
+   the legacy path, so the threshold selects BETWEEN paths. A per-request route cannot see
+   the batch it will land in, so this wants the runner's `batch.len()` or the scheduler's
+   queue depth as the signal.
