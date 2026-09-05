@@ -98,8 +98,7 @@ pub fn generate_mtp(
 
     // Prompt build mirrors generate_dflash: Jinja chat template when enabled,
     // else the hand-rolled ChatFrame::Plain scaffold.
-    let jinja_enabled = m.jinja_chat;
-    let try_jinja = jinja_enabled && m.chat_template.is_some();
+    let try_jinja = m.renders_jinja();
     let prompt_tokens: Vec<u32> = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
         let frame = prompt_frame::JinjaChatFrame {
@@ -527,9 +526,9 @@ pub fn generate_dflash(
         ModelSlotConfig, Phase2Snapshots,
     };
 
-    // Prompt build: same two-path branch as the AR-path generate() — when
-    // `HIPFIRE_JINJA_CHAT=1` AND the model carries a chat_template, render
-    // via `JinjaChatFrame` so structured `tools` / `messages` can reach
+    // Prompt build: same two-path branch as the AR-path generate() — when the
+    // model's resolved `chat_prompt` policy says Jinja, render via
+    // `JinjaChatFrame` so structured `tools` / `messages` can reach
     // the upstream template's `{% if tools %}` / multi-turn branches.
     // Otherwise fall back to the hand-rolled `ChatFrame::Plain` scaffold
     // (byte-identical to the prior DFlash-path build).
@@ -538,8 +537,7 @@ pub fn generate_dflash(
     // below before seed_target_hidden_from_prompt runs — so we never
     // need to guard on `seq_pos == 0` here.
     let tokenizer = m.tokenizer.as_ref().unwrap();
-    let jinja_enabled = m.jinja_chat;
-    let try_jinja = jinja_enabled && m.chat_template.is_some();
+    let try_jinja = m.renders_jinja();
     let prompt_tokens: Vec<u32> = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
         let frame = prompt_frame::JinjaChatFrame {
@@ -1597,7 +1595,7 @@ pub fn generate_multi(
     // ChatML framing — two paths, same shape as the single-GPU AR
     // generate() (line 3147+):
     //
-    //   1) HIPFIRE_JINJA_CHAT=1 + model has chat_template + seq_pos==0
+    //   1) `chat_prompt` resolved to Jinja + seq_pos==0
     //      → render via JinjaChatFrame so structured tools/messages
     //      reach the upstream template. PFlash compression is bypassed
     //      under Jinja (q_tokens is unused; the rendered prompt string
@@ -1606,8 +1604,7 @@ pub fn generate_multi(
     //   2) Default: hand-rolled ChatFrame::Plain scaffold, byte-
     //      identical to the pp=1 default path so multi-turn behavior
     //      matches between pp=1 and pp>1 when both run the same prompt.
-    let jinja_enabled = m.jinja_chat;
-    let try_jinja = jinja_enabled && m.active.cursor.seq_pos == 0 && m.chat_template.is_some();
+    let try_jinja = m.renders_jinja() && m.active.cursor.seq_pos == 0;
     let new_tokens = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
         let frame = prompt_frame::JinjaChatFrame {
@@ -4472,8 +4469,8 @@ pub fn generate_start(
 
     // ChatML framing — two paths:
     //
-    //   1) `HIPFIRE_JINJA_CHAT=1` AND model carries an embedded chat_template
-    //      AND first turn (seq_pos == 0): render through `JinjaChatFrame`
+    //   1) `chat_prompt` resolved to Jinja (so the model carries an embedded
+    //      chat_template) AND first turn (seq_pos == 0): render through `JinjaChatFrame`
     //      against the upstream HF Jinja template, producing the byte
     //      sequence the model was actually trained on (fixes the "hand-roll
     //      drifted from upstream template" class — XML tool calls on
@@ -4496,7 +4493,6 @@ pub fn generate_start(
     // honors `assistant_prefix` directly (ClosedThink emits a closed
     // `<think></think>` block after the assistant prefix). Each path
     // picks up the signal it needs.
-    let jinja_enabled = m.jinja_chat;
     let seq_pos_for_prompt = if prefill_already_done {
         0
     } else {
@@ -4505,7 +4501,7 @@ pub fn generate_start(
             .map(|s| s.cursor.seq_pos)
             .unwrap_or(m.active.cursor.seq_pos)
     };
-    let try_jinja = jinja_enabled && seq_pos_for_prompt == 0 && m.chat_template.is_some();
+    let try_jinja = m.renders_jinja() && seq_pos_for_prompt == 0;
     let new_tokens = if try_jinja {
         let template = m.chat_template.as_ref().unwrap();
         let frame = prompt_frame::JinjaChatFrame {
@@ -4522,7 +4518,7 @@ pub fn generate_start(
         // `{% if tools %}` / multi-turn branches fire. With neither
         // supplied, fall through to the single-turn `render()` convenience,
         // which is byte-identical to the synthesized [system?, user]
-        // path that shipped under HIPFIRE_JINJA_CHAT=1 before this change.
+        // path that shipped under the Jinja policy before this change.
         let render_result = if tools.is_some() || messages_history.is_some() {
             // Synthesize [system?, user] when no explicit history was
             // provided. Tools-with-legacy-prompt is the natural OpenAI

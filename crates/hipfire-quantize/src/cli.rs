@@ -358,6 +358,7 @@ static LDLQ_MISSING: AtomicUsize = AtomicUsize::new(0);
 static ROTATED_HESSIANS: AtomicUsize = AtomicUsize::new(0);
 static LDLQ_K_MISMATCH: AtomicUsize = AtomicUsize::new(0);
 static LDLQ_PACK_FAILED: AtomicUsize = AtomicUsize::new(0);
+static LDLQ_DAMP_ESCALATED: AtomicUsize = AtomicUsize::new(0);
 
 /// Layer-pooled Hessian donor for a routed-expert projection that reads the
 /// layer-shared FFN input. Routed experts are captured imatrix-only, so without
@@ -473,8 +474,32 @@ fn report_rotated_hessians() {
     }
 }
 
-fn ldlq_record_success() {
+/// Count a successful LDLQ tensor, and NAME it when its factorization only
+/// succeeded at escalated damping.
+///
+/// `inv_cholesky_lower_rotated_fast` retries at lambda x{1,10,100,1000,10000}.
+/// A tensor that only factorized at the top of that ladder has lambda swamping
+/// its Hessian -- H+lambda I is effectively lambda I, so the OBS solution
+/// collapses toward plain RTN while the AWQ scales were still rebased against
+/// it. That used to be indistinguishable from a clean success: the ladder
+/// `continue`d silently and this counter incremented either way, so `success=496`
+/// said nothing about whether LDLQ had helped 496 tensors or 4.
+///
+/// Printed per tensor rather than only aggregated because WHICH tensors escalate
+/// is the diagnostic: it tracks conditioning, so it concentrates in the
+/// largest-K tensors, and an aggregate count cannot show that.
+fn ldlq_record_success(name: &str, k: usize) {
     LDLQ_SUCCESS.fetch_add(1, Ordering::Relaxed);
+    if let Some(rung) = ldlq::last_damp_rung() {
+        if rung > 0 {
+            LDLQ_DAMP_ESCALATED.fetch_add(1, Ordering::Relaxed);
+            eprintln!(
+                "  ldlq: DAMPED {name} [k={k}] factorized only at {}x the requested lambda \
+                 -- the OBS solution is that much closer to RTN",
+                ldlq::DAMP_LADDER[rung]
+            );
+        }
+    }
 }
 
 fn ldlq_record_pack_failed(name: &str) {
@@ -501,6 +526,33 @@ fn ldlq_report_and_validate(strict: bool) -> Result<(), String> {
     eprintln!(
         "  LDLQ tensors:     success={success} attempts={attempts} missing={missing} k_mismatch={k_mismatch} pack_failed={pack_failed}"
     );
+    // Reported unconditionally, next to the success count it qualifies. A run
+    // where every tensor sits on rung 0 is the one where `success` means what it
+    // looks like; anything else is a partial result wearing a `++` name.
+    let (rungs, exhausted) = ldlq::damp_rung_histogram();
+    let escalated = LDLQ_DAMP_ESCALATED.load(Ordering::Relaxed);
+    let ladder: Vec<String> = ldlq::DAMP_LADDER
+        .iter()
+        .zip(rungs.iter())
+        .filter(|(_, &n)| n > 0)
+        .map(|(mult, n)| format!("{mult:.0}x={n}"))
+        .collect();
+    eprintln!(
+        "  LDLQ damping:     {} (escalated={escalated} exhausted={exhausted})",
+        if ladder.is_empty() {
+            "none".to_string()
+        } else {
+            ladder.join(" ")
+        }
+    );
+    if escalated > 0 {
+        eprintln!(
+            "  LDLQ damping:     {escalated} tensor(s) needed escalated damping, so their OBS \
+             feedback is degraded toward RTN. Conditioning, not coverage: bf16 Hessian storage \
+             forces ~13% of the mean diagonal on its own, and rank deficiency sets the floor \
+             (calibrate more sequences, or store the Hessian at f16 -- same bytes)."
+        );
+    }
     // Never let a pooled build be mistaken for one where every expert had its
     // own Hessian — the two are different experiments.
     let pooled = POOLED_HESSIAN_HITS.load(Ordering::Relaxed);
@@ -656,21 +708,47 @@ thread_local! {
         const { std::cell::RefCell::new(None) };
 }
 
-/// `--no-coarse-lmhead` (or `HIPFIRE_NO_COARSE_LMHEAD`) disables emission of the
-/// two-pass lm_head coarse tier. Default is ON: the coarse tier is ~0.5 b/weight
-/// on top of the fine embed and makes decode's output projection ~4× cheaper
-/// while the fine pass keeps the logits exact for the shortlisted rows. A model
-/// built without it still serves — the runtime falls back to a single fine pass.
+/// `--coarse-lmhead` opts IN to emitting the two-pass lm_head coarse tier.
+///
+/// **Default is OFF, and was ON until 2026-09-04.** Nothing reads the sidecar:
+/// the runtime's two-stage path builds its coarse tier at load from the head it
+/// will actually shortlist for (`llama::lmhead_project` ->
+/// `build_coarse_from_compact`), so `<embed>.coarse.weight` was pure artifact
+/// weight — 636 MB on a 27B (4.0% of the file), 255 MB on a 35B-A3B. See
+/// `docs/bugs/2026-09-04-coarse-lmhead-sidecar-unread.md`.
+///
+/// It is opt-in rather than deleted because the tier itself is sound and cheap
+/// to rebuild (`docs/kernel_work/two-stage-lmhead.md`); what is missing is a
+/// loader. Wire one and this becomes a default again — but fix the untied case
+/// first: the tier is built in the `is_embed` arm, and `is_embedding_table_name`
+/// does not match `lm_head.weight`, so on an untied model it ranks rows of the
+/// EMBEDDING to shortlist for a different trained output head.
+///
+/// `HIPFIRE_NO_COARSE_LMHEAD` is still honoured and now redundant; it wins over
+/// the flag, so a script that sets it keeps getting no sidecar.
 fn coarse_lmhead_enabled() -> bool {
     static ON: OnceLock<bool> = OnceLock::new();
-    // The CLI flag is documented in --help ("`--no-coarse-lmhead` (or
-    // HIPFIRE_NO_COARSE_LMHEAD)") but was never parsed, so only the env var
-    // worked and the flag was silently ignored. Read both. (Same shape as
-    // `--include-vision` above, which also scans args directly.)
     *ON.get_or_init(|| {
-        !hipfire_env::NO_COARSE_LMHEAD.is_set()
-            && !std::env::args().any(|a| a == "--no-coarse-lmhead")
+        !hipfire_env::NO_COARSE_LMHEAD.is_set() && COARSE_LMHEAD_OPT_IN.get().copied() == Some(true)
     })
+}
+
+/// Set once from [`coarse_lmhead_arg`] at argument-parse time; see
+/// [`coarse_lmhead_enabled`].
+static COARSE_LMHEAD_OPT_IN: OnceLock<bool> = OnceLock::new();
+
+/// What the command line says about the coarse tier: `Some(true)` for
+/// `--coarse-lmhead`, `Some(false)` for `--no-coarse-lmhead`, `None` when
+/// neither appears (the off default stands).
+///
+/// The negative wins when both are given — refusing to emit is the safe way to
+/// read a contradictory command line, and it matches
+/// `HIPFIRE_NO_COARSE_LMHEAD` beating the flag.
+fn coarse_lmhead_arg(args: &[String]) -> Option<bool> {
+    if args.iter().any(|a| a == "--no-coarse-lmhead") {
+        return Some(false);
+    }
+    args.iter().any(|a| a == "--coarse-lmhead").then_some(true)
 }
 
 /// Drain the pending coarse tier (if the just-pushed tensor produced one) and
@@ -4788,7 +4866,7 @@ fn quantize_hfq_source_tensor(
                 let damp = 0.01 * (diag_sum / k as f64).max(1e-12);
                 let out = ldlq::oq3_ldlq_pack(&wbuf, m_dim, k, &h, &signs1, &signs2, damp);
                 if out.is_some() {
-                    ldlq_record_success();
+                    ldlq_record_success(name, k);
                     if let Some(s) = awq_scales {
                         OQ4_AWQ_SIDECAR.with(|c| *c.borrow_mut() = Some(s));
                         eprintln!("  ldlq+awq: {name} [{m_dim}x{k}] OBS int3 + smooth");
@@ -4846,7 +4924,7 @@ fn quantize_hfq_source_tensor(
                 let damp = 0.01 * (diag_sum / k as f64).max(1e-12);
                 let out = ldlq::oq2_ldlq_pack(&wbuf, m_dim, k, &h, &signs1, &signs2, damp);
                 if out.is_some() {
-                    ldlq_record_success();
+                    ldlq_record_success(name, k);
                     if let Some(s) = awq_scales {
                         OQ4_AWQ_SIDECAR.with(|c| *c.borrow_mut() = Some(s));
                         eprintln!("  ldlq+awq: {name} [{m_dim}x{k}] OBS int2 + smooth");
@@ -4922,7 +5000,7 @@ fn quantize_hfq_source_tensor(
                     damp,
                 );
                 if out.is_some() {
-                    ldlq_record_success();
+                    ldlq_record_success(name, k);
                     if let Some(s) = awq_scales {
                         OQ4_AWQ_SIDECAR.with(|c| *c.borrow_mut() = Some(s));
                         eprintln!("  ldlq+awq: {name} [{m_dim}x{k}] OBS int4 + smooth");
@@ -4988,7 +5066,7 @@ fn quantize_hfq_source_tensor(
                         damp,
                     );
                     if out.is_some() {
-                        ldlq_record_success();
+                        ldlq_record_success(name, k);
                         if let Some(s) = awq_scales {
                             OQ4_AWQ_SIDECAR.with(|c| *c.borrow_mut() = Some(s));
                             eprintln!("  ldlq+awq: {name} [{m_dim}x{k}] OBS int8 + smooth");
@@ -5079,7 +5157,7 @@ fn quantize_hfq_source_tensor(
                     w8_frac,
                 );
                 if out.is_some() {
-                    ldlq_record_success();
+                    ldlq_record_success(name, k);
                     if let Some(s) = awq_scales {
                         OQ4_AWQ_SIDECAR.with(|c| *c.borrow_mut() = Some(s));
                         eprintln!("  ldlq+awq: {name} [{m_dim}x{k}] tiered OBS int4/int8 + smooth");
@@ -8023,6 +8101,8 @@ OPTIONS:
     --no-kmap, --uniform       disable K-map promotion entirely
     --q8-router                quantize the MoE router/gate to Q8
     --no-q8-conv1d             keep DeltaNet conv1d at the --format quant (default: forced Q8)
+    --coarse-lmhead            emit the two-pass lm_head coarse tier as <embed>.coarse.weight
+                               (default: off -- no loader reads it; 4% of a 27B artifact)
     --tier-ratio <F>           MQ tier split for tiered routed formats (default 0.30; env HIPFIRE_TIER_RATIO)
 
   Tensor selection:
@@ -8957,6 +9037,13 @@ pub fn main() {
     // keep conv1d at the same quant as the rest of the model.
     let q8_conv1d_default = !args.iter().any(|a| a == "--no-q8-conv1d");
     let no_kmap = args.iter().any(|a| a == "--no-kmap" || a == "--uniform");
+    // Opt in to the two-pass lm_head coarse tier. `--no-coarse-lmhead` was
+    // DOCUMENTED here and in hipfire-env but never parsed, so only the env var
+    // ever turned it off; it is accepted now so the documented spelling stops
+    // being a lie, and is a no-op against an off default.
+    if let Some(on) = coarse_lmhead_arg(&args) {
+        let _ = COARSE_LMHEAD_OPT_IN.set(on);
+    }
 
     // ── imatrix loader (consumed by AWQ pre-scaling) ──
     // --imatrix <path>: load an llama-imatrix-produced GGUF (per `examples/
@@ -16873,6 +16960,22 @@ mod hfq_block_diag {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// The coarse tier is off unless asked for, and a contradictory command line
+    /// resolves to off. Guards the 2026-09-04 default flip: an artifact that
+    /// silently regrows a 636 MB unread sidecar is the regression to catch.
+    #[test]
+    fn coarse_lmhead_is_opt_in_and_the_negative_wins() {
+        let a = |v: &[&str]| v.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert_eq!(coarse_lmhead_arg(&a(&["--format", "oq4.25++"])), None);
+        assert_eq!(coarse_lmhead_arg(&a(&["--coarse-lmhead"])), Some(true));
+        assert_eq!(coarse_lmhead_arg(&a(&["--no-coarse-lmhead"])), Some(false));
+        assert_eq!(
+            coarse_lmhead_arg(&a(&["--coarse-lmhead", "--no-coarse-lmhead"])),
+            Some(false),
+            "a contradictory command line must not emit the sidecar"
+        );
+    }
 
     #[test]
     fn pooled_donors_only_for_shared_input_expert_projections() {

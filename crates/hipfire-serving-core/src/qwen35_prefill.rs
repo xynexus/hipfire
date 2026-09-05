@@ -297,8 +297,7 @@ pub fn qwen35_materialize_batch_prefill_prompt(
     };
     let assistant_prefix =
         prompt_frame::AssistantPrefix::from_label(Some(&session.assistant_prefix));
-    let jinja_enabled = m.jinja_chat;
-    let try_jinja = jinja_enabled && seq_pos_for_prompt == 0 && m.chat_template.is_some();
+    let try_jinja = m.renders_jinja() && seq_pos_for_prompt == 0;
     let system_prompt = session.system_prompt.as_deref();
     let tools = session.tools.as_deref();
     let messages_history = session.messages_history.as_deref();
@@ -1884,9 +1883,10 @@ pub fn run_generate_batch_prefill_serial_qwen35(
             "generate_batch_prefill does not support pipeline-parallel models yet".to_string(),
         );
     }
-    if m.dflash.is_some() {
-        return Err("generate_batch_prefill does not support DFlash-loaded models yet".to_string());
-    }
+    // Drafter, not `DflashState` — see `batch_executor::has_draft_model`. The n-gram path
+    // carries a DflashState with no drafter, and refusing it here (while the probe admits
+    // it) would turn a fallback into `fail_all` for the whole cycle.
+    // Drafter-loaded models are admitted; the batched prefill does not speculate.
     if m.eviction.is_some() {
         return Err(
             "generate_batch_prefill does not support CASK/TriAttention eviction yet".to_string(),

@@ -689,11 +689,6 @@ pub fn prefill_session_batch_attention_q8_layer(
     )
 }
 
-/// FP16-state companion to [`dense_prefill_session_batch_gated_delta_net_f32_layer`].
-///
-/// Same routing, same argument order; the pointers in `dn_s_ptrs` must address
-/// f16 state, which is why the caller selects this by `DeltaNetState::quant`
-/// rather than by model. No scales: f16 carries a per-element exponent.
 /// KVarN companion to [`prefill_session_batch_write_q8_kv_layer`].
 ///
 /// KVarN splits K across two buffers: 4-bit variance-normalized records for every
@@ -1001,7 +996,16 @@ pub fn grouped_moe_prefill_session_batch_kvarn_block_flushes(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn grouped_moe_prefill_session_batch_gated_delta_net_f16_layer(
+/// FP16-state companion to [`dense_prefill_session_batch_gated_delta_net_f32_layer`].
+///
+/// Same routing, same argument order; the pointers in `dn_s_ptrs` must address f16
+/// state, which is why the caller selects this by `DeltaNetState::quant` rather than by
+/// model. No scales: f16 carries a per-element exponent.
+///
+/// Named `grouped_moe_*` until 2026-09-05, which was never true of the body — it only
+/// dispatches the routed kernel and is FFN-agnostic, and the dense path already called
+/// it. The f32 sibling is shared by both paths under one name; this now matches.
+pub fn prefill_session_batch_gated_delta_net_f16_layer(
     gpu: &mut Gpu,
     device_tables: &DensePrefillSessionBatchDevicePointerTables,
     route_shape: DensePrefillSessionStateRouteShape,
@@ -1021,7 +1025,7 @@ pub fn grouped_moe_prefill_session_batch_gated_delta_net_f16_layer(
         return Err(hip_bridge::HipError::new(
             0,
             &format!(
-                "grouped MoE session prefill routed FP16 DeltaNet layer {delta_layer_index} out of range for route shape {:?}",
+                "session prefill routed FP16 DeltaNet layer {delta_layer_index} out of range for route shape {:?}",
                 route_shape,
             ),
         ));
@@ -1451,26 +1455,27 @@ pub fn validate_dense_prefill_session_batch_fused_prefix_full_precision_contract
                 if allow_kvarn { ", KVarN," } else { "" },
             ));
         }
-        if signature.dn_quant != StateQuant::FP32 {
-            // f5b32ea32 flipped the family default to FP16 DeltaNet state without
-            // widening this contract, so the dense fused prefix went dark for every
-            // dense Qwen3.5 model and quietly fell back to serial. The grouped-MoE
-            // sibling (below) accepts FP32 | FP16 because it HAS an FP16 arm
-            // (`grouped_moe_prefill_session_batch_gated_delta_net_f16_layer`); the
-            // dense path does not, so accepting FP16 here would run FP16 state
-            // through FP32 code — a wrong answer instead of a slow one.
-            //
-            // Keep refusing, but say so where the operator can see it: this is a
-            // silent throughput cliff, not a config error on their part.
+        // FP32 | FP16, matching the grouped-MoE sibling. The dense path refused FP16
+        // because it had no FP16 arm — f5b32ea32 made FP16 the family default without
+        // widening this contract, so the fused prefix went dark for every dense
+        // Qwen3.5 model and fell back to serial. The arm now exists
+        // (`dense_prefill_session_batch_gated_delta_net_f16_layer`) and the caller
+        // selects it from the rows' `dn_state.quant`, so the reason to refuse is gone.
+        //
+        // Still an allowlist, not a hole: anything narrower than FP16 (Q8 state and
+        // below) has no routed arm at all, and the stride mismatch that made this a
+        // wrong answer rather than a slow one applies to those exactly as it did here.
+        if !matches!(signature.dn_quant, StateQuant::FP32 | StateQuant::FP16) {
             hipfire_rdna::kernel_trace::record_fallback(
-                "dense fused prefill DISABLED: DeltaNet state is not FP32",
+                "dense fused prefill DISABLED: DeltaNet state is neither FP32 nor FP16",
                 &format!(
-                    "row {idx} dn_quant={:?}; the family default became FP16 at                      f5b32ea32 and the dense fused path has no FP16 arm, so prefill                      runs serial. Set deltanet_state_precision=fp32 to re-enable it,                      or add the dense FP16 arm.",
+                    "row {idx} dn_quant={:?}; the dense fused path has FP32 and FP16 routed \
+                     arms only, so prefill runs serial.",
                     signature.dn_quant,
                 ),
             );
             return Err(format!(
-                "dense session fused prefix row {idx} has {:?} DeltaNet state; first fused target is FP32 DeltaNet state",
+                "dense session fused prefix row {idx} has {:?} DeltaNet state; the fused targets are FP32 and FP16",
                 signature.dn_quant,
             ));
         }
@@ -1569,7 +1574,20 @@ fn dense_prefill_weight_unsupported_reason(weight: &WeightTensor) -> Option<&'st
     // with the `_for` call sites below — adding a rotated arm without adding it
     // here silently routes an AWQ model to serial, which is how the Opus arms
     // were caught during bring-up.
-    if weight.awq_scale.is_some() && !matches!(weight.gpu_dtype, DType::MQ4G256 | DType::Oq8G256) {
+    // OqCompactG256 belongs here with the other two: all three of its dispatch sites —
+    // lm_head, the non-residual GEMM, and the residual GEMM — call
+    // `rotate_x_mq_batched_for`, which applies `x /= awq_scale` when the sidecar is
+    // present. The list had drifted from the call sites in exactly the direction this
+    // comment warns about, and the refusal string above already named OqCompactG256 as
+    // supported, so the message and the guard disagreed. The cost was silent: every
+    // oq4.25++ artifact (OqPlusCompact on disk) refused the fused body and ran
+    // serial_reference, which is why continuous batching delivered no throughput at all.
+    if weight.awq_scale.is_some()
+        && !matches!(
+            weight.gpu_dtype,
+            DType::MQ4G256 | DType::Oq8G256 | DType::OqCompactG256
+        )
+    {
         return Some(
             "AWQ pre-scaled weights: the fused body applies awq_scale only on the FWHT-rotated arms (MQ4G256, Oq8G256, OqCompactG256)",
         );
@@ -1602,6 +1620,16 @@ fn dense_prefill_weight_unsupported_reason(weight: &WeightTensor) -> Option<&'st
         return Some("unsupported weight dtype");
     }
     None
+}
+
+/// [`dense_prefill_weight_unsupported_reason`] plus the dtype that refused.
+///
+/// The reason string names the arms that ARE supported; without the dtype in hand a
+/// reader still cannot tell which arm this weight is, and the lm_head arm already
+/// reports it. Leaked as an owned String because the reason is `&'static str`.
+fn dense_prefill_weight_named_reason(weight: &WeightTensor) -> Option<String> {
+    dense_prefill_weight_unsupported_reason(weight)
+        .map(|reason| format!("{reason}; dtype {:?}", weight.gpu_dtype))
 }
 
 pub fn validate_dense_prefill_session_batch_fused_prefix_full_precision_weights(
@@ -1639,7 +1667,7 @@ pub fn validate_dense_prefill_session_batch_fused_prefix_full_precision_weights(
                 &layer.w_down,
             ]
             .into_iter()
-            .find_map(dense_prefill_weight_unsupported_reason),
+            .find_map(dense_prefill_weight_named_reason),
             LayerWeights::FullAttn(layer) => [
                 &layer.wq,
                 &layer.wk,
@@ -1650,9 +1678,9 @@ pub fn validate_dense_prefill_session_batch_fused_prefix_full_precision_weights(
                 &layer.w_down,
             ]
             .into_iter()
-            .find_map(dense_prefill_weight_unsupported_reason),
+            .find_map(dense_prefill_weight_named_reason),
             LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_) => {
-                Some("MoE layer weights; the dense fused prefix is dense-only")
+                Some("MoE layer weights; the dense fused prefix is dense-only".to_string())
             }
         };
         if let Some(reason) = unsupported {
@@ -2610,6 +2638,11 @@ fn forward_dense_session_batch_layers_full_precision(
     // grouped-MoE path uses — the routed window write, flush executor and
     // segment planner are FFN-agnostic, so dense reuses them unchanged.
     kvarn: Option<&KvarnBatchFlushContext<'_>>,
+    // Which routed DeltaNet arm the rows' state requires. FP16 state is half the
+    // stride of FP32, so kernel and state precision must be chosen together — the f32
+    // kernel over f16 state reads every element at the wrong offset. Uniform across
+    // rows by the state-signature contract, same as `kv_q8`.
+    delta_f16: bool,
 ) -> HipResult<()> {
     let dim = config.dim;
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
@@ -2793,22 +2826,41 @@ fn forward_dense_session_batch_layers_full_precision(
                         row_count * k_dim * 4,
                     )?;
                 }
-                dense_prefill_session_batch_gated_delta_net_f32_layer(
-                    gpu,
-                    device_tables,
-                    route_shape,
-                    sessions,
-                    delta_layer_idx,
-                    &pbs.dn_q_batch,
-                    &pbs.dn_k_batch,
-                    &pbs.dn_v_batch,
-                    &pbs.dn_alpha_batch,
-                    &pbs.dn_beta_batch,
-                    &pbs.dn_attn_out_batch,
-                    row_count,
-                    n_v_heads,
-                    config.linear_value_head_dim,
-                )?;
+                if delta_f16 {
+                    prefill_session_batch_gated_delta_net_f16_layer(
+                        gpu,
+                        device_tables,
+                        route_shape,
+                        sessions,
+                        delta_layer_idx,
+                        &pbs.dn_q_batch,
+                        &pbs.dn_k_batch,
+                        &pbs.dn_v_batch,
+                        &pbs.dn_alpha_batch,
+                        &pbs.dn_beta_batch,
+                        &pbs.dn_attn_out_batch,
+                        row_count,
+                        n_v_heads,
+                        config.linear_value_head_dim,
+                    )?;
+                } else {
+                    dense_prefill_session_batch_gated_delta_net_f32_layer(
+                        gpu,
+                        device_tables,
+                        route_shape,
+                        sessions,
+                        delta_layer_idx,
+                        &pbs.dn_q_batch,
+                        &pbs.dn_k_batch,
+                        &pbs.dn_v_batch,
+                        &pbs.dn_alpha_batch,
+                        &pbs.dn_beta_batch,
+                        &pbs.dn_attn_out_batch,
+                        row_count,
+                        n_v_heads,
+                        config.linear_value_head_dim,
+                    )?;
+                }
                 gpu.gated_norm_f32_batched(
                     &pbs.dn_attn_out_batch,
                     &pbs.dn_z_batch,
@@ -3258,6 +3310,7 @@ fn forward_prefill_dense_session_batch_prefix_full_precision(
     )>,
     post_layer_capture: Option<&mut DensePostLayerCapture<'_>>,
     kvarn: Option<&KvarnBatchFlushContext<'_>>,
+    delta_f16: bool,
 ) -> HipResult<()> {
     forward_dense_session_batch_layers_full_precision(
         gpu,
@@ -3277,6 +3330,7 @@ fn forward_prefill_dense_session_batch_prefix_full_precision(
         post_layer_capture,
         kv_q8,
         kvarn,
+        delta_f16,
     )
 }
 
@@ -3465,6 +3519,14 @@ fn forward_prefill_dense_session_batch_impl(
             splits,
             flushes,
         });
+    // Which routed DeltaNet arm the rows need. Uniform across rows by the
+    // state-signature contract (`validate_dense_prefill_session_batch_state_signatures`),
+    // so the first row decides — the same shape as the grouped-MoE path's own
+    // `delta_f16`, which reads it off the signatures a few hundred lines below.
+    let delta_f16 = rows
+        .first()
+        .map(|row| matches!(row.dn_state.quant, StateQuant::FP16))
+        .unwrap_or(false);
     let result = forward_prefill_dense_session_batch_prefix_full_precision(
         gpu,
         weights,
@@ -3480,6 +3542,7 @@ fn forward_prefill_dense_session_batch_impl(
         dense_capture,
         post_layer_capture,
         kvarn_ctx.as_ref(),
+        delta_f16,
     );
     drop(kvarn_ctx);
     if let Some((_, _, tiles)) = kvarn_state {
@@ -3611,6 +3674,9 @@ pub(crate) fn forward_streamed_dense_layer_batch(
         // Streamed calibration runs FP32 KV, never KVarN — one-layer view, no
         // session batch behind it. Mirrors the grouped-MoE streamed path.
         None,
+        // ... and FP32 DeltaNet state, which is what this path did before the arm
+        // existed. Not a new assumption, just the previous one written down.
+        false,
     )
 }
 
@@ -4085,7 +4151,7 @@ fn forward_grouped_moe_session_batch_layers(
                     )?;
                 }
                 if delta_f16 {
-                    grouped_moe_prefill_session_batch_gated_delta_net_f16_layer(
+                    prefill_session_batch_gated_delta_net_f16_layer(
                         gpu,
                         device_tables,
                         route_shape,

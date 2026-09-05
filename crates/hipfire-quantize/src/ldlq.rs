@@ -6,6 +6,8 @@
 // 14.0) because reconstruction-optimal ≠ output-optimal; LDLQ minimizes the
 // activation-weighted output error ‖(W−Ŵ)·√H‖ via OBS error feedback.
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use faer::prelude::Solve;
 use faer::{Mat, Side};
 
@@ -72,6 +74,64 @@ pub fn rotate_hessian(h: &mut [f64], k: usize, signs1: &[f32], signs2: &[f32]) {
     transpose(&t, h);
 }
 
+// ── Damping telemetry ────────────────────────────────────────────────────
+//
+// The Cholesky ladder below retries with lambda x{1,10,100,1000,10000} and, until
+// 2026-09-04, `continue`d on failure with nothing recorded. That made two very
+// different outcomes indistinguishable: a tensor factorized at the requested
+// damping, and one that only factorized at 10000x, where lambda swamps the
+// Hessian, H+lambda I is effectively lambda I, and the OBS solution collapses
+// toward plain RTN -- while the AWQ scales were still rebased against it.
+//
+// So "LDLQ success" counted a tensor LDLQ may not have helped, and nothing said
+// which. It matters most where the Hessian is least well conditioned: bf16
+// on-disk storage forces damping to ~13% of the mean diagonal (measured in
+// `88a5b192c`, "Hessian PSD: bf16 STORAGE is the dominant error"), and rank
+// deficiency sets the floor, so the largest-K tensors are the exposed ones.
+
+/// Damping rungs, indexed by position in [`DAMP_LADDER`].
+pub const DAMP_LADDER: [f64; 5] = [1.0, 10.0, 100.0, 1000.0, 10000.0];
+
+static DAMP_RUNG_HITS: [AtomicUsize; DAMP_LADDER.len()] =
+    [const { AtomicUsize::new(0) }; DAMP_LADDER.len()];
+static DAMP_LADDER_EXHAUSTED: AtomicUsize = AtomicUsize::new(0);
+
+thread_local! {
+    /// Rung the most recent factorization on THIS thread landed on, so the
+    /// caller can attribute it to the tensor it just packed. Set by the ladder,
+    /// read immediately after the pack call on the same thread.
+    static LAST_DAMP_RUNG: std::cell::Cell<Option<usize>> = const { std::cell::Cell::new(None) };
+}
+
+fn record_damp_rung(rung: Option<usize>) {
+    match rung {
+        Some(i) => {
+            DAMP_RUNG_HITS[i].fetch_add(1, Ordering::Relaxed);
+        }
+        None => {
+            DAMP_LADDER_EXHAUSTED.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+    LAST_DAMP_RUNG.with(|c| c.set(rung));
+}
+
+/// Rung the last factorization on this thread landed on: `Some(0)` means the
+/// requested damping worked, `Some(4)` means it took 10000x, `None` means the
+/// ladder was exhausted (or nothing has run yet).
+pub fn last_damp_rung() -> Option<usize> {
+    LAST_DAMP_RUNG.with(|c| c.get())
+}
+
+/// Per-rung factorization counts for the run, plus the number that exhausted the
+/// ladder entirely. Reported unconditionally alongside the LDLQ counters.
+pub fn damp_rung_histogram() -> ([usize; DAMP_LADDER.len()], usize) {
+    let mut out = [0usize; DAMP_LADDER.len()];
+    for (slot, hits) in out.iter_mut().zip(DAMP_RUNG_HITS.iter()) {
+        *slot = hits.load(Ordering::Relaxed);
+    }
+    (out, DAMP_LADDER_EXHAUSTED.load(Ordering::Relaxed))
+}
+
 /// Lower Cholesky of (H_rot + lambda I)^-1. Exposed alongside rotate_hessian.
 /// Same contract as [`inv_cholesky_lower_rotated`], without the identity solve.
 ///
@@ -89,7 +149,7 @@ pub fn rotate_hessian(h: &mut [f64], k: usize, signs1: &[f32], signs2: &[f32]) {
 pub fn inv_cholesky_lower_rotated_fast(h: &[f64], k: usize, damp: f64) -> Option<Mat<f64>> {
     use faer::linalg::solvers::DenseSolveCore;
     let base = damp.max(1e-12);
-    for mult in [1.0, 10.0, 100.0, 1000.0, 10000.0] {
+    for (rung, mult) in DAMP_LADDER.iter().enumerate() {
         let lambda = base * mult;
         let hd = Mat::<f64>::from_fn(k, k, |i, j| {
             h[i * k + j] + if i == j { lambda } else { 0.0 }
@@ -101,8 +161,10 @@ pub fn inv_cholesky_lower_rotated_fast(h: &[f64], k: usize, damp: f64) -> Option
         let Ok(chol2) = hinv.llt(Side::Lower) else {
             continue;
         };
+        record_damp_rung(Some(rung));
         return Some(chol2.L().to_owned());
     }
+    record_damp_rung(None);
     None
 }
 
@@ -1483,6 +1545,70 @@ mod rotate_tests {
 mod tests {
     use super::*;
 
+    /// A Hessian too indefinite to factorize at the requested lambda must be
+    /// REPORTED as escalated, not silently accepted. This is the whole point of
+    /// the telemetry: before it, `success` counted such a tensor identically to
+    /// one that factorized cleanly, so a run could report full LDLQ coverage
+    /// while its tensors had been damped into de-facto RTN.
+    ///
+    /// The matrix is deliberately INDEFINITE rather than merely rank-deficient:
+    /// faer factorizes a PSD matrix at lambda=1e-12 without escalating (checked
+    /// -- a rank-1 all-ones matrix lands on rung 0), so a semidefinite fixture
+    /// would pass this test without ever exercising the ladder. A small negative
+    /// eigenvalue is also the real failure: bf16 Hessian storage measured
+    /// min eig -5.7e-3 on an exactly-PSD input (`88a5b192c`).
+    ///
+    /// Asserts on the DELTA it causes -- the histogram is process-global and
+    /// other tests share it.
+    #[test]
+    fn escalated_damping_is_recorded_not_swallowed() {
+        let k = 8;
+        let damp = 0.1;
+
+        // Diagonal, one eigenvalue at -0.5: lambda=0.1 (rung 0) leaves it
+        // indefinite at -0.4, lambda=1.0 (rung 1) makes it PD at +0.5.
+        let mut indefinite = vec![0.0f64; k * k];
+        for i in 0..k {
+            indefinite[i * k + i] = 1.0;
+        }
+        indefinite[0] = -0.5;
+
+        let (before, _) = damp_rung_histogram();
+        let out = inv_cholesky_lower_rotated_fast(&indefinite, k, damp);
+        let (after, _) = damp_rung_histogram();
+
+        assert!(
+            out.is_some(),
+            "the ladder must recover an indefinite Hessian"
+        );
+        assert_eq!(
+            last_damp_rung(),
+            Some(1),
+            "lambda had to climb to 10x to make this PD"
+        );
+        assert_eq!(
+            after[1] - before[1],
+            1,
+            "the rung it landed on must be counted"
+        );
+        assert_eq!(
+            after[0], before[0],
+            "rung 0 must not be credited for a factorization it did not achieve"
+        );
+
+        // A well-conditioned Hessian at the SAME damping lands on rung 0, which
+        // is what makes a non-zero rung meaningful rather than ambient.
+        let mut spd = vec![0.0f64; k * k];
+        for i in 0..k {
+            spd[i * k + i] = 1.0;
+        }
+        let (b2, _) = damp_rung_histogram();
+        assert!(inv_cholesky_lower_rotated_fast(&spd, k, damp).is_some());
+        let (a2, _) = damp_rung_histogram();
+        assert_eq!(last_damp_rung(), Some(0), "a PD Hessian must not escalate");
+        assert_eq!(a2[0] - b2[0], 1);
+    }
+
     // Deterministic LCG for a reproducible SPD matrix.
     struct Lcg(u64);
     impl Lcg {
@@ -2093,7 +2219,7 @@ pub fn inv_cholesky_lower_rotated_gpu(
     damp: f64,
 ) -> Option<Mat<f64>> {
     let base = damp.max(1e-12);
-    for mult in [1.0, 10.0, 100.0, 1000.0, 10000.0] {
+    for (rung, mult) in DAMP_LADDER.iter().enumerate() {
         let lambda = base * mult;
         let mut hd = vec![0.0f64; k * k];
         for i in 0..k {
@@ -2157,6 +2283,7 @@ pub fn inv_cholesky_lower_rotated_gpu(
         let Some(l) = llt_lower_right_looking_gpu(gpu, &hinv, k) else {
             continue;
         };
+        record_damp_rung(Some(rung));
         return Some(Mat::<f64>::from_fn(k, k, |i, j| {
             if j <= i {
                 l[i * k + j]
@@ -2165,5 +2292,6 @@ pub fn inv_cholesky_lower_rotated_gpu(
             }
         }));
     }
+    record_damp_rung(None);
     None
 }

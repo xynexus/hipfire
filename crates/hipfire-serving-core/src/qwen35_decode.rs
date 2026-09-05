@@ -51,11 +51,16 @@ pub fn validate_qwen35_decode_batch_runtime_surface(
             "generate_batch_decode_step currently supports single-GPU qwen35/qwen35-moe only (arch_id={arch_id} pp={pp})"
         ));
     }
-    if dflash_loaded {
-        return Err(
-            "generate_batch_decode_step is not supported on DFlash-loaded models".to_string(),
-        );
-    }
+    // A loaded drafter no longer refuses the batched decode. The batched path never
+    // speculates — it advances every resident session by one real token — and nothing
+    // here touches `DflashState`, so the old refusal was "never validated" rather than
+    // "known to corrupt". Verified 2026-09-05: with a sibling drafter loaded, batched
+    // decode produces correct output at N=1..8.
+    //
+    // WHETHER to batch a drafter-loaded model is a routing question, not a capability
+    // one, and it is answered in the server by `spec_batch_threshold` — speculation
+    // lives on the legacy path, so the choice is between paths, not inside this one.
+    let _ = dflash_loaded;
     if eviction_active {
         return Err(
             "generate_batch_decode_step is not supported with active eviction state".to_string(),
@@ -179,9 +184,16 @@ pub fn validate_qwen35_fused_dense_decode_model_capability(
     let state_quant = m.q35_state_quant.ok_or_else(|| {
         "qwen35 fused dense decode requires known DeltaNet state quant".to_string()
     })?;
-    if state_quant != qwen35::StateQuant::FP32 {
+    // FP32 | FP16. The decode chunk reuses `forward_prefill_dense_session_batch`, which
+    // now selects the routed DeltaNet arm from the rows' own `dn_state.quant`, so the
+    // FP16 arm added for the prefix serves decode unchanged. Narrower state (Q8 and
+    // below) still has no routed arm.
+    if !matches!(
+        state_quant,
+        qwen35::StateQuant::FP32 | qwen35::StateQuant::FP16
+    ) {
         return Err(format!(
-            "qwen35 fused dense decode requires FP32 DeltaNet state; loaded state={state_quant:?}; use HIPFIRE_QWEN35_DECODE_BATCH=serial"
+            "qwen35 fused dense decode has FP32 and FP16 routed DeltaNet arms only; loaded state={state_quant:?}; use HIPFIRE_QWEN35_DECODE_BATCH=serial"
         ));
     }
     let weights = m
@@ -612,10 +624,15 @@ pub fn run_generate_batch_decode_step_qwen35(
     stdout: &mut dyn std::io::Write,
     envelope: &GenerateBatchDecodeEnvelope,
 ) -> Result<(), String> {
+    // The gate's parameter is "a DFlash DRAFTER is loaded", so pass that rather than
+    // "a DflashState exists": the n-gram path carries the state with no drafter, and
+    // `m.dflash.is_some()` refused it here too. Must match the prefill probe
+    // (`batch_executor::has_draft_model`) exactly — the probe admitting what this
+    // refuses is a `fail_all` for every session in the cycle, not a fallback.
     validate_qwen35_decode_batch_runtime_surface(
         m.arch_id,
         m.pp,
-        m.dflash.is_some(),
+        crate::batch_executor::has_draft_model(m),
         m.eviction.is_some(),
     )?;
     let requested_backend =
