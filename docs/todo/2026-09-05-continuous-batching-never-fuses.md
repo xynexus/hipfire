@@ -1,0 +1,388 @@
+# Continuous batching never delivers throughput (measured 2026-09-05)
+
+Three prefix-sharing requests, sent 0.4 ms apart (inside the 10 ms gather window),
+Qwen3.5-9B--oq4.25++ on gfx1103:
+
+| | wall clock |
+|---|---|
+| 1 request | 14.1 s |
+| 3 concurrent | 50.9 s (3.6x) |
+| 6 concurrent | 99.1 s (7.1x) |
+
+Linear. Meanwhile `/health` reports `prefill_batch.enabled = true` and capability
+`supported`. Two independent defects, in series.
+
+## 1. The probe refuses, so nothing is even eligible
+
+```
+[batch-route] enabled=true eligible=false arch=Some("qwen3_5") capable=Some(false)
+[batch-probe] REFUSED: dflash drafter present
+```
+
+`Qwen35BatchExecutor::probe` refuses any speculative-decode model. **Two** independent
+config defaults set `m.dflash`: `ngram_spec: true` and `dflash_draft: "auto"` (which finds
+a drafter by sibling discovery). Either alone is enough. With both off the route flips:
+
+```
+[batch-probe] OK pp=1 dflash=false eviction=false
+[batch-route] eligible=true capable=Some(true) -> BATCH
+```
+
+So the shipped default config silently disables continuous batching entirely. Whether
+speculative decode should lose to batching is a policy question, but it should be a
+*decision*, not an accident: nothing in the logs or `/health` says batching is off because
+a drafter is attached.
+
+## 2. Even when eligible, the fused kernel refuses these weights
+
+With the drafters off, everything upstream works. The scheduler groups correctly
+(`lease workloads=3`), the runner coalesces (`coalesced 3 request(s) into one batch`), and
+the daemon makes all three sessions co-resident within 4 ms. It is still 3.6x.
+
+`HIPFIRE_QWEN35_PREFILL_SESSION_BATCH=fused` surfaces what `auto` swallows:
+
+```
+qwen35 fused dense prefill unsupported weights: dense session fused prefix layer 0 has
+unsupported weights (AWQ pre-scaled weights: the fused body applies awq_scale only on
+the FWHT-rotated arms (MQ4G256, Oq8G256, OqCompactG256))
+```
+
+`select_qwen35_prefill_batch_backend` under `auto` maps that `Err` to `SerialReference`,
+which computes each session in turn — hence exactly Nx. Every locally served Qwen artifact
+is `oq4`/`oq4.25`, so none of them can ever take the fused path.
+
+The silent downgrade is the reportable part. A serial fallback is a correct answer to an
+unsupported model; being unable to tell it happened is not. `auto` should record the
+refusal reason where an operator sees it — `/health` already has `fallback_reason` plumbed.
+
+## What would actually fix it
+
+1. Apply `awq_scale` on the non-rotated arms in the fused dense body, so oq4.x artifacts
+   are fused-eligible. This is the real fix and unblocks every model served here.
+2. Failing that, quantize the swarm models to one of the supported arms and measure.
+3. Independently: surface both refusals. Batching that reports "enabled" and "supported"
+   while running strictly serially cost a day to characterise from the outside.
+
+## Not a factor
+
+`prefill_batch.selected_batch_size = 0` in `/health` looks damning and is not evidence —
+that counter is uninstrumented, as its own sibling `counters` field says. The trustworthy
+signals are `[prefill-eligible]` (one line per prefill), the runner's `coalesced N` debug
+line, and daemon session-creation timestamps.
+
+
+## Update: the AWQ guard had drifted from its own call sites
+
+`dense_prefill_weight_unsupported_reason` refused any AWQ-sidecar weight whose dtype was
+not `MQ4G256 | Oq8G256` — while the refusal string it returns names **three** arms,
+including `OqCompactG256`. The guard and its own message disagreed.
+
+`OqCompactG256` belongs in the list: all three of its dispatch sites (lm_head,
+non-residual GEMM, residual GEMM) call `rotate_x_mq_batched_for`, which applies
+`x /= awq_scale` when the sidecar is present — the same path `Oq8G256` and `MQ4G256`
+take. This is exactly the drift the comment above the guard warns about.
+
+It matters because `oq4.25++` is `OqPlusCompact` on disk and loads as `OqCompactG256`,
+so **every** locally served Qwen artifact hit this and silently ran `serial_reference`.
+Adding the dtype (one line) makes the fused body run on them. Measured, same KV=q8 /
+DeltaNet=FP32 config, only the backend differing:
+
+| N | serial | fused |
+|---|---|---|
+| 1 | 4.5 s (4.51 s/req) | 4.7 s (4.70 s/req) |
+| 2 | 9.1 s (4.54 s/req) | 8.4 s (4.18 s/req) |
+| 3 | 14.1 s (4.69 s/req) | 10.4 s (3.45 s/req) |
+
+Serial is flat at ~4.5 s/req — no batching benefit at all. Fused improves with N: 1.36x
+throughput at N=3. N=4 OOMs (`hipMalloc` 136 MB) at `max_seq: 131072`, so residency, not
+the kernel, caps the batch here.
+
+### It does not meet the parity bar
+
+**6/9 sessions byte-identical to serial** across three repeats. Divergences are near-tie
+flips (`$n-1$` vs `$n/2$`; a reordered clause), not gross corruption — the same signature
+that keeps `Oq4G256` on serial two comments below this guard ("3 of 8 sessions produced a
+different first token ... most likely an activation-precision difference"). Parity is this
+file's stated bar, so **this change should not land as-is**: the fix is correct about
+which arms apply the scale, and it exposes the same numerical gap that is already known
+and unexplained for the neighbouring dtype. Same investigation, now with a second dtype
+reproducing it.
+
+## Speculative decode does not have to exclude batching
+
+The probe refuses on `m.dflash.is_some()`, and the wording in `run_generate_batch_prefill_serial_qwen35`
+is "does not support DFlash-loaded models **yet**" — unimplemented, not impossible. vLLM and
+TRT-LLM run both together; the real tension is batch-size dependent. At small batch the GPU
+is underutilised and speculation is close to free; as batch grows the GPU saturates and
+rejected draft tokens start costing more than they save. That argues for a batch-size
+threshold, not a hard refusal.
+
+The n-gram case is stronger still, and is currently a plain defect:
+
+```
+[batch-probe] REFUSED: dflash drafter present (ngram=true dspark=false)
+```
+
+`ngram_spec: true` with `dflash_draft: off` still refuses. `NgramState` is a separate
+field whose own comment says it is "**deliberately NOT inside `dflash`**: it needs no
+drafter" — yet enabling it populates `m.dflash` (the shared `spec_step_dflash` verify
+engine), so the drafter-free path is refused by a check written for draft models. N-gram
+drafting costs a table lookup, no second forward pass, so it should compose with batching
+at any batch size. Fixing this is narrower than the general spec-decode question: the
+probe should test for an actual drafter, not for the verify engine they share.
+
+
+## Update 2: the drafter check, and KV=kvarn4
+
+### The probe tested for the wrong thing
+
+`DflashState::draft_weights` is the drafter, and its own field comment says the state is
+carried with `draft_config`/`draft_weights` = `None` "when this state exists only to carry
+n-gram speculative decode, which drafts from statistics and needs no drafter model".
+Three sites tested `m.dflash.is_some()` instead — the probe, the prefill operation, and
+the decode gate's call site — so the drafter-free path was refused by a check written for
+draft models. `batch_executor::has_draft_model` is now the single predicate all three use.
+
+Measured: `ngram_spec: true` with no drafter now routes `-> BATCH`
+(`draft_model=false ngram=true`), where it previously refused.
+
+Fixing the probe alone was WRONG and briefly made things worse: the probe admitted models
+the decode gate still refused, turning a silent fallback into `fail_all` for every session
+("generate_batch_decode_step is not supported on DFlash-loaded models"). The probe's own
+comment warns about exactly this. All three sites must move together.
+
+### `auto` could select a backend that then hard-fails
+
+Admitting OqCompactG256 exposed a second hazard. `select_qwen35_prefill_batch_backend`
+picks FusedDense from `validate_qwen35_fused_dense_prefill_model_capability`, which
+checked only WEIGHTS — while the dense fused prefix also requires FP32 DeltaNet state and
+refuses FP16 per-session at execution, inside the batch op, where it is fatal to the whole
+cycle. The family default has been FP16 since f5b32ea32, so this was the common case. The
+capability check now refuses FP16 state, so `auto` degrades to serial as the contract
+promises. Verified: default config (kvarn4, ngram on, FP16 state) runs clean at
+4.42/4.45/4.47 s/req for N=1/2/3 — serial, but no errors.
+
+### KV=kvarn4 gets no benefit
+
+| config | N=1 | N=2 | N=3 |
+|---|---|---|---|
+| kvarn4, DeltaNet FP16 (defaults) | 4.42 | 4.45 | 4.47 s/req |
+| kvarn4, DeltaNet FP32 | 4.43 | 4.45 | 5.78 s/req |
+| q8, DeltaNet FP32, serial | 4.51 | 4.54 | 4.69 s/req |
+| q8, DeltaNet FP32, fused | 4.70 | 4.18 | **3.45 s/req** |
+
+KVarN is admissible for the fused PREFILL (`allow_kvarn`), but the fused DECODE requires
+FP32 or plain Q8 KV and excludes it. Decode dominates a 60-token completion, so the prefill
+win is invisible and N=3 is slightly worse than N=1. Only q8 — which is deprecated and
+needs `HIPFIRE_KV_ALLOW_DEPRECATED=1` — reaches the fused decode.
+
+**CORRECTION — see Update 3.** The conclusion drawn here, that the recommended KV mode and
+continuous batching are mutually exclusive, was wrong. The fused decode already accepts
+KVarN. What refused in the runs above was the DeltaNet state precision, which is FP16 by
+default and blocks the fused path for every KV mode alike. With FP32 state, KVarN reaches
+the same throughput as q8.
+
+
+## Update 3: KVarN needed no widening; the blocker was DeltaNet precision
+
+`validate_qwen35_fused_dense_decode_model_capability` already admits KVarN:
+
+```rust
+let kvarn_ok = kv_mode.starts_with("kvarn") && qwen35::qwen35_kvarn_fused_batch_enabled();
+```
+
+and `qwen35_kvarn_fused_batch_enabled()` is ON by default (only `=0` disables it). So
+there was no kernel to write. `HIPFIRE_DECODE_BACKEND_TRACE=1` gives the real refusal:
+
+```
+fused dense declined: qwen35 fused dense decode requires FP32 DeltaNet state;
+loaded state=FP16
+```
+
+The same FP16 DeltaNet default that blocks the fused PREFILL blocks the fused DECODE, for
+every KV mode. Attributing it to KVarN in Update 2 was wrong: the q8 runs there had
+`deltanet_state_precision=fp32` applied and the KVarN runs did not, so the variable that
+actually changed was the state precision, not the KV mode.
+
+With KVarN + FP32 DeltaNet state (and the OqCompactG256 admission, which the decode gate
+also needs — it calls the same weights validation):
+
+| N | serial | fused |
+|---|---|---|
+| 1 | — | 4.60 s/req |
+| 2 | — | 4.15 s/req |
+| 3 | 13.6 s (4.53 s/req) | 10.1 s (**3.46 s/req**) |
+
+1.35x at N=3 — the same figure q8 reached (3.45 s/req), confirming the KV mode was never
+the discriminator. Parity is 2/3, diverging on the identical `$n-1$` vs `$n/2$` near-tie as
+under q8, so the OqCompactG256 parity question is KV-independent too.
+
+### What actually gates batching today
+
+1. A real DFlash drafter (`dflash_draft: auto` finds a sibling for the 9B) — correctly
+   refused; drafter-based speculation with batching is unimplemented.
+2. FP16 DeltaNet state — the family default since f5b32ea32. `deltanet_state_precision=fp32`
+   clears it, at the cost of doubling per-sequence state.
+3. OqCompactG256 weights — fixed here, parity pending.
+
+None of these is the KV mode.
+
+### Config bug: per-model overrides silently ignored
+
+`deltanet_state_precision` set under `model_overrides.<model>` had no effect — the daemon
+loaded FP16 and the trace said so; only the top-level key worked. `dflash_draft` behaves
+the same way. Both are declared `GLOBAL_MODEL_RUNTIME` in the schema, so a per-model value
+is accepted by validation and then dropped, which is the worst of the three options.
+
+
+## Update 4: the dense FP16 DeltaNet arm now exists
+
+The FP32 guard was NOT an accuracy guard, so removing it would have been wrong whatever
+the FP16 state's numerics look like. Its stated reason:
+
+> the dense path does not [have an FP16 arm], so accepting FP16 here would run FP16 state
+> through FP32 code — a wrong answer instead of a slow one
+
+and, at the point `delta_f16` is computed for the grouped-MoE path:
+
+> FP16 state is half the stride of FP32, so the routed kernel and the state precision must
+> be chosen together — the f32 kernel over f16 state reads every element at the wrong offset
+
+That is a missing code path, not a tolerance. Deleting the guard would have fed f16 bytes
+to an f32 kernel at doubled stride.
+
+What was actually missing was small. `gated_delta_net_f16_routed_batch_seq` already exists
+and the grouped-MoE sibling already calls it; the dense wrapper had been **specified and
+never written** — its doc comment was sitting orphaned above
+`prefill_session_batch_write_kvarn_kv_layer`, describing a function that was not there:
+
+> FP16-state companion to `dense_prefill_session_batch_gated_delta_net_f32_layer`. Same
+> routing, same argument order; the pointers in `dn_s_ptrs` must address f16 state, which
+> is why the caller selects this by `DeltaNetState::quant` rather than by model.
+
+Added exactly that, plus the selector the doc describes: `delta_f16` is derived in
+`forward_prefill_dense_session_batch_impl` from `rows[0].dn_state.quant` (uniform by the
+state-signature contract) and threaded to the call site, which now branches the way the
+grouped-MoE path already did. Both guards widened to `FP32 | FP16` — still an allowlist,
+since Q8 state and below have no routed arm and the same stride argument applies to them.
+
+Measured on the DEFAULT DeltaNet precision (FP16), KVarN KV, ngram on:
+
+| N | serial | fused |
+|---|---|---|
+| 1 | — | 4.53 s/req |
+| 2 | — | 4.13 s/req |
+| 3 | 13.4 s (4.47 s/req) | 10.3 s (**3.43 s/req**) |
+
+Zero `fused dense declined` messages. 3.43 s/req matches FP32 state (3.46) and q8 (3.45),
+so FP16 reaches the fused path at no throughput cost — and the config no longer has to
+trade doubled per-sequence state for batching.
+
+Parity is 2/3, the same as FP32 state and q8, diverging on the same near-tie phrasing.
+That is the pre-existing OqCompactG256 gap, unchanged by this arm: it reproduces
+identically with FP32 state, where the new code does not run. Outputs are coherent prose
+throughout, which is what distinguishes this from the wrong-offset failure the guard was
+protecting against.
+
+**Still gating the default config:** `dflash_draft: auto` finds a real sibling drafter for
+the 9B, and drafter-based speculation with batching remains unimplemented. That is now the
+only remaining blocker, and it is the one the batch-size-threshold argument in Update 2
+applies to.
+
+
+## Update 5: drafter + batching CAN coexist — and speculation wins to at least N=4
+
+The refusal was "never validated", not "known to corrupt": nothing in `qwen35_decode.rs`
+touches `DflashState` outside the gate itself, and the batched decode never speculates —
+it advances every resident session by one real token. `HIPFIRE_QWEN35_BATCH_WITH_DRAFTER=1`
+lifts the gate so the reading can be tested rather than assumed.
+
+It holds. With a real sibling drafter loaded, the probe admits the model
+(`draft_model=true -> BATCH`) and the batched path produces correct output.
+
+The first attempt OOM'd (`hipMalloc(69 MB)` on a SINGLE request) — but that was headroom,
+not incompatibility: `max_seq: 131072` reserves enough KV that the drafter leaves no room
+for batch scratch. At `max_seq: 8192` the two coexist comfortably.
+
+### The crossover is further out than expected
+
+Drafter loaded, KVarN KV, FP16 state, max_seq 8192, 60-token completions:
+
+| N | batch path (no speculation) | legacy path (speculation) |
+|---|---|---|
+| 1 | 4.45 s/req | **2.05 s/req** |
+| 2 | 4.02 s/req | **2.04 s/req** |
+| 3 | 3.31 s/req | **2.03 s/req** |
+| 4 | 2.78 s/req | (concurrency-capped) |
+
+Speculation wins by 39-54% across the measurable range, and the legacy path is FLAT —
+2.03-2.05 s/req from N=1 to N=3. A flat curve means the GPU is not saturated at N=3, which
+is the condition under which speculation is nearly free and the argument for a threshold
+holds exactly as stated: small batch keeps the drafter.
+
+Batching improves steadily (4.45 -> 2.78) but had not crossed by N=4. Linear extrapolation
+puts the crossover near N=6, and that number is NOT measured — a `text_concurrency` rate
+limit caps in-flight text requests at 4. **CORRECTION — see Update 6: that config is not
+broken.** `local_rate_policy` is documented as loopback-only, and this host binds 0.0.0.0.
+
+**No threshold is hard-coded here, deliberately.** The default would have to be the
+crossover, and the crossover is the one number this could not measure. Picking ~6 from a
+two-point extrapolation would be a guess wearing a measurement's clothes. What to do next,
+in order:
+
+1. Find why `local_rate_policy` is ignored and lift the cap, then measure N=6..16.
+2. Set the threshold from that curve, as a config key, defaulting to the measured crossover.
+3. The routing decision belongs at the server, not the daemon gate: speculation lives on
+   the legacy path, so the threshold selects BETWEEN paths. A per-request route cannot see
+   the batch it will land in, so this wants the runner's `batch.len()` or the scheduler's
+   queue depth as the signal.
+
+
+## Update 6: the rate limit was not a bug, and the crossover is measured
+
+`local_rate_policy` is consulted ONLY for a loopback bind — its own doc says so, and the
+reason is that nothing in it may loosen limits for a remote client. This host binds
+`0.0.0.0`, so the standard policy applies: `max_in_flight_text: 4`, which was the cap.
+The loopback default is `0` (unlimited). Binding `127.0.0.1` for the measurement is the
+mechanism working as designed, not a workaround.
+
+With the cap lifted, both curves to N=8 (9B, KVarN, FP16 state, 60-token replies, drafter
+resident):
+
+| N | batch path (no speculation) | legacy path (speculation) |
+|---|---|---|
+| 1 | 4.60 | **2.08** |
+| 2 | 4.23 | **2.06** |
+| 3 | 3.47 | **2.06** |
+| 4 | 2.92 | **2.47** |
+| 6 | **2.44** | 2.59 |
+| 8 | **2.38** | 2.66 |
+
+Both halves of the argument show up. Speculation is nearly free while the GPU is idle
+(flat 2.06 to N=3) and **degrades as it saturates** (2.47, 2.59, 2.66) — rejected draft
+tokens are wasted compute a busy GPU cannot absorb. Batching is the mirror image, improving
+4.60 -> 2.38 and flattening as the fused kernels fill. **They cross between N=4 and N=6.**
+
+### The threshold
+
+`spec_batch_threshold()` — default **5**, `HIPFIRE_QWEN35_BATCH_SPEC_THRESHOLD` overrides.
+A drafter-loaded model keeps its drafter below it and takes the batch path at or above it.
+Models with no drafter are unaffected: they have nothing to speculate with and always
+batch.
+
+The decision belongs in the server router, because speculation lives on the legacy path —
+the choice is BETWEEN paths, not inside either. The signal is `state.text_inflight`, a
+counter of requests between the route decision and their reply, because a request cannot
+see the batch it will land in and the scheduler exposes no queue depth. It is approximate
+by construction: it counts arrivals, not formed batches. Verified live:
+
+```
+inflight=1..4 -> legacy      inflight=5..8 -> BATCH
+```
+
+The drafter gates are gone from the capability checks entirely — batched prefill and
+decode both accept a drafter-loaded model, since neither speculates. `has_draft_model` now
+crosses the daemon boundary in the `loaded` message so the router can see it.
+
+**The number is hardware- and drafter-specific.** It is where this drafter's wasted draft
+compute stops being absorbable on this GPU; it is a knob, not a constant to port.

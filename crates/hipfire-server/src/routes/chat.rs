@@ -320,6 +320,9 @@ pub(crate) struct LoadedModelContext {
     /// The daemon's probe of the LOADED model: can it take the fused batch
     /// prefill? `None` from a daemon that does not report it.
     pub(crate) batch_prefill_capable: Option<bool>,
+    /// A DFlash drafter is loaded — the model can speculate on the legacy path, so the
+    /// batch-vs-speculation choice applies to it.
+    pub(crate) has_draft_model: bool,
 }
 
 const MAX_REQUEST_TOKENS: u32 = 131_072;
@@ -524,6 +527,7 @@ pub(crate) async fn ensure_model_loaded(
                 cache_capable: loaded.cache_capable,
                 arch: loaded.arch,
                 batch_prefill_capable: loaded.batch_prefill_capable,
+                has_draft_model: loaded.has_draft_model,
             });
         }
     }
@@ -541,6 +545,7 @@ pub(crate) async fn ensure_model_loaded(
                             cache_capable: loaded.cache_capable,
                             arch: loaded.arch,
                             batch_prefill_capable: loaded.batch_prefill_capable,
+                            has_draft_model: loaded.has_draft_model,
                         });
                     }
                     tracing::info!(
@@ -562,6 +567,8 @@ pub(crate) async fn ensure_model_loaded(
                 let cache_capable = loaded_response_cache_capable(&loaded);
                 let arch = loaded.arch.clone();
                 let batch_prefill_capable = loaded.batch_prefill_capable;
+                let has_draft_model = loaded.has_draft_model.unwrap_or(false);
+                let has_draft_model = loaded.has_draft_model.unwrap_or(false);
                 let worker_key_id = Some(loaded.worker_key_id);
                 set_loaded_model_state(
                     state,
@@ -572,6 +579,7 @@ pub(crate) async fn ensure_model_loaded(
                         max_seq: params.max_seq,
                         arch: arch.clone(),
                         batch_prefill_capable,
+                        has_draft_model,
                     },
                 )
                 .await;
@@ -581,6 +589,7 @@ pub(crate) async fn ensure_model_loaded(
                     cache_capable,
                     arch,
                     batch_prefill_capable,
+                    has_draft_model,
                 });
             }
             Err(e) => {
@@ -610,6 +619,7 @@ pub(crate) async fn ensure_model_loaded(
     let cache_capable = loaded_response_cache_capable(&loaded);
     let arch = loaded.arch.clone();
     let batch_prefill_capable = loaded.batch_prefill_capable;
+    let has_draft_model = loaded.has_draft_model.unwrap_or(false);
     let worker_key_id = Some(loaded.worker_key_id);
     set_loaded_model_state(
         state,
@@ -620,6 +630,7 @@ pub(crate) async fn ensure_model_loaded(
             max_seq: params.max_seq,
             arch: arch.clone(),
             batch_prefill_capable,
+            has_draft_model,
         },
     )
     .await;
@@ -630,6 +641,7 @@ pub(crate) async fn ensure_model_loaded(
         cache_capable,
         arch,
         batch_prefill_capable,
+        has_draft_model,
     })
 }
 
@@ -1891,6 +1903,33 @@ impl Drop for CancelWorkerOnDrop {
     }
 }
 
+/// Concurrency at or above which a drafter-loaded model takes the batch path instead of
+/// the speculative one. Measured crossover is between 4 and 6 (see the table at the route
+/// decision); 5 sits on it. `HIPFIRE_QWEN35_BATCH_SPEC_THRESHOLD` overrides.
+///
+/// The number is hardware- and drafter-specific — it is where speculation's wasted draft
+/// compute stops being absorbable — so it is a knob, not a constant to trust elsewhere.
+fn spec_batch_threshold() -> usize {
+    std::env::var("HIPFIRE_QWEN35_BATCH_SPEC_THRESHOLD")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n >= 1)
+        .unwrap_or(5)
+}
+
+/// Decrements the in-flight text counter however the request leaves — including the
+/// early returns for scheduler admission failure and client cancellation, which is why
+/// this is a guard rather than a decrement at the end of the happy path.
+struct InflightGuard(SharedState);
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        self.0
+            .text_inflight
+            .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 async fn execute_blocking_chat_cancellable<F>(
     state: SharedState,
     body: ChatRequest,
@@ -1947,9 +1986,43 @@ where
     // tokens, instead of taking the engine per-request. Gated by the flag that
     // spawns the runner AND by batch-eligibility (arch declares ContinuousBatching
     // + runtime envelope) — ineligible models fall through to the legacy path.
-    if server_prefill_batch_enabled(&SchedulerPolicyEnv::from_pairs(std::env::vars()))
-        && crate::batch_runner::batch_eligible(loaded.arch.as_deref(), loaded.batch_prefill_capable)
-    {
+    let __bt_enabled =
+        server_prefill_batch_enabled(&SchedulerPolicyEnv::from_pairs(std::env::vars()));
+    let __bt_elig =
+        crate::batch_runner::batch_eligible(loaded.arch.as_deref(), loaded.batch_prefill_capable);
+    // Batching and speculation are mutually exclusive per request, because speculation
+    // lives on the legacy path and the batched path never speculates. Which wins depends
+    // on concurrency, and measurably crosses over:
+    //
+    //   N        1     2     3     4     6     8     (s/request, 9B, 60-token replies)
+    //   batch  4.60  4.23  3.47  2.92  2.44  2.38
+    //   spec   2.08  2.06  2.06  2.47  2.59  2.66
+    //
+    // Speculation is nearly free while the GPU is idle and gets worse as it saturates —
+    // rejected draft tokens are wasted compute that a busy GPU cannot absorb. Batching is
+    // the reverse. They cross between 4 and 6, so a drafter-loaded model keeps its drafter
+    // below the threshold and takes the batch path at or above it.
+    let inflight = state
+        .text_inflight
+        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        + 1;
+    let _inflight_guard = InflightGuard(std::sync::Arc::clone(&state));
+    let __bt_spec = loaded.has_draft_model && inflight < spec_batch_threshold();
+    if std::env::var("HIPFIRE_DEBUG_BATCH_ROUTE").as_deref() == Ok("1") {
+        eprintln!(
+            "[batch-route] enabled={__bt_enabled} eligible={__bt_elig} arch={:?} capable={:?} \
+             drafter={} inflight={inflight} -> {}",
+            loaded.arch,
+            loaded.batch_prefill_capable,
+            loaded.has_draft_model,
+            if __bt_enabled && __bt_elig && !__bt_spec {
+                "BATCH"
+            } else {
+                "legacy"
+            }
+        );
+    }
+    if __bt_enabled && __bt_elig && !__bt_spec {
         let controls = {
             let cfg = state.config.lock().await;
             let resolved = cfg.resolve_for_model(&model_arg);
@@ -3697,6 +3770,7 @@ mod tests {
                 max_seq: 1024,
                 arch: None,
                 batch_prefill_capable: None,
+                has_draft_model: false,
             },
         );
 
@@ -3720,6 +3794,7 @@ mod tests {
                 max_seq: 4096,
                 arch: None,
                 batch_prefill_capable: None,
+                has_draft_model: false,
             },
         );
         let status = json!({
@@ -3769,6 +3844,7 @@ mod tests {
                 max_seq: 2048,
                 arch: None,
                 batch_prefill_capable: None,
+                has_draft_model: false,
             },
         );
 
@@ -3837,6 +3913,7 @@ mod tests {
             vocab: None,
             model_worker: None,
             batch_prefill_capable: None,
+            has_draft_model: None,
             response_id: None,
         };
         assert!(loaded_response_cache_capable(&loaded));

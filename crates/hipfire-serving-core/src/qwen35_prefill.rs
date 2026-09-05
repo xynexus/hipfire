@@ -1883,9 +1883,10 @@ pub fn run_generate_batch_prefill_serial_qwen35(
             "generate_batch_prefill does not support pipeline-parallel models yet".to_string(),
         );
     }
-    if m.dflash.is_some() {
-        return Err("generate_batch_prefill does not support DFlash-loaded models yet".to_string());
-    }
+    // Drafter, not `DflashState` — see `batch_executor::has_draft_model`. The n-gram path
+    // carries a DflashState with no drafter, and refusing it here (while the probe admits
+    // it) would turn a fallback into `fail_all` for the whole cycle.
+    // Drafter-loaded models are admitted; the batched prefill does not speculate.
     if m.eviction.is_some() {
         return Err(
             "generate_batch_prefill does not support CASK/TriAttention eviction yet".to_string(),
