@@ -33,8 +33,8 @@ fn arch_registry() -> &'static ArchRegistry {
     REG.get_or_init(ArchRegistry::build)
 }
 
-/// Whether a request whose model reports arch tag `arch` (the daemon's
-/// `model_type`, e.g. `qwen3_5`) may be routed through the continuous-batching
+/// Whether a request whose model reports arch tag `arch` may be routed through the
+/// continuous-batching
 /// runner. Eligibility is a **declared arch capability** (`ContinuousBatching`)
 /// resolved via the arch-specs registry, AND the runtime envelope the daemon's
 /// fused batch path requires. Anything ineligible falls back to the legacy
@@ -55,8 +55,19 @@ fn arch_supports_continuous_batching(arch: Option<&str>) -> bool {
     let Some(arch) = arch else {
         return false;
     };
+    // `resolve`, NOT `find_by_model_type`: the string's provenance is exactly the
+    // ambiguity `resolve` exists for. The daemon reports `loaded.family` whenever the
+    // model has a registered backend — "qwen3.5", with a dot — while `model_types` holds
+    // "qwen3_5"/"qwen3_5_text". An exact match on model_types therefore missed EVERY
+    // qwen3.5 model, so the whole family fell to the legacy per-request path and
+    // concurrent requests never fused. Measured before this fix: three prefix-sharing
+    // requests sent 0.4 ms apart took 72.3 s against 14.1 s for one, with
+    // `prefill_batch.selected_batch_size` stuck at 0 across 191 requests while
+    // `/health` cheerfully reported batching "enabled" and "supported".
+    // `resolve` is separator- and case-insensitive and tries model_types before family,
+    // so it accepts either form on purpose.
     arch_registry()
-        .find_by_model_type(arch)
+        .resolve(arch)
         .and_then(|a| a.caps.continuous_batching)
         .is_some()
 }
@@ -1235,6 +1246,24 @@ async fn run_batch_cycle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // The form the daemon ACTUALLY sends. `lifecycle.rs` reports `loaded.family` for any
+    // model with a registered backend — "qwen3.5", with a dot — and only falls back to a
+    // model_type ("qwen3_5") when there is none. Every test here used the underscore
+    // form, so they all passed while no real qwen3.5 request was ever batch-eligible:
+    // the family fell to the legacy path and concurrent requests ran one at a time.
+    #[test]
+    fn the_family_tag_the_daemon_reports_is_batch_eligible() {
+        for tag in ["qwen3.5", "qwen3_5", "qwen3_5_text", "Qwen3.5"] {
+            assert!(
+                batch_eligible(Some(tag), None),
+                "{tag}: the daemon reports this form; it must resolve to the arch"
+            );
+        }
+        // Still honestly false for an arch nothing linked in declares.
+        assert!(!batch_eligible(Some("not-an-arch"), None));
+        assert!(!batch_eligible(None, None));
+    }
 
     #[test]
     fn a_model_the_prefill_refuses_is_not_batch_eligible() {

@@ -1947,9 +1947,16 @@ where
     // tokens, instead of taking the engine per-request. Gated by the flag that
     // spawns the runner AND by batch-eligibility (arch declares ContinuousBatching
     // + runtime envelope) — ineligible models fall through to the legacy path.
-    if server_prefill_batch_enabled(&SchedulerPolicyEnv::from_pairs(std::env::vars()))
-        && crate::batch_runner::batch_eligible(loaded.arch.as_deref(), loaded.batch_prefill_capable)
-    {
+    let __bt_enabled = server_prefill_batch_enabled(&SchedulerPolicyEnv::from_pairs(std::env::vars()));
+    let __bt_elig = crate::batch_runner::batch_eligible(loaded.arch.as_deref(), loaded.batch_prefill_capable);
+    if std::env::var("HIPFIRE_DEBUG_BATCH_ROUTE").as_deref() == Ok("1") {
+        eprintln!(
+            "[batch-route] enabled={__bt_enabled} eligible={__bt_elig} arch={:?} capable={:?} -> {}",
+            loaded.arch, loaded.batch_prefill_capable,
+            if __bt_enabled && __bt_elig { "BATCH" } else { "legacy" }
+        );
+    }
+    if __bt_enabled && __bt_elig {
         let controls = {
             let cfg = state.config.lock().await;
             let resolved = cfg.resolve_for_model(&model_arg);
