@@ -1386,7 +1386,28 @@ pub fn validate_qwen35_fused_dense_prefill_model_capability(m: &LoadedModel) -> 
         .as_ref()
         .ok_or_else(|| "qwen35 fused dense prefill requires qwen35 weights".to_string())?;
     qwen35::validate_dense_prefill_session_batch_fused_prefix_full_precision_weights(weights)
-        .map_err(|e| format!("qwen35 fused dense prefill unsupported weights: {e}"))
+        .map_err(|e| format!("qwen35 fused dense prefill unsupported weights: {e}"))?;
+    // The dense fused prefix has no FP16 DeltaNet arm and refuses FP16 state per-session
+    // at execution — correctly, since running FP16 state through FP32 code is a wrong
+    // answer rather than a slow one. But that refusal lands INSIDE the batch operation,
+    // where it is fatal to every session in the cycle, while `auto` selects the backend
+    // from this capability check, which looked only at weights. The result is a hard
+    // failure where the contract promises a fallback.
+    //
+    // The family default has been FP16 since f5b32ea32, so this is the common case, not
+    // the corner. Refusing here makes `select_qwen35_prefill_batch_backend` pick
+    // SerialReference — the same shape as the AWQ and dtype refusals beside it.
+    if let Some(dn) = m.dn_state() {
+        if !matches!(dn.quant, hipfire_arch_qwen35::qwen35::StateQuant::FP32) {
+            return Err(format!(
+                "qwen35 fused dense prefill requires FP32 DeltaNet state, loaded state is \
+                 {:?}; set deltanet_state_precision=fp32 to enable the fused path, or add \
+                 the dense FP16 arm",
+                dn.quant
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Make the requested worker the active one, parking whatever was active first

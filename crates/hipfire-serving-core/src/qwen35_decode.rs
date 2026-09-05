@@ -612,10 +612,15 @@ pub fn run_generate_batch_decode_step_qwen35(
     stdout: &mut dyn std::io::Write,
     envelope: &GenerateBatchDecodeEnvelope,
 ) -> Result<(), String> {
+    // The gate's parameter is "a DFlash DRAFTER is loaded", so pass that rather than
+    // "a DflashState exists": the n-gram path carries the state with no drafter, and
+    // `m.dflash.is_some()` refused it here too. Must match the prefill probe
+    // (`batch_executor::has_draft_model`) exactly — the probe admitting what this
+    // refuses is a `fail_all` for every session in the cycle, not a fallback.
     validate_qwen35_decode_batch_runtime_surface(
         m.arch_id,
         m.pp,
-        m.dflash.is_some(),
+        crate::batch_executor::has_draft_model(m),
         m.eviction.is_some(),
     )?;
     let requested_backend =
