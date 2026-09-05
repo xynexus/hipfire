@@ -322,9 +322,8 @@ holds exactly as stated: small batch keeps the drafter.
 
 Batching improves steadily (4.45 -> 2.78) but had not crossed by N=4. Linear extrapolation
 puts the crossover near N=6, and that number is NOT measured — a `text_concurrency` rate
-limit caps in-flight text requests at 4, and setting `local_rate_policy.max_in_flight_text`
-in config.json did not lift it (another override that validates and does nothing, like
-`deltanet_state_precision` and `dflash_draft`).
+limit caps in-flight text requests at 4. **CORRECTION — see Update 6: that config is not
+broken.** `local_rate_policy` is documented as loopback-only, and this host binds 0.0.0.0.
 
 **No threshold is hard-coded here, deliberately.** The default would have to be the
 crossover, and the crossover is the one number this could not measure. Picking ~6 from a
@@ -337,3 +336,53 @@ in order:
    the legacy path, so the threshold selects BETWEEN paths. A per-request route cannot see
    the batch it will land in, so this wants the runner's `batch.len()` or the scheduler's
    queue depth as the signal.
+
+
+## Update 6: the rate limit was not a bug, and the crossover is measured
+
+`local_rate_policy` is consulted ONLY for a loopback bind — its own doc says so, and the
+reason is that nothing in it may loosen limits for a remote client. This host binds
+`0.0.0.0`, so the standard policy applies: `max_in_flight_text: 4`, which was the cap.
+The loopback default is `0` (unlimited). Binding `127.0.0.1` for the measurement is the
+mechanism working as designed, not a workaround.
+
+With the cap lifted, both curves to N=8 (9B, KVarN, FP16 state, 60-token replies, drafter
+resident):
+
+| N | batch path (no speculation) | legacy path (speculation) |
+|---|---|---|
+| 1 | 4.60 | **2.08** |
+| 2 | 4.23 | **2.06** |
+| 3 | 3.47 | **2.06** |
+| 4 | 2.92 | **2.47** |
+| 6 | **2.44** | 2.59 |
+| 8 | **2.38** | 2.66 |
+
+Both halves of the argument show up. Speculation is nearly free while the GPU is idle
+(flat 2.06 to N=3) and **degrades as it saturates** (2.47, 2.59, 2.66) — rejected draft
+tokens are wasted compute a busy GPU cannot absorb. Batching is the mirror image, improving
+4.60 -> 2.38 and flattening as the fused kernels fill. **They cross between N=4 and N=6.**
+
+### The threshold
+
+`spec_batch_threshold()` — default **5**, `HIPFIRE_QWEN35_BATCH_SPEC_THRESHOLD` overrides.
+A drafter-loaded model keeps its drafter below it and takes the batch path at or above it.
+Models with no drafter are unaffected: they have nothing to speculate with and always
+batch.
+
+The decision belongs in the server router, because speculation lives on the legacy path —
+the choice is BETWEEN paths, not inside either. The signal is `state.text_inflight`, a
+counter of requests between the route decision and their reply, because a request cannot
+see the batch it will land in and the scheduler exposes no queue depth. It is approximate
+by construction: it counts arrivals, not formed batches. Verified live:
+
+```
+inflight=1..4 -> legacy      inflight=5..8 -> BATCH
+```
+
+The drafter gates are gone from the capability checks entirely — batched prefill and
+decode both accept a drafter-loaded model, since neither speculates. `has_draft_model` now
+crosses the daemon boundary in the `loaded` message so the router can see it.
+
+**The number is hardware- and drafter-specific.** It is where this drafter's wasted draft
+compute stops being absorbable on this GPU; it is a knob, not a constant to port.

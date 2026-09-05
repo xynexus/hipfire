@@ -1658,7 +1658,7 @@ fn selects_dense_layer_chunked_decode_backend_only_for_dense_batches() {
 }
 
 #[test]
-fn decode_batch_runtime_surface_rejects_spec_decode_and_eviction_state() {
+fn decode_batch_runtime_surface_rejects_bad_arch_pp_and_eviction() {
     validate_qwen35_decode_batch_runtime_surface(5, 1, false, false).unwrap();
     validate_qwen35_decode_batch_runtime_surface(6, 1, false, false).unwrap();
 
@@ -1668,11 +1668,12 @@ fn decode_batch_runtime_surface_rejects_spec_decode_and_eviction_state() {
     let arch_err = validate_qwen35_decode_batch_runtime_surface(9, 1, false, false).unwrap_err();
     assert!(arch_err.contains("single-GPU qwen35/qwen35-moe"));
 
-    let dflash_err = validate_qwen35_decode_batch_runtime_surface(5, 1, true, false).unwrap_err();
-    assert_eq!(
-        dflash_err,
-        "generate_batch_decode_step is not supported on DFlash-loaded models"
-    );
+    // A loaded drafter no longer refuses the batched decode. It never speculates, and
+    // nothing in the decode path touches DflashState — verified live 2026-09-05, correct
+    // output at N=1..8 with a sibling drafter resident. WHETHER to batch such a model is
+    // a routing question (speculation lives on the legacy path), answered by
+    // `spec_batch_threshold` in the server, not a capability question answered here.
+    validate_qwen35_decode_batch_runtime_surface(5, 1, true, false).unwrap();
 
     let eviction_err = validate_qwen35_decode_batch_runtime_surface(5, 1, false, true).unwrap_err();
     assert_eq!(
