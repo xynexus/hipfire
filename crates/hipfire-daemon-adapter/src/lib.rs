@@ -2141,6 +2141,7 @@ mod tests {
                 model_worker: None,
                 response_id: Some("stale".to_string()),
                 batch_prefill_capable: None,
+                has_draft_model: None,
             }),
             DaemonResponse::Loaded(ModelLoadedResponse {
                 worker_key_id: "worker-a".to_string(),
@@ -2152,6 +2153,7 @@ mod tests {
                 model_worker: None,
                 response_id: None,
                 batch_prefill_capable: None,
+                has_draft_model: None,
             }),
         ]);
 
