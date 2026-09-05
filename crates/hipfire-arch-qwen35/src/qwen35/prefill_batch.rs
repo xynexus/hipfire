@@ -1622,7 +1622,6 @@ fn dense_prefill_weight_unsupported_reason(weight: &WeightTensor) -> Option<&'st
     None
 }
 
-
 /// [`dense_prefill_weight_unsupported_reason`] plus the dtype that refused.
 ///
 /// The reason string names the arms that ARE supported; without the dtype in hand a

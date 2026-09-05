@@ -567,7 +567,7 @@ pub(crate) async fn ensure_model_loaded(
                 let cache_capable = loaded_response_cache_capable(&loaded);
                 let arch = loaded.arch.clone();
                 let batch_prefill_capable = loaded.batch_prefill_capable;
-    let has_draft_model = loaded.has_draft_model.unwrap_or(false);
+                let has_draft_model = loaded.has_draft_model.unwrap_or(false);
                 let has_draft_model = loaded.has_draft_model.unwrap_or(false);
                 let worker_key_id = Some(loaded.worker_key_id);
                 set_loaded_model_state(
@@ -1986,8 +1986,10 @@ where
     // tokens, instead of taking the engine per-request. Gated by the flag that
     // spawns the runner AND by batch-eligibility (arch declares ContinuousBatching
     // + runtime envelope) — ineligible models fall through to the legacy path.
-    let __bt_enabled = server_prefill_batch_enabled(&SchedulerPolicyEnv::from_pairs(std::env::vars()));
-    let __bt_elig = crate::batch_runner::batch_eligible(loaded.arch.as_deref(), loaded.batch_prefill_capable);
+    let __bt_enabled =
+        server_prefill_batch_enabled(&SchedulerPolicyEnv::from_pairs(std::env::vars()));
+    let __bt_elig =
+        crate::batch_runner::batch_eligible(loaded.arch.as_deref(), loaded.batch_prefill_capable);
     // Batching and speculation are mutually exclusive per request, because speculation
     // lives on the legacy path and the batched path never speculates. Which wins depends
     // on concurrency, and measurably crosses over:
@@ -2010,8 +2012,14 @@ where
         eprintln!(
             "[batch-route] enabled={__bt_enabled} eligible={__bt_elig} arch={:?} capable={:?} \
              drafter={} inflight={inflight} -> {}",
-            loaded.arch, loaded.batch_prefill_capable, loaded.has_draft_model,
-            if __bt_enabled && __bt_elig && !__bt_spec { "BATCH" } else { "legacy" }
+            loaded.arch,
+            loaded.batch_prefill_capable,
+            loaded.has_draft_model,
+            if __bt_enabled && __bt_elig && !__bt_spec {
+                "BATCH"
+            } else {
+                "legacy"
+            }
         );
     }
     if __bt_enabled && __bt_elig && !__bt_spec {
