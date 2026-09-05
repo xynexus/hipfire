@@ -131,16 +131,23 @@ impl BatchExecutor for Qwen35BatchExecutor {
         // `batch_runner::batch_envelope_ok` looks for HIPFIRE_DFLASH_DRAFT
         // instead of at the loaded model. Keep in step with
         // `run_generate_batch_prefill_serial_qwen35`.
-        if m.dflash.is_some() {
+        // Test for an actual DRAFTER, not for `DflashState`. `draft_weights` is None when
+        // the state exists only to carry n-gram speculative decode — its own field comment
+        // says so ("needs no drafter model"), and `spec_step_dflash` skips the drafter
+        // branch entirely in that case. Testing `dflash.is_some()` therefore refused the
+        // drafter-free path too, and since `ngram_spec: true` is the shipped default that
+        // silently disabled continuous batching for every model on this host.
+        //
+        // Kept in step with `run_generate_batch_prefill_serial_qwen35`, which carries the
+        // same predicate: a probe that admits what the operation refuses turns a fallback
+        // into `fail_all` for every session in the cycle.
+        if has_draft_model(m) {
             if std::env::var("HIPFIRE_DEBUG_BATCH_ROUTE").as_deref() == Ok("1") {
-                eprintln!(
-                    "[batch-probe] REFUSED: dflash drafter present (ngram={} dspark={})",
-                    m.ngram.is_some(),
-                    m.dspark.is_some()
-                );
+                eprintln!("[batch-probe] REFUSED: draft model present");
             }
             return Err(
-                "generate_batch_prefill does not support speculative-decode models yet".to_string(),
+                "generate_batch_prefill does not support drafter-based speculative decode yet"
+                    .to_string(),
             );
         }
         if m.eviction.is_some() {
@@ -154,9 +161,9 @@ impl BatchExecutor for Qwen35BatchExecutor {
         }
         if std::env::var("HIPFIRE_DEBUG_BATCH_ROUTE").as_deref() == Ok("1") {
             eprintln!(
-                "[batch-probe] OK pp={} dflash={} ngram={} dspark={} eviction={}",
+                "[batch-probe] OK pp={} draft_model={} ngram={} dspark={} eviction={}",
                 m.pp,
-                m.dflash.is_some(),
+                has_draft_model(m),
                 m.ngram.is_some(),
                 m.dspark.is_some(),
                 m.eviction.is_some()
@@ -261,6 +268,18 @@ static LFM2_MOE_BATCH_EXECUTOR: Lfm2MoeBatchExecutor = Lfm2MoeBatchExecutor;
 /// This is the whole of the daemon's arch knowledge for continuous batching:
 /// adding an arch means adding an implementation and one arm here, not editing
 /// four call sites in the handler.
+/// Whether a real drafter MODEL is loaded, as opposed to a `DflashState` that exists
+/// only to carry drafter-free (n-gram) speculation.
+///
+/// `DflashState::draft_weights` is the drafter itself and is `None` for the n-gram path,
+/// which drafts from statistics and runs no second forward pass. The batched prefill's
+/// limitation is the drafter, so this is the predicate it should test.
+pub fn has_draft_model(m: &LoadedModel) -> bool {
+    m.dflash
+        .as_ref()
+        .is_some_and(|d| d.draft_weights.is_some() || d.draft_config.is_some())
+}
+
 pub fn batch_executor_for(arch_id: u32) -> Option<&'static dyn BatchExecutor> {
     if is_qwen35_family_arch_id(arch_id) {
         return Some(&QWEN35_BATCH_EXECUTOR);

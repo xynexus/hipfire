@@ -130,3 +130,54 @@ engine), so the drafter-free path is refused by a check written for draft models
 drafting costs a table lookup, no second forward pass, so it should compose with batching
 at any batch size. Fixing this is narrower than the general spec-decode question: the
 probe should test for an actual drafter, not for the verify engine they share.
+
+
+## Update 2: the drafter check, and KV=kvarn4
+
+### The probe tested for the wrong thing
+
+`DflashState::draft_weights` is the drafter, and its own field comment says the state is
+carried with `draft_config`/`draft_weights` = `None` "when this state exists only to carry
+n-gram speculative decode, which drafts from statistics and needs no drafter model".
+Three sites tested `m.dflash.is_some()` instead — the probe, the prefill operation, and
+the decode gate's call site — so the drafter-free path was refused by a check written for
+draft models. `batch_executor::has_draft_model` is now the single predicate all three use.
+
+Measured: `ngram_spec: true` with no drafter now routes `-> BATCH`
+(`draft_model=false ngram=true`), where it previously refused.
+
+Fixing the probe alone was WRONG and briefly made things worse: the probe admitted models
+the decode gate still refused, turning a silent fallback into `fail_all` for every session
+("generate_batch_decode_step is not supported on DFlash-loaded models"). The probe's own
+comment warns about exactly this. All three sites must move together.
+
+### `auto` could select a backend that then hard-fails
+
+Admitting OqCompactG256 exposed a second hazard. `select_qwen35_prefill_batch_backend`
+picks FusedDense from `validate_qwen35_fused_dense_prefill_model_capability`, which
+checked only WEIGHTS — while the dense fused prefix also requires FP32 DeltaNet state and
+refuses FP16 per-session at execution, inside the batch op, where it is fatal to the whole
+cycle. The family default has been FP16 since f5b32ea32, so this was the common case. The
+capability check now refuses FP16 state, so `auto` degrades to serial as the contract
+promises. Verified: default config (kvarn4, ngram on, FP16 state) runs clean at
+4.42/4.45/4.47 s/req for N=1/2/3 — serial, but no errors.
+
+### KV=kvarn4 gets no benefit
+
+| config | N=1 | N=2 | N=3 |
+|---|---|---|---|
+| kvarn4, DeltaNet FP16 (defaults) | 4.42 | 4.45 | 4.47 s/req |
+| kvarn4, DeltaNet FP32 | 4.43 | 4.45 | 5.78 s/req |
+| q8, DeltaNet FP32, serial | 4.51 | 4.54 | 4.69 s/req |
+| q8, DeltaNet FP32, fused | 4.70 | 4.18 | **3.45 s/req** |
+
+KVarN is admissible for the fused PREFILL (`allow_kvarn`), but the fused DECODE requires
+FP32 or plain Q8 KV and excludes it. Decode dominates a 60-token completion, so the prefill
+win is invisible and N=3 is slightly worse than N=1. Only q8 — which is deprecated and
+needs `HIPFIRE_KV_ALLOW_DEPRECATED=1` — reaches the fused decode.
+
+That is the substantive finding for the swarm: **the recommended KV mode and continuous
+batching are mutually exclusive today.** KVarN is the recommended single-tier KV; batching
+throughput requires a deprecated KV mode plus a non-default DeltaNet precision. Widening
+the fused decode to KVarN is what would make batching useful on the models actually served
+here.
