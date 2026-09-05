@@ -339,10 +339,69 @@ earlier from the dirty tree at `95b30d829`. That corroborates §2's "every one o
 the 19 .rs files is formatting-only" claim — the `git_dirty: true` stamp on these
 artifacts is not a reproducibility hazard.
 
-**What is left is point 1 above, and it is now the leading explanation rather
-than the fallback:** both CIs are wide and both are driven by a single ~0.4
-outlier chunk against a ~0.03 minimum, at n=16. The gap may simply be noise.
-Re-score at higher n before anything else.
+### RESOLVED 2026-09-05 — the premise was wrong, not the artifacts
+
+Re-scored all four models at **n=64** against freshly built n=64 references
+(halo; the old refs hold only 16 chunks, so `max_chunks: 64` against them is
+silently clamped — see "Traps"). Both n=16 numbers reproduced first, so the
+pipeline was validated before anything was concluded: dense 0.11147 vs the
+0.110658 recorded here, MoE 0.038527 vs 0.038913.
+
+| model | n=16 (recorded) | **n=64** | 95% CI |
+|---|---|---|---|
+| Qwen3.5-27B dense | 0.110658 | **0.085211** | [0.0691, 0.1013] |
+| Qwen3.5-35B-A3B MoE | 0.038913 | **0.049020** | [0.0421, 0.0559] |
+| Qwen3.6-27B dense | 0.143372 | **0.141211** | [0.1153, 0.1672] |
+| Qwen3.6-35B-A3B MoE | 0.051324 | **0.068637** | [0.0554, 0.0819] |
+
+**Point 1 is confirmed but only worth about half.** The 3.5 gap falls from 2.9x
+to 1.74x, and the movement went BOTH ways — the dense fell 24% while the MoE rose
+27%, which is the heavy tail behaving exactly as warned. The 3.6 pair barely
+moved, so the n=16 sensitivity was specific to the 3.5 draw.
+
+**The surviving gap is architectural, and the comparison was never apples to
+apples.** dense/MoE is 1.74x (3.5) and 2.06x (3.6) — same direction, similar
+magnitude, so not one bad artifact. From the artifacts' own `parameter_counts`:
+
+| | dense 27B | MoE 35B-A3B |
+|---|---|---|
+| active params/token | 26.90 B | 3.43 B |
+| quantized | 25.62 B (95.3%) | 34.15 B (98.5%) |
+| **active AND quantized** | **~25.6 B** | **~2.9 B** |
+
+The dense model puts **8.8x more quantized weight on every token's path** at the
+same ~4.25 bpw and pays 1.74x in KLD — i.e. **~5x MORE robust per active
+quantized parameter**, not less. A MoE routes 8 of 256 experts per token, so most
+of its 4-bit weight is absent from any given forward pass and what error remains
+averages across experts.
+
+Three things favour that over a defect:
+
+- **At the easiest chunks the ratio is 0.97** — the dense is marginally BETTER.
+  The two degrade identically on easy text and diverge as difficulty rises
+  (1.32 at q25, 1.84 at q75, 2.70 at max).
+- **Cross-model per-chunk correlation is 0.154.** The chunks that hurt the dense
+  are not the ones that hurt the MoE, so this is not "some passages are hard".
+- The MoE gets WORSE per-tensor treatment — its 10240 expert `down_proj` are
+  plain RTN with no Hessian — and still wins. Hard to square with a quantization
+  defect, easy to square with routing dilution.
+
+**Honest limit:** this explains the direction and shows the naive
+per-active-parameter prediction (7.5-9x) massively over-predicts, but no model
+here lands on 1.74x specifically. "Expected" is an inference from structure, not
+a fit.
+
+**So §5's original framing was the error.** "The dense pair is worth a look
+before anyone trusts it" compared two models that were never comparable —
+different architectures, 8.8x different active quantized weight, and a KLD that
+is self-relative to each model's OWN bf16, so it ranks degradation and not
+quality. Nothing about the dense artifacts needs fixing. All three candidate
+causes are closed: VL (ruled out from the artifacts), damping (measured and
+refuted above), outlier chunks (confirmed, worth about half).
+
+The n=64 references are promoted to `/srv/hipfire/kldrefs/` as
+`*--bf16.n64.kldref.hfq` — ~80 minutes of GPU to rebuild, so they are worth
+keeping.
 
 Calibration route was forced by shape, not preference: a dense 27B has
 `intermediate_size=17408`, so ONE `down_proj` Hessian is 17408²·4 = 1.13 GiB and
@@ -461,6 +520,15 @@ where LDLQ saturates (`docs/quant-formats/moe-expert-hessians.md` Q2).
 - **The tiny-quant gate has 8 pre-existing failures** (qwen2/hfq4, gemma3
   q8f16+hfq4, minimax/mq4, qwen3_5/q8f16, qwen3_5_moe q8f16+mq6+mq4). They are
   NOT regressions; they were identical before every commit this session.
+- **`max_chunks` is silently clamped by the reference.** A kldref contains only
+  the chunks it was BUILT with, so scoring an n=16 ref with `max_chunks: 64`
+  quietly scores 16 and reports `n_chunk: 16`. Nothing warns. Raising n means
+  rebuilding the ref from the bf16 model first.
+- **A `oq*` target auto-attaches a DFlash drafter it cannot drive.** Loading
+  `Qwen3.5-35B-A3B--oq4.25++.hfq` fails with "target lm_head quant_type=36 is not
+  supported by speculative.rs's batched GEMM paths on this arch (gfx1151)". Pass
+  `"dflash_mode": "off"` in the load params. The error names the supported quant
+  types and the workaround.
 - **Statistics:** compare arms built from the SAME calib and scored against the
   SAME reference. `mode=score` draws tokens from the reference, so arms are
   paired by construction. n=16 chunks cannot resolve effects below ~3%.
