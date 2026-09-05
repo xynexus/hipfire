@@ -112,6 +112,9 @@ impl BatchExecutor for Qwen35BatchExecutor {
 
     fn probe(&self, m: &LoadedModel) -> Result<(), String> {
         if m.pp != 1 {
+            if std::env::var("HIPFIRE_DEBUG_BATCH_ROUTE").as_deref() == Ok("1") {
+                eprintln!("[batch-probe] REFUSED: pp={}", m.pp);
+            }
             return Err(format!(
                 "generate_batch_prefill requires pipeline_parallel=1, got pp={}",
                 m.pp
@@ -129,14 +132,28 @@ impl BatchExecutor for Qwen35BatchExecutor {
         // instead of at the loaded model. Keep in step with
         // `run_generate_batch_prefill_serial_qwen35`.
         if m.dflash.is_some() {
+            if std::env::var("HIPFIRE_DEBUG_BATCH_ROUTE").as_deref() == Ok("1") {
+                eprintln!("[batch-probe] REFUSED: dflash drafter present");
+            }
             return Err(
                 "generate_batch_prefill does not support speculative-decode models yet".to_string(),
             );
         }
         if m.eviction.is_some() {
+            if std::env::var("HIPFIRE_DEBUG_BATCH_ROUTE").as_deref() == Ok("1") {
+                eprintln!("[batch-probe] REFUSED: eviction active");
+            }
             return Err(
                 "generate_batch_prefill does not support CASK/TriAttention eviction yet"
                     .to_string(),
+            );
+        }
+        if std::env::var("HIPFIRE_DEBUG_BATCH_ROUTE").as_deref() == Ok("1") {
+            eprintln!(
+                "[batch-probe] OK pp={} dflash={} eviction={}",
+                m.pp,
+                m.dflash.is_some(),
+                m.eviction.is_some()
             );
         }
         Ok(())
