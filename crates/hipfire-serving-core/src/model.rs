@@ -638,23 +638,30 @@ pub struct LoadedModel {
     pub dspark: Option<DsparkState>,
     // Upstream HF Jinja chat_template, extracted from the HFQ
     // `tokenizer_config.chat_template` at load time. `None` when the source
-    // model didn't ship one (rare for instruct models). Only consumed when
-    // `HIPFIRE_JINJA_CHAT=1` is set; otherwise the daemon's hand-rolled
-    // `prompt_frame::ChatFrame::Plain` scaffolding is used as today.
-    //
-    // Stage 2 partial: AR generate() path only. DFlash, multi-GPU PP>1, and
-    // VL paths still hit the Plain scaffold.
+    // model didn't ship one (rare for instruct models). Consumed only when
+    // `chat_prompt` resolves to Jinja; otherwise the daemon's hand-rolled
+    // `prompt_frame::ChatFrame::Plain` scaffolding renders the prompt.
     pub chat_template: Option<String>,
     pub chat_template_profile: Option<prompt_frame::ChatTemplateProfile>,
-    /// Whether this model renders prompts through its Jinja chat template, resolved from
-    /// config (`jinja_chat`, settable per model under `model_overrides`) with
-    /// `HIPFIRE_JINJA_CHAT` still winning when set. Carried on the model rather than read
-    /// from the environment at each render site, so a per-model override actually
-    /// reaches the decision — an env read cannot see one.
-    pub jinja_chat: bool,
+    /// How this model's prompts are framed, resolved once at load by
+    /// [`hipfire_model::chat_prompt_policy`] from the arch's own default plus the
+    /// operator's `jinja_chat` setting (`auto` | `on` | `off`, settable per model under
+    /// `model_overrides`, with `HIPFIRE_JINJA_CHAT` still winning when set). One
+    /// resolved answer on the model rather than the decision itself re-derived at each
+    /// render site: the sites used to spell it as two *opposite* environment
+    /// comparisons, so a Qwen-only defect read as a global one.
+    pub chat_prompt: hipfire_model::ChatPromptPolicy,
 }
 
 impl LoadedModel {
+    /// Does this model's prompt render through its Jinja `chat_template`?
+    ///
+    /// `true` implies `chat_template.is_some()` — [`hipfire_model::chat_prompt_policy`]
+    /// resolves a template-less model to the scaffold — so a render site may unwrap it.
+    pub fn renders_jinja(&self) -> bool {
+        self.chat_prompt == hipfire_model::ChatPromptPolicy::Jinja
+    }
+
     /// Active session's KV cache, if any. Replaces the former `kv_cache.as_ref()`
     /// on the unified `sequence_state`. Sites needing KV **and** DeltaNet
     /// simultaneously bind `sequence_state.as_mut()` once, then borrow its
