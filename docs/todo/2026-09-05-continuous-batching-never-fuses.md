@@ -176,8 +176,60 @@ FP32 or plain Q8 KV and excludes it. Decode dominates a 60-token completion, so 
 win is invisible and N=3 is slightly worse than N=1. Only q8 — which is deprecated and
 needs `HIPFIRE_KV_ALLOW_DEPRECATED=1` — reaches the fused decode.
 
-That is the substantive finding for the swarm: **the recommended KV mode and continuous
-batching are mutually exclusive today.** KVarN is the recommended single-tier KV; batching
-throughput requires a deprecated KV mode plus a non-default DeltaNet precision. Widening
-the fused decode to KVarN is what would make batching useful on the models actually served
-here.
+**CORRECTION — see Update 3.** The conclusion drawn here, that the recommended KV mode and
+continuous batching are mutually exclusive, was wrong. The fused decode already accepts
+KVarN. What refused in the runs above was the DeltaNet state precision, which is FP16 by
+default and blocks the fused path for every KV mode alike. With FP32 state, KVarN reaches
+the same throughput as q8.
+
+
+## Update 3: KVarN needed no widening; the blocker was DeltaNet precision
+
+`validate_qwen35_fused_dense_decode_model_capability` already admits KVarN:
+
+```rust
+let kvarn_ok = kv_mode.starts_with("kvarn") && qwen35::qwen35_kvarn_fused_batch_enabled();
+```
+
+and `qwen35_kvarn_fused_batch_enabled()` is ON by default (only `=0` disables it). So
+there was no kernel to write. `HIPFIRE_DECODE_BACKEND_TRACE=1` gives the real refusal:
+
+```
+fused dense declined: qwen35 fused dense decode requires FP32 DeltaNet state;
+loaded state=FP16
+```
+
+The same FP16 DeltaNet default that blocks the fused PREFILL blocks the fused DECODE, for
+every KV mode. Attributing it to KVarN in Update 2 was wrong: the q8 runs there had
+`deltanet_state_precision=fp32` applied and the KVarN runs did not, so the variable that
+actually changed was the state precision, not the KV mode.
+
+With KVarN + FP32 DeltaNet state (and the OqCompactG256 admission, which the decode gate
+also needs — it calls the same weights validation):
+
+| N | serial | fused |
+|---|---|---|
+| 1 | — | 4.60 s/req |
+| 2 | — | 4.15 s/req |
+| 3 | 13.6 s (4.53 s/req) | 10.1 s (**3.46 s/req**) |
+
+1.35x at N=3 — the same figure q8 reached (3.45 s/req), confirming the KV mode was never
+the discriminator. Parity is 2/3, diverging on the identical `$n-1$` vs `$n/2$` near-tie as
+under q8, so the OqCompactG256 parity question is KV-independent too.
+
+### What actually gates batching today
+
+1. A real DFlash drafter (`dflash_draft: auto` finds a sibling for the 9B) — correctly
+   refused; drafter-based speculation with batching is unimplemented.
+2. FP16 DeltaNet state — the family default since f5b32ea32. `deltanet_state_precision=fp32`
+   clears it, at the cost of doubling per-sequence state.
+3. OqCompactG256 weights — fixed here, parity pending.
+
+None of these is the KV mode.
+
+### Config bug: per-model overrides silently ignored
+
+`deltanet_state_precision` set under `model_overrides.<model>` had no effect — the daemon
+loaded FP16 and the trace said so; only the top-level key worked. `dflash_draft` behaves
+the same way. Both are declared `GLOBAL_MODEL_RUNTIME` in the schema, so a per-model value
+is accepted by validation and then dropped, which is the worst of the three options.
