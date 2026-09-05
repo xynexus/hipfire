@@ -689,60 +689,6 @@ pub fn prefill_session_batch_attention_q8_layer(
     )
 }
 
-/// FP16-state companion to [`dense_prefill_session_batch_gated_delta_net_f32_layer`].
-///
-/// Same routing, same argument order; the pointers in `dn_s_ptrs` must address
-/// f16 state, which is why the caller selects this by `DeltaNetState::quant`
-/// rather than by model. No scales: f16 carries a per-element exponent.
-///
-/// This doc comment sat above an unrelated function for some time — the companion it
-/// describes was specified and never written, which is why the dense fused prefix
-/// refused FP16 state and the family default (FP16 since f5b32ea32) kept every dense
-/// Qwen3.5 model on serial_reference.
-#[allow(clippy::too_many_arguments)]
-pub fn dense_prefill_session_batch_gated_delta_net_f16_layer(
-    gpu: &mut Gpu,
-    device_tables: &DensePrefillSessionBatchDevicePointerTables,
-    route_shape: DensePrefillSessionStateRouteShape,
-    sessions: usize,
-    delta_layer_index: usize,
-    q_batch: &GpuTensor,
-    k_batch: &GpuTensor,
-    v_batch: &GpuTensor,
-    gate_batch: &GpuTensor,
-    beta_batch: &GpuTensor,
-    output_batch: &GpuTensor,
-    row_count: usize,
-    n_heads: usize,
-    head_dim: usize,
-) -> HipResult<()> {
-    if delta_layer_index >= route_shape.dn_s_layers {
-        return Err(hip_bridge::HipError::new(
-            0,
-            &format!(
-                "dense session prefill routed FP16 DeltaNet layer {delta_layer_index} out of range for route shape {:?}",
-                route_shape,
-            ),
-        ));
-    }
-    gpu.gated_delta_net_f16_routed_batch_seq(
-        q_batch,
-        k_batch,
-        v_batch,
-        gate_batch,
-        beta_batch,
-        &device_tables.dn_s_ptrs,
-        &device_tables.row_session_indices,
-        output_batch,
-        route_shape.dn_s_layers,
-        delta_layer_index,
-        row_count,
-        n_heads,
-        head_dim,
-        sessions,
-    )
-}
-
 /// KVarN companion to [`prefill_session_batch_write_q8_kv_layer`].
 ///
 /// KVarN splits K across two buffers: 4-bit variance-normalized records for every
@@ -1050,7 +996,16 @@ pub fn grouped_moe_prefill_session_batch_kvarn_block_flushes(
 }
 
 #[allow(clippy::too_many_arguments)]
-pub fn grouped_moe_prefill_session_batch_gated_delta_net_f16_layer(
+/// FP16-state companion to [`dense_prefill_session_batch_gated_delta_net_f32_layer`].
+///
+/// Same routing, same argument order; the pointers in `dn_s_ptrs` must address f16
+/// state, which is why the caller selects this by `DeltaNetState::quant` rather than by
+/// model. No scales: f16 carries a per-element exponent.
+///
+/// Named `grouped_moe_*` until 2026-09-05, which was never true of the body — it only
+/// dispatches the routed kernel and is FFN-agnostic, and the dense path already called
+/// it. The f32 sibling is shared by both paths under one name; this now matches.
+pub fn prefill_session_batch_gated_delta_net_f16_layer(
     gpu: &mut Gpu,
     device_tables: &DensePrefillSessionBatchDevicePointerTables,
     route_shape: DensePrefillSessionStateRouteShape,
@@ -1070,7 +1025,7 @@ pub fn grouped_moe_prefill_session_batch_gated_delta_net_f16_layer(
         return Err(hip_bridge::HipError::new(
             0,
             &format!(
-                "grouped MoE session prefill routed FP16 DeltaNet layer {delta_layer_index} out of range for route shape {:?}",
+                "session prefill routed FP16 DeltaNet layer {delta_layer_index} out of range for route shape {:?}",
                 route_shape,
             ),
         ));
@@ -2873,7 +2828,7 @@ fn forward_dense_session_batch_layers_full_precision(
                     )?;
                 }
                 if delta_f16 {
-                    dense_prefill_session_batch_gated_delta_net_f16_layer(
+                    prefill_session_batch_gated_delta_net_f16_layer(
                         gpu,
                         device_tables,
                         route_shape,
@@ -4197,7 +4152,7 @@ fn forward_grouped_moe_session_batch_layers(
                     )?;
                 }
                 if delta_f16 {
-                    grouped_moe_prefill_session_batch_gated_delta_net_f16_layer(
+                    prefill_session_batch_gated_delta_net_f16_layer(
                         gpu,
                         device_tables,
                         route_shape,
