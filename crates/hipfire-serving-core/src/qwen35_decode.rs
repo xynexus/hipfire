@@ -179,9 +179,16 @@ pub fn validate_qwen35_fused_dense_decode_model_capability(
     let state_quant = m.q35_state_quant.ok_or_else(|| {
         "qwen35 fused dense decode requires known DeltaNet state quant".to_string()
     })?;
-    if state_quant != qwen35::StateQuant::FP32 {
+    // FP32 | FP16. The decode chunk reuses `forward_prefill_dense_session_batch`, which
+    // now selects the routed DeltaNet arm from the rows' own `dn_state.quant`, so the
+    // FP16 arm added for the prefix serves decode unchanged. Narrower state (Q8 and
+    // below) still has no routed arm.
+    if !matches!(
+        state_quant,
+        qwen35::StateQuant::FP32 | qwen35::StateQuant::FP16
+    ) {
         return Err(format!(
-            "qwen35 fused dense decode requires FP32 DeltaNet state; loaded state={state_quant:?}; use HIPFIRE_QWEN35_DECODE_BATCH=serial"
+            "qwen35 fused dense decode has FP32 and FP16 routed DeltaNet arms only; loaded state={state_quant:?}; use HIPFIRE_QWEN35_DECODE_BATCH=serial"
         ));
     }
     let weights = m

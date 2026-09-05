@@ -1398,11 +1398,11 @@ pub fn validate_qwen35_fused_dense_prefill_model_capability(m: &LoadedModel) -> 
     // the corner. Refusing here makes `select_qwen35_prefill_batch_backend` pick
     // SerialReference — the same shape as the AWQ and dtype refusals beside it.
     if let Some(dn) = m.dn_state() {
-        if !matches!(dn.quant, hipfire_arch_qwen35::qwen35::StateQuant::FP32) {
+        use hipfire_arch_qwen35::qwen35::StateQuant;
+        if !matches!(dn.quant, StateQuant::FP32 | StateQuant::FP16) {
             return Err(format!(
-                "qwen35 fused dense prefill requires FP32 DeltaNet state, loaded state is \
-                 {:?}; set deltanet_state_precision=fp32 to enable the fused path, or add \
-                 the dense FP16 arm",
+                "qwen35 fused dense prefill has FP32 and FP16 routed DeltaNet arms only, \
+                 loaded state is {:?}",
                 dn.quant
             ));
         }

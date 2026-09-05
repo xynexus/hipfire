@@ -233,3 +233,58 @@ None of these is the KV mode.
 loaded FP16 and the trace said so; only the top-level key worked. `dflash_draft` behaves
 the same way. Both are declared `GLOBAL_MODEL_RUNTIME` in the schema, so a per-model value
 is accepted by validation and then dropped, which is the worst of the three options.
+
+
+## Update 4: the dense FP16 DeltaNet arm now exists
+
+The FP32 guard was NOT an accuracy guard, so removing it would have been wrong whatever
+the FP16 state's numerics look like. Its stated reason:
+
+> the dense path does not [have an FP16 arm], so accepting FP16 here would run FP16 state
+> through FP32 code — a wrong answer instead of a slow one
+
+and, at the point `delta_f16` is computed for the grouped-MoE path:
+
+> FP16 state is half the stride of FP32, so the routed kernel and the state precision must
+> be chosen together — the f32 kernel over f16 state reads every element at the wrong offset
+
+That is a missing code path, not a tolerance. Deleting the guard would have fed f16 bytes
+to an f32 kernel at doubled stride.
+
+What was actually missing was small. `gated_delta_net_f16_routed_batch_seq` already exists
+and the grouped-MoE sibling already calls it; the dense wrapper had been **specified and
+never written** — its doc comment was sitting orphaned above
+`prefill_session_batch_write_kvarn_kv_layer`, describing a function that was not there:
+
+> FP16-state companion to `dense_prefill_session_batch_gated_delta_net_f32_layer`. Same
+> routing, same argument order; the pointers in `dn_s_ptrs` must address f16 state, which
+> is why the caller selects this by `DeltaNetState::quant` rather than by model.
+
+Added exactly that, plus the selector the doc describes: `delta_f16` is derived in
+`forward_prefill_dense_session_batch_impl` from `rows[0].dn_state.quant` (uniform by the
+state-signature contract) and threaded to the call site, which now branches the way the
+grouped-MoE path already did. Both guards widened to `FP32 | FP16` — still an allowlist,
+since Q8 state and below have no routed arm and the same stride argument applies to them.
+
+Measured on the DEFAULT DeltaNet precision (FP16), KVarN KV, ngram on:
+
+| N | serial | fused |
+|---|---|---|
+| 1 | — | 4.53 s/req |
+| 2 | — | 4.13 s/req |
+| 3 | 13.4 s (4.47 s/req) | 10.3 s (**3.43 s/req**) |
+
+Zero `fused dense declined` messages. 3.43 s/req matches FP32 state (3.46) and q8 (3.45),
+so FP16 reaches the fused path at no throughput cost — and the config no longer has to
+trade doubled per-sequence state for batching.
+
+Parity is 2/3, the same as FP32 state and q8, diverging on the same near-tie phrasing.
+That is the pre-existing OqCompactG256 gap, unchanged by this arm: it reproduces
+identically with FP32 state, where the new code does not run. Outputs are coherent prose
+throughout, which is what distinguishes this from the wrong-offset failure the guard was
+protecting against.
+
+**Still gating the default config:** `dflash_draft: auto` finds a real sibling drafter for
+the 9B, and drafter-based speculation with batching remains unimplemented. That is now the
+only remaining blocker, and it is the one the batch-size-threshold argument in Update 2
+applies to.
