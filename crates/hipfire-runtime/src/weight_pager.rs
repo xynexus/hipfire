@@ -1100,6 +1100,33 @@ pub fn estimated_module_resident_bytes(hfq: &HfqFile) -> (u64, u64) {
     (resident, on_disk)
 }
 
+/// Bytes that are NEVER resident: read from drive during the forward pass
+/// rather than uploaded at load.
+///
+/// The qwen4_exp n-gram table is ~102 GB — 41% of that model's parameters — and
+/// `ngram_store` reads exactly `heads` 4 KiB blocks per token with `O_DIRECT`
+/// instead of holding it. "Keeping it on drive rather than resident is what
+/// makes the model fit" (see `ngram_store`), so pricing it as resident is what
+/// made `check_load_headroom` refuse the 180B: it estimated 172.2 GiB against
+/// 121.7 GiB available, while the same load path actually sits near 20 GiB.
+///
+/// Matched by name, as `estimated_module_resident_bytes` already matches
+/// `awq_scale` and `qwen4exp-gate.sh` matches these same shards. These tensors
+/// are not module members, so this never double-counts against that function's
+/// `on_disk`; `on_drive_is_disjoint_from_modules` pins that.
+pub fn estimated_on_drive_bytes(hfq: &HfqFile) -> u64 {
+    hfq.tensors()
+        .iter()
+        .filter(|t| on_drive_tensor(&t.name))
+        .map(|t| t.data_size as u64)
+        .sum()
+}
+
+/// Is this tensor read from drive per token rather than uploaded at load?
+pub(crate) fn on_drive_tensor(name: &str) -> bool {
+    name.contains("ngram_embedding.shard_")
+}
+
 fn module_resident_len(
     module: &HfqModuleRecord,
     layout: ExpertResidentLayout,
@@ -2410,6 +2437,46 @@ pub fn open_hfq(path: &Path) -> std::io::Result<HfqFile> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The headroom guard subtracts module bytes AND on-drive bytes. If a name
+    /// could be both, the two subtractions would double-count and the guard
+    /// would admit a load that does not fit — the failure direction that OOM-kills
+    /// the session. Also pins the pattern against a typo: a `shard` that matched
+    /// nothing would silently return 0 bytes on drive, restoring the 172.2 GiB
+    /// refusal this function exists to fix.
+    #[test]
+    fn on_drive_is_disjoint_from_modules() {
+        use super::{expert_module_tensor_role as role, on_drive_tensor};
+
+        // Real shard names from the 180B must match, or the subtraction is a no-op.
+        for n in [
+            "model.language_model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight",
+            "model.language_model.layers.0.ple.ple_embedding.ngram_embedding.shard_99.weight",
+        ] {
+            assert!(on_drive_tensor(n), "must be priced as on-drive: {n}");
+            assert_eq!(
+                role(n),
+                None,
+                "an on-drive tensor must not be a module member"
+            );
+        }
+
+        // Routed-expert weights are priced by estimated_module_resident_bytes.
+        for n in [
+            "model.layers.0.mlp.experts.11.gate_up_proj.weight",
+            "model.layers.0.mlp.experts.11.down_proj.weight",
+        ] {
+            assert!(
+                !on_drive_tensor(n),
+                "module weight must not be double-subtracted: {n}"
+            );
+        }
+
+        // Neighbours that stay resident must not be swept up.
+        assert!(!on_drive_tensor(
+            "model.language_model.layers.0.ple.ple_embedding.weight"
+        ));
+    }
 
     /// A sidecar must never claim the weight's slot. This is the exact bug that
     /// made paged decode ignore its own expert weights on every calibrated

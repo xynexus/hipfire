@@ -732,7 +732,10 @@ fn load_headroom_verdict(need: u64, available: u64, reserve: u64) -> Result<(), 
 ///
 /// Still approximate: it omits the KV cache and scratch (the reserve absorbs
 /// those, ~6 GiB measured across three models) and over-counts when
-/// `paged_experts` is on and most experts stay on host. A guard against the
+/// `paged_experts` is on and most experts stay on host. Bytes the forward pass
+/// streams from drive rather than uploading (the qwen4_exp n-gram table) are
+/// subtracted via [`estimated_on_drive_bytes`], because counting those as
+/// resident refused the one model whose design depends on them. A guard against the
 /// catastrophic case, not a precise admission test. Anything unreadable (no
 /// `/proc`, no `stat`, an index that will not parse) skips the check: never
 /// block a load because a diagnostic could not be read.
@@ -758,7 +761,15 @@ fn check_load_headroom(path: &str) -> Result<(), String> {
         Ok(index) => {
             let (resident, on_disk) =
                 hipfire_runtime::weight_pager::estimated_module_resident_bytes(&index);
-            meta.len().saturating_sub(on_disk).saturating_add(resident)
+            // Tensors the forward pass streams from drive are not resident and
+            // must not be priced as if they were. Without this the qwen4_exp
+            // 180B is refused at 172.2 GiB when it actually sits near 20 GiB:
+            // its 102 GB n-gram table is read per token, never uploaded.
+            let on_drive = hipfire_runtime::weight_pager::estimated_on_drive_bytes(&index);
+            meta.len()
+                .saturating_sub(on_disk)
+                .saturating_sub(on_drive)
+                .saturating_add(resident)
         }
         Err(_) => meta.len(),
     };
