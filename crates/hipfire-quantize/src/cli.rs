@@ -423,6 +423,22 @@ fn ldlq_skipped_expert_leaf(name: &str) -> bool {
         .any(|s| !s.is_empty() && s == leaf)
 }
 
+/// Whether `name` would actually draw a Hessian out of `idx` -- the cheap,
+/// non-logging half of `ldlq_hessian_for_tensor`.
+///
+/// Callers that need to know "does this tensor take LDLQ" WITHOUT consuming an
+/// attempt or emitting a skip line use this; `ldlq_hessian_for_tensor` both
+/// counts and logs, so probing with it would double-report every tensor.
+fn ldlq_has_hessian(idx: &Oq4LdlqHessian, name: &str, k: usize) -> bool {
+    if ldlq_skipped_expert_leaf(name) {
+        return false;
+    }
+    calibration_tensor_name_candidates(name)
+        .iter()
+        .any(|key| idx.k_of(key) == Some(k))
+        || pooled_hessian_donor(idx, name, k).is_some()
+}
+
 fn ldlq_hessian_for_tensor(idx: &Oq4LdlqHessian, name: &str, k: usize) -> Option<Vec<f32>> {
     LDLQ_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
     if ldlq_skipped_expert_leaf(name) {
@@ -5175,11 +5191,30 @@ fn quantize_hfq_source_tensor(
             // safetensors path leaves alone (`should_quantize(name) || k % 256 != 0`),
             // and the result hard-errors on first forward.
             //
-            // Fall back to Q8, matching the Oq2/Oq3/Oq6/Mq3/Mq6 arms. A K%128==0
-            // tensor could instead take OqPlusCompactG128 (qt 52) and keep ~4 b/w,
-            // but that is a per-tensor group choice this function cannot make
-            // today -- the group arrives run-wide.
+            // A K%128==0 tensor takes OqPlusCompactG128 (qt 52) and keeps ~4 b/w
+            // instead of doubling to Q8. The group arrives run-wide, but `k` is
+            // right here, so the per-tensor choice IS makeable -- the safetensors
+            // path already makes it (`stacked_expert_oq_format`); only this
+            // HFQ-source arm did not.
+            //
+            // Qwen3.8-Flash-Next is exactly this case: `moe_intermediate_size`
+            // 640, so every routed `down_proj` is ragged. At Q8 the qwen4_exp
+            // loader has no device form for the expert stack and falls back to
+            // f32 -- "8x the resident bytes" -- which OOMs the 180B before it
+            // serves a token. Q8 here is not a conservative choice, it is an
+            // unloadable one, and it was SILENT: no warning distinguished it
+            // from a clean build.
             if k % 256 != 0 {
+                if k % 128 == 0 {
+                    return quantize_hfq_source_tensor(
+                        name,
+                        arch_id,
+                        raw,
+                        src_qt,
+                        shape,
+                        HfqInputFormat::OqPlusCompactG128,
+                    );
+                }
                 return Ok((quantize_q8f16(&f32_data), QuantType::Q8F16, 32, "Q8_F16"));
             }
             let m_dim = shape[0] as usize;
@@ -5267,7 +5302,15 @@ fn quantize_hfq_source_tensor(
             // `oqplus_compact_ldlq_pack` emits 256-element blocks, so tiered LDLQ
             // has no G=128 form yet. Refuse rather than silently writing blocks
             // of the wrong group.
-            if OQ4_LDLQ_HESSIAN.get().is_some() {
+            // Refuse only when THIS tensor would actually draw a Hessian. The
+            // flag being set just means `--hessian` was passed run-wide, and
+            // under `oq4.25++` it always is -- so the coarse check turned every
+            // ragged-K tensor into a hard build failure even though routed
+            // experts take the imatrix path and never had a Hessian to pack.
+            if OQ4_LDLQ_HESSIAN
+                .get()
+                .is_some_and(|idx| ldlq_has_hessian(idx, name, k))
+            {
                 return Err(format!(
                     "{name}: --ldlq is not supported at group 128 (oq*g128); \
                      oqplus_compact_ldlq_pack emits 256-element blocks. Use a \
