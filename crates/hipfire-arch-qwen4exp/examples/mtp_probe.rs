@@ -61,6 +61,7 @@ use std::path::Path;
 /// are handled, and anything else is a loud panic rather than a wrong number.
 fn to_f32(qt: u8, bytes: &[u8], n: usize, name: &str) -> Vec<f32> {
     match qt {
+        3 => hipfire_runtime::quant::dequant_q8f16(bytes, n),
         35 => hipfire_runtime::quant::dequant_oq8g256(bytes, n),
         54 => hipfire_runtime::quant::dequant_oq8g128(bytes, n),
         1 => bytes
@@ -178,12 +179,20 @@ fn phase_dump(base: &str, out: &str, n_tok: usize) {
     let mut m = Qwen4ExpBackend::load(&mut gpu, &mut hfq, 256).expect("load base");
     let cfg = m.config().clone();
     let (hidden, hc) = (cfg.hidden, cfg.gated_residual.count);
-    let prompt: Vec<u32> = (0..n_tok).map(|i| 9707u32 + (i as u32 % 977)).collect();
+    // GENERATE, don't feed fixed ids. A synthetic prompt (9707 + i%977) drives
+    // the trunk into degenerate repetition — the first run of this probe showed
+    // `198, 271, 487, 220` cycling — which both inflates the do-nothing baseline
+    // (consecutive tokens repeat, so reusing the last state "predicts" well) and
+    // asks the drafter to work on a distribution the model never sees. Feeding
+    // the trunk its OWN argmax makes the sequence self-consistent, which is the
+    // distribution a real drafter would face.
+    let mut prompt: Vec<u32> = vec![9707];
 
     // Decode, not prefill: this is the state a drafter would actually see.
     let mut rows: Vec<Vec<f32>> = Vec::new();
     m.prefill(&mut gpu, &prompt[..1]).expect("prefill");
-    for (i, &tok) in prompt.iter().enumerate() {
+    for i in 0..n_tok {
+        let tok = prompt[i];
         if i > 0 {
             m.decode_step(&mut gpu, tok, i).expect("decode");
         }
@@ -191,6 +200,23 @@ fn phase_dump(base: &str, out: &str, n_tok: usize) {
         rows.push(gpu.download_f32(wide_t).expect("download wide"));
         rows.push(gpu.download_f32(coll_t).expect("download collapsed"));
         rows.push(m.embed_row(tok).to_vec());
+        // The token the TRUNK would emit here. Token-level agreement against
+        // this is what speculative decoding actually accepts on; cosine between
+        // hidden states is only a proxy, and a weak one in 2560 dimensions.
+        let lg = gpu.download_f32(m.trunk_logits()).expect("download logits");
+        let (am, _) =
+            lg.iter()
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
+                    if v > bv {
+                        (i, v)
+                    } else {
+                        (bi, bv)
+                    }
+                });
+        rows.push(vec![am as f32]);
+        // The trunk's own next token continues the sequence.
+        prompt.push(am as u32);
     }
     assert_eq!(rows[0].len(), hc * hidden, "wide residual width");
     assert_eq!(rows[1].len(), hidden, "collapsed width");
@@ -198,11 +224,12 @@ fn phase_dump(base: &str, out: &str, n_tok: usize) {
     println!("wrote {} positions to {out}", n_tok);
 }
 
-fn phase_score(mtp_path: &str, states: &str) {
+fn phase_score(mtp_path: &str, states: &str, base: Option<&str>) {
     let (n_tok, hidden, hc, rows) = read_states(states);
-    let wide = |t: usize| &rows[t * 3];
-    let collapsed = |t: usize| &rows[t * 3 + 1];
-    let embed = |t: usize| &rows[t * 3 + 2];
+    let wide = |t: usize| &rows[t * 4];
+    let collapsed = |t: usize| &rows[t * 4 + 1];
+    let embed = |t: usize| &rows[t * 4 + 2];
+    let trunk_tok = |t: usize| rows[t * 4 + 3][0] as usize;
 
     let mtp_hfq = HfqFile::open(Path::new(mtp_path)).expect("open mtp sidecar");
     let names: Vec<String> = mtp_hfq
@@ -428,7 +455,103 @@ fn phase_score(mtp_path: &str, states: &str) {
     } else {
         "NOT A DRAFTER YET — no gain over the trunk's own residual"
     };
-    println!("\nverdict: {verdict}");
+    println!("\nverdict (cosine proxy): {verdict}");
+
+    // ── THE METRIC THAT DECIDES IT ────────────────────────────────────────
+    //
+    // Cosine between hidden states is a PROXY. Speculative decoding accepts on
+    // TOKENS: the draft is kept only where argmax(lm_head . draft) equals what
+    // the trunk emits. In 2560 dimensions two states can sit at modest cosine
+    // and still argmax to the same row out of 248320, so the proxy can be
+    // pessimistic — which is why a negative cosine result must not be the last
+    // word before abandoning a drafter.
+    let Some(base) = base else {
+        println!("\n(no base.hfq given — token-level acceptance not measured)");
+        return;
+    };
+    let base_hfq = HfqFile::open(Path::new(base)).expect("open base artifact");
+    let (hi, hraw) = base_hfq
+        .tensor_data("lm_head.weight")
+        .expect("base artifact has no lm_head.weight");
+    let vocab = hi.shape[0] as usize;
+    println!("\nlm_head [{vocab}, {hidden}] qt {} -> f32", hi.quant_type);
+    let head = to_f32(hi.quant_type, &hraw, vocab * hidden, "lm_head.weight");
+
+    // Re-run the winning convention and take argmax over the real vocabulary.
+    let fusion = if best.1.contains("stream0") {
+        hipfire_arch_qwen4exp::mtp::Fusion::Stream0Only
+    } else {
+        hipfire_arch_qwen4exp::mtp::Fusion::BroadcastAllStreams
+    };
+    let emb_off = if best.1.contains("emb=t+1") { 1 } else { 0 };
+    let mut wide_in: Vec<f32> = Vec::new();
+    let mut emb_in: Vec<f32> = Vec::new();
+    for t in 0..scored {
+        wide_in.extend_from_slice(wide(t));
+        emb_in.extend_from_slice(embed(t + emb_off));
+    }
+    let out = hipfire_arch_qwen4exp::mtp::forward(
+        &cfg, &w, &wide_in, &emb_in, scored, &cos, &sin, fusion,
+    );
+
+    let argmax_of = |h: &[f32]| -> usize {
+        let mut best_i = 0usize;
+        let mut best_v = f32::NEG_INFINITY;
+        for r in 0..vocab {
+            let row = &head[r * hidden..(r + 1) * hidden];
+            let dot: f32 = row.iter().zip(h).map(|(a, b)| a * b).sum();
+            if dot > best_v {
+                best_v = dot;
+                best_i = r;
+            }
+        }
+        best_i
+    };
+
+    // Two baselines, both necessary:
+    //   trunk_tok(t+1) is what the drafter must match.
+    //   do-nothing = feeding the trunk's OWN state at t through lm_head; if the
+    //   head cannot beat that, it is not adding prediction, just latency.
+    let (mut hit, mut base_hit) = (0usize, 0usize);
+    println!("\n  t    mtp_tok   do-nothing   trunk_tok   accept");
+    for t in 0..scored {
+        let o = &out[t * hidden..(t + 1) * hidden];
+        let want = trunk_tok(t + 1);
+        let got = argmax_of(o);
+        let nothing = argmax_of(collapsed(t));
+        if got == want {
+            hit += 1;
+        }
+        if nothing == want {
+            base_hit += 1;
+        }
+        if t < 10 {
+            println!(
+                "  {t:<3}  {got:<9} {nothing:<12} {want:<11} {}",
+                if got == want { "YES" } else { "no" }
+            );
+        }
+    }
+    let acc = hit as f32 / scored as f32;
+    let base_acc = base_hit as f32 / scored as f32;
+    println!(
+        "\n  MTP acceptance        = {hit}/{scored}  ({:.1}%)",
+        100.0 * acc
+    );
+    println!(
+        "  do-nothing acceptance = {base_hit}/{scored}  ({:.1}%)",
+        100.0 * base_acc
+    );
+    println!(
+        "\nTOKEN VERDICT: {}",
+        if acc > base_acc && acc >= 0.25 {
+            "DRAFTS USEFULLY — port it"
+        } else if acc > base_acc {
+            "beats do-nothing but acceptance is low"
+        } else {
+            "does not beat do-nothing on TOKENS either"
+        }
+    );
 }
 
 fn main() {
@@ -442,9 +565,14 @@ fn main() {
             phase_dump(&base, &out, n);
         }
         "score" => {
-            let mtp = args.next().expect("score <mtp.hfq> <states.bin>");
-            let st = args.next().expect("score <mtp.hfq> <states.bin>");
-            phase_score(&mtp, &st);
+            let mtp = args
+                .next()
+                .expect("score <mtp.hfq> <states.bin> [base.hfq]");
+            let st = args
+                .next()
+                .expect("score <mtp.hfq> <states.bin> [base.hfq]");
+            let base = args.next(); // optional: enables TOKEN-level acceptance
+            phase_score(&mtp, &st, base.as_deref());
         }
         _ => {
             eprintln!("usage: mtp_probe dump <base.hfq> <states.bin> [n]");

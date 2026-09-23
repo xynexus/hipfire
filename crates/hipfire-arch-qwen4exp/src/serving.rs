@@ -293,6 +293,11 @@ impl Qwen4ExpBackend {
         &self.embed[o..o + h]
     }
 
+    /// Last-position logits, `[vocab]`.
+    pub fn trunk_logits(&self) -> &GpuTensor {
+        self.scratch.logits()
+    }
+
     /// The trunk's wide residual and collapsed hidden from the last step.
     ///
     /// Exposed for the MTP probe: the head reads the wide stream, and its own
