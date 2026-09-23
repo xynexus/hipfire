@@ -1676,6 +1676,84 @@ mod tests {
         assert!(max_off < 1e-4, "offdiag err {max_off}");
     }
 
+    /// `targets` must be what the symbols were CHOSEN to represent.
+    ///
+    /// This is the seam three bugs lived in, all invisible to the encoder's own
+    /// unit tests. `BeamLdlq` re-aims every column c>0 inside a block at a
+    /// residual that already absorbed columns 0..c, so for the FIRST block —
+    /// where no cross-block feedback has happened yet — its targets must differ
+    /// from the input weights. Returning the unadjusted weights instead meant
+    /// the caller refit the per-group scale against the wrong values and the
+    /// block loop pushed an already-compensated error forward a second time.
+    ///
+    /// `Greedy` is the control: it has no within-block feedback by design, so
+    /// its first block must be EXACTLY the input. An implementation that
+    /// adjusted both, or neither, fails one half of this.
+    #[test]
+    fn beamldlq_reports_the_targets_it_actually_encoded() {
+        let (m, k) = (2usize, 256usize);
+        let mut rng = Lcg(0x9e37);
+        let mut w = vec![0.0f32; m * k];
+        for row in 0..m {
+            let mut prev = 0.0f64;
+            for c in 0..k {
+                prev = 0.8 * prev + rng.next();
+                w[row * k + c] = prev as f32;
+            }
+        }
+        // Correlated SPD Hessian: a diagonal one would make L diagonal and the
+        // feedback a no-op, so the test would pass on a broken implementation.
+        let mut h = vec![0.0f32; k * k];
+        for row in 0..m {
+            for i in 0..k {
+                for j in 0..k {
+                    h[i * k + j] += w[row * k + i] * w[row * k + j];
+                }
+            }
+        }
+        for i in 0..k {
+            h[i * k + i] += 1e-2;
+        }
+        let s1 = crate::gen_fwht_signs(42, 256);
+        let s2 = crate::gen_fwht_signs(1042, 256);
+        let cb = crate::qtip::build_codebook_3inst();
+
+        let run = |mode| {
+            qtip_conditioned_encode(
+                &w,
+                m,
+                k,
+                &h,
+                &s1,
+                &s2,
+                1e-2,
+                &cb,
+                8,
+                crate::qtip::BITS_PER_WEIGHT,
+                mode,
+                None,
+            )
+            .expect("encode")
+        };
+        let (_, t_beam) = run(QtipCondMode::BeamLdlq);
+        let (_, t_greedy) = run(QtipCondMode::Greedy);
+
+        // The encode runs on the ROTATED weights, so compare the two modes to
+        // each other rather than to `w`: Greedy's targets are the rotated input
+        // untouched, which is the reference BeamLdlq must deviate from.
+        let moved = t_beam
+            .iter()
+            .zip(&t_greedy)
+            .filter(|(a, b)| (**a - **b).abs() > 1e-6)
+            .count();
+        assert!(
+            moved > k / 4,
+            "BeamLdlq targets barely differ from the unadjusted ones ({moved} of {} positions) \
+             — within-block feedback is not reaching `targets`",
+            m * k
+        );
+    }
+
     /// The LDLQ claim: OBS feedback (real H) reduces the H-weighted *output*
     /// error vs no feedback (identity H) on column-correlated weights — the
     /// fix for the PPL-125 MSE-only QTIP-2.
@@ -2054,15 +2132,54 @@ pub fn qtip_conditioned_encode(
                 let scale = crate::qtip::optimal_scale_bits(&grp, &sym, cb, bits);
                 let deq = crate::qtip::decode_group_bits(&sym, scale, cb, bits);
                 let mut err = vec![0.0f64; 256];
-                for c in 0..256 {
-                    let lcc = l[(c0 + c, c0 + c)];
-                    err[c] = if lcc > 0.0 {
-                        (grp[c] as f64 - deq[c] as f64) / lcc
-                    } else {
-                        0.0
-                    };
+                let mut tgt = grp.clone();
+                if mode == QtipCondMode::BeamLdlq {
+                    // REPLAY the winning path's within-block feedback, at the
+                    // FINAL scale, and read both outputs off it.
+                    //
+                    // Three things were wrong without this. (a) The encoder
+                    // re-aims every column c>0 at a residual that already
+                    // absorbed columns 0..c, so `grp[c] - deq[c]` is not the
+                    // error this column leaves — pushing it to later blocks
+                    // double-counts the compensation this block already made.
+                    // (b) `grp` is then also the wrong thing to hand back as
+                    // `targets`, which the caller must refit the scale against;
+                    // inside a block it is just the unadjusted weights, i.e.
+                    // exactly the "quietly degrade to RTN-with-extra-steps"
+                    // trap this function's own contract warns about. (c) The
+                    // encoder fed error forward against `scale0`, but the
+                    // artifact ships `scale` — so every compensation was
+                    // computed against a reconstruction that never existed.
+                    //
+                    // Replaying with `deq` (final scale) fixes all three at
+                    // once and costs one O(256^2) pass per group.
+                    let mut res: Vec<f64> = grp.iter().map(|&v| v as f64).collect();
+                    for c in 0..256 {
+                        tgt[c] = res[c] as f32;
+                        let d = res[c] - deq[c] as f64;
+                        let lcc = l_block[c * 256 + c];
+                        err[c] = if lcc > 0.0 { d / lcc } else { 0.0 };
+                        if lcc > 0.0 && c + 1 < 256 {
+                            let e = d / lcc;
+                            for f in (c + 1)..256 {
+                                let lfc = l_block[f * 256 + c];
+                                if lfc != 0.0 {
+                                    res[f] -= e * lfc;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    for c in 0..256 {
+                        let lcc = l[(c0 + c, c0 + c)];
+                        err[c] = if lcc > 0.0 {
+                            (grp[c] as f64 - deq[c] as f64) / lcc
+                        } else {
+                            0.0
+                        };
+                    }
                 }
-                (sym, grp, err)
+                (sym, tgt, err)
             })
             .collect();
 

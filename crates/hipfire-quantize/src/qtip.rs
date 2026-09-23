@@ -319,7 +319,14 @@ pub fn beam_encode_group_bits_ldlq(
     let mut steps: Vec<Vec<(u32, u32, u8)>> = Vec::with_capacity(n);
 
     for i in 0..n {
-        let mut cand: Vec<(u32, f64, u32, u8, Vec<f64>)> = Vec::new();
+        // Candidates carry only (state, cost, parent, symbol, diff) — NOT a
+        // residual. Materialising `next_res` per candidate meant beam_width *
+        // 2^bits clones of an n-vector per step: at n=256, beam 128, 3 bits that
+        // is ~512 MB of allocation churn per 256-weight group, which is why this
+        // mode was never run on a real model. Only survivors need a residual, so
+        // the clone moves after the prune: 8x fewer at 3 bits, and the pruned
+        // children are never built at all.
+        let mut cand: Vec<(u32, f64, u32, u8, f64)> = Vec::with_capacity(beam.len() * num_symbols);
         let lii = l_block[i * n + i];
         for (bi, (s_prev, c_prev, res)) in beam.iter().enumerate() {
             let base = (s_prev << bits) & STATE_MASK;
@@ -330,17 +337,7 @@ pub fn beam_encode_group_bits_ldlq(
                 let s_new = base | sym;
                 let rec = scale as f64 * codebook[s_new as usize] as f64;
                 let diff = w_i - rec;
-                let mut next_res = res.clone();
-                if lii > 0.0 && i + 1 < n {
-                    let err = diff / lii;
-                    for f in (i + 1)..n {
-                        let lfc = l_block[f * n + i];
-                        if lfc != 0.0 {
-                            next_res[f] -= err * lfc;
-                        }
-                    }
-                }
-                cand.push((s_new, c_prev + diff * diff, bi as u32, sym as u8, next_res));
+                cand.push((s_new, c_prev + diff * diff, bi as u32, sym as u8, diff));
             }
         }
         // Dedup by state keeping min cost, then keep the best `beam_width`.
@@ -352,7 +349,17 @@ pub fn beam_encode_group_bits_ldlq(
         }
         let mut rec = Vec::with_capacity(cand.len());
         let mut next_beam = Vec::with_capacity(cand.len());
-        for (st, c, pi, sy, res) in cand.into_iter() {
+        for (st, c, pi, sy, diff) in cand.into_iter() {
+            let mut res = beam[pi as usize].2.clone();
+            if lii > 0.0 && i + 1 < n {
+                let err = diff / lii;
+                for f in (i + 1)..n {
+                    let lfc = l_block[f * n + i];
+                    if lfc != 0.0 {
+                        res[f] -= err * lfc;
+                    }
+                }
+            }
             rec.push((st, pi, sy));
             next_beam.push((st, c, res));
         }
