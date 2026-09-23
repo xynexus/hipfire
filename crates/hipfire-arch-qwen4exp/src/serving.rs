@@ -283,6 +283,24 @@ impl Qwen4ExpBackend {
     /// artifact whose experts were dequantised to f32 serves exactly as well and
     /// costs ~8x the memory. On the shipped geometry the experts are 97.3% of the
     /// trunk, so this one value decides whether the model fits.
+    /// One row of the trunk's embedding table, `[hidden]`.
+    ///
+    /// The MTP head shares it (`mtp_use_dedicated_embeddings` is false), so the
+    /// probe and any future drafter need the same rows the trunk gathers.
+    pub fn embed_row(&self, token: u32) -> &[f32] {
+        let h = self.cfg.hidden;
+        let o = token as usize * h;
+        &self.embed[o..o + h]
+    }
+
+    /// The trunk's wide residual and collapsed hidden from the last step.
+    ///
+    /// Exposed for the MTP probe: the head reads the wide stream, and its own
+    /// output is compared against the collapsed one.
+    pub fn trunk_states(&self) -> (&GpuTensor, &GpuTensor) {
+        (self.scratch.wide(), self.scratch.collapsed())
+    }
+
     pub fn routed_expert_dtype(&self) -> Option<hipfire_rdna::DType> {
         self.weights.layers.first().map(|l| l.moe.gate_up.dtype())
     }

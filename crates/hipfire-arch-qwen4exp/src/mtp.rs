@@ -38,7 +38,23 @@
 use crate::attn::{Indexer, QsaAttention};
 use crate::config::Qwen4ExpConfig;
 use crate::hc::{grouped_rmsnorm, GatedResidual};
-use crate::moe::MoeLayer;
+use crate::moe::{Expert, MoeLayer};
+use crate::trunk::WeightSource;
+
+/// How `fc_embedding`'s narrow output reaches the WIDE stream.
+///
+/// The module docs call this the genuinely unpinned part: "broadcast-added to
+/// every stream is the natural reading ... but nothing in the shapes rules out,
+/// say, adding it to stream 0 only." Both are expressible so the question can be
+/// MEASURED rather than assumed — `examples/mtp_probe` scores them against a
+/// do-nothing baseline.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fusion {
+    /// Add the projected embedding to every stream (the original reading).
+    BroadcastAllStreams,
+    /// Add it to stream 0 only, leaving the others carrying hidden alone.
+    Stream0Only,
+}
 
 /// Build the head's wide input from the trunk's wide hidden state and the
 /// embedding of the token being predicted from.
@@ -53,6 +69,7 @@ pub fn fuse_inputs(
     pre_fc_norm_embedding: &[f32],
     fc_hidden: &[f32],
     fc_embedding: &[f32],
+    fusion: Fusion,
 ) -> Vec<f32> {
     let (h, hc) = (cfg.hidden, cfg.gated_residual.count);
     assert_eq!(wide_hidden.len(), hc * h);
@@ -70,11 +87,99 @@ pub fn fuse_inputs(
     let mut out = vec![0.0f32; hc * h];
     for s in 0..hc {
         let ph = mv(fc_hidden, &hn[s * h..(s + 1) * h]);
+        let take_embed = match fusion {
+            Fusion::BroadcastAllStreams => true,
+            Fusion::Stream0Only => s == 0,
+        };
         for d in 0..h {
-            out[s * h + d] = ph[d] + pe[d];
+            out[s * h + d] = ph[d] + if take_embed { pe[d] } else { 0.0 };
         }
     }
     out
+}
+
+/// Assemble [`MtpWeights`] from a weight source.
+///
+/// The head is structurally one trunk sparse-attention layer plus a stream
+/// mixer, so this mirrors `trunk::forward`'s per-layer assembly with the `mtp.`
+/// prefix. Kept beside the forward it feeds: the tensor NAMES are the contract
+/// between `weights.rs` (which declares the expectations) and this, and a
+/// mismatch is a missing-weight panic rather than a wrong answer.
+///
+/// `mtp_use_dedicated_embeddings` is false in the shipped model, so there is no
+/// embed or `lm_head` here — the caller supplies the trunk's.
+pub fn weights_from<'a>(cfg: &Qwen4ExpConfig, w: &'a dyn WeightSource) -> MtpWeights<'a> {
+    let (hidden, hc) = (cfg.hidden, cfg.gated_residual.count);
+    let lp = "mtp.layers.0";
+    let gated = |which: &str, prefix: &str, inject: bool| GatedResidual {
+        hc_norm: w.get(&format!("{prefix}.{which}hc_norm.weight")),
+        mix_down: w.get(&format!("{prefix}.{which}input_mix_weight_down.weight")),
+        mix_up: w.get(&format!("{prefix}.{which}input_mix_weight_up.weight")),
+        block_inject: inject.then(|| w.get(&format!("{prefix}.{which}block_inject_weight.weight"))),
+        hc_count: hc,
+        hidden,
+        lowrank: cfg.gated_residual.lowrank,
+        eps: cfg.rms_norm_eps,
+    };
+    let (mi, smi) = (cfg.moe.intermediate, cfg.moe.shared_intermediate);
+    let mp = format!("{lp}.mlp");
+    let gu = w.get(&format!("{mp}.experts.gate_up_proj"));
+    let dn = w.get(&format!("{mp}.experts.down_proj"));
+    let (gu_sz, dn_sz) = (2 * mi * hidden, hidden * mi);
+    let sa = format!("{lp}.self_attn");
+    let ix = &cfg.indexer;
+    MtpWeights {
+        pre_fc_norm_hidden: w.get("mtp.pre_fc_norm_hidden.weight"),
+        pre_fc_norm_embedding: w.get("mtp.pre_fc_norm_embedding.weight"),
+        fc_hidden: w.get("mtp.fc_hidden.weight"),
+        fc_embedding: w.get("mtp.fc_embedding.weight"),
+        attn_hc: gated("", &format!("{lp}.attn_hyper_connection"), true),
+        mlp_hc: gated("", &format!("{lp}.mlp_hyper_connection"), true),
+        attn: QsaAttention {
+            q_proj: w.get(&format!("{sa}.q_proj.weight")),
+            k_proj: w.get(&format!("{sa}.k_proj.weight")),
+            v_proj: w.get(&format!("{sa}.v_proj.weight")),
+            o_proj: w.get(&format!("{sa}.o_proj.weight")),
+            q_norm: w.get(&format!("{sa}.q_norm.weight")),
+            k_norm: w.get(&format!("{sa}.k_norm.weight")),
+            hidden,
+            n_heads: cfg.n_heads,
+            n_kv: cfg.n_kv_heads,
+            head_dim: cfg.head_dim,
+            eps: cfg.rms_norm_eps,
+        },
+        indexer: Indexer {
+            qk_proj: w.get(&format!("{sa}.indexer.index_qk_proj.weight")),
+            q_norm: w.get(&format!("{sa}.indexer.q_layernorm.weight")),
+            k_norm: w.get(&format!("{sa}.indexer.k_layernorm.weight")),
+            hidden,
+            n_heads: ix.n_heads,
+            kv_heads: ix.kv_heads,
+            head_dim: ix.head_dim,
+            budget: ix.budget,
+            compress_ratio: ix.compress_ratio,
+            eps: cfg.rms_norm_eps,
+        },
+        moe: MoeLayer {
+            router: w.get(&format!("{mp}.gate.weight")),
+            experts: (0..cfg.moe.num_experts)
+                .map(|e| Expert {
+                    gate_up: &gu[e * gu_sz..(e + 1) * gu_sz],
+                    down: &dn[e * dn_sz..(e + 1) * dn_sz],
+                })
+                .collect(),
+            shared_gate: w.get(&format!("{mp}.shared_expert.gate_proj.weight")),
+            shared_up: w.get(&format!("{mp}.shared_expert.up_proj.weight")),
+            shared_down: w.get(&format!("{mp}.shared_expert.down_proj.weight")),
+            shared_expert_gate: w.get(&format!("{mp}.shared_expert_gate.weight")),
+            hidden,
+            mi,
+            shared_mi: smi,
+            top_k: cfg.moe.experts_per_tok,
+            norm_topk_prob: cfg.moe.norm_topk_prob,
+        },
+        mixer: gated("", "mtp.hyper_connection_mixer", false),
+    }
 }
 
 /// Weights for the head's single decoder layer, plus its stream mixer.
@@ -104,6 +209,7 @@ pub fn forward(
     n_tok: usize,
     cos: &[f32],
     sin: &[f32],
+    fusion: Fusion,
 ) -> Vec<f32> {
     let (h, hc) = (cfg.hidden, cfg.gated_residual.count);
     let width = hc * h;
@@ -118,6 +224,7 @@ pub fn forward(
                 w.pre_fc_norm_embedding,
                 w.fc_hidden,
                 w.fc_embedding,
+                fusion,
             )
         })
         .collect();

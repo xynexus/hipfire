@@ -640,6 +640,24 @@ impl TrunkScratch {
         &self.logits
     }
 
+    /// The WIDE residual, `[hc_count * hidden]` f32, as left by the last
+    /// [`decode_step_into`].
+    ///
+    /// This is what the MTP head consumes: `mtp.pre_fc_norm_hidden` is
+    /// `[hc_count * hidden]`, so the head is fed the wide stream, not the
+    /// collapsed output. Exposed so the head can be driven and scored against
+    /// the trunk without a second forward.
+    pub fn wide(&self) -> &GpuTensor {
+        &self.wide
+    }
+
+    /// The COLLAPSED hidden, `[hidden]` f32 — the mixer output that feeds
+    /// `lm_head`. The MTP's own output is the same shape, which is what makes a
+    /// cosine between them meaningful.
+    pub fn collapsed(&self) -> &GpuTensor {
+        &self.collapsed
+    }
+
     pub fn new(gpu: &mut Gpu, cfg: &Qwen4ExpConfig, max_seq: usize) -> HipResult<Self> {
         let width = cfg.gated_residual.count * cfg.hidden;
         Ok(Self {
