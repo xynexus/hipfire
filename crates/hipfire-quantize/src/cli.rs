@@ -10735,7 +10735,15 @@ pub fn main() {
         // because no forward path consumed them. deepseek4-q8-mtp is the first format
         // that ingests the MTP layer; v3 spec-decode requires it. For other
         // formats we still skip to avoid bloating the HFQ with unused tensors.
-        if name.starts_with("mtp.") && !use_deepseek4_source_precision {
+        // ...unless the caller ASKED for them by prefix. `--include-prefix mtp.`
+        // is documented as the way to build an MTP sidecar, and this skip —
+        // keyed to the deepseek4 FORMATS rather than to intent — silently ate
+        // every tensor it selected. The run then reported `Total params: 0`,
+        // wrote a 14 MB artifact with no weights, and exited 0.
+        let mtp_requested = include_prefix
+            .as_deref()
+            .is_some_and(|p| p.starts_with("mtp."));
+        if name.starts_with("mtp.") && !use_deepseek4_source_precision && !mtp_requested {
             let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
             let n: usize = meta.shape.iter().product();
             skipped_params += n as u64;
@@ -13607,6 +13615,26 @@ pub fn main() {
     } else {
         0.0
     };
+
+    // An artifact with no weights is never what anyone asked for, and it is
+    // indistinguishable from success at the shell: `--include-prefix mtp.` used
+    // to select every MTP tensor, hand them to a skip rule keyed on the
+    // deepseek4 formats, and report "Total params: 0 ... Done: 14.3 MB written"
+    // with exit 0. Refuse instead, and name the selection that emptied the run.
+    if total_params == 0 {
+        eprintln!("\n=== Quantization Summary ===");
+        eprintln!("  Skipped params:   {skipped_params}");
+        eprintln!("  Total params:     0");
+        let selector = match include_prefix.as_deref() {
+            Some(p) => format!("--include-prefix {p}"),
+            None => "the current format/skip rules".to_string(),
+        };
+        eprintln!(
+            "\nERROR: no tensor survived selection ({selector}), so the artifact \
+             would contain no weights. Nothing was written."
+        );
+        std::process::exit(2);
+    }
 
     eprintln!("\n=== Quantization Summary ===");
     if skipped_params > 0 {
