@@ -4385,6 +4385,15 @@ enum HfqInputFormat {
     OqPlusCompactG128,
     Oq8,
     Oq8Plus,
+    /// `Oq8` at a 128-element group (qt 54), for K divisible by 128 but not 256.
+    ///
+    /// Carries NO AWQ sidecar, ever. `Oq8G128` declares `RotationPlan::FwhtG128`
+    /// and `RotationVariant::PlainG128` REFUSES an AWQ sidecar outright — no
+    /// 128-point AWQ rotation kernel exists, and the 256-point one does not
+    /// cancel the weights' 128-point rotation. Since AWQ weights are stored
+    /// pre-scaled, attaching one would ship an artifact that either errors at
+    /// load or computes a silently wrong answer.
+    Oq8G128,
 }
 
 fn stacked_expert_oq_format(
@@ -4413,9 +4422,20 @@ fn stacked_expert_oq_format(
             HfqInputFormat::Oq4
         })
     } else if use_oq8_plus {
-        Some(HfqInputFormat::Oq8Plus)
+        // G128 has no AWQ rotation kernel and `oq8_ldlq_pack` asserts K % 256,
+        // so the calibrated variants collapse to plain Oq8G128 here. That is
+        // still 8-bit and still Opus, where the alternative was 4-bit HFQ4G128.
+        Some(if opus_group == 128 {
+            HfqInputFormat::Oq8G128
+        } else {
+            HfqInputFormat::Oq8Plus
+        })
     } else if use_oq8 {
-        Some(HfqInputFormat::Oq8)
+        Some(if opus_group == 128 {
+            HfqInputFormat::Oq8G128
+        } else {
+            HfqInputFormat::Oq8
+        })
     } else {
         None
     }
@@ -5113,6 +5133,32 @@ fn quantize_hfq_source_tensor(
             };
             let quant_type = QuantType::oq8_for_matrix_cols(k);
             (q, quant_type, 256, "OQ8G256")
+        }
+        HfqInputFormat::Oq8G128 => {
+            // Opus W8 at a 128 group (qt 54), for a K divisible by 128 but not
+            // 256 — `moe_intermediate_size` 640 (Qwen3.8-Flash-Next) and 128
+            // (the qwen3_5_moe / gemma4_moe fixtures). Before this arm those
+            // routed `down_proj` tensors left Opus for HFQ4G128 and shipped
+            // FOUR-bit uncalibrated weights inside an eight-bit artifact.
+            //
+            // Seeds 43/1043, not 42/1042: the group is the FWHT length, and
+            // `quantize_oq8g128` asserts the 128-length pair. The 256 pair
+            // rotates by a transform the forward never inverts, which reads as
+            // plausible garbage rather than an error.
+            //
+            // NO AWQ, NO LDLQ, deliberately. `RotationVariant::PlainG128`
+            // refuses an AWQ sidecar (no 128-point AWQ rotation kernel exists,
+            // and AWQ weights ship pre-scaled, so the division of x would never
+            // happen), and `oq8_ldlq_pack` asserts K % 256 == 0. Attaching
+            // either here would trade a loud 4-bit fallback for a quiet wrong
+            // answer. Plain 8-bit beats calibrated 4-bit regardless.
+            let m_dim = shape[0] as usize;
+            let signs1_128 = gen_fwht_signs(43, 128);
+            let signs2_128 = gen_fwht_signs(1043, 128);
+            let q = quantize_opus_rows(&f32_data, m_dim, k, |row| {
+                crate::codecs::quantize_oq8g128(row, &signs1_128, &signs2_128)
+            });
+            (q, QuantType::Oq8G128, 128, "OQ8G128")
         }
         HfqInputFormat::OqPlusCompact => {
             // OQ+ magnitude-tiered W4A8: bulk int4, top-`w8_frac` weights/group at
@@ -11740,19 +11786,27 @@ pub fn main() {
                     .or(opus_expert_group)
                     .unwrap_or(256),
             );
-            // oq8/oq8+ have no G128 input format yet, so they still need 256. Say so
-            // rather than dropping them silently, which is the defect being fixed.
-            let oq_needs_g256 = use_oq8 || use_oq8_plus;
-            let opus_admits = match opus_expert_group {
-                Some(256) => true,
-                Some(_) => !oq_needs_g256,
-                None => false,
-            };
+            // Every Opus group a K admits is now producible: 256 natively, and
+            // 128 through `Oq4`/`OqPlusCompactG128` or `Oq8G128`. Only a K that
+            // divides by NEITHER has no Opus home.
+            let opus_admits = matches!(opus_expert_group, Some(256) | Some(128));
             if stacked_oq_format.is_some() && !opus_admits {
                 quant_progress.warn(format!(
-                    "  ⚠️  {base_name}: K={inner_k} admits no Opus group for this format \
-                     (oq8/oq8+ need K % 256 == 0); falling back OUT of Opus, which also \
-                     drops calibration for this tensor"
+                    "  ⚠️  {base_name}: K={inner_k} admits no Opus group (needs K % 128 == 0); \
+                     falling back OUT of Opus, which also drops calibration for this tensor"
+                ));
+            }
+            // A G128 Opus home exists, but not a calibrated one: there is no
+            // 128-point AWQ rotation kernel (`RotationVariant::PlainG128` refuses
+            // the sidecar outright, because AWQ weights ship pre-scaled) and
+            // `oq8_ldlq_pack` asserts K % 256 == 0. Under `oq8+`/`oq8++` the
+            // tensor is therefore quantised plain. Say so: the operator asked
+            // for calibration and this tensor will not get it.
+            if opus_admits && opus_expert_group == Some(128) && use_oq8_plus {
+                quant_progress.warn(format!(
+                    "  ⚠️  {base_name}: K={inner_k} is Opus G128, which has no AWQ rotation \
+                     kernel and no LDLQ pack; quantising PLAIN Oq8G128 (8-bit, uncalibrated) \
+                     rather than the 4-bit HFQ4G128 this used to fall back to"
                 ));
             }
             // Undercovered experts go to W8 rather than source precision, but

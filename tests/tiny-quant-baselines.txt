@@ -314,9 +314,9 @@ gfx1151 qwen3_5_moe oq4 0.19762914 0.25
 gfx1151 qwen3_5_moe oq4++-calib 0.19994946 0.25
 gfx1151 qwen3_5_moe oq4+-calib 0.19994946 0.25
 gfx1151 qwen3_5_moe oq4.25++-calib 0.18535157 0.25
-gfx1151 qwen3_5_moe oq8 0.01959566 0.25
-gfx1151 qwen3_5_moe oq8++-calib 0.00258944 0.25
-gfx1151 qwen3_5_moe oq8+-calib 0.00258944 0.25
+gfx1151 qwen3_5_moe oq8 0.00155500 0.25
+gfx1151 qwen3_5_moe oq8++-calib 0.00517900 0.25
+gfx1151 qwen3_5_moe oq8+-calib 0.00517900 0.25
 gfx1151 qwen3_5_moe_indexed oq4 0.06788641 0.25
 gfx1151 qwen3_5_moe_indexed oq4++-calib 0.04781233 0.25
 gfx1151 qwen3_5_moe_indexed oq4+-calib 0.05532512 0.25
