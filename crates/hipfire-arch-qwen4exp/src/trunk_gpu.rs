@@ -686,6 +686,116 @@ impl TrunkScratch {
 /// is what the parity examples and tests want but costs a `vocab`-wide transfer
 /// per token — 993 KB at the shipped 248320 vocab, every step, for a sampler that
 /// may only need an argmax.
+impl TrunkWeights {
+    /// Map every DENSE linear's device buffer to its canonical artifact name,
+    /// for `gpu.capture_names`.
+    ///
+    /// This is what makes Hessian capture work on this arch without a streamed
+    /// calibration adapter. `weight_gemv` already carries the tap — "the single
+    /// chokepoint that makes activation capture work for every arch that routes
+    /// its linears through `weight_gemv`" — and qwen4_exp routes all of them
+    /// through it. The streamed adapter exists for models that cannot be held
+    /// resident; this one already loads paged and runs, so arming the tap over a
+    /// live forward is the shorter path to a `.calib.hfq`.
+    ///
+    /// ROUTED EXPERTS ARE EXCLUDED. There are `n_experts` of them per layer and a
+    /// full [K,K] Hessian each would not fit; they take the imatrix path instead
+    /// (`CalibCollector::with_imatrix_only`), which is the same split the other
+    /// families use. The names here must match the ARTIFACT's tensor names,
+    /// because that is what `--hessian` looks up at quantize time.
+    ///
+    /// `max_k` caps which tensors are worth a Hessian. The accumulator is
+    /// [K,K] f32 on device, so its cost is QUADRATIC in K while the benefit
+    /// scales with the tensor's parameter count. The hyper-connection
+    /// `input_mix_weight_down` projections are the pathological case here:
+    /// K=10240 costs 419 MB each, 96 of them is ~40 GB of device memory, and
+    /// each holds only 320x10240 = 3.3 M params. Capturing them OOM-killed this
+    /// box; skipping them frees more memory than every other tensor combined
+    /// and costs LDLQ on 0.2% of the model's weights. `None` captures
+    /// everything.
+    pub fn capture_map(&self, _cfg: &Qwen4ExpConfig, max_k: Option<usize>) -> Vec<(usize, String)> {
+        let cap = max_k.unwrap_or(usize::MAX);
+        let push = move |v: &mut Vec<(usize, String)>, t: &WeightTensor, name: String| {
+            if t.k > cap {
+                return;
+            }
+            v.push((t.buf.buf.as_ptr() as usize, name));
+        };
+        let hc = |v: &mut Vec<(usize, String)>, w: &HcWeights, base: &str| {
+            push(
+                v,
+                &w.mix_down,
+                format!("{base}.input_mix_weight_down.weight"),
+            );
+            push(v, &w.mix_up, format!("{base}.input_mix_weight_up.weight"));
+            if let Some(bi) = w.block_inject.as_ref() {
+                push(v, bi, format!("{base}.block_inject_weight.weight"));
+            }
+        };
+
+        let p = "model.language_model";
+        let mut out: Vec<(usize, String)> = Vec::new();
+        for (l, lw) in self.layers.iter().enumerate() {
+            let lp = format!("{p}.layers.{l}");
+            hc(
+                &mut out,
+                &lw.attn_hc,
+                &format!("{lp}.attn_hyper_connection"),
+            );
+            hc(&mut out, &lw.mlp_hc, &format!("{lp}.mlp_hyper_connection"));
+            // GDN is deliberately NOT captured. Its projections are
+            // `Oq8G256` — the PROTECTED 8-bit set — and LDLQ runs on the 4-bit
+            // bulk, so a Hessian for them is never consulted. Capturing them
+            // anyway cost ~7 GB of device accumulator and forced a `max_k` cap
+            // that dropped the hyper-connection `mix_down` Hessians, which ARE
+            // used. Verified by inspecting the shipped oq4 artifact:
+            // `linear_attn.in_proj_qkv` is Oq8G256, `shared_expert.up_proj` is
+            // Oq4G256 and is what carries `tiered OBS` in the quantize log.
+            if let Some(ple) = lw.ple.as_ref() {
+                let pl = format!("{lp}.ple");
+                push(&mut out, &ple.key_proj, format!("{pl}.key_proj.weight"));
+                push(&mut out, &ple.value_proj, format!("{pl}.value_proj.weight"));
+            }
+            if let TokenMixer::Qsa(q) = &lw.mixer {
+                let sa = format!("{lp}.self_attn");
+                push(&mut out, &q.q_proj, format!("{sa}.q_proj.weight"));
+                push(&mut out, &q.k_proj, format!("{sa}.k_proj.weight"));
+                push(&mut out, &q.v_proj, format!("{sa}.v_proj.weight"));
+                push(&mut out, &q.o_proj, format!("{sa}.o_proj.weight"));
+                push(
+                    &mut out,
+                    &q.ix_qk_proj,
+                    format!("{sa}.indexer.index_qk_proj.weight"),
+                );
+            }
+            let mp = format!("{lp}.mlp");
+            push(&mut out, &lw.moe.router, format!("{mp}.gate.weight"));
+            push(
+                &mut out,
+                &lw.moe.shared_gate,
+                format!("{mp}.shared_expert.gate_proj.weight"),
+            );
+            push(
+                &mut out,
+                &lw.moe.shared_up,
+                format!("{mp}.shared_expert.up_proj.weight"),
+            );
+            push(
+                &mut out,
+                &lw.moe.shared_down,
+                format!("{mp}.shared_expert.down_proj.weight"),
+            );
+        }
+        hc(
+            &mut out,
+            &self.mixer,
+            &format!("{p}.hyper_connection_mixer"),
+        );
+        push(&mut out, &self.lm_head, "lm_head.weight".to_string());
+        out
+    }
+}
+
 /// Upload the MTP head (`mtp.layers.0` + its fusion projections and mixer).
 ///
 /// Lives here rather than in `mtp_gpu` because the loaders it needs

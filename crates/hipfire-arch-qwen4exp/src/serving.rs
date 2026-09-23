@@ -293,6 +293,11 @@ impl Qwen4ExpBackend {
         &self.embed[o..o + h]
     }
 
+    /// The uploaded trunk weights, for building a calibration capture map.
+    pub fn weights(&self) -> &TrunkWeights {
+        &self.weights
+    }
+
     /// Apply the trunk's `lm_head` to an arbitrary collapsed hidden.
     ///
     /// The MTP head shares this head (`mtp_use_dedicated_embeddings` is false),
