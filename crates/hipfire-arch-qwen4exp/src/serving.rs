@@ -293,6 +293,23 @@ impl Qwen4ExpBackend {
         &self.embed[o..o + h]
     }
 
+    /// Apply the trunk's `lm_head` to an arbitrary collapsed hidden.
+    ///
+    /// The MTP head shares this head (`mtp_use_dedicated_embeddings` is false),
+    /// so a draft's logits must come from the same matrix the trunk uses — a
+    /// separate copy would drift and make acceptance meaningless.
+    pub fn logits_of(&self, gpu: &mut Gpu, hidden: &GpuTensor) -> Result<Vec<f32>, String> {
+        hipfire_runtime::weights::weight_gemv(
+            gpu,
+            &self.weights.lm_head,
+            hidden,
+            self.scratch.logits(),
+        )
+        .map_err(|e| format!("qwen4_exp lm_head: {e:?}"))?;
+        gpu.download_f32(self.scratch.logits())
+            .map_err(|e| format!("qwen4_exp logits download: {e:?}"))
+    }
+
     /// Last-position logits, `[vocab]`.
     pub fn trunk_logits(&self) -> &GpuTensor {
         self.scratch.logits()

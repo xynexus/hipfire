@@ -193,12 +193,11 @@ pub fn mtp_decode_step(
 impl MtpWeightsGpu {
     /// Upload the head from a reader over an MTP sidecar.
     ///
-    /// ⚠️ The sidecar stores routed experts SPLIT per expert
-    /// (`experts.<e>.<proj>.weight`) because `hipfire-quantize` splits stacked
-    /// MoE tensors on the way in, while the source ships them stacked. The
-    /// trunk's `stack_experts` expects the stacked name, so a reader for this
-    /// must present them stacked — the probe restacks, and so must any caller
-    /// here. Getting it wrong is a missing-weight error, not a wrong answer.
+    /// The sidecar stores routed experts SPLIT per expert
+    /// (`experts.<e>.<proj>.weight`), which is what `stack_experts` reads, so
+    /// this path needs no restacking. The CPU path is the one that differs: the
+    /// CPU `MoeLayer` slices ONE stacked tensor, which is why `mtp_probe`
+    /// restacks and this does not.
     pub fn upload(gpu: &mut Gpu, cfg: &Qwen4ExpConfig, w: &dyn TensorReader) -> HipResult<Self> {
         crate::trunk_gpu::upload_mtp_head(gpu, cfg, w)
     }
