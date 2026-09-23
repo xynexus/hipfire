@@ -3981,6 +3981,22 @@ impl TensorProgress {
         if !enabled {
             return;
         }
+        self.emit(message);
+    }
+
+    /// A line that prints whatever `--verbose-tensors` says.
+    ///
+    /// `detail` is for per-tensor commentary nobody needs by default. A
+    /// CORRECTNESS warning is not that: the K=128 Opus fallback silently ships
+    /// 4-bit uncalibrated experts inside an `oq8` artifact, and routing it
+    /// through `detail` meant the warning added to make that case audible only
+    /// printed under a flag nobody passes. Default runs emitted zero warnings
+    /// while 32 tensors dropped to HFQ4G128.
+    fn warn(&self, message: String) {
+        self.emit(message);
+    }
+
+    fn emit(&self, message: String) {
         if self.log_snapshots {
             eprintln!("{message}");
         } else {
@@ -11733,11 +11749,11 @@ pub fn main() {
                 None => false,
             };
             if stacked_oq_format.is_some() && !opus_admits {
-                quant_log!(
+                quant_progress.warn(format!(
                     "  ⚠️  {base_name}: K={inner_k} admits no Opus group for this format \
                      (oq8/oq8+ need K % 256 == 0); falling back OUT of Opus, which also \
                      drops calibration for this tensor"
-                );
+                ));
             }
             // Undercovered experts go to W8 rather than source precision, but
             // only where an OQ expert target is actually in play — under a
