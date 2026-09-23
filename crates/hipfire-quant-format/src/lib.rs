@@ -366,6 +366,7 @@ impl QuantType {
             35 => Oq8G256,
             36 => OqPlusCompact,
             52 => OqPlusCompactG128,
+            54 => Oq8G128,
             53 => Oq4G256MoeBlocks,
             37 => Oq4G256ArchPacked,
             38 => Oq3G256,
@@ -644,5 +645,136 @@ mod tests {
         assert_eq!(QuantType::CoarseQ4Row.code(), 48);
         assert_eq!(QuantType::Bf16Lut3.code(), 49);
         assert_eq!(QuantType::Bf16Huff.code(), 50);
+    }
+
+    /// Every declared variant must survive `code()` -> `from_code()`.
+    ///
+    /// `Oq8G128` was declared as 54, matched by name in `weight_pager` and the
+    /// arch loaders, and OMITTED from `from_code` — so reconstructing it from a
+    /// stored byte returned `None`. `inspect` showed `qt54?`, and
+    /// `module_tensor_resident_len` rejected a paged routed expert as "unknown
+    /// quant_type 54". A format can be fully implemented and still be invisible
+    /// to every caller that starts from the on-disk byte.
+    ///
+    /// The inner match is the real guard: it is exhaustive, so ADDING a variant
+    /// breaks the build here until it is listed, and the loop then proves the
+    /// mapping exists. A list alone would have gone stale exactly as `from_code` did.
+    #[test]
+    fn every_variant_round_trips_through_from_code() {
+        use QuantType::*;
+        let all = [
+            Q4F16G64,
+            F16,
+            F32,
+            Q8F16,
+            Q4K,
+            Q8HFQ,
+            HFQ4G256,
+            HFQ4G128,
+            HFQ6G256,
+            HFQ2G256,
+            HFQ2G128,
+            HFQ3G256,
+            HFQ3G128,
+            MQ4G256,
+            MQ8G256,
+            MQ6G256,
+            BF16,
+            MQ3G256,
+            MQ2G256,
+            MQ2G256Lloyd,
+            MQ3G256Lloyd,
+            HFP4G32,
+            TidI32,
+            MFP4G32,
+            PARO4G128,
+            PARO4G128T,
+            MQ4G256Lloyd,
+            Qtip3G256,
+            OqPlusG256,
+            Oq4G256,
+            Oq8G256,
+            OqPlusCompact,
+            Oq4G256ArchPacked,
+            Oq3G256,
+            Oq2G256,
+            Oq6G256,
+            Qtip2G256,
+            Qtip4G256,
+            Oq8G256RowPadded,
+            OpaqueBytes,
+            Oq8Plain,
+            Oq4MixedPlain,
+            Oq4Plain,
+            CoarseQ4Row,
+            Bf16Lut3,
+            Bf16Huff,
+            Qtip3G256I3,
+            OqPlusCompactG128,
+            Oq4G256MoeBlocks,
+            Oq8G128,
+        ];
+        for qt in all {
+            assert_eq!(
+                QuantType::from_code(qt.code()),
+                Some(qt),
+                "{qt:?} (code {}) does not round-trip — add it to from_code",
+                qt.code()
+            );
+        }
+        fn _exhaustive(q: QuantType) {
+            match q {
+                Q4F16G64 => (),
+                F16 => (),
+                F32 => (),
+                Q8F16 => (),
+                Q4K => (),
+                Q8HFQ => (),
+                HFQ4G256 => (),
+                HFQ4G128 => (),
+                HFQ6G256 => (),
+                HFQ2G256 => (),
+                HFQ2G128 => (),
+                HFQ3G256 => (),
+                HFQ3G128 => (),
+                MQ4G256 => (),
+                MQ8G256 => (),
+                MQ6G256 => (),
+                BF16 => (),
+                MQ3G256 => (),
+                MQ2G256 => (),
+                MQ2G256Lloyd => (),
+                MQ3G256Lloyd => (),
+                HFP4G32 => (),
+                TidI32 => (),
+                MFP4G32 => (),
+                PARO4G128 => (),
+                PARO4G128T => (),
+                MQ4G256Lloyd => (),
+                Qtip3G256 => (),
+                OqPlusG256 => (),
+                Oq4G256 => (),
+                Oq8G256 => (),
+                OqPlusCompact => (),
+                Oq4G256ArchPacked => (),
+                Oq3G256 => (),
+                Oq2G256 => (),
+                Oq6G256 => (),
+                Qtip2G256 => (),
+                Qtip4G256 => (),
+                Oq8G256RowPadded => (),
+                OpaqueBytes => (),
+                Oq8Plain => (),
+                Oq4MixedPlain => (),
+                Oq4Plain => (),
+                CoarseQ4Row => (),
+                Bf16Lut3 => (),
+                Bf16Huff => (),
+                Qtip3G256I3 => (),
+                OqPlusCompactG128 => (),
+                Oq4G256MoeBlocks => (),
+                Oq8G128 => (),
+            }
+        }
     }
 }
