@@ -205,8 +205,16 @@ impl ExpertStack {
                 ),
             )
         })?;
-        let mk = |rel: usize, p: &PagedExperts| -> WeightTensor {
-            let len = views.buf.numel().saturating_sub(rel);
+        // Slice to the role's OWN length. Taking "the rest of the module" made
+        // gate_up's view include down_proj's bytes, and the compact Opus arm of
+        // `weight_gemv` derives its block stride from the view
+        // (`block_stride = byte_size / blocks`) -- so an over-long view yields an
+        // over-large stride, which reads the same bytes as a different format.
+        // The `% blocks` guard there divides evenly often enough to miss it, so
+        // the failure surfaced as non-finite logits rather than an error.
+        let mk = |rel: usize, own_len: usize, p: &PagedExperts| -> WeightTensor {
+            let rest = views.buf.numel().saturating_sub(rel);
+            let len = if own_len > 0 { own_len.min(rest) } else { rest };
             let mut buf = views.buf.sub_offset(rel, len);
             if p.dtype == DType::F32 {
                 buf.shape = vec![p.rows, p.cols];
@@ -221,7 +229,10 @@ impl ExpertStack {
                 awq_scale: None,
             }
         };
-        Ok((mk(views.gate_up_rel, gp), mk(views.down_rel, dp)))
+        Ok((
+            mk(views.gate_up_rel, views.gate_up_len, gp),
+            mk(views.down_rel, views.down_len, dp),
+        ))
     }
 
     pub fn free(self, gpu: &mut Gpu) {
