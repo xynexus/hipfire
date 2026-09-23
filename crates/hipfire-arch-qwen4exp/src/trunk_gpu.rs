@@ -686,6 +686,137 @@ impl TrunkScratch {
 /// is what the parity examples and tests want but costs a `vocab`-wide transfer
 /// per token — 993 KB at the shipped 248320 vocab, every step, for a sampler that
 /// may only need an argmax.
+/// Upload the MTP head (`mtp.layers.0` + its fusion projections and mixer).
+///
+/// Lives here rather than in `mtp_gpu` because the loaders it needs
+/// (`load_linear`, `up1`, `stack_experts`) are this module's, and the head is
+/// structurally one trunk layer — keeping the two uploads adjacent is what
+/// stops them drifting. `pager` is deliberately `None`: the head is ~2.6 B
+/// params against the trunk's 180 B, so its experts stay resident.
+pub fn upload_mtp_head(
+    gpu: &mut Gpu,
+    cfg: &Qwen4ExpConfig,
+    w: &dyn TensorReader,
+) -> HipResult<crate::mtp_gpu::MtpWeightsGpu> {
+    let (hidden, hc) = (cfg.hidden, cfg.gated_residual.count);
+    let lr = cfg.gated_residual.lowrank;
+    let (m, ix) = (&cfg.moe, &cfg.indexer);
+    let (nh, nkv, hd) = (cfg.n_heads, cfg.n_kv_heads, cfg.head_dim);
+    let lp = "mtp.layers.0";
+    let sa = format!("{lp}.self_attn");
+    let mp = format!("{lp}.mlp");
+
+    let hcw = |gpu: &mut Gpu, base: &str, inject: bool| -> HipResult<HcWeights> {
+        Ok(HcWeights {
+            hc_norm: up1(gpu, w, &format!("{base}.hc_norm.weight"))?,
+            mix_down: load_linear(
+                gpu,
+                w,
+                &format!("{base}.input_mix_weight_down.weight"),
+                lr,
+                hc * hidden,
+            )?,
+            mix_up: load_linear(
+                gpu,
+                w,
+                &format!("{base}.input_mix_weight_up.weight"),
+                hc * hidden,
+                lr,
+            )?,
+            block_inject: match inject {
+                true => Some(load_linear(
+                    gpu,
+                    w,
+                    &format!("{base}.block_inject_weight.weight"),
+                    hc,
+                    hc * hidden,
+                )?),
+                false => None,
+            },
+        })
+    };
+
+    Ok(crate::mtp_gpu::MtpWeightsGpu {
+        pre_fc_norm_hidden: up1(gpu, w, "mtp.pre_fc_norm_hidden.weight")?,
+        pre_fc_norm_embedding: up1(gpu, w, "mtp.pre_fc_norm_embedding.weight")?,
+        fc_hidden: load_linear(gpu, w, "mtp.fc_hidden.weight", hidden, hidden)?,
+        fc_embedding: load_linear(gpu, w, "mtp.fc_embedding.weight", hidden, hidden)?,
+        attn_hc: hcw(gpu, &format!("{lp}.attn_hyper_connection"), true)?,
+        mlp_hc: hcw(gpu, &format!("{lp}.mlp_hyper_connection"), true)?,
+        qsa: QsaWeights {
+            q_proj: load_linear(gpu, w, &format!("{sa}.q_proj.weight"), nh * hd * 2, hidden)?,
+            k_proj: load_linear(gpu, w, &format!("{sa}.k_proj.weight"), nkv * hd, hidden)?,
+            v_proj: load_linear(gpu, w, &format!("{sa}.v_proj.weight"), nkv * hd, hidden)?,
+            o_proj: load_linear(gpu, w, &format!("{sa}.o_proj.weight"), hidden, nh * hd)?,
+            q_norm: up1(gpu, w, &format!("{sa}.q_norm.weight"))?,
+            k_norm: up1(gpu, w, &format!("{sa}.k_norm.weight"))?,
+            ix_qk_proj: load_linear(
+                gpu,
+                w,
+                &format!("{sa}.indexer.index_qk_proj.weight"),
+                (ix.n_heads + ix.kv_heads) * ix.head_dim,
+                hidden,
+            )?,
+            ix_q_norm: up1(gpu, w, &format!("{sa}.indexer.q_layernorm.weight"))?,
+            ix_k_norm: up1(gpu, w, &format!("{sa}.indexer.k_layernorm.weight"))?,
+        },
+        moe: MoeWeights {
+            router: load_linear(gpu, w, &format!("{mp}.gate.weight"), m.num_experts, hidden)?,
+            gate_up: stack_experts(
+                gpu,
+                w,
+                &mp,
+                "gate_up_proj",
+                m.num_experts,
+                &[m.num_experts, 2 * m.intermediate, hidden],
+                None,
+                0,
+                hipfire_runtime::weight_pager::ExpertRole::GateUp,
+            )?,
+            down: stack_experts(
+                gpu,
+                w,
+                &mp,
+                "down_proj",
+                m.num_experts,
+                &[m.num_experts, hidden, m.intermediate],
+                None,
+                0,
+                hipfire_runtime::weight_pager::ExpertRole::Down,
+            )?,
+            shared_gate: load_linear(
+                gpu,
+                w,
+                &format!("{mp}.shared_expert.gate_proj.weight"),
+                m.shared_intermediate,
+                hidden,
+            )?,
+            shared_up: load_linear(
+                gpu,
+                w,
+                &format!("{mp}.shared_expert.up_proj.weight"),
+                m.shared_intermediate,
+                hidden,
+            )?,
+            shared_down: load_linear(
+                gpu,
+                w,
+                &format!("{mp}.shared_expert.down_proj.weight"),
+                hidden,
+                m.shared_intermediate,
+            )?,
+            shared_expert_gate: load_linear(
+                gpu,
+                w,
+                &format!("{mp}.shared_expert_gate.weight"),
+                1,
+                hidden,
+            )?,
+        },
+        mixer: hcw(gpu, "mtp.hyper_connection_mixer", false)?,
+    })
+}
+
 pub fn decode_step_into(
     gpu: &mut Gpu,
     cfg: &Qwen4ExpConfig,

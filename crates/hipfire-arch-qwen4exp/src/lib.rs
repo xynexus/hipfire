@@ -23,6 +23,7 @@ pub mod hc_gpu;
 pub mod moe;
 pub mod moe_gpu;
 pub mod mtp;
+pub mod mtp_gpu;
 pub mod ngram;
 pub mod ngram_rows;
 pub mod ngram_store;
