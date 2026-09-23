@@ -1082,7 +1082,15 @@ pub fn estimated_module_resident_bytes(hfq: &HfqFile) -> (u64, u64) {
                 // layer on those would reject every real artifact.
                 .filter(|t| !t.name.contains("awq_scale"))
                 .all(|t| {
+                    // Both compact groups qualify: `split_compact_planes` only
+                    // reorders bytes at 256 AND at 128. Omitting G128 here
+                    // priced a qwen4_exp `oq4.25++` artifact as if its 24576
+                    // ragged-K `down_proj` experts expanded to Oq8, which is the
+                    // 1.80x this function exists to avoid -- the daemon then
+                    // refused a 172 GB model needing "124.8 GiB" that the
+                    // serving path loads with 8.4 GiB of experts resident.
                     t.quant_type == QuantType::OqPlusCompact.code()
+                        || t.quant_type == QuantType::OqPlusCompactG128.code()
                         || t.quant_type == QuantType::Oq8G256.code()
                 })
         });
@@ -1095,7 +1103,9 @@ pub fn estimated_module_resident_bytes(hfq: &HfqFile) -> (u64, u64) {
             // the byte count exactly. Asking the pager's question here would
             // over-estimate a compact artifact by 1.80x and refuse a load that
             // now fits -- which is precisely the 122B.
-            let len = if compact_resident && tensor.quant_type == QuantType::OqPlusCompact.code() {
+            let compact_tensor = tensor.quant_type == QuantType::OqPlusCompact.code()
+                || tensor.quant_type == QuantType::OqPlusCompactG128.code();
+            let len = if compact_resident && compact_tensor {
                 tensor.data_size
             } else {
                 module_tensor_resident_len(tensor, ExpertResidentLayout::IndexedMoeBlocks)
