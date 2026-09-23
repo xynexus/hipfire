@@ -271,9 +271,14 @@ fn lfm2_triattn_kv_layer_ids(config: &lfm2moe::config::Lfm2MoeConfig) -> Vec<usi
 /// through to config, where it used to mean "off" on one set of paths and "on" on the
 /// other.
 pub fn resolve_jinja_chat(configured: Option<bool>) -> Option<bool> {
+    // Accept the SCHEMA's vocabulary (auto|off|on) as well as the historical
+    // 1/0. Two vocabularies for one setting is what let the config layer print
+    // "HIPFIRE_JINJA_CHAT=1 ignored: want one of auto|off|on" while this
+    // function honoured that exact value.
     match std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() {
-        Some("1") => Some(true),
-        Some("0") => Some(false),
+        Some("1") | Some("on") => Some(true),
+        Some("0") | Some("off") => Some(false),
+        Some("auto") => configured,
         _ => configured,
     }
 }
@@ -294,7 +299,14 @@ pub fn resolve_chat_template(
 ) -> Option<String> {
     match prompt_frame::resolve_chat_template(model_path, hfq.chat_template()) {
         Some(resolved) => {
-            prompt_frame::log_resolved_chat_template_source(&resolved.source);
+            // One authority: the resolver above, never a second env read inside
+            // the prompt crate. `None` (env says nothing) keeps this seed line's
+            // historical answer of "not rendering"; the daemon recomputes the
+            // real decision with resolved config in `handlers::lifecycle`.
+            prompt_frame::log_resolved_chat_template_source(
+                &resolved.source,
+                resolve_jinja_chat(None).unwrap_or(false),
+            );
             Some(resolved.template)
         }
         None => {
@@ -4657,6 +4669,18 @@ mod admission_tests {
         assert_eq!(resolve_jinja_chat(Some(false)), Some(true));
         std::env::set_var("HIPFIRE_JINJA_CHAT", "0");
         assert_eq!(resolve_jinja_chat(Some(true)), Some(false));
+        // The SCHEMA's own vocabulary must mean the same thing here. When it did
+        // not, the config layer rejected `1` ("want one of auto|off|on") while
+        // this function honoured it, and the operator was told the opposite of
+        // what ran.
+        std::env::set_var("HIPFIRE_JINJA_CHAT", "on");
+        assert_eq!(resolve_jinja_chat(Some(false)), Some(true));
+        std::env::set_var("HIPFIRE_JINJA_CHAT", "off");
+        assert_eq!(resolve_jinja_chat(Some(true)), Some(false));
+        // `auto` is "no opinion" — it must defer, not force a default.
+        std::env::set_var("HIPFIRE_JINJA_CHAT", "auto");
+        assert_eq!(resolve_jinja_chat(Some(true)), Some(true));
+        assert_eq!(resolve_jinja_chat(Some(false)), Some(false));
         std::env::set_var("HIPFIRE_JINJA_CHAT", "yes");
         assert_eq!(resolve_jinja_chat(Some(true)), Some(true));
         assert_eq!(resolve_jinja_chat(None), None);
