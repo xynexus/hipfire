@@ -79,3 +79,23 @@ Nothing had ever consumed an MTP head end to end, and three were broken:
   own artifacts — fixed `4f5174f2c`.
 * The quantizer SPLITS stacked MoE experts while the CPU forward wants them
   stacked; the probe restacks, and any GPU wiring must too.
+
+## Acceptance is confounded by base-model quality (2026-09-24)
+
+Measured on both 180B bases, same MTP sidecar, 63 drafts each:
+
+    base=oq4.25++   AR 6.39 tok/s   +MTP 11.21 tok/s   60/63 accepted (95.2%)
+    base=oq4        AR 4.92 tok/s   +MTP  6.98 tok/s   43/63 accepted (68.3%)
+
+DO NOT READ 95.2% AS THE BETTER RESULT. Acceptance here is measured on
+SELF-GENERATED text, so a base that degenerates into repetition is trivially
+easy to draft for. `oq4.25++` is the WORSE model by every independent measure —
+25% higher perplexity on held-out wikitext2 (5.0611 vs 4.0400) and an observed
+repetition loop in a temp-0 generation — and its acceptance is higher precisely
+because of that.
+
+This is the same trap that inverted the original MTP probe result, where a
+synthetic prompt drove the trunk into degenerate repetition and inflated the
+do-nothing baseline to 31.8%. Acceptance measured on a model's own output is a
+measure of that output's predictability, not of the drafter. Compare acceptance
+only between bases of equal quality, or against teacher-forced real text.

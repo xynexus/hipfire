@@ -132,3 +132,49 @@ The build logs ~1024 `mlp.experts.N.gate_up_proj` LDLQ skips per two layers, and
 that is by design, not a coverage hole: a full [K,K] Hessian per expert across
 24576 modules does not fit, which is why `CalibCollector::with_imatrix_only`
 exists and why every other family splits the same way.
+
+## CORRECTION: the experts get no imatrix either, and the ++ is net-harmful
+
+The section above says the routed-expert LDLQ skips are "by design, not a
+coverage hole ... which is why `CalibCollector::with_imatrix_only` exists". The
+first half is right and the second is WRONG, so correcting it here rather than
+editing it away.
+
+The experts were supposed to take the imatrix path. They did not take any path.
+The build log counts it:
+
+    imatrix derived from HFQM calibration: 704 keys
+      (352 Hessian diagonals, 352 imatrix vectors)
+
+352 against 24576 expert modules. `TrunkWeights::capture_map` names only
+resident trunk tensors, and routed experts are PAGED — the `weight_gemv` tap is
+keyed on buffer POINTER, and a paged expert's pointer is a rotating pager
+buffer, so `with_imatrix_only(["experts."])` collected nothing. 97% of the
+weights are uncalibrated.
+
+### What that costs, measured
+
+Four artifacts, same corpus (held-out wikitext2), 4095 scored tokens:
+
+    oq4       canonical Oq4G256, no calib   PPL 4.0400
+    oq4.25    tiered OqPlusCompact, no calib PPL 4.0418
+    oq4.25++  alpha=0.1                      PPL 4.1090
+    oq4.25++  alpha=0.55 (default)           PPL 5.0611
+
+`oq4.25` and `oq4.25++` are FORMAT-IDENTICAL (same histogram, 172.37 GB); the
+`++` differs by 96 AWQ sidecars out of 50347. So the tiered 4.25-bit format
+costs nothing, and the whole 25% regression is the calibration.
+
+96 tensors do that much because they are `shared_expert.{gate,up}_proj` on all
+48 layers, and the shared expert fires on EVERY token. They are also exactly the
+tensors logged as `DAMPED ... only at 10x the requested lambda`: LDLQ collapsed
+toward RTN while AWQ pre-scaling was still applied against that same
+ill-conditioned Hessian, and AWQ weights ship PRE-SCALED, so the bad scale is
+permanent.
+
+The alpha sweep is monotonic and alpha=0.1 is still worse than no AWQ, so this
+is not a mistuned alpha — the optimum is zero. **Ship `oq4` or `oq4.25`; do not
+ship `oq4.25++` for this model.**
+
+The `++` has no upside here until calibration reaches the routed experts, which
+needs the pager to name them. Until then it can only add the downside.
