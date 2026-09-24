@@ -178,3 +178,54 @@ ship `oq4.25++` for this model.**
 
 The `++` has no upside here until calibration reaches the routed experts, which
 needs the pager to name them. Until then it can only add the downside.
+
+## CORRECTION TO THE CORRECTION: experts DO take the imatrix path
+
+The section above says the routed experts "do not take the imatrix path ... they
+take no path". That is wrong about the SYSTEM and right only about this run.
+
+Experts do take the imatrix path, by design and in code:
+
+- `CalibCollector::with_imatrix_only(["experts."])` exists to route them there.
+- `imatrix_col_weights_for_parent` consumes a per-expert `[K, n_experts]`
+  imatrix, one importance column per expert.
+- a dedicated expert-coverage admission runs over the package and preserves
+  undercovered routed experts at source precision, which only makes sense
+  because expert coverage is expected.
+
+What actually happened is narrower and is a defect in
+`examples/calibrate_qwen4exp.rs`, not in the design: THIS package contained no
+expert entries at all.
+
+    shared_expert 288 | hyper_connection 194 | self_attn 120 | ple 4 | experts. 0
+
+`TrunkWeights::capture_map` names only resident trunk tensors, and the
+`weight_gemv` tap is keyed on buffer POINTER. A paged expert's pointer is a
+rotating pager slot, so no expert was ever named and the imatrix path they were
+routed to received nothing. Fix the capture, not the split.
+
+### The damping is partly self-inflicted by Hessian STORAGE
+
+The same build says so directly, and it was skimmed past the first time:
+
+    LDLQ damping: 4 tensor(s) needed escalated damping ... Conditioning, not
+    coverage: bf16 Hessian storage forces ~13% of the mean diagonal on its own,
+    and rank deficiency sets the floor (calibrate more sequences, or store the
+    Hessian at f16 -- same bytes).
+
+So the 10x damping on `shared_expert` — the thing that made AWQ destructive — is
+not purely a token-count problem. Roughly 13% of the mean diagonal is quantisation
+noise from storing the off-diagonal triangle as BF16.
+
+`hessian_io` has exactly ONE compact storage dtype today,
+`Bf16TrilDiagF32` (qt 130), so the f16 option the message recommends is NOT
+implemented. F16 has 10 mantissa bits against BF16's 7 at identical width, which
+is the right trade for Hessian entries (narrow dynamic range, precision-critical)
+as opposed to weights.
+
+That makes "do not ship oq4.25++" a statement about the CURRENT pipeline, not a
+verdict on `++` for this model. Ranked next steps:
+
+1. Name paged experts in the capture so 97% of the weights get their imatrix.
+2. Add an F16 tril storage dtype and re-measure the damping.
+3. Only then re-judge AWQ alpha.
