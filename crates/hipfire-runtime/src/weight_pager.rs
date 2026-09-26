@@ -755,16 +755,52 @@ pub mod page_timing {
         EnsureResident = 2,
         /// Rewriting the device-side expert pointer table.
         PatchPtrTable = 3,
+        // ── per-EXPERT path (qwen4_exp): one round trip per routed expert,
+        // rather than one pointer-table patch per layer. These NEST, so they are
+        // reported as absolutes and per-call means, never as shares of a sum.
+        /// Whole `expert_pair` call: the per-access cost being hunted.
+        ExpertPair = 4,
+        /// Acquiring the shared pager mutex.
+        MutexWait = 5,
+        /// `ensure_expert_module_resident` on a RESIDENT module: hash + LRU touch.
+        EnsureWarm = 6,
+        /// `ensure_expert_module_resident` on a MISS: budget, fetch, repack, upload.
+        EnsureCold = 7,
+        /// `resident_expert_views` plus building the two `WeightTensor` views.
+        Views = 8,
+        /// The two `weight_gemv` calls the pair feeds — the compute denominator.
+        ExpertGemv = 9,
+        // ── inside EnsureCold. Splits the one phase that turned out to BE the
+        // cost, so "cold load is 798 us" becomes "which of the three".
+        /// `transport.read_host`: pulling the module's bytes off drive.
+        ColdRead = 10,
+        /// `prepare_expert_module`: the CPU host repack into the device form.
+        ColdRepack = 11,
+        /// `upload_raw_pooled`: the H2D copy.
+        ColdUpload = 12,
     }
 
-    const N: usize = 4;
-    static NANOS: [AtomicU64; N] = [
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
+    const N: usize = 13;
+    const PHASE_NAMES: [&str; N] = [
+        "topk_readback",
+        "would_fit",
+        "ensure_resident",
+        "patch_ptrs",
+        "expert_pair(total)",
+        "  mutex_wait",
+        "  ensure_warm",
+        "  ensure_cold",
+        "  views",
+        "expert_gemv",
+        "    cold_read",
+        "    cold_repack",
+        "    cold_upload",
     ];
-    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static NANOS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    /// Per-phase call counts. A single global counter cannot produce a per-call
+    /// mean, which is the number that distinguishes "a lot of cheap calls" from
+    /// "a few expensive ones" — and that distinction is the whole question here.
+    static COUNTS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
     static ADMISSIONS: AtomicU64 = AtomicU64::new(0);
     static WARNED: AtomicBool = AtomicBool::new(false);
 
@@ -789,7 +825,7 @@ pub mod page_timing {
             return;
         }
         NANOS[phase as usize].fetch_add(nanos, Ordering::Relaxed);
-        CALLS.fetch_add(1, Ordering::Relaxed);
+        COUNTS[phase as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Call once per `ensure_paged_experts_resident`; prints on a cadence.
@@ -802,28 +838,37 @@ pub mod page_timing {
             return;
         }
         let vals: Vec<u64> = NANOS.iter().map(|a| a.load(Ordering::Relaxed)).collect();
-        let total: u64 = vals.iter().sum();
-        if total == 0 {
+        let cnts: Vec<u64> = COUNTS.iter().map(|a| a.load(Ordering::Relaxed)).collect();
+        if vals.iter().all(|v| *v == 0) {
             if !WARNED.swap(true, Ordering::Relaxed) {
-                tracing::debug!("no phase time recorded — is the paged path live?");
+                eprintln!("[pager-timing] no phase time recorded — is the paged path live?");
             }
             return;
         }
-        let pct = |v: u64| (v as f64) * 100.0 / (total as f64);
-        tracing::debug!(
-            "admissions={n} last_set={experts_admitted} total={:.2}s | \
-             topk_readback {:.2}s ({:.1}%) | would_fit {:.2}s ({:.1}%) | \
-             ensure_resident {:.2}s ({:.1}%) | patch_ptrs {:.2}s ({:.1}%)",
-            total as f64 / 1e9,
-            vals[0] as f64 / 1e9,
-            pct(vals[0]),
-            vals[1] as f64 / 1e9,
-            pct(vals[1]),
-            vals[2] as f64 / 1e9,
-            pct(vals[2]),
-            vals[3] as f64 / 1e9,
-            pct(vals[3]),
+        // eprintln, not tracing: this is env-gated diagnostic output, and the
+        // examples that exercise the paged path install no tracing subscriber,
+        // so a `debug!` here printed nothing and read as "no phase time".
+        eprintln!(
+            "[pager-timing] admissions={n} last_set={experts_admitted}\n{:<20} {:>10} {:>10} {:>12}",
+            "phase", "calls", "total_s", "mean_us"
         );
+        for i in 0..N {
+            if cnts[i] == 0 && vals[i] == 0 {
+                continue;
+            }
+            let mean_us = if cnts[i] > 0 {
+                (vals[i] as f64 / cnts[i] as f64) / 1e3
+            } else {
+                0.0
+            };
+            eprintln!(
+                "[pager-timing] {:<20} {:>10} {:>10.3} {:>12.3}",
+                PHASE_NAMES[i],
+                cnts[i],
+                vals[i] as f64 / 1e9,
+                mean_us
+            );
+        }
     }
 
     /// Time `f`, attributing its wall time to `phase`.
@@ -835,6 +880,26 @@ pub mod page_timing {
         let out = f();
         record(phase, t.elapsed().as_nanos() as u64);
         out
+    }
+}
+
+/// Attributes a cold page-in to `Phase::EnsureCold` on scope exit.
+///
+/// A Drop guard rather than a `timed()` closure because the cold path is a long
+/// run of `?` early returns (budget refusal, eviction failure, a malformed
+/// module); wrapping it in a closure would mean restructuring the function, and
+/// timing only the success path would under-report exactly the failures worth
+/// seeing.
+struct ColdGuard(Option<std::time::Instant>);
+
+impl Drop for ColdGuard {
+    fn drop(&mut self) {
+        if let Some(t) = self.0 {
+            page_timing::record(
+                page_timing::Phase::EnsureCold,
+                t.elapsed().as_nanos() as u64,
+            );
+        }
     }
 }
 
@@ -1877,11 +1942,20 @@ impl WeightPager {
         gpu: &mut Gpu,
     ) -> Result<(), WeightPagerError> {
         if self.resident_modules.contains_key(&key) {
+            let t = page_timing::enabled().then(std::time::Instant::now);
             self.touch_module_lru(key);
             self.module_stats.module_cache_hits =
                 self.module_stats.module_cache_hits.saturating_add(1);
+            if let Some(t) = t {
+                page_timing::record(
+                    page_timing::Phase::EnsureWarm,
+                    t.elapsed().as_nanos() as u64,
+                );
+            }
             return Ok(());
         }
+        let t_cold = page_timing::enabled().then(std::time::Instant::now);
+        let _cold = ColdGuard(t_cold);
         let module = self
             .module_catalog
             .get(&key)
@@ -1903,10 +1977,13 @@ impl WeightPager {
         let layout = self.config.expert_layout;
         let (tensor, gate_up_rel, down_rel, gate_up_len, down_len) =
             if module_requires_host_repack(&module, layout) {
-                let disk_bytes =
+                let disk_bytes = page_timing::timed(page_timing::Phase::ColdRead, || {
                     self.transport
-                        .read_host(module.data_offset, module.data_size, gpu)?;
-                let prepared = prepare_expert_module(&module, &disk_bytes, layout)?;
+                        .read_host(module.data_offset, module.data_size, gpu)
+                })?;
+                let prepared = page_timing::timed(page_timing::Phase::ColdRepack, || {
+                    prepare_expert_module(&module, &disk_bytes, layout)
+                })?;
                 // POOLED, not `upload_raw`. Eviction returns the buffer via
                 // `free_tensor` -> `pool.free`, so allocating outside the pool means
                 // every cold load takes fresh GTT while every eviction piles into a
@@ -1933,7 +2010,9 @@ impl WeightPager {
                 // `cargo run -p hipfire-rdna --example pool_churn_upload_raw` bounds
                 // it: 200 unpooled cycles strand 400 MiB, 4000 pooled cycles strand
                 // nothing.
-                let tensor = gpu.upload_raw_pooled(&prepared.bytes, &[prepared.bytes.len()])?;
+                let tensor = page_timing::timed(page_timing::Phase::ColdUpload, || {
+                    gpu.upload_raw_pooled(&prepared.bytes, &[prepared.bytes.len()])
+                })?;
                 (
                     tensor,
                     prepared.gate_up_rel,

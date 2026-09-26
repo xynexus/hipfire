@@ -184,10 +184,13 @@ impl ExpertStack {
             layer: gp.layer,
             expert: e as u16,
         };
-        let mut pager = gp
-            .pager
-            .lock()
-            .map_err(|_| HipError::new(0, "qwen4_exp: expert pager mutex poisoned"))?;
+        use hipfire_runtime::weight_pager::page_timing::{self, Phase};
+        let t_pair = page_timing::enabled().then(std::time::Instant::now);
+        let mut pager = page_timing::timed(Phase::MutexWait, || {
+            gp.pager
+                .lock()
+                .map_err(|_| HipError::new(0, "qwen4_exp: expert pager mutex poisoned"))
+        })?;
         pager
             .ensure_expert_module_resident(key, gpu)
             .map_err(|err| {
@@ -196,6 +199,8 @@ impl ExpertStack {
                     &format!("qwen4_exp paged expert l{} e{e}: {err}", gp.layer),
                 )
             })?;
+        let t_views = page_timing::enabled().then(std::time::Instant::now);
+        let t_views = page_timing::enabled().then(std::time::Instant::now);
         let views = pager.resident_expert_views(key).ok_or_else(|| {
             HipError::new(
                 0,
@@ -212,6 +217,9 @@ impl ExpertStack {
         // over-large stride, which reads the same bytes as a different format.
         // The `% blocks` guard there divides evenly often enough to miss it, so
         // the failure surfaced as non-finite logits rather than an error.
+        if let Some(t) = t_views {
+            page_timing::record(Phase::Views, t.elapsed().as_nanos() as u64);
+        }
         let mk = |rel: usize, own_len: usize, p: &PagedExperts| -> WeightTensor {
             let rest = views.buf.numel().saturating_sub(rel);
             let len = if own_len > 0 { own_len.min(rest) } else { rest };
@@ -229,10 +237,14 @@ impl ExpertStack {
                 awq_scale: None,
             }
         };
-        Ok((
+        let out = (
             mk(views.gate_up_rel, views.gate_up_len, gp),
             mk(views.down_rel, views.down_len, dp),
-        ))
+        );
+        if let Some(t) = t_pair {
+            page_timing::record(Phase::ExpertPair, t.elapsed().as_nanos() as u64);
+        }
+        Ok(out)
     }
 
     pub fn free(self, gpu: &mut Gpu) {
@@ -362,12 +374,18 @@ pub fn moe_forward(
         // `weight_gemv` dispatches on the stack's dtype, so a quantised expert
         // runs its own kernel rather than being dequantised into scratch.
         let (gu, dn) = ExpertStack::expert_pair(&w.gate_up, &w.down, gpu, e)?;
-        weight_gemv(gpu, &gu, x, &s.gu)?;
+        hipfire_runtime::weight_pager::page_timing::timed(
+            hipfire_runtime::weight_pager::page_timing::Phase::ExpertGemv,
+            || weight_gemv(gpu, &gu, x, &s.gu),
+        )?;
         // Contiguous halves of the projection output, gate FIRST.
         let gate = s.gu.sub_offset(0, mi);
         let up = s.gu.sub_offset(mi, mi);
         gpu.silu_mul_f32(&gate, &up, &s.inter)?;
-        weight_gemv(gpu, &dn, &s.inter, &s.expert_out)?;
+        hipfire_runtime::weight_pager::page_timing::timed(
+            hipfire_runtime::weight_pager::page_timing::Phase::ExpertGemv,
+            || weight_gemv(gpu, &dn, &s.inter, &s.expert_out),
+        )?;
         // The routing weight scales the expert's OUTPUT, after `down`.
         // Slot 0 overwrites; the rest accumulate. Saves a zero-fill pass.
         gpu.moe_accum_scaled(
@@ -387,7 +405,11 @@ pub fn moe_forward(
     weight_gemv(gpu, &w.shared_down, &s.sinter, &s.sout)?;
     weight_gemv(gpu, &w.shared_expert_gate, x, &s.sgate)?;
     gpu.moe_shared_gate(&s.sout, &s.sgate, &s.sout, hidden as i32)?;
-    gpu.add_inplace_f32(out, &s.sout)
+    let r = gpu.add_inplace_f32(out, &s.sout);
+    // One "admission" per layer, matching qwen35's cadence, so the shared dump
+    // threshold means the same thing on both paths.
+    hipfire_runtime::weight_pager::page_timing::admission(idx.len());
+    r
 }
 
 // ── GPU teardown ────────────────────────────────────────────────────────────
