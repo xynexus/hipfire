@@ -19,10 +19,11 @@ mod ffi;
 mod kernarg;
 mod rccl;
 mod rocblas;
+pub mod vmm;
 
 pub use error::{
-    HipError, HipResult, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED, HIP_ERROR_PEER_ACCESS_NOT_ENABLED,
-    HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
+    HipError, HipResult, HIP_ERROR_OUT_OF_MEMORY, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED,
+    HIP_ERROR_PEER_ACCESS_NOT_ENABLED, HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
 };
 pub use ffi::alloc_stats;
 pub use ffi::launch_counters;

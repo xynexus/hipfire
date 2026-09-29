@@ -5,7 +5,23 @@
 //! GPU memory pool — eliminates hipMalloc/hipFree overhead in the hot loop.
 //! Pre-allocates buffers of common sizes and reuses them via a free list.
 
-use hip_bridge::{BufferOrigin, DeviceBuffer, HipResult, HipRuntime};
+use hip_bridge::{
+    BufferOrigin, DeviceBuffer, HipError, HipResult, HipRuntime, HIP_ERROR_OUT_OF_MEMORY,
+};
+
+/// Device memory the pool leaves free for the runtime, `HIPFIRE_POOL_HEADROOM_MB`
+/// (default 2048; 0 disables the check). See `GpuPool::alloc`.
+pub fn pool_headroom_bytes() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("HIPFIRE_POOL_HEADROOM_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(2048)
+            * 1024
+            * 1024
+    })
+}
 use std::collections::HashMap;
 
 const MIN_ALLOC: usize = 256;
@@ -121,7 +137,36 @@ impl GpuPool {
         // `hip.malloc` stamps Direct. The pool is taking responsibility for this
         // buffer from here on, so re-stamp it Pooled: that is what routes it back
         // to `GpuPool::free` instead of `hipFree` when the caller is done.
-        Ok(hip.malloc(actual)?.with_origin(BufferOrigin::Pooled))
+        // Keep headroom for the runtime's own allocations (kernel scratch, signals,
+        // staging): drain the cache, or fail, BEFORE the driver runs dry. Draining
+        // after it had deadlocked: `hipFree` synchronises the device, while queued
+        // work waited on runtime memory that only a free could release — the GPU sat
+        // idle and the daemon spun in `hipFree` until killed. Failing here instead is
+        // a clean `hipError=2` the batch runner splits and retries on.
+        let headroom = pool_headroom_bytes();
+        if headroom > 0 {
+            let short = |hip: &HipRuntime| {
+                hip.get_vram_info()
+                    .ok()
+                    .filter(|&(free, _)| free < actual + headroom)
+                    .map(|(free, _)| free)
+            };
+            if short(hip).is_some() && self.free_lists.values().any(|list| !list.is_empty()) {
+                self.drain(hip);
+            }
+            if let Some(free) = short(hip) {
+                return Err(HipError::new(
+                    HIP_ERROR_OUT_OF_MEMORY,
+                    &format!(
+                        "hipMalloc({actual} bytes) would leave {:.1} MiB free, under the {} MiB headroom kept for the runtime (hipError=2)",
+                        free.saturating_sub(actual) as f64 / 1048576.0,
+                        headroom / 1048576
+                    ),
+                ));
+            }
+        }
+        let buf = hip.malloc(actual)?;
+        Ok(buf.with_origin(BufferOrigin::Pooled))
     }
 
     /// Return a buffer to the pool for reuse. The buffer's ACTUAL

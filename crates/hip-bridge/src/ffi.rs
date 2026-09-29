@@ -113,6 +113,49 @@ type HipGraphExec = *mut c_void;
 type HipHostMallocFn = unsafe extern "C" fn(*mut *mut c_void, usize, c_uint) -> u32;
 type HipHostFreeFn = unsafe extern "C" fn(*mut c_void) -> u32;
 
+// Virtual memory management — optional symbols; see `crate::vmm`. Layouts mirror
+// hip_runtime_api.h (hipMemAllocationProp is 32 bytes, location at 8, flags at 24;
+// hipMemAccessDesc is 12), checked against the header with offsetof.
+#[repr(C)]
+#[derive(Clone, Copy)]
+pub(crate) struct HipMemLocation {
+    pub(crate) kind: c_int,
+    pub(crate) id: c_int,
+}
+#[repr(C)]
+pub(crate) struct HipMemAllocationProp {
+    pub(crate) alloc_type: c_int,
+    pub(crate) requested_handle_type: c_int,
+    pub(crate) location: HipMemLocation,
+    pub(crate) win32_handle_meta_data: *mut c_void,
+    pub(crate) compression_type: u8,
+    pub(crate) gpu_direct_rdma_capable: u8,
+    pub(crate) usage: u16,
+}
+#[repr(C)]
+pub(crate) struct HipMemAccessDesc {
+    pub(crate) location: HipMemLocation,
+    pub(crate) flags: c_int,
+}
+const HIP_MEM_ALLOCATION_TYPE_PINNED: c_int = 1;
+const HIP_MEM_LOCATION_TYPE_DEVICE: c_int = 1;
+const HIP_MEM_ACCESS_FLAGS_PROT_READ_WRITE: c_int = 3;
+const HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM: c_int = 0;
+const HIP_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED: c_int = 89;
+type HipMemCreateFn =
+    unsafe extern "C" fn(*mut *mut c_void, usize, *const HipMemAllocationProp, u64) -> u32;
+type HipMemReleaseFn = unsafe extern "C" fn(*mut c_void) -> u32;
+type HipMemAddressReserveFn =
+    unsafe extern "C" fn(*mut *mut c_void, usize, usize, *mut c_void, u64) -> u32;
+type HipMemAddressFreeFn = unsafe extern "C" fn(*mut c_void, usize) -> u32;
+type HipMemMapFn = unsafe extern "C" fn(*mut c_void, usize, usize, *mut c_void, u64) -> u32;
+type HipMemUnmapFn = unsafe extern "C" fn(*mut c_void, usize) -> u32;
+type HipMemSetAccessFn =
+    unsafe extern "C" fn(*mut c_void, usize, *const HipMemAccessDesc, usize) -> u32;
+type HipMemRetainAllocationHandleFn = unsafe extern "C" fn(*mut *mut c_void, *mut c_void) -> u32;
+type HipMemGetAllocationGranularityFn =
+    unsafe extern "C" fn(*mut usize, *const HipMemAllocationProp, c_int) -> u32;
+
 // External-memory interop (dma-buf import) — CUDA-compat API; optional symbols. Lets the
 // GPU import an amdgpu GTT dma-buf as a native device pointer (the correct zero-copy
 // heterogeneous handoff, verified working on ROCm-7.14/gfx1151).
@@ -220,6 +263,15 @@ pub struct HipRuntime {
     fn_free: unsafe extern "C" fn(*mut c_void) -> u32,
     fn_host_malloc: Option<HipHostMallocFn>,
     fn_host_free: Option<HipHostFreeFn>,
+    fn_mem_create: Option<HipMemCreateFn>,
+    fn_mem_release: Option<HipMemReleaseFn>,
+    fn_mem_address_reserve: Option<HipMemAddressReserveFn>,
+    fn_mem_address_free: Option<HipMemAddressFreeFn>,
+    fn_mem_map: Option<HipMemMapFn>,
+    fn_mem_unmap: Option<HipMemUnmapFn>,
+    fn_mem_set_access: Option<HipMemSetAccessFn>,
+    fn_mem_retain_allocation_handle: Option<HipMemRetainAllocationHandleFn>,
+    fn_mem_get_allocation_granularity: Option<HipMemGetAllocationGranularityFn>,
     fn_memcpy: unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint) -> u32,
     fn_memcpy_async:
         unsafe extern "C" fn(*mut c_void, *const c_void, usize, c_uint, HipStream) -> u32,
@@ -451,6 +503,31 @@ impl HipRuntime {
                 fn_host_malloc: load_optional_fn!(lib, "hipHostMalloc", HipHostMallocFn),
                 fn_host_free: load_optional_fn!(lib, "hipHostFree", HipHostFreeFn)
                     .or_else(|| load_optional_fn!(lib, "hipFreeHost", HipHostFreeFn)),
+                fn_mem_create: load_optional_fn!(lib, "hipMemCreate", HipMemCreateFn),
+                fn_mem_release: load_optional_fn!(lib, "hipMemRelease", HipMemReleaseFn),
+                fn_mem_address_reserve: load_optional_fn!(
+                    lib,
+                    "hipMemAddressReserve",
+                    HipMemAddressReserveFn
+                ),
+                fn_mem_address_free: load_optional_fn!(
+                    lib,
+                    "hipMemAddressFree",
+                    HipMemAddressFreeFn
+                ),
+                fn_mem_map: load_optional_fn!(lib, "hipMemMap", HipMemMapFn),
+                fn_mem_unmap: load_optional_fn!(lib, "hipMemUnmap", HipMemUnmapFn),
+                fn_mem_set_access: load_optional_fn!(lib, "hipMemSetAccess", HipMemSetAccessFn),
+                fn_mem_retain_allocation_handle: load_optional_fn!(
+                    lib,
+                    "hipMemRetainAllocationHandle",
+                    HipMemRetainAllocationHandleFn
+                ),
+                fn_mem_get_allocation_granularity: load_optional_fn!(
+                    lib,
+                    "hipMemGetAllocationGranularity",
+                    HipMemGetAllocationGranularityFn
+                ),
                 fn_memcpy: load_fn!(
                     lib,
                     "hipMemcpy",
@@ -737,6 +814,163 @@ impl HipRuntime {
         let code = unsafe { (self.fn_get_device)(&mut id) };
         self.check(code, "hipGetDevice")?;
         Ok(id)
+    }
+
+    // ── Virtual memory management (see `crate::vmm`) ────────────
+
+    fn vmm_prop(&self) -> HipResult<HipMemAllocationProp> {
+        Ok(HipMemAllocationProp {
+            alloc_type: HIP_MEM_ALLOCATION_TYPE_PINNED,
+            requested_handle_type: 0,
+            location: HipMemLocation {
+                kind: HIP_MEM_LOCATION_TYPE_DEVICE,
+                id: self.current_device()?,
+            },
+            win32_handle_meta_data: ptr::null_mut(),
+            compression_type: 0,
+            gpu_direct_rdma_capable: 0,
+            usage: 0,
+        })
+    }
+
+    /// Minimum physical page size for [`Self::vmm_create`], or `None` when this
+    /// runtime or device has no virtual memory management.
+    pub fn vmm_granularity(&self) -> Option<usize> {
+        let (
+            Some(granularity),
+            Some(_),
+            Some(_),
+            Some(_),
+            Some(_),
+            Some(_),
+            Some(_),
+            Some(_),
+            Some(_),
+        ) = (
+            self.fn_mem_get_allocation_granularity,
+            self.fn_mem_create,
+            self.fn_mem_release,
+            self.fn_mem_address_reserve,
+            self.fn_mem_address_free,
+            self.fn_mem_map,
+            self.fn_mem_unmap,
+            self.fn_mem_set_access,
+            self.fn_mem_retain_allocation_handle,
+        )
+        else {
+            return None;
+        };
+        let device = self.current_device().ok()?;
+        let mut supported: c_int = 0;
+        let code = unsafe {
+            (self.fn_get_device_attribute)(
+                &mut supported,
+                HIP_DEVICE_ATTRIBUTE_VIRTUAL_MEMORY_MANAGEMENT_SUPPORTED,
+                device,
+            )
+        };
+        if code != 0 || supported == 0 {
+            return None;
+        }
+        let prop = self.vmm_prop().ok()?;
+        let mut bytes = 0usize;
+        let code =
+            unsafe { granularity(&mut bytes, &prop, HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM) };
+        (code == 0 && bytes > 0).then_some(bytes)
+    }
+
+    /// Reserve `size` bytes of device virtual address space, backed by nothing.
+    pub(crate) fn vmm_reserve(&self, size: usize) -> HipResult<*mut c_void> {
+        let f = self
+            .fn_mem_address_reserve
+            .ok_or_else(|| HipError::new(0, "no hipMemAddressReserve"))?;
+        let mut ptr = ptr::null_mut();
+        self.check(
+            unsafe { f(&mut ptr, size, 0, ptr::null_mut(), 0) },
+            "hipMemAddressReserve",
+        )?;
+        Ok(ptr)
+    }
+
+    pub(crate) fn vmm_free_reservation(&self, ptr: *mut c_void, size: usize) -> HipResult<()> {
+        let f = self
+            .fn_mem_address_free
+            .ok_or_else(|| HipError::new(0, "no hipMemAddressFree"))?;
+        self.check(unsafe { f(ptr, size) }, "hipMemAddressFree")
+    }
+
+    /// Back `[ptr, ptr+size)` with fresh physical memory (grant access afterwards with
+    /// [`Self::vmm_set_access`]). The handle is released at once: the mapping keeps the
+    /// memory alive until its last unmap.
+    pub(crate) fn vmm_map_new(&self, ptr: *mut c_void, size: usize) -> HipResult<()> {
+        let (create, release, map) = (
+            self.fn_mem_create
+                .ok_or_else(|| HipError::new(0, "no hipMemCreate"))?,
+            self.fn_mem_release
+                .ok_or_else(|| HipError::new(0, "no hipMemRelease"))?,
+            self.fn_mem_map
+                .ok_or_else(|| HipError::new(0, "no hipMemMap"))?,
+        );
+        let prop = self.vmm_prop()?;
+        let mut handle = ptr::null_mut();
+        self.check(
+            unsafe { create(&mut handle, size, &prop, 0) },
+            "hipMemCreate",
+        )?;
+        let mapped = self.check(unsafe { map(ptr, size, 0, handle, 0) }, "hipMemMap");
+        let _ = unsafe { release(handle) };
+        mapped
+    }
+
+    /// Map the physical memory already behind `src` at `dst` too — the two ranges
+    /// then read and write the same bytes. `size` must cover exactly one mapping's
+    /// worth (one page as created by [`Self::vmm_map_new`]).
+    pub(crate) fn vmm_map_alias(
+        &self,
+        dst: *mut c_void,
+        src: *mut c_void,
+        size: usize,
+    ) -> HipResult<()> {
+        let (retain, release, map) = (
+            self.fn_mem_retain_allocation_handle
+                .ok_or_else(|| HipError::new(0, "no hipMemRetainAllocationHandle"))?,
+            self.fn_mem_release
+                .ok_or_else(|| HipError::new(0, "no hipMemRelease"))?,
+            self.fn_mem_map
+                .ok_or_else(|| HipError::new(0, "no hipMemMap"))?,
+        );
+        let mut handle = ptr::null_mut();
+        self.check(
+            unsafe { retain(&mut handle, src) },
+            "hipMemRetainAllocationHandle",
+        )?;
+        let mapped = self.check(unsafe { map(dst, size, 0, handle, 0) }, "hipMemMap");
+        let _ = unsafe { release(handle) };
+        mapped
+    }
+
+    /// Make a mapped span readable and writable by the current device. Once per span
+    /// rather than per page: the call costs about as much as a map.
+    pub(crate) fn vmm_set_access(&self, ptr: *mut c_void, size: usize) -> HipResult<()> {
+        let f = self
+            .fn_mem_set_access
+            .ok_or_else(|| HipError::new(0, "no hipMemSetAccess"))?;
+        let desc = HipMemAccessDesc {
+            location: HipMemLocation {
+                kind: HIP_MEM_LOCATION_TYPE_DEVICE,
+                id: self.current_device()?,
+            },
+            flags: HIP_MEM_ACCESS_FLAGS_PROT_READ_WRITE,
+        };
+        self.check(unsafe { f(ptr, size, &desc, 1) }, "hipMemSetAccess")
+    }
+
+    /// Unmap `[ptr, ptr+size)`. Physical memory is freed once no mapping remains.
+    pub(crate) fn vmm_unmap(&self, ptr: *mut c_void, size: usize) -> HipResult<()> {
+        let f = self
+            .fn_mem_unmap
+            .ok_or_else(|| HipError::new(0, "no hipMemUnmap"))?;
+        self.check(unsafe { f(ptr, size) }, "hipMemUnmap")
     }
 
     // ── Multi-device / peer access ──────────────────────────────

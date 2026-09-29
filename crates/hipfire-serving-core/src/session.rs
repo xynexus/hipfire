@@ -68,6 +68,10 @@ pub struct SessionRegistry<S> {
     pub sessions: std::collections::HashMap<String, S>,
     pub active_session_id: Option<String>,
     pub allocation_epoch: u64,
+    /// KV positions a session about to be allocated or forked should hold, keyed
+    /// by session id and consumed when that happens. Absent = the model's full
+    /// `physical_cap`. Set by the batch prefill once it knows prompt + max_tokens.
+    pub kv_caps: std::collections::HashMap<String, usize>,
 }
 
 // Manual `Default` (not derived) so it does not impose `S: Default` — the
@@ -78,6 +82,7 @@ impl<S> Default for SessionRegistry<S> {
             sessions: std::collections::HashMap::new(),
             active_session_id: None,
             allocation_epoch: 0,
+            kv_caps: std::collections::HashMap::new(),
         }
     }
 }
@@ -262,6 +267,7 @@ impl Qwen35RequestSessionState {
             kvarn_shadow: None,
             kvarn_tiles: None,
             hier: None,
+            pages: None,
         })
     }
 
@@ -285,7 +291,16 @@ impl Qwen35RequestSessionState {
         gpu: &mut hipfire_rdna::Gpu,
         source: &Qwen35RequestSessionState,
     ) -> Result<Self, String> {
-        let kv = Self::clone_kv_cache(gpu, source.kv_cache())?;
+        let src_kv = source.kv_cache();
+        // A paged source shares the pages behind what it has already written; the
+        // rest is copied. Pooled caches are deep-copied as before.
+        let kv = if src_kv.pages.is_some() {
+            src_kv
+                .fork_paged(gpu, source.cursor.seq_pos, src_kv.physical_cap)
+                .map_err(|e| format!("fork paged KV: {e}"))?
+        } else {
+            Self::clone_kv_cache(gpu, src_kv)?
+        };
         let dn = Self::clone_dn_state(gpu, source.dn_state())?;
         Ok(Self {
             cursor: source.cursor.clone(),
@@ -299,6 +314,45 @@ impl Qwen35RequestSessionState {
             prefilled_generated_suffix_len: source.prefilled_generated_suffix_len,
             allocation_epoch: next_qwen35_state_allocation_epoch(),
         })
+    }
+
+    /// Re-home this session's KVarN cache into one holding `physical_cap`
+    /// positions ([`kv::KvCache::grow_kvarn`]); a no-op if it already does.
+    pub fn grow_kv_cache(
+        &mut self,
+        gpu: &mut hipfire_rdna::Gpu,
+        physical_cap: usize,
+        is_kv_layer: &[bool],
+    ) -> Result<(), String> {
+        let old = self
+            .sequence_state
+            .kv
+            .as_ref()
+            .ok_or_else(|| "qwen35 session has no KV cache".to_string())?;
+        if physical_cap <= old.physical_cap {
+            return Ok(());
+        }
+        if old.pages.is_some() {
+            return self
+                .sequence_state
+                .kv
+                .as_mut()
+                .expect("checked above")
+                .grow_paged(gpu, physical_cap)
+                .map_err(|e| format!("grow paged session KV to {physical_cap}: {e}"));
+        }
+        // Sessions are only sized below full for KVarN (see the batch prefill),
+        // so no other mode can reach here needing to grow.
+        if !old.quant_kvarn {
+            return Err("growing a session's KV is implemented for KVarN only".to_string());
+        }
+        let grown = old
+            .grow_kvarn(gpu, physical_cap, is_kv_layer)
+            .map_err(|e| format!("grow session KV to {physical_cap}: {e}"))?;
+        if let Some(old) = self.sequence_state.kv.replace(grown) {
+            old.free_gpu(gpu);
+        }
+        Ok(())
     }
 
     /// Move the active model's live KV/DeltaNet/logits state out into an owned
@@ -1344,6 +1398,20 @@ pub fn validate_qwen35_fused_grouped_moe_prefill_model_capability(
     if m.q35_scratch.is_none() {
         return Err("qwen35 grouped-MoE fused prefill requires qwen35 scratch".to_string());
     }
+    // The fused body refuses these weights per layer at execution; checked here,
+    // `auto` picks serial instead of failing every batch that selects fused.
+    if let Some(weights) = m.q35_weights.as_ref() {
+        let unsupported = weights.layers.iter().any(|layer| {
+            matches!(layer, qwen35::LayerWeights::DeltaNetMoe(l)
+                if !qwen35::grouped_moe_prefix_supports_attention(l))
+        });
+        if unsupported {
+            return Err(
+                "grouped MoE session fused prefix does not support this model's DeltaNet-MoE attention weight format"
+                    .to_string(),
+            );
+        }
+    }
     if config.paged_experts {
         if let Some(weights) = m.q35_weights.as_ref() {
             qwen35::validate_paged_moe_decode_expert_cache(weights, config)?;
@@ -1699,6 +1767,18 @@ pub fn qwen35_active_logical_position(m: &LoadedModel) -> Result<usize, String> 
     Ok(m.active.cursor.seq_pos + compact_offset)
 }
 
+/// Logical positions a resident qwen35 session can hold: its own KV `physical_cap`
+/// (not the model's — a session's cache is what the kernels index) plus any
+/// compacted-away prefix. `None` if the session is not resident.
+pub fn qwen35_session_kv_capacity(m: &LoadedModel, session_id: &str) -> Option<usize> {
+    let kv = if m.q35_registry.active_session_id.as_deref() == Some(session_id) {
+        m.kv_cache()?
+    } else {
+        m.q35_registry.sessions.get(session_id)?.kv_cache()
+    };
+    Some(kv.physical_cap + kv.compact_offset)
+}
+
 /// Per-layer token-mixer profile for a qwen3.5 hybrid stack: `FullAttention`
 /// layers are KV-backed [`MixerKind::FullAttn`], `LinearAttention` layers are
 /// recurrent [`MixerKind::DeltaNet`] (no KV). The KV allocator consumes
@@ -1720,10 +1800,26 @@ pub(crate) fn qwen35_mixer_profile(layer_types: &[LayerType]) -> MixerProfile {
 /// Allocate (or reuse) the resident session-state slot for a session id,
 /// parking any other active session first; the entry point that makes a session
 /// the live one before prefill.
+/// Page-backed KVarN session caches; `HIPFIRE_KV_PAGED=0` keeps pooled buffers.
+fn paged_kv_enabled() -> bool {
+    !matches!(
+        std::env::var("HIPFIRE_KV_PAGED").as_deref(),
+        Ok("0" | "off" | "false" | "no")
+    )
+}
+
 pub fn qwen35_allocate_session_state(
     m: &LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
+    session_id: &str,
 ) -> Result<Qwen35RequestSessionState, String> {
+    // Read, not taken: the batch prefill that set it clears it once the session
+    // is activated.
+    let physical_cap = m
+        .q35_registry
+        .kv_caps
+        .get(session_id)
+        .map_or(m.physical_cap, |&cap| cap.min(m.physical_cap));
     let config = m
         .q35_config
         .as_ref()
@@ -1737,9 +1833,8 @@ pub fn qwen35_allocate_session_state(
     // `physical_cap=N / max_seq=N`, kvarn reports neither — so an over-sized KV
     // was invisible on the mode operators are meant to use.
     tracing::info!(
-        "session KV: mode={kv_mode} max_seq={} physical_cap={}",
+        "session KV: mode={kv_mode} max_seq={} physical_cap={physical_cap}",
         m.max_seq,
-        m.physical_cap
     );
     let kv_cache = match kv_mode {
         "fp32" | "f32" => {
@@ -1759,7 +1854,7 @@ pub fn qwen35_allocate_session_state(
             config.n_kv_heads,
             config.head_dim,
             m.max_seq,
-            m.physical_cap,
+            physical_cap,
         )
         .map_err(|e| format!("{e}"))?,
         "asym4" | "turbo4" => kv::KvCache::new_gpu_asym4_capped(
@@ -1768,7 +1863,7 @@ pub fn qwen35_allocate_session_state(
             config.n_kv_heads,
             config.head_dim,
             m.max_seq,
-            m.physical_cap,
+            physical_cap,
         )
         .map_err(|e| format!("{e}"))?,
         "asym2" | "turbo2" => kv::KvCache::new_gpu_asym2_capped(
@@ -1777,7 +1872,7 @@ pub fn qwen35_allocate_session_state(
             config.n_kv_heads,
             config.head_dim,
             m.max_seq,
-            m.physical_cap,
+            physical_cap,
         )
         .map_err(|e| format!("{e}"))?,
         "asym3" | "turbo3" | "turbo" if config.head_dim == 256 => {
@@ -1787,7 +1882,7 @@ pub fn qwen35_allocate_session_state(
                 config.n_kv_heads,
                 config.head_dim,
                 m.max_seq,
-                m.physical_cap,
+                physical_cap,
             )
             .map_err(|e| format!("{e}"))?
         }
@@ -1804,7 +1899,7 @@ pub fn qwen35_allocate_session_state(
             config.n_kv_heads,
             config.head_dim,
             m.max_seq,
-            m.physical_cap,
+            physical_cap,
         )
         .map_err(|e| format!("{e}"))?,
         "auto" | "" => kv::KvCache::new_gpu_q8_capped(
@@ -1813,7 +1908,7 @@ pub fn qwen35_allocate_session_state(
             config.n_kv_heads,
             config.head_dim,
             m.max_seq,
-            m.physical_cap,
+            physical_cap,
         )
         .map_err(|e| format!("{e}"))?,
         "asym3" | "turbo3" | "turbo" => {
@@ -1837,16 +1932,42 @@ pub fn qwen35_allocate_session_state(
         // into the KV write, so kvarn is batched here exactly as q8/asym are.
         // The separate ladder is a leftover from when the choice was fp16 vs
         // asym3 and only the rotated modes had a batched masked kernel.
-        "kvarn" | "kvarn2" | "kvarn4" | "kvarn8" => kv::KvCache::new_gpu_kvarn_capped(
-            gpu,
-            config.n_layers,
-            config.n_kv_heads,
-            config.head_dim,
-            m.max_seq,
-            m.physical_cap,
-            crate::load::kvarn_bits_from_mode(kv_mode),
-        )
-        .map_err(|e| format!("{e}"))?,
+        // Filtered like the fp32 arm and the load-time cache: only full-attention
+        // layers read KV. Unfiltered, every DeltaNet layer (48 of 64 on the 27B)
+        // carried a full-length KV that nothing touches — 4x the session's memory.
+        "kvarn" | "kvarn2" | "kvarn4" | "kvarn8" => {
+            let mask = qwen35_mixer_profile(&config.layer_types).kv_layer_mask();
+            let bits = crate::load::kvarn_bits_from_mode(kv_mode);
+            // Page-backed where the device can map memory: grows in place and lets a
+            // fork share the prefix it was forked at. Falls back to pooled buffers.
+            let paged = if paged_kv_enabled() {
+                kv::KvCache::new_gpu_kvarn_paged(
+                    gpu,
+                    &mask,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    m.max_seq,
+                    physical_cap,
+                    bits,
+                )
+                .map_err(|e| format!("{e}"))?
+            } else {
+                None
+            };
+            match paged {
+                Some(kv) => kv,
+                None => kv::KvCache::new_gpu_kvarn_capped_filtered(
+                    gpu,
+                    &mask,
+                    config.n_kv_heads,
+                    config.head_dim,
+                    m.max_seq,
+                    physical_cap,
+                    bits,
+                )
+                .map_err(|e| format!("{e}"))?,
+            }
+        }
         other => {
             tracing::warn!("batch-prefill KV cache: unrecognized '{other}', defaulting to asym3");
             kv::KvCache::new_gpu_asym3_capped(
@@ -1855,7 +1976,7 @@ pub fn qwen35_allocate_session_state(
                 config.n_kv_heads,
                 config.head_dim,
                 m.max_seq,
-                m.physical_cap,
+                physical_cap,
             )
             .map_err(|e| format!("{e}"))?
         }
@@ -1911,7 +2032,7 @@ pub fn qwen35_activate_session(
     qwen35_save_active_session(m, gpu)?;
     let session = match m.q35_registry.sessions.remove(session_id) {
         Some(session) => session,
-        None => qwen35_allocate_session_state(m, gpu)?,
+        None => qwen35_allocate_session_state(m, gpu, session_id)?,
     };
     session.restore_into_loaded(m, gpu)?;
     m.q35_registry.active_session_id = Some(session_id.to_string());
@@ -2154,7 +2275,26 @@ pub fn qwen35_fork_session_state(
         .sessions
         .get(request.source_session_id)
         .expect("source residency was validated");
-    let forked = Qwen35RequestSessionState::fork_from(gpu, source)?;
+    let mut forked = Qwen35RequestSessionState::fork_from(gpu, source)?;
+    // Being forked from is a use. Eviction is oldest-first by this epoch, so without
+    // the touch a prefix every request attaches to — minted first, hence oldest — was
+    // the first thing evicted, and each request then re-prefilled it in full.
+    if let Some(source) = m.q35_registry.sessions.get_mut(request.source_session_id) {
+        source.allocation_epoch = next_qwen35_state_allocation_epoch();
+    }
+    // A checkpoint carries the capacity of the request it was taken from; the
+    // request attaching to it may need more room than that.
+    if let Some(cap) = m.q35_registry.kv_caps.remove(request.dest_session_id) {
+        let config = m
+            .q35_config
+            .as_ref()
+            .ok_or_else(|| "qwen35 config missing".to_string())?;
+        let is_kv_layer = qwen35_mixer_profile(&config.layer_types).kv_layer_mask();
+        if let Err(e) = forked.grow_kv_cache(gpu, cap.min(m.physical_cap), &is_kv_layer) {
+            forked.free_gpu(gpu);
+            return Err(e);
+        }
+    }
     m.q35_registry
         .sessions
         .insert(request.dest_session_id.to_string(), forked);
@@ -2370,7 +2510,9 @@ fn resident_session_limit() -> usize {
         std::env::var("HIPFIRE_SCHED_RESIDENT_STATE_MAX")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(8)
+            // Counts only sessions not in use by the current batch, so it is the
+            // parked + checkpoint budget; the server keeps up to 16 checkpoints.
+            .unwrap_or(32)
             .clamp(1, 64)
     })
 }
@@ -2393,10 +2535,14 @@ fn resident_session_limit() -> usize {
 /// `session_id`, so every session is created, used once and dropped. Give
 /// `Qwen35RequestSessionState` a touch timestamp and feed that in instead the
 /// moment multi-turn session reuse becomes reachable.
+/// ponytail: sessions of a batch the server parked (preempted) are still
+/// candidates — the daemon cannot see them. Have the server pass its parked ids
+/// if a preemption ever stacks over the limit.
 pub fn qwen35_evict_sessions_over_limit(
     m: &mut LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
     limit: usize,
+    in_use: &[&str],
 ) -> Result<usize, String> {
     if !is_qwen35_family_arch_id(m.arch_id) || m.pp != 1 {
         return Ok(0);
@@ -2406,6 +2552,7 @@ pub fn qwen35_evict_sessions_over_limit(
         .q35_registry
         .sessions
         .iter()
+        .filter(|(id, _)| !in_use.contains(&id.as_str()))
         .map(|(id, session)| (id.clone(), session.allocation_epoch))
         .collect();
     let victims = eviction_victims(&sessions, active.as_deref(), limit);

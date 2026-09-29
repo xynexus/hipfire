@@ -13,6 +13,7 @@ pub type HipErrorCode = u32;
 /// HIP operation result.
 pub type HipResult<T> = Result<T, HipError>;
 
+pub const HIP_ERROR_OUT_OF_MEMORY: HipErrorCode = 2;
 pub const HIP_ERROR_PEER_ACCESS_UNSUPPORTED: HipErrorCode = 217;
 pub const HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED: HipErrorCode = 704;
 pub const HIP_ERROR_PEER_ACCESS_NOT_ENABLED: HipErrorCode = 705;

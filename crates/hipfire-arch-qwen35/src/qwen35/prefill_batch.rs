@@ -1048,22 +1048,6 @@ pub fn prefill_session_batch_gated_delta_net_f16_layer(
     )
 }
 
-pub fn dense_prefill_session_batch_scatter_last_logits(
-    gpu: &mut Gpu,
-    device_tables: &DensePrefillSessionBatchDevicePointerTables,
-    batch_logits: &GpuTensor,
-    vocab_size: usize,
-    sessions: usize,
-) -> HipResult<()> {
-    gpu.scatter_session_last_logits_f32(
-        batch_logits,
-        &device_tables.logits_ptrs,
-        &device_tables.session_last_row_indices,
-        vocab_size,
-        sessions,
-    )
-}
-
 pub(crate) fn dense_prefill_session_batch_logits_full_precision(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -1229,6 +1213,57 @@ pub(crate) fn dense_prefill_session_batch_logits_full_precision(
     }
 }
 
+/// DeltaNet-MoE attention weight formats the grouped-MoE fused prefix computes.
+/// The capability check calls this too, so `auto` routes a model the body would
+/// refuse (the 35B-A3B's OqCompact attention) to serial instead of selecting the
+/// fused body and failing every batch it lands on.
+pub fn grouped_moe_prefix_supports_attention(layer: &DeltaNetMoeLayerWeights) -> bool {
+    let dtypes = [
+        layer.wqkv.gpu_dtype,
+        layer.wz.gpu_dtype,
+        layer.w_alpha.gpu_dtype,
+        layer.w_beta.gpu_dtype,
+    ];
+    let all = |want: DType| dtypes.iter().all(|d| *d == want);
+    all(DType::Q8_0)
+        || all(DType::MQ4G256)
+        || all(DType::MQ6G256)
+        || dtypes
+            .iter()
+            .all(|d| matches!(d, DType::F32 | DType::F16 | DType::BF16 | DType::Raw))
+}
+
+/// Move each session's last hidden row to the front of `pbs.x_batch`, and return
+/// the identity row table that scatters logits row `i` to session `i`.
+///
+/// Only a session's last row feeds a logit anyone reads. Running the vocab-wide
+/// lm_head over every prompt row instead cost a `[rows x vocab]` F32 buffer —
+/// 2.5 GB for 4 sessions of ~630 tokens — and a GEMM ~630x larger than needed,
+/// to keep 4 rows. Gathered through a separate buffer: in place, session `i`'s
+/// source row can be one another block is overwriting.
+fn compact_session_last_rows(
+    gpu: &mut Gpu,
+    pbs: &PrefillBatchScratch,
+    device_tables: &DensePrefillSessionBatchDevicePointerTables,
+    dim: usize,
+    sessions: usize,
+) -> HipResult<GpuTensor> {
+    let last_rows = gpu.alloc_tensor(&[sessions * dim], DType::F32)?;
+    let gathered = gpu
+        .embedding_lookup_f32_batched(
+            &pbs.x_batch,
+            &last_rows,
+            &device_tables.session_last_row_indices,
+            sessions,
+            dim,
+        )
+        .and_then(|()| gpu.memcpy_dtod_auto(&pbs.x_batch.buf, &last_rows.buf, sessions * dim * 4));
+    let _ = gpu.free_tensor(last_rows);
+    gathered?;
+    let identity: Vec<i32> = (0..sessions as i32).collect();
+    alloc_and_upload_i32_table(gpu, &identity)
+}
+
 pub fn dense_prefill_session_batch_final_logits_full_precision(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -1238,25 +1273,33 @@ pub fn dense_prefill_session_batch_final_logits_full_precision(
     row_count: usize,
     sessions: usize,
 ) -> HipResult<()> {
-    let batch_logits = gpu.alloc_tensor(&[row_count * config.vocab_size], DType::F32)?;
+    if sessions == 0 || sessions > row_count {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "dense session prefill final logits needs 1..=row_count sessions",
+        ));
+    }
+    let identity = compact_session_last_rows(gpu, pbs, device_tables, config.dim, sessions)?;
+    let batch_logits = gpu.alloc_tensor(&[sessions * config.vocab_size], DType::F32)?;
     let result = dense_prefill_session_batch_logits_full_precision(
         gpu,
         weights,
         config,
         pbs,
         &batch_logits,
-        row_count,
+        sessions,
     )
     .and_then(|()| {
-        dense_prefill_session_batch_scatter_last_logits(
-            gpu,
-            device_tables,
+        gpu.scatter_session_last_logits_f32(
             &batch_logits,
+            &device_tables.logits_ptrs,
+            &identity,
             config.vocab_size,
             sessions,
         )
     });
     let _ = gpu.free_tensor(batch_logits);
+    let _ = gpu.free_tensor(identity);
     result
 }
 
@@ -1281,6 +1324,15 @@ pub fn grouped_moe_prefill_session_batch_final_logits(
             "grouped MoE session prefill final logits row_count exceeds PrefillBatchScratch max_batch",
         ));
     }
+    if sessions == 0 || sessions > row_count {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "grouped MoE session prefill final logits needs 1..=row_count sessions",
+        ));
+    }
+    // Only the last row per session is read; see `compact_session_last_rows`.
+    let identity = compact_session_last_rows(gpu, pbs, device_tables, config.dim, sessions)?;
+    let row_count = sessions;
 
     let normed_rows = pbs.x_norm_batch.sub_offset(0, row_count * config.dim);
     gpu.rmsnorm_batched(
@@ -1396,13 +1448,15 @@ pub fn grouped_moe_prefill_session_batch_final_logits(
             ),
         )),
     }?;
-    dense_prefill_session_batch_scatter_last_logits(
-        gpu,
-        device_tables,
+    let scattered = gpu.scatter_session_last_logits_f32(
         &batch_logits,
+        &device_tables.logits_ptrs,
+        &identity,
         config.vocab_size,
         sessions,
-    )?;
+    );
+    let _ = gpu.free_tensor(identity);
+    scattered?;
     // `batch_logits` (RAII `OwnedTensor`) returns to the pool on drop.
     drop(batch_logits);
     gpu.reclaim_pending();
@@ -2920,7 +2974,16 @@ fn forward_dense_session_batch_layers_full_precision(
                     &pbs.up_batch,
                     row_count,
                 )?;
-                gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
+                // Scratch is sized for the largest batch seen, which is a prefill;
+                // a decode step has one row per session. Over the whole buffer this
+                // does prefill-sized work on every decode step, so bound it to the
+                // live rows.
+                let ffn_len = row_count * config.hidden_dim;
+                gpu.silu_mul_f32(
+                    &pbs.gate_ffn_batch.sub_offset(0, ffn_len),
+                    &pbs.up_batch.sub_offset(0, ffn_len),
+                    &pbs.ffn_hidden_batch.sub_offset(0, ffn_len),
+                )?;
                 capture_streamed_dense_input(
                     gpu,
                     dense_capture,
@@ -3175,7 +3238,14 @@ fn forward_dense_session_batch_layers_full_precision(
                         row_count,
                     )?;
                 }
-                qwen35_apply_fa_gate(gpu, config, &pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
+                // Live rows only: scratch keeps its prefill size through decode.
+                let q_len = row_count * qwen35_fa_q_dim(config);
+                qwen35_apply_fa_gate(
+                    gpu,
+                    config,
+                    &pbs.fa_attn_out_batch.sub_offset(0, q_len),
+                    &pbs.fa_gate_batch.sub_offset(0, q_len),
+                )?;
                 capture_streamed_dense_input(
                     gpu,
                     dense_capture,
@@ -3225,7 +3295,16 @@ fn forward_dense_session_batch_layers_full_precision(
                     &pbs.up_batch,
                     row_count,
                 )?;
-                gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
+                // Scratch is sized for the largest batch seen, which is a prefill;
+                // a decode step has one row per session. Over the whole buffer this
+                // does prefill-sized work on every decode step, so bound it to the
+                // live rows.
+                let ffn_len = row_count * config.hidden_dim;
+                gpu.silu_mul_f32(
+                    &pbs.gate_ffn_batch.sub_offset(0, ffn_len),
+                    &pbs.up_batch.sub_offset(0, ffn_len),
+                    &pbs.ffn_hidden_batch.sub_offset(0, ffn_len),
+                )?;
                 capture_streamed_dense_input(
                     gpu,
                     dense_capture,
@@ -3914,32 +3993,17 @@ fn forward_grouped_moe_session_batch_layers(
         let capture_layer_idx = logical_layer_idx.unwrap_or(layer_idx);
         match (layer_weights, config.layer_types[layer_idx]) {
             (LayerWeights::DeltaNetMoe(layer), LayerType::LinearAttention) => {
-                let attn_is_q8 = matches!(layer.wqkv.gpu_dtype, DType::Q8_0)
-                    && matches!(layer.wz.gpu_dtype, DType::Q8_0)
-                    && matches!(layer.w_alpha.gpu_dtype, DType::Q8_0)
-                    && matches!(layer.w_beta.gpu_dtype, DType::Q8_0);
-                let attn_is_mq4 = matches!(layer.wqkv.gpu_dtype, DType::MQ4G256)
-                    && matches!(layer.wz.gpu_dtype, DType::MQ4G256)
-                    && matches!(layer.w_alpha.gpu_dtype, DType::MQ4G256)
-                    && matches!(layer.w_beta.gpu_dtype, DType::MQ4G256);
-                let attn_is_mq6 = matches!(layer.wqkv.gpu_dtype, DType::MQ6G256)
-                    && matches!(layer.wz.gpu_dtype, DType::MQ6G256)
-                    && matches!(layer.w_alpha.gpu_dtype, DType::MQ6G256)
-                    && matches!(layer.w_beta.gpu_dtype, DType::MQ6G256);
-                let attn_is_raw = [
-                    layer.wqkv.gpu_dtype,
-                    layer.wz.gpu_dtype,
-                    layer.w_alpha.gpu_dtype,
-                    layer.w_beta.gpu_dtype,
-                ]
-                .into_iter()
-                .all(|dtype| matches!(dtype, DType::F32 | DType::F16 | DType::BF16 | DType::Raw));
-                if !attn_is_q8 && !attn_is_mq4 && !attn_is_mq6 && !attn_is_raw {
+                if !grouped_moe_prefix_supports_attention(layer) {
                     return Err(hip_bridge::HipError::new(
                         0,
                         "grouped MoE session fused prefix supports raw F32/F16/BF16, Q8, MQ4, or MQ6 DeltaNet-MoE attention weights",
                     ));
                 }
+                // Past the check above the four are one format (raw never includes
+                // these), so `wqkv` alone says which.
+                let attn_is_q8 = matches!(layer.wqkv.gpu_dtype, DType::Q8_0);
+                let attn_is_mq4 = matches!(layer.wqkv.gpu_dtype, DType::MQ4G256);
+                let attn_is_mq6 = matches!(layer.wqkv.gpu_dtype, DType::MQ6G256);
                 if attn_is_mq4 || attn_is_mq6 {
                     fused_rmsnorm_rotate_mq_batched_for(
                         gpu,
@@ -4661,7 +4725,14 @@ fn forward_grouped_moe_session_batch_layers(
                         row_count,
                     )?;
                 }
-                qwen35_apply_fa_gate(gpu, config, &pbs.fa_attn_out_batch, &pbs.fa_gate_batch)?;
+                // Live rows only: scratch keeps its prefill size through decode.
+                let q_len = row_count * qwen35_fa_q_dim(config);
+                qwen35_apply_fa_gate(
+                    gpu,
+                    config,
+                    &pbs.fa_attn_out_batch.sub_offset(0, q_len),
+                    &pbs.fa_gate_batch.sub_offset(0, q_len),
+                )?;
                 capture_streamed_dense_input(
                     gpu,
                     dense_capture,
@@ -5036,6 +5107,28 @@ impl PrefillBatchScratch {
     }
 
     pub fn new(gpu: &mut Gpu, config: &Qwen35Config, max_batch: usize) -> HipResult<Self> {
+        Self::build(gpu, config, max_batch, true)
+    }
+
+    /// For callers that never run tree verification — the continuous-batching
+    /// session prefill/decode. `dn_s_tape` holds a full DeltaNet state PER ROW
+    /// (3 MiB/row on the 27B), sized for a spec-verify batch of ~22; a session
+    /// batch sizes rows by its prompts, so 4 x 630-token prompts allocated a
+    /// 7.9 GB tape that nothing read.
+    pub fn new_without_tree_tape(
+        gpu: &mut Gpu,
+        config: &Qwen35Config,
+        max_batch: usize,
+    ) -> HipResult<Self> {
+        Self::build(gpu, config, max_batch, false)
+    }
+
+    fn build(
+        gpu: &mut Gpu,
+        config: &Qwen35Config,
+        max_batch: usize,
+        tree_tape: bool,
+    ) -> HipResult<Self> {
         let dim = config.dim;
         let hidden_dim = config.hidden_dim;
         let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
@@ -5190,7 +5283,7 @@ impl PrefillBatchScratch {
             } else {
                 None
             },
-            dn_s_tape: if config.linear_num_value_heads > 0 {
+            dn_s_tape: if tree_tape && config.linear_num_value_heads > 0 {
                 // 4 bytes/element — the f32 tree kernel's stride. The f16 tree
                 // kernel uses the first half of the same buffer.
                 let bytes = max_batch

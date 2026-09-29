@@ -234,6 +234,21 @@ pub fn validate_qwen35_grouped_moe_decode_model_capability(
     if m.q35_scratch.is_none() {
         return Err("qwen35 grouped-MoE decode requires single-GPU qwen35 scratch".to_string());
     }
+    // The decode advance runs the grouped-MoE fused prefix body, which refuses
+    // these weights per layer. Unchecked here, `auto` selected it for the
+    // 35B-A3B (OqCompact attention) and every batch of 2+ failed its first step.
+    if let Some(weights) = m.q35_weights.as_ref() {
+        let unsupported = weights.layers.iter().any(|layer| {
+            matches!(layer, qwen35::LayerWeights::DeltaNetMoe(l)
+                if !qwen35::grouped_moe_prefix_supports_attention(l))
+        });
+        if unsupported {
+            return Err(
+                "qwen35 grouped-MoE decode does not support this model's DeltaNet-MoE attention weight format"
+                    .to_string(),
+            );
+        }
+    }
     // The KV flags must reflect the LOADED model, not a convenient constant.
     // Hardcoding `kv_quant_q8: true` made this probe's KV test vacuous: it passed
     // for every mode, so an ineligible KV mode was not caught at selection time
@@ -635,6 +650,21 @@ pub fn run_generate_batch_decode_step_qwen35(
         crate::batch_executor::has_draft_model(m),
         m.eviction.is_some(),
     )?;
+    // A decode step writes one KV row at `logical_position`. Past the session's
+    // capacity that write lands outside its cache — the window write wraps, but
+    // the block flush and the V plane are indexed absolutely. The server stops
+    // sessions at `kv_capacity` first; this turns a server that does not into an
+    // error instead of corrupted device memory.
+    for session in &envelope.sessions {
+        if let Some(cap) = crate::session::qwen35_session_kv_capacity(m, &session.session_id) {
+            if session.logical_position >= cap {
+                return Err(format!(
+                    "decode session {} at logical_position={} is past its KV capacity {cap}",
+                    session.session_id, session.logical_position
+                ));
+            }
+        }
+    }
     let requested_backend =
         std::env::var("HIPFIRE_QWEN35_DECODE_BATCH").unwrap_or_else(|_| "auto".to_string());
     let mut backend = select_qwen35_decode_batch_backend(
@@ -915,7 +945,12 @@ pub fn qwen35_decode_token_outcome(
     } else {
         tokenizer.decode(&[token])
     };
-    Ok(Qwen35DecodeTokenOutcome { token, text, stop })
+    Ok(Qwen35DecodeTokenOutcome {
+        token,
+        text,
+        stop,
+        by_length: !is_terminator && max_tokens_remaining <= 1,
+    })
 }
 
 // ── Decode-step kernels ─────────────────────────────────────────────────────
@@ -1009,6 +1044,7 @@ pub fn qwen35_decode_step_serial_reference(
             "token": outcome.token,
             "text": outcome.text,
             "stop": outcome.stop,
+            "finish_reason": outcome.finish_reason(),
             "logical_position": new_logical_position,
         }));
     }
@@ -1229,6 +1265,7 @@ pub fn qwen35_decode_step_fused_grouped_moe_native_chunk(
                 "token": outcome.token,
                 "text": outcome.text,
                 "stop": outcome.stop,
+            "finish_reason": outcome.finish_reason(),
                 "logical_position": new_logical_position,
             }));
         }
@@ -1382,7 +1419,7 @@ pub fn qwen35_ensure_decode_prefill_batch_scratch(
             .unwrap_or(qwen35::PREFILL_MAX_BATCH);
         let max_batch = configured_max.max(min_rows);
         scratch.prefill_batch = Some(
-            qwen35::PrefillBatchScratch::new(gpu, config, max_batch)
+            qwen35::PrefillBatchScratch::new_without_tree_tape(gpu, config, max_batch)
                 .map_err(|e| format!("alloc qwen35 decode native batch scratch: {e:?}"))?,
         );
     }
@@ -1510,6 +1547,7 @@ pub fn qwen35_decode_step_fused_dense_native_chunk(
                 "token": outcome.token,
                 "text": outcome.text,
                 "stop": outcome.stop,
+            "finish_reason": outcome.finish_reason(),
                 "logical_position": new_logical_position,
             }));
         }
@@ -1688,6 +1726,7 @@ pub fn qwen35_decode_step_fused_dense_native_singleton(
             "token": outcome.token,
             "text": outcome.text,
             "stop": outcome.stop,
+            "finish_reason": outcome.finish_reason(),
             "logical_position": new_logical_position,
         })])
     })();

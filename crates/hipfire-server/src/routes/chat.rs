@@ -533,6 +533,17 @@ pub(crate) async fn ensure_model_loaded(
     }
 
     let mut engine_guard = state.engine.lock().await;
+    // The batch runner checks the engine out for a whole cycle. With a model loaded
+    // a daemon exists, so an empty slot means "in use", not "none": wait for it.
+    // Spawning instead ran into the daemon's machine-wide lock (`FATAL: hipfire
+    // daemon already running`), failing requests for a second model — the swarm's
+    // coder model — whenever they arrived mid-cycle. A daemon that died clears
+    // `loaded_models`, so that case still falls through to a respawn.
+    while engine_guard.is_none() && !state.loaded_models.lock().await.is_empty() {
+        drop(engine_guard);
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        engine_guard = state.engine.lock().await;
+    }
 
     if let Some(eng) = engine_guard.as_mut() {
         match eng.ping().await {
@@ -2055,6 +2066,7 @@ where
             assistant_prefix,
             max_think_tokens,
             max_tokens: request_max_tokens as usize,
+            tools: body.tools.clone(),
         };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let worker_key_id = loaded.worker_key_id.clone().unwrap_or_default();
@@ -2118,6 +2130,9 @@ where
         }
         let token_count = text.split_whitespace().count() as u32;
         let final_text = strip_visible_thinking(text, preserve_thinking, true);
+        // The daemon's batch decode returns text only, so parse calls the way the
+        // legacy path does when the daemon hands it none.
+        let (final_text, tool_calls) = parse_inline_tool_calls(&final_text, &req_id);
         let done = hipfire_generate::DoneEvent {
             id: req_id.clone(),
             tokens: token_count,
@@ -2137,7 +2152,7 @@ where
             model: model_arg,
             text: final_text,
             done,
-            tool_calls: Vec::new(),
+            tool_calls,
             request_max_tokens,
         }));
     }

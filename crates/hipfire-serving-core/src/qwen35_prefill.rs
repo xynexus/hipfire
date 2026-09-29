@@ -112,12 +112,15 @@ pub fn qwen35_prefill_active_session(
     if tokens.is_empty() {
         return Ok(0);
     }
-    if m.active.cursor.seq_pos + tokens.len() > m.physical_cap {
+    // The session's own cache, not the model's: a batch session can be sized
+    // below the model's physical_cap, and the kernels index the session's cache.
+    let physical_cap = m.kv_cache().map_or(m.physical_cap, |kv| kv.physical_cap);
+    if m.active.cursor.seq_pos + tokens.len() > physical_cap {
         return Err(format!(
             "generate_batch_prefill exceeds loaded KV budget: seq_pos={} + prefill={} > physical_cap={}",
             m.active.cursor.seq_pos,
             tokens.len(),
-            m.physical_cap
+            physical_cap
         ));
     }
     let config = m
@@ -788,7 +791,7 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
     for spec in prepared {
         let state = match m.q35_registry.sessions.remove(&spec.id) {
             Some(state) => state,
-            None => match qwen35_allocate_session_state(m, gpu) {
+            None => match qwen35_allocate_session_state(m, gpu, &spec.id) {
                 Ok(state) => state,
                 Err(e) => {
                     for (restore_id, restore_state) in owned_sessions {
@@ -798,7 +801,8 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
                 }
             },
         };
-        if state.cursor.seq_pos + spec.tokens.len() > m.physical_cap {
+        let cap = state.kv_cache().physical_cap;
+        if state.cursor.seq_pos + spec.tokens.len() > cap {
             let id = spec.id.to_string();
             let seq_pos = state.cursor.seq_pos;
             m.q35_registry.sessions.insert(id.clone(), state);
@@ -810,7 +814,7 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
                 id,
                 seq_pos,
                 spec.tokens.len(),
-                m.physical_cap
+                cap
             ));
         }
         owned_sessions.push((spec.id.to_string(), state));
@@ -867,7 +871,7 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
                             batch_id,
                             session_id: &prepared[idx].id,
                             source_state_handle: &prepared[idx].id,
-                            logical_position: end,
+                            logical_position: prepared[idx].cached_prefix_tokens + end,
                             kind: Qwen35PrefillCheckpointKind::SemanticBoundary {
                                 boundary: &boundary.boundary,
                                 boundary_index: boundary.boundary_index,
@@ -913,10 +917,14 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
                         existing.free_gpu(gpu);
                     }
                     scratch.prefill_batch = Some(
-                        qwen35::PrefillBatchScratch::new(gpu, config, scratch_target_batch)
-                            .map_err(|e| {
-                                format!("allocate qwen35 grouped-MoE fused prefill scratch: {e:?}")
-                            })?,
+                        qwen35::PrefillBatchScratch::new_without_tree_tape(
+                            gpu,
+                            config,
+                            scratch_target_batch,
+                        )
+                        .map_err(|e| {
+                            format!("allocate qwen35 grouped-MoE fused prefill scratch: {e:?}")
+                        })?,
                     );
                 }
                 let pbs_max_batch = scratch.prefill_batch.as_ref().unwrap().max_batch;
@@ -985,7 +993,7 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
                         batch_id,
                         session_id: &prepared[idx].id,
                         source_state_handle: &prepared[idx].id,
-                        logical_position: end,
+                        logical_position: prepared[idx].cached_prefix_tokens + end,
                         kind: Qwen35PrefillCheckpointKind::SemanticBoundary {
                             boundary: &boundary.boundary,
                             boundary_index: boundary.boundary_index,
@@ -1059,9 +1067,12 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
                 existing.free_gpu(gpu);
             }
             scratch.prefill_batch = Some(
-                qwen35::PrefillBatchScratch::new(gpu, config, scratch_target_batch).map_err(
-                    |e| format!("allocate qwen35 grouped-MoE fused prefill scratch: {e:?}"),
-                )?,
+                qwen35::PrefillBatchScratch::new_without_tree_tape(
+                    gpu,
+                    config,
+                    scratch_target_batch,
+                )
+                .map_err(|e| format!("allocate qwen35 grouped-MoE fused prefill scratch: {e:?}"))?,
             );
         }
         let pbs_max_batch = scratch.prefill_batch.as_ref().unwrap().max_batch;
@@ -1314,7 +1325,7 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
     for spec in &contract.sessions {
         let state = match m.q35_registry.sessions.remove(spec.id) {
             Some(state) => state,
-            None => match qwen35_allocate_session_state(m, gpu) {
+            None => match qwen35_allocate_session_state(m, gpu, &spec.id) {
                 Ok(state) => state,
                 Err(e) => {
                     for (restore_id, restore_state) in owned_sessions {
@@ -1324,7 +1335,8 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
                 }
             },
         };
-        if state.cursor.seq_pos + spec.tokens.len() > m.physical_cap {
+        let cap = state.kv_cache().physical_cap;
+        if state.cursor.seq_pos + spec.tokens.len() > cap {
             let id = spec.id.to_string();
             let seq_pos = state.cursor.seq_pos;
             m.q35_registry.sessions.insert(id.clone(), state);
@@ -1336,7 +1348,7 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
                 id,
                 seq_pos,
                 spec.tokens.len(),
-                m.physical_cap
+                cap
             ));
         }
         owned_sessions.push((spec.id.to_string(), state));
@@ -1393,7 +1405,7 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
                             batch_id,
                             session_id: contract.sessions[idx].id,
                             source_state_handle: contract.sessions[idx].id,
-                            logical_position: end,
+                            logical_position: prepared[idx].cached_prefix_tokens + end,
                             kind: Qwen35PrefillCheckpointKind::SemanticBoundary {
                                 boundary: &boundary.boundary,
                                 boundary_index: boundary.boundary_index,
@@ -1439,9 +1451,10 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
                         .unwrap_or(qwen35::PREFILL_MAX_BATCH)
                         .max(contract.total_tokens);
                     scratch.prefill_batch = Some(
-                        qwen35::PrefillBatchScratch::new(gpu, config, max_batch).map_err(|e| {
-                            format!("allocate qwen35 fused dense prefill scratch: {e:?}")
-                        })?,
+                        qwen35::PrefillBatchScratch::new_without_tree_tape(gpu, config, max_batch)
+                            .map_err(|e| {
+                                format!("allocate qwen35 fused dense prefill scratch: {e:?}")
+                            })?,
                     );
                 }
                 let pbs_max_batch = scratch.prefill_batch.as_ref().unwrap().max_batch;
@@ -1510,7 +1523,7 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
                         batch_id,
                         session_id: contract.sessions[idx].id,
                         source_state_handle: contract.sessions[idx].id,
-                        logical_position: end,
+                        logical_position: prepared[idx].cached_prefix_tokens + end,
                         kind: Qwen35PrefillCheckpointKind::SemanticBoundary {
                             boundary: &boundary.boundary,
                             boundary_index: boundary.boundary_index,
@@ -1583,7 +1596,7 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
                 .unwrap_or(qwen35::PREFILL_MAX_BATCH)
                 .max(contract.total_tokens);
             scratch.prefill_batch = Some(
-                qwen35::PrefillBatchScratch::new(gpu, config, max_batch)
+                qwen35::PrefillBatchScratch::new_without_tree_tape(gpu, config, max_batch)
                     .map_err(|e| format!("allocate qwen35 fused dense prefill scratch: {e:?}"))?,
             );
         }
@@ -1749,10 +1762,14 @@ pub fn qwen35_prefill_suffix_batch_serial_reference(
                 let segment = &session.tokens[prefilled..boundary.prefix_len];
                 prefilled += qwen35_prefill_active_session(m, gpu, segment, false)?;
                 let logical_position = qwen35_active_logical_position(m)?;
-                if logical_position != boundary.prefix_len {
+                // `prefix_len` indexes `tokens`, which start after any attached
+                // prefix; the session's position counts that prefix too.
+                if logical_position != session.cached_prefix_tokens + boundary.prefix_len {
                     return Err(format!(
                         "qwen35 semantic boundary checkpoint position mismatch for session {}: boundary_len={} logical_position={}",
-                        session.id, boundary.prefix_len, logical_position
+                        session.id,
+                        session.cached_prefix_tokens + boundary.prefix_len,
+                        logical_position
                     ));
                 }
                 let hook = Qwen35PrefillCheckpointHook {
@@ -1948,6 +1965,32 @@ pub fn run_generate_batch_prefill_serial_qwen35(
             ));
         }
 
+        // Size a session about to be created, or forked from a checkpoint, to what
+        // this request can reach — prompt + max_tokens — instead of the model's full
+        // context. Only a prompt starting at position zero renders independently of
+        // the active slot, so only that case renders here; the tokens are reused
+        // below. KVarN only, because only KVarN can grow a forked session later.
+        let mut pre_rendered: Option<Vec<u32>> = None;
+        if let (Some(max_tokens), Some(_)) = (session.max_tokens, session.prompt.as_ref()) {
+            let starts_at_zero = session.state_handle.runtime_state_handle.is_some()
+                || (session.state_handle.logical_position == 0
+                    && session.state_handle.cached_prefix_tokens == 0);
+            let kvarn = m
+                .q35_kv_mode
+                .as_deref()
+                .is_some_and(|k| k.starts_with("kvarn"));
+            if starts_at_zero
+                && kvarn
+                && !sequence_state_arena_is_session_resident(arena_backend, m, &session.id)
+            {
+                let tokens = qwen35_materialize_batch_prefill_prompt(m, session)?;
+                let group = hipfire_runtime::kv::KvCache::KVARN_GROUP;
+                let cap = (tokens.len() + max_tokens).div_ceil(group) * group;
+                m.q35_registry.kv_caps.insert(session.id.clone(), cap);
+                pre_rendered = Some(tokens);
+            }
+        }
+
         if let Some(runtime_state_handle) = session.state_handle.runtime_state_handle.as_deref() {
             sequence_state_arena_fork_session_state(
                 arena_backend,
@@ -1981,9 +2024,15 @@ pub fn run_generate_batch_prefill_serial_qwen35(
         }
 
         let created = sequence_state_arena_activate_session(arena_backend, m, gpu, &session.id)?;
+        // Consumed by the allocation or fork above if one happened; a session that
+        // was already resident allocated nothing, so drop the unused entry.
+        m.q35_registry.kv_caps.remove(&session.id);
         let mut boundary_checkpoints = Vec::new();
         let tokens: Vec<u32> = if session.prompt.is_some() {
-            let full_tokens = qwen35_materialize_batch_prefill_prompt(m, session)?;
+            let full_tokens = match pre_rendered.take() {
+                Some(tokens) => tokens,
+                None => qwen35_materialize_batch_prefill_prompt(m, session)?,
+            };
             if session.state_handle.runtime_state_handle.is_some() {
                 let prefix_len = session
                     .state_handle
@@ -1999,6 +2048,29 @@ pub fn run_generate_batch_prefill_serial_qwen35(
                         full_tokens.len()
                     ));
                 }
+                // Checkpoint the boundaries past the attached prefix too. Without
+                // this only a cold request ever minted, so a conversation that
+                // attached at step N had nothing to attach to at step N+1 and
+                // re-prefilled everything since its first turn. Stored relative to
+                // the tokens prefilled here (they start at `prefix_len`); the hash
+                // keeps the absolute length a later request will look up by.
+                //
+                // Only the LAST boundary: an attached session is continuing a
+                // conversation, and where it ends is the only place the next step
+                // attaches. Checkpointing every boundary had 16 concurrent attaches
+                // mint ~40 checkpoints, past the resident limit, evicting the shared
+                // prefix they had all just attached to.
+                boundary_checkpoints =
+                    qwen35_semantic_boundary_checkpoints(m, session, &full_tokens)?
+                        .into_iter()
+                        .filter(|boundary| boundary.prefix_len > prefix_len)
+                        .max_by_key(|boundary| boundary.prefix_len)
+                        .map(|mut boundary| {
+                            boundary.prefix_len -= prefix_len;
+                            boundary
+                        })
+                        .into_iter()
+                        .collect();
                 full_tokens[prefix_len..].to_vec()
             } else if session.state_handle.logical_position != 0
                 || session.state_handle.cached_prefix_tokens != 0
@@ -2067,12 +2139,17 @@ pub fn run_generate_batch_prefill_serial_qwen35(
         } else {
             None
         };
-        let line = qwen35_generate_batch_prefill_session_done_json(
+        let mut line = qwen35_generate_batch_prefill_session_done_json(
             envelope,
             session,
             checkpoint_id.as_deref(),
             &result,
         );
+        // The decode loop is driven from the server, which otherwise has no way to
+        // know where this session's KV ends and would decode past it.
+        if let Some(cap) = crate::session::qwen35_session_kv_capacity(m, &session.id) {
+            line["kv_capacity"] = serde_json::json!(cap);
+        }
         let _ = writeln!(stdout, "{line}");
         let _ = stdout.flush();
     }
@@ -2080,10 +2157,16 @@ pub fn run_generate_batch_prefill_serial_qwen35(
     // Bound the resident set. One-shot requests release their own session, so
     // this is normally a no-op; it catches the sessions nothing releases —
     // parked by cooperative preemption, or stranded by a prefill error.
+    //
+    // The sessions just prefilled are about to decode and are never candidates.
+    // Counted in, any batch over the limit (8) lost its oldest sessions here and
+    // the whole batch failed at its first decode step (`resident=0`).
+    let in_use: Vec<&str> = envelope.sessions.iter().map(|s| s.id.as_str()).collect();
     match crate::session::qwen35_evict_sessions_over_limit(
         m,
         gpu,
         crate::session::resident_session_limit_value(),
+        &in_use,
     ) {
         Ok(0) => {}
         Ok(n) => tracing::debug!("evicted {n} resident session(s) over the limit"),
@@ -2097,6 +2180,11 @@ pub fn run_generate_batch_prefill_serial_qwen35(
         // `total_new` sat frozen means buffers are being returned to a pool that
         // never allocated them — an unpooled alloc paired with a pooled free.
         // Debug level: useful the next time residency drifts, silent otherwise.
+        // Which sizes a batch allocated, not just how much: with HIPFIRE_ALLOC_REPORT=1
+        // this named per-session prefill scratch as the bulk of a batch's memory.
+        if hip_bridge::alloc_stats::enabled() {
+            tracing::debug!("{}", gpu.alloc_report(12));
+        }
         let (p, mailbox) = gpu.pool_stats();
         tracing::debug!(
             "pool after batch prefill: new={} reused={} allocated={:.1}MB free_buffers={} \

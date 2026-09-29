@@ -553,6 +553,10 @@ pub enum DaemonResponse {
         #[serde(flatten)]
         payload: serde_json::Map<String, serde_json::Value>,
     },
+    PrefixHashPreflightDone {
+        #[serde(flatten)]
+        payload: serde_json::Map<String, serde_json::Value>,
+    },
     HneuronOk {
         n_intervened: usize,
         gain: f32,
@@ -964,6 +968,10 @@ mod tests {
             (
                 json!({"type": "release_sessions_done", "id": "x", "released": 1}),
                 |response| matches!(response, DaemonResponse::ReleaseSessionsDone { .. }),
+            ),
+            (
+                json!({"type": "prefix_hash_preflight_done", "id": "p", "prefixes": []}),
+                |response| matches!(response, DaemonResponse::PrefixHashPreflightDone { .. }),
             ),
             (
                 json!({"type": "train_progress", "run_id": "r", "step": 25, "done": false}),

@@ -939,6 +939,31 @@ impl DaemonEngine {
         }
     }
 
+    /// Hash a prompt's chat-template boundaries without prefilling it. The
+    /// `prefixes` in the reply are what a batch prefill can attach a cached
+    /// checkpoint at.
+    pub async fn prefix_hash_preflight(
+        &mut self,
+        request: serde_json::Value,
+    ) -> anyhow::Result<serde_json::Value> {
+        require_extended_request_type(&request, "prefix_hash_preflight")?;
+        self.send_value(&request).await?;
+        loop {
+            match self.recv().await? {
+                DaemonResponse::PrefixHashPreflightDone { payload } => {
+                    return Ok(tagged_extended_event("prefix_hash_preflight_done", payload));
+                }
+                DaemonResponse::Error(error) => {
+                    anyhow::bail!("daemon prefix_hash_preflight error: {}", error.message)
+                }
+                DaemonResponse::Unknown => {}
+                other => {
+                    tracing::warn!("unexpected response during prefix_hash_preflight: {other:?}")
+                }
+            }
+        }
+    }
+
     /// Send `reset` and wait for the daemon to confirm state reset.
     pub async fn reset(&mut self) -> anyhow::Result<()> {
         self.send(&DaemonRequest::Reset).await?;

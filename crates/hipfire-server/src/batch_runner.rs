@@ -130,6 +130,15 @@ pub struct PendingRequest {
 enum CycleOutcome {
     Completed,
     Parked(Vec<PendingRequest>),
+    /// The batch's prefill ran out of device memory before anything was decoded.
+    /// Its sessions are released and every request is still waiting, so the
+    /// runner can retry them in smaller batches instead of failing them all.
+    OutOfMemory(Vec<PendingRequest>),
+}
+
+/// hipErrorOutOfMemory, as the daemon's allocator reports it.
+fn is_device_oom(err: &str) -> bool {
+    err.contains("hipError=2)")
 }
 
 /// A unit of GPU work admitted to the runner (P5). The runner is the single GPU
@@ -302,6 +311,10 @@ pub struct SessionSpec {
     pub max_think_tokens: u32,
     /// Total tokens this request may still generate.
     pub max_tokens: usize,
+    /// The request's tool declarations, rendered into the chat template by the
+    /// daemon. Without them the model never learns a tool exists and answers in
+    /// prose, or invents a call nothing will parse.
+    pub tools: Option<serde_json::Value>,
 }
 
 /// Post-prefill decode cursor for one resident session, sourced from that
@@ -314,6 +327,170 @@ pub struct DecodeCursor {
     pub max_tokens_remaining: usize,
 }
 
+/// How one session of a prefill uses the prefix cache.
+#[derive(Clone, Debug)]
+pub enum PrefixReuse {
+    /// Fork from a cached checkpoint and prefill only the rest of the prompt; the
+    /// boundaries after the fork point are checkpointed in turn.
+    Attach(PrefixEntry),
+    /// Nothing cached: have the daemon checkpoint this prompt's boundaries.
+    Mint,
+}
+
+/// A chat-template boundary checkpoint the daemon holds for reuse.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PrefixEntry {
+    pub worker: String,
+    /// `prefix_hash` as the daemon reports it: `{algorithm, value, prefix_len}`.
+    pub prefix_hash: serde_json::Value,
+    pub prefix_len: usize,
+    pub checkpoint_id: String,
+    /// Requests that attached to it. Decides eviction: see `PrefixIndex::insert`.
+    pub hits: u32,
+    /// Which prefill minted it (the index's batch counter). Decides eviction too.
+    pub batch: u64,
+}
+
+impl PrefixEntry {
+    fn hash_value(&self) -> &str {
+        self.prefix_hash["value"].as_str().unwrap_or_default()
+    }
+}
+
+/// Prefix checkpoints the server has asked the daemon to keep, least recently
+/// used first. Qwen3.5's DeltaNet state cannot be rewound to a shorter prefix the
+/// way a KV cache can be truncated, so reuse means forking a state snapshotted at
+/// exactly that boundary — which is what these are.
+#[derive(Default)]
+pub struct PrefixIndex {
+    entries: Vec<PrefixEntry>,
+    batches: u64,
+}
+
+/// Checkpoints held for reuse, per server. Each is a resident daemon session — on
+/// the 27B ~72 MB of DeltaNet state plus ~13 KB per prefix token of KV — and the
+/// daemon evicts resident sessions over `HIPFIRE_SCHED_RESIDENT_STATE_MAX` (32),
+/// so keep this under that.
+/// ponytail: a count, not bytes; a byte budget once prefixes get long (a 30K-token
+/// prefix is ~0.4 GB of KV per checkpoint).
+fn prefix_cache_max() -> usize {
+    std::env::var("HIPFIRE_SERVER_PREFIX_CACHE_MAX")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(16)
+}
+
+impl PrefixIndex {
+    /// The longest of `candidates` (a preflight's `prefixes`) that is cached for
+    /// `worker`, marked most recently used.
+    pub fn lookup(
+        &mut self,
+        worker: &str,
+        candidates: &[serde_json::Value],
+    ) -> Option<PrefixEntry> {
+        let best = candidates
+            .iter()
+            .filter_map(|c| {
+                let value = c["value"].as_str()?;
+                self.entries
+                    .iter()
+                    .position(|e| e.worker == worker && e.hash_value() == value)
+            })
+            .max_by_key(|&i| self.entries[i].prefix_len)?;
+        let mut entry = self.entries.remove(best);
+        entry.hits += 1;
+        self.entries.push(entry.clone());
+        Some(entry)
+    }
+
+    /// Record a checkpoint. Returns checkpoint ids the caller must release: a
+    /// duplicate of a hash already held, or the evictions that bring the index
+    /// back under its cap.
+    ///
+    /// Eviction takes never-attached entries first — from the oldest minting batch,
+    /// and within a batch the longest — and only then the least recently used.
+    /// Within a batch, longest-first keeps the shared system turn over the
+    /// request-specific tails minted beside it (plain LRU evicted it first, as it
+    /// is minted first). Across batches, oldest-first keeps a conversation's
+    /// fresh checkpoint over stale leftovers: longest-first alone evicted the new
+    /// tail a tool loop's next step needed whenever older, shorter entries filled
+    /// the index.
+    pub fn insert(&mut self, entry: PrefixEntry) -> Vec<String> {
+        if self
+            .entries
+            .iter()
+            .any(|e| e.worker == entry.worker && e.hash_value() == entry.hash_value())
+        {
+            return vec![entry.checkpoint_id];
+        }
+        self.entries.push(entry);
+        let mut evicted = Vec::new();
+        while self.entries.len() > prefix_cache_max() {
+            let victim = self
+                .entries
+                .iter()
+                .enumerate()
+                .filter(|(_, e)| e.hits == 0)
+                .min_by_key(|(_, e)| (e.batch, std::cmp::Reverse(e.prefix_len)))
+                .map_or(0, |(i, _)| i);
+            evicted.push(self.entries.remove(victim).checkpoint_id);
+        }
+        evicted
+    }
+
+    /// Forget a checkpoint (the daemon no longer has it, or it failed to attach).
+    pub fn forget(&mut self, checkpoint_id: &str) {
+        self.entries.retain(|e| e.checkpoint_id != checkpoint_id);
+    }
+}
+
+/// One session of a `generate_batch_prefill` or `prefix_hash_preflight`. Both
+/// must render the prompt identically, or a preflight hash would never match the
+/// checkpoint a prefill minted.
+fn session_json(s: &SessionSpec, reuse: Option<&PrefixReuse>) -> serde_json::Value {
+    // The daemon reads assistant_prefix / max_think_tokens /
+    // semantic_boundary_checkpoints from a nested `params` object, the
+    // conversation from `messages`, and the system prompt from `system`
+    // (see hipfire_generate::validate_generate_batch_prefill).
+    let mut session = serde_json::json!({
+        "id": s.id,
+        "prompt": s.prompt,
+        "params": {
+            "assistant_prefix": s.assistant_prefix,
+            "max_think_tokens": s.max_think_tokens,
+            // An attached session checkpoints the boundaries past its prefix, so a
+            // conversation's next step can attach at this one's end.
+            "semantic_boundary_checkpoints": reuse.is_some(),
+            // Sizes the session's KV to prompt + this, not the model's max_seq.
+            "max_tokens": s.max_tokens,
+        },
+        "state_handle": {
+            "state_kinds": s.state_kinds,
+            "logical_position": 0,
+            "cached_prefix_tokens": 0,
+        },
+    });
+    if let Some(PrefixReuse::Attach(entry)) = reuse {
+        let handle = &mut session["state_handle"];
+        handle["logical_position"] = serde_json::json!(entry.prefix_len);
+        handle["cached_prefix_tokens"] = serde_json::json!(entry.prefix_len);
+        handle["runtime_state_handle"] = serde_json::json!(entry.checkpoint_id);
+        handle["prefix_hash"] = entry.prefix_hash.clone();
+    }
+    if let Some(obj) = session.as_object_mut() {
+        if let Some(history) = &s.messages_history {
+            obj.insert("messages".to_string(), history.clone());
+        }
+        if let Some(system) = &s.system_prompt {
+            obj.insert("system".to_string(), serde_json::json!(system));
+        }
+        if let Some(tools) = &s.tools {
+            obj.insert("tools".to_string(), tools.clone());
+        }
+    }
+    session
+}
+
 /// Build a `generate_batch_prefill` request for `specs` on `worker_key_id`.
 /// Fused-prefill of all sessions in one daemon call; each emits a
 /// `generate_batch_prefill_session_done` carrying its `logical_position`.
@@ -321,38 +498,11 @@ pub fn build_batch_prefill_request(
     batch_id: &str,
     worker_key_id: &str,
     specs: &[SessionSpec],
+    reuse: &HashMap<String, PrefixReuse>,
 ) -> serde_json::Value {
     let sessions: Vec<serde_json::Value> = specs
         .iter()
-        .map(|s| {
-            // The daemon reads assistant_prefix / max_think_tokens /
-            // semantic_boundary_checkpoints from a nested `params` object, the
-            // conversation from `messages`, and the system prompt from `system`
-            // (see hipfire_generate::validate_generate_batch_prefill).
-            let mut session = serde_json::json!({
-                "id": s.id,
-                "prompt": s.prompt,
-                "params": {
-                    "assistant_prefix": s.assistant_prefix,
-                    "max_think_tokens": s.max_think_tokens,
-                    "semantic_boundary_checkpoints": false,
-                },
-                "state_handle": {
-                    "state_kinds": s.state_kinds,
-                    "logical_position": 0,
-                    "cached_prefix_tokens": 0,
-                },
-            });
-            if let Some(obj) = session.as_object_mut() {
-                if let Some(history) = &s.messages_history {
-                    obj.insert("messages".to_string(), history.clone());
-                }
-                if let Some(system) = &s.system_prompt {
-                    obj.insert("system".to_string(), serde_json::json!(system));
-                }
-            }
-            session
-        })
+        .map(|s| session_json(s, reuse.get(&s.id)))
         .collect();
     serde_json::json!({
         "type": "generate_batch_prefill",
@@ -361,6 +511,257 @@ pub fn build_batch_prefill_request(
         "worker_key_id": worker_key_id,
         "sessions": sessions,
     })
+}
+
+/// Build a `prefix_hash_preflight` request: hash `spec`'s chat-template
+/// boundaries without prefilling anything.
+pub fn build_prefix_preflight_request(
+    worker_key_id: &str,
+    spec: &SessionSpec,
+) -> serde_json::Value {
+    serde_json::json!({
+        "type": "prefix_hash_preflight",
+        "id": format!("preflight-{}", spec.id),
+        "worker_key_id": worker_key_id,
+        "boundary_policy": "semantic_chat_template",
+        "session": session_json(spec, None),
+    })
+}
+
+/// Decide, per session, whether to attach a cached prefix or mint one, and which
+/// sessions should wait for a checkpoint another session is about to mint.
+///
+/// Only one session per not-yet-cached boundary mints: sessions arriving together
+/// with the same prefix would otherwise each snapshot identical state. The rest
+/// are returned as deferred, to attach once it exists. A failed preflight leaves
+/// the session alone — the cache is an optimisation, never a reason to fail a
+/// request.
+async fn plan_prefix_reuse(
+    engine: &mut DaemonEngine,
+    worker: &str,
+    specs: &[SessionSpec],
+    index: &mut PrefixIndex,
+) -> (HashMap<String, PrefixReuse>, Vec<String>) {
+    let mut plan = HashMap::new();
+    let mut deferred = Vec::new();
+    // Boundary hashes some earlier session in this batch will checkpoint.
+    let mut minting: Vec<String> = Vec::new();
+    for spec in specs {
+        let reply = match engine
+            .prefix_hash_preflight(build_prefix_preflight_request(worker, spec))
+            .await
+        {
+            Ok(reply) => reply,
+            Err(e) => {
+                tracing::debug!("prefix preflight for {}: {e}", spec.id);
+                continue;
+            }
+        };
+        // `full` is the whole prompt; checkpoints are only ever taken at the
+        // boundaries inside it.
+        let boundaries: Vec<serde_json::Value> = reply["prefixes"]
+            .as_array()
+            .map(|a| {
+                a.iter()
+                    .filter(|p| p["boundary"] != "full")
+                    .cloned()
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(entry) = index.lookup(worker, &boundaries) {
+            tracing::debug!(
+                "session {}: attaching cached prefix {} ({} tokens)",
+                spec.id,
+                entry.checkpoint_id,
+                entry.prefix_len
+            );
+            plan.insert(spec.id.clone(), PrefixReuse::Attach(entry));
+            continue;
+        }
+        tracing::debug!(
+            "session {}: no cached prefix among {:?}; index holds {:?}",
+            spec.id,
+            boundaries
+                .iter()
+                .map(|b| (
+                    b["prefix_len"].as_u64().unwrap_or(0),
+                    b["value"].as_str().unwrap_or("")
+                ))
+                .collect::<Vec<_>>(),
+            index
+                .entries
+                .iter()
+                .map(|e| (e.prefix_len, e.hash_value()))
+                .collect::<Vec<_>>()
+        );
+        // Mint unless an earlier session already checkpoints one of these
+        // boundaries: sessions sharing a system turn differ in their tails, so
+        // keying on the longest boundary had every one of them mint.
+        let hashes: Vec<String> = boundaries
+            .iter()
+            .filter_map(|p| p["value"].as_str().map(str::to_string))
+            .collect();
+        if hashes.iter().any(|h| minting.contains(h)) {
+            deferred.push(spec.id.clone());
+        } else if !hashes.is_empty() {
+            minting.extend(hashes);
+            plan.insert(spec.id.clone(), PrefixReuse::Mint);
+        }
+    }
+    (plan, deferred)
+}
+
+/// One `generate_batch_prefill` of `specs` under `reuse`, then index what it
+/// minted. An attach can fail for reasons the index cannot see (the daemon evicted
+/// the checkpoint): forget what was attached and prefill in full once, rather
+/// than fail requests over a cache miss.
+async fn prefill_once(
+    engine: &mut DaemonEngine,
+    batch_id: &str,
+    worker: &str,
+    specs: &[SessionSpec],
+    reuse: &HashMap<String, PrefixReuse>,
+    index: &mut PrefixIndex,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    let mut reuse = reuse.clone();
+    let handles: Vec<String> = specs.iter().map(|s| s.id.clone()).collect();
+    let mut result = engine
+        .generate_batch_prefill(build_batch_prefill_request(batch_id, worker, specs, &reuse))
+        .await;
+    // A checkpoint the daemon no longer has (evicted) fails its whole batch. Drop
+    // just the one the error names and retry with the rest still attached: retrying
+    // with no cache at all turned one stale entry into N full prefills, whose
+    // scratch alone ran the device out of memory. An error that names no checkpoint
+    // drops every attach, as before.
+    for _ in 0..specs.len() {
+        let Err(e) = &result else { break };
+        let message = e.to_string();
+        let attached: Vec<String> = reuse
+            .values()
+            .filter_map(|r| match r {
+                PrefixReuse::Attach(entry) => Some(entry.checkpoint_id.clone()),
+                PrefixReuse::Mint => None,
+            })
+            .collect();
+        if attached.is_empty() {
+            break;
+        }
+        let named: Vec<String> = attached
+            .into_iter()
+            .filter(|id| message.contains(id.as_str()))
+            .collect();
+        tracing::warn!(
+            "prefill with cached prefixes failed ({message}); retrying without {}",
+            if named.is_empty() {
+                "any of them".to_string()
+            } else {
+                named.join(", ")
+            }
+        );
+        reuse.retain(|_, r| match r {
+            PrefixReuse::Attach(entry) => {
+                let drop = named.is_empty() || named.contains(&entry.checkpoint_id);
+                if drop {
+                    index.forget(&entry.checkpoint_id);
+                }
+                !drop
+            }
+            PrefixReuse::Mint => true,
+        });
+        let _ = engine
+            .release_sessions(build_release_request(worker, &handles))
+            .await;
+        result = engine
+            .generate_batch_prefill(build_batch_prefill_request(batch_id, worker, specs, &reuse))
+            .await;
+    }
+    let events = result?;
+    record_prefix_checkpoints(engine, worker, &events, index).await;
+    Ok(events)
+}
+
+/// Prefill `specs`, reusing cached prefixes. Sessions sharing a boundary with one
+/// being minted in this same batch wait a round: round 1 prefills everything else,
+/// round 2 attaches them to what round 1 checkpointed — so a cold batch of N
+/// requests with a common system turn prefills it once, not N times. They still
+/// decode together; only prefill is split.
+async fn prefill_with_prefix_reuse(
+    engine: &mut DaemonEngine,
+    batch_id: &str,
+    worker: &str,
+    specs: &[SessionSpec],
+    index: &mut PrefixIndex,
+) -> anyhow::Result<Vec<serde_json::Value>> {
+    if !prefix_cache_enabled() {
+        let request = build_batch_prefill_request(batch_id, worker, specs, &HashMap::new());
+        return engine.generate_batch_prefill(request).await;
+    }
+    const MAX_ROUNDS: usize = 3;
+    let mut events = Vec::new();
+    let mut pending: Vec<SessionSpec> = specs.to_vec();
+    for round in 0..MAX_ROUNDS {
+        let (reuse, mut deferred) = plan_prefix_reuse(engine, worker, &pending, index).await;
+        if round + 1 == MAX_ROUNDS {
+            deferred.clear();
+        }
+        let (now, later): (Vec<SessionSpec>, Vec<SessionSpec>) =
+            pending.into_iter().partition(|s| !deferred.contains(&s.id));
+        let id = if round == 0 {
+            batch_id.to_string()
+        } else {
+            format!("{batch_id}-r{round}")
+        };
+        events.extend(prefill_once(engine, &id, worker, &now, &reuse, index).await?);
+        if later.is_empty() {
+            break;
+        }
+        pending = later;
+    }
+    Ok(events)
+}
+
+/// Index the checkpoints a prefill minted, releasing duplicates and evictions.
+async fn record_prefix_checkpoints(
+    engine: &mut DaemonEngine,
+    worker: &str,
+    events: &[serde_json::Value],
+    index: &mut PrefixIndex,
+) {
+    let mut release = Vec::new();
+    index.batches += 1;
+    let batch = index.batches;
+    for ev in events {
+        let Some(checkpoints) = ev["state_handle"]["prefix_checkpoints"].as_array() else {
+            continue;
+        };
+        for c in checkpoints {
+            let (Some(id), Some(len)) = (c["checkpoint_id"].as_str(), c["prefix_len"].as_u64())
+            else {
+                continue;
+            };
+            release.extend(index.insert(PrefixEntry {
+                worker: worker.to_string(),
+                prefix_hash: c["prefix_hash"].clone(),
+                prefix_len: len as usize,
+                checkpoint_id: id.to_string(),
+                hits: 0,
+                batch,
+            }));
+        }
+    }
+    if !release.is_empty() {
+        let _ = engine
+            .release_sessions(build_release_request(worker, &release))
+            .await;
+    }
+}
+
+/// Prefix reuse on by default; `HIPFIRE_SERVER_PREFIX_CACHE=0` turns it off.
+fn prefix_cache_enabled() -> bool {
+    !matches!(
+        std::env::var("HIPFIRE_SERVER_PREFIX_CACHE").as_deref(),
+        Ok("0" | "off" | "false" | "no")
+    )
 }
 
 /// Build one `generate_batch_decode_step` request: advance every resident
@@ -514,6 +915,12 @@ async fn batch_runner_loop(state: SharedState) {
     // `preempt_max_depth`. `.1` is the priority the batch was running at.
     let mut parked: Vec<(Vec<PendingRequest>, u8)> = Vec::new();
     let max_depth = preempt_max_depth();
+    // Largest fresh batch known to fit in device memory, learned from prefill OOMs.
+    // ponytail: only ratchets down until restart; probe upward if memory is freed
+    // (a model unloaded) and batches stay needlessly small.
+    let mut fit_cap = usize::MAX;
+    // Prefix checkpoints the daemon holds for this runner; see `PrefixIndex`.
+    let mut prefix_index = PrefixIndex::default();
     loop {
         // What would the scheduler grant next (honouring aging)? Lower = sooner.
         let waiter = {
@@ -660,10 +1067,16 @@ async fn batch_runner_loop(state: SharedState) {
 
         match dispatch {
             Dispatch::Text {
-                batch,
+                mut batch,
                 running_priority,
                 lease_id,
             } => {
+                // Split before attempting a batch already known not to fit. The
+                // remainder waits on the parked stack as a fresh batch: it holds no
+                // resident state, so it pins nothing while it waits.
+                if batch.len() > fit_cap && batch[0].resume_position.is_none() {
+                    parked.push((batch.split_off(fit_cap), running_priority));
+                }
                 let mut engine = match state.engine.lock().await.take() {
                     Some(e) => e,
                     None => {
@@ -680,14 +1093,35 @@ async fn batch_runner_loop(state: SharedState) {
                 // Park only while the stack has room (bounds resident VRAM from
                 // nested preemption); at the cap the batch runs to completion.
                 let can_park = parked.len() < max_depth;
-                let outcome =
-                    run_batch_cycle(&mut engine, &state, batch, running_priority, can_park).await;
+                let outcome = run_batch_cycle(
+                    &mut engine,
+                    &state,
+                    batch,
+                    running_priority,
+                    can_park,
+                    &mut prefix_index,
+                )
+                .await;
                 *state.engine.lock().await = Some(engine);
                 if let Some(id) = lease_id {
                     state.work_scheduler.lock().await.complete(id);
                 }
-                if let CycleOutcome::Parked(remaining) = outcome {
-                    parked.push((remaining, running_priority));
+                match outcome {
+                    CycleOutcome::Completed => {}
+                    CycleOutcome::Parked(remaining) => parked.push((remaining, running_priority)),
+                    CycleOutcome::OutOfMemory(mut batch) => {
+                        let half = batch.len() / 2;
+                        fit_cap = half;
+                        tracing::warn!(
+                            "batch of {} ran out of device memory; retrying as {} + {}",
+                            batch.len(),
+                            half,
+                            batch.len() - half
+                        );
+                        // LIFO: push the second half first so the first runs next.
+                        parked.push((batch.split_off(half), running_priority));
+                        parked.push((batch, running_priority));
+                    }
                 }
             }
             Dispatch::Embed { jobs, lease_id } => {
@@ -965,6 +1399,7 @@ async fn run_batch_cycle(
     batch: Vec<PendingRequest>,
     running_priority: u8,
     can_park: bool,
+    prefix_index: &mut PrefixIndex,
 ) -> CycleOutcome {
     let worker = batch[0].worker_key_id.clone();
     let batch_id = format!("batch-{}", batch[0].spec.id);
@@ -995,8 +1430,9 @@ async fn run_batch_cycle(
     if resuming {
         positions = resume_pos.clone();
     } else {
-        let prefill_req = build_batch_prefill_request(&batch_id, &worker, &specs);
-        let events = match engine.generate_batch_prefill(prefill_req).await {
+        let result =
+            prefill_with_prefix_reuse(engine, &batch_id, &worker, &specs, prefix_index).await;
+        let events = match result {
             Ok(events) => events,
             Err(e) => {
                 // The daemon's activation loop can run to completion for every
@@ -1008,6 +1444,10 @@ async fn run_batch_cycle(
                 let _ = engine
                     .release_sessions(build_release_request(&worker, &handles))
                     .await;
+                // A lone request that does not fit cannot be split any further.
+                if !resuming && batch.len() > 1 && is_device_oom(&e.to_string()) {
+                    return CycleOutcome::OutOfMemory(batch);
+                }
                 fail_all(&txs, &format!("batch prefill: {e}"));
                 return CycleOutcome::Completed;
             }
@@ -1021,6 +1461,25 @@ async fn run_batch_cycle(
                     ev.get("logical_position").and_then(|v| v.as_u64()),
                 ) {
                     positions.insert(sid.to_string(), pos as usize);
+                    // `/health` has no prefix-cache counters; this is where reuse shows.
+                    tracing::debug!(
+                        "session {sid}: prefilled {} token(s), {} reused from a cached prefix",
+                        ev.get("prefill_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0),
+                        ev.get("cached_prefix_tokens")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0),
+                    );
+                    // Each decode step writes one KV row, so a session can generate
+                    // only as many tokens as its cache has rows left. The request's
+                    // max_tokens is not that bound (the default far exceeds max_seq).
+                    if let (Some(cap), Some(rem)) = (
+                        ev.get("kv_capacity").and_then(|v| v.as_u64()),
+                        remaining.get_mut(sid),
+                    ) {
+                        *rem = (*rem).min(cap.saturating_sub(pos) as usize);
+                    }
                 }
             }
         }
@@ -1031,6 +1490,19 @@ async fn run_batch_cycle(
         .map(|s| s.id.clone())
         .filter(|id| positions.contains_key(id))
         .collect();
+    // A prompt that filled its KV has nothing left to decode into: finish it now,
+    // since one decode step for it would fail the whole batch at the daemon guard.
+    active.retain(|id| {
+        if remaining[id] > 0 {
+            return true;
+        }
+        if let Some(tx) = txs.get(id) {
+            let _ = tx.send(BatchEvent::Done(
+                serde_json::json!({ "finish_reason": "length" }),
+            ));
+        }
+        false
+    });
     // Any session with no prefill checkpoint can't decode — fail it, don't hang.
     for s in &specs {
         if !positions.contains_key(&s.id) {
@@ -1113,9 +1585,15 @@ async fn run_batch_cycle(
                 *r
             });
             if stop || rem == Some(0) {
+                // The daemon says why it stopped; `stop` alone is also raised when
+                // the budget runs out, which made every truncated reply look done.
+                let finish_reason = ev
+                    .get("finish_reason")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or(if stop { "stop" } else { "length" });
                 if let Some(tx) = txs.get(id) {
                     let _ = tx.send(BatchEvent::Done(serde_json::json!({
-                        "finish_reason": if stop { "stop" } else { "length" }
+                        "finish_reason": finish_reason
                     })));
                 }
             } else {
@@ -1303,6 +1781,7 @@ mod tests {
             assistant_prefix: "plain".to_string(),
             max_think_tokens: 0,
             max_tokens: 16,
+            tools: None,
         }
     }
 
@@ -1314,7 +1793,7 @@ mod tests {
         a.assistant_prefix = "closed_think".to_string();
         a.max_think_tokens = 1; // thinking disabled (daemon: enable_thinking = != 1)
         let specs = [a, spec("req-b")];
-        let req = build_batch_prefill_request("batch-1", "worker-xyz", &specs);
+        let req = build_batch_prefill_request("batch-1", "worker-xyz", &specs, &HashMap::new());
         let env = hipfire_generate::validate_generate_batch_prefill(&req)
             .expect("built prefill request must validate");
         assert_eq!(env.batch_id, "batch-1");
@@ -1330,6 +1809,92 @@ mod tests {
             env.sessions[0].max_think_tokens, 1,
             "max_think_tokens must reach the daemon via params"
         );
+    }
+
+    #[test]
+    fn the_shared_prefix_outlives_the_request_specific_tails() {
+        let entry = |len: usize, hash: &str| PrefixEntry {
+            worker: "w".into(),
+            prefix_hash: serde_json::json!({"algorithm": "xxh128", "value": hash, "prefix_len": len}),
+            prefix_len: len,
+            checkpoint_id: format!("ck-{hash}"),
+            hits: 0,
+            batch: 1,
+        };
+        let mut index = PrefixIndex::default();
+        // One prefill mints every boundary of its prompt, shortest (the shared
+        // system turn) first; fill the index past its cap with such batches.
+        let mut released = Vec::new();
+        released.extend(index.insert(entry(603, "system")));
+        for i in 0..prefix_cache_max() {
+            released.extend(index.insert(entry(622, &format!("tail-{i}"))));
+        }
+        assert!(
+            !released.contains(&"ck-system".to_string()),
+            "shared prefix evicted: {released:?}"
+        );
+        // A hit on it is found, and it is the longest cached match.
+        let candidates = [
+            serde_json::json!({"value": "system"}),
+            serde_json::json!({"value": "nope"}),
+        ];
+        assert_eq!(
+            index.lookup("w", &candidates).unwrap().checkpoint_id,
+            "ck-system"
+        );
+        // A second checkpoint of an already-held hash (minted by another batch) is
+        // handed back for release; the held one stays.
+        let mut dup = entry(603, "system");
+        dup.checkpoint_id = "ck-system-2".into();
+        assert_eq!(index.insert(dup), vec!["ck-system-2".to_string()]);
+        assert_eq!(
+            index.lookup("w", &candidates).unwrap().checkpoint_id,
+            "ck-system"
+        );
+
+        // A later batch's fresh tail outlives the earlier batch's unused tails —
+        // what a tool loop's next step attaches to.
+        let mut fresh = entry(900, "next-step");
+        fresh.batch = 2;
+        let released = index.insert(fresh);
+        assert!(
+            !released.contains(&"ck-next-step".to_string()),
+            "fresh tail evicted: {released:?}"
+        );
+        let next = [serde_json::json!({"value": "next-step"})];
+        assert_eq!(
+            index.lookup("w", &next).unwrap().checkpoint_id,
+            "ck-next-step"
+        );
+    }
+
+    #[test]
+    fn device_oom_is_recognised_in_the_daemon_error() {
+        // Verbatim from a 16-session prefill on gfx1151. The split-and-retry keys
+        // on this; a rewording of the daemon error must not silently disable it.
+        let err = "daemon generate_batch_prefill error: qwen35 fused dense prefill-session \
+                   batch backend failed: HipError { code: 2, message: \"hipMalloc(703840256 \
+                   bytes = 671.23 MiB), free=299.6 MiB of total=110592.0 MiB (hipError=2)\" }";
+        assert!(is_device_oom(err));
+        assert!(!is_device_oom("hipModuleLaunchKernel failed (hipError=98)"));
+    }
+
+    #[test]
+    fn prefill_request_carries_tools_to_the_daemon() {
+        // Dropped once already: the batch path sent no tools, so a model whose
+        // request declared them answered in prose or invented a call.
+        let tool = serde_json::json!({"type": "function", "function": {
+            "name": "read_file",
+            "parameters": {"type": "object", "properties": {"path": {"type": "string"}}},
+        }});
+        let mut a = spec("req-a");
+        a.tools = Some(serde_json::json!([tool.clone()]));
+        let specs = [a, spec("req-b")];
+        let req = build_batch_prefill_request("batch-1", "worker-xyz", &specs, &HashMap::new());
+        let env = hipfire_generate::validate_generate_batch_prefill(&req)
+            .expect("a prefill request with tools must validate");
+        assert_eq!(env.sessions[0].tools, Some(vec![tool]));
+        assert_eq!(env.sessions[1].tools, None);
     }
 
     #[test]
