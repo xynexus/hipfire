@@ -536,14 +536,24 @@ pub fn build_prefix_preflight_request(
 /// are returned as deferred, to attach once it exists. A failed preflight leaves
 /// the session alone — the cache is an optimisation, never a reason to fail a
 /// request.
+///
+/// Also returns each session's full prompt length from the preflight, which the row
+/// budget works from — so it runs even with the cache off (`use_cache` false:
+/// lengths only).
 async fn plan_prefix_reuse(
     engine: &mut DaemonEngine,
     worker: &str,
     specs: &[SessionSpec],
     index: &mut PrefixIndex,
-) -> (HashMap<String, PrefixReuse>, Vec<String>) {
+    use_cache: bool,
+) -> (
+    HashMap<String, PrefixReuse>,
+    Vec<String>,
+    HashMap<String, usize>,
+) {
     let mut plan = HashMap::new();
     let mut deferred = Vec::new();
+    let mut full = HashMap::new();
     // Boundary hashes some earlier session in this batch will checkpoint.
     let mut minting: Vec<String> = Vec::new();
     for spec in specs {
@@ -557,6 +567,12 @@ async fn plan_prefix_reuse(
                 continue;
             }
         };
+        if let Some(n) = reply["full"]["prefix_len"].as_u64() {
+            full.insert(spec.id.clone(), n as usize);
+        }
+        if !use_cache {
+            continue;
+        }
         // `full` is the whole prompt; checkpoints are only ever taken at the
         // boundaries inside it.
         let boundaries: Vec<serde_json::Value> = reply["prefixes"]
@@ -608,75 +624,152 @@ async fn plan_prefix_reuse(
             plan.insert(spec.id.clone(), PrefixReuse::Mint);
         }
     }
-    (plan, deferred)
+    (plan, deferred, full)
 }
 
-/// One `generate_batch_prefill` of `specs` under `reuse`, then index what it
-/// minted. An attach can fail for reasons the index cannot see (the daemon evicted
-/// the checkpoint): forget what was attached and prefill in full once, rather
-/// than fail requests over a cache miss.
-async fn prefill_once(
+/// Rows each session still has to prefill under `reuse`: its full length, less the
+/// prefix it attaches. Recomputed whenever an attach is dropped, since a session
+/// that loses its prefix prefills in full.
+fn rows_to_prefill(
+    full: &HashMap<String, usize>,
+    reuse: &HashMap<String, PrefixReuse>,
+) -> HashMap<String, usize> {
+    full.iter()
+        .map(|(id, &n)| {
+            let attached = match reuse.get(id) {
+                Some(PrefixReuse::Attach(entry)) => entry.prefix_len,
+                _ => 0,
+            };
+            (id.clone(), n.saturating_sub(attached))
+        })
+        .collect()
+}
+
+/// Prompt rows one daemon prefill call may carry, `HIPFIRE_SERVER_PREFILL_ROW_BUDGET`
+/// (default 8192; 0 = no limit).
+///
+/// Batched prefill sizes its scratch to every row of the call, and the model keeps
+/// that scratch at the largest size it has seen: 16 prompts of 16.7K tokens left ~90
+/// GB pinned for the life of the process, and every later large request failed or
+/// crawled against it. At 8192 rows the scratch stays ~3 GB on the 27B.
+fn prefill_row_budget() -> usize {
+    std::env::var("HIPFIRE_SERVER_PREFILL_ROW_BUDGET")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(8192)
+}
+
+/// Split `specs` into prefill calls of at most `budget` rows each, in order. A
+/// session larger than the budget goes alone — the single-session path prefills in
+/// bounded chunks of its own. A session whose rows are unknown (its preflight
+/// failed) also goes alone, counted as a full budget. Decode is unaffected: every
+/// session still decodes in one batch.
+fn prefill_groups(
+    specs: &[SessionSpec],
+    rows: &HashMap<String, usize>,
+    budget: usize,
+) -> Vec<Vec<SessionSpec>> {
+    if budget == 0 {
+        return vec![specs.to_vec()];
+    }
+    let mut groups: Vec<Vec<SessionSpec>> = Vec::new();
+    let mut current: Vec<SessionSpec> = Vec::new();
+    let mut used = 0usize;
+    for spec in specs {
+        let n = rows.get(&spec.id).copied().unwrap_or(budget);
+        if !current.is_empty() && used + n > budget {
+            groups.push(std::mem::take(&mut current));
+            used = 0;
+        }
+        current.push(spec.clone());
+        used += n;
+    }
+    if !current.is_empty() {
+        groups.push(current);
+    }
+    groups
+}
+
+/// Prefill `specs` under `reuse` in calls of at most `budget` rows, indexing what
+/// each call mints.
+///
+/// An attach can fail for reasons the index cannot see (the daemon evicted the
+/// checkpoint). Drop just the checkpoint the error names — or every attach in the
+/// call, if it names none — and retry, re-splitting by the budget: a session that
+/// lost its prefix now prefills in full, and retrying it inside the group formed
+/// for its attached size put 15 full 16.7K prompts in one call and ran the device
+/// out of memory.
+#[allow(clippy::too_many_arguments)]
+async fn prefill_budgeted(
     engine: &mut DaemonEngine,
     batch_id: &str,
     worker: &str,
     specs: &[SessionSpec],
-    reuse: &HashMap<String, PrefixReuse>,
+    reuse: &mut HashMap<String, PrefixReuse>,
+    full: &HashMap<String, usize>,
+    budget: usize,
     index: &mut PrefixIndex,
 ) -> anyhow::Result<Vec<serde_json::Value>> {
-    let mut reuse = reuse.clone();
-    let handles: Vec<String> = specs.iter().map(|s| s.id.clone()).collect();
-    let mut result = engine
-        .generate_batch_prefill(build_batch_prefill_request(batch_id, worker, specs, &reuse))
-        .await;
-    // A checkpoint the daemon no longer has (evicted) fails its whole batch. Drop
-    // just the one the error names and retry with the rest still attached: retrying
-    // with no cache at all turned one stale entry into N full prefills, whose
-    // scratch alone ran the device out of memory. An error that names no checkpoint
-    // drops every attach, as before.
-    for _ in 0..specs.len() {
-        let Err(e) = &result else { break };
+    let mut events = Vec::new();
+    let mut queue: std::collections::VecDeque<Vec<SessionSpec>> =
+        prefill_groups(specs, &rows_to_prefill(full, reuse), budget).into();
+    let mut calls = 0usize;
+    while let Some(group) = queue.pop_front() {
+        let id = if calls == 0 {
+            batch_id.to_string()
+        } else {
+            format!("{batch_id}-g{calls}")
+        };
+        calls += 1;
+        let result = engine
+            .generate_batch_prefill(build_batch_prefill_request(&id, worker, &group, reuse))
+            .await;
+        let e = match result {
+            Ok(call_events) => {
+                record_prefix_checkpoints(engine, worker, &call_events, index).await;
+                events.extend(call_events);
+                continue;
+            }
+            Err(e) => e,
+        };
         let message = e.to_string();
-        let attached: Vec<String> = reuse
-            .values()
-            .filter_map(|r| match r {
-                PrefixReuse::Attach(entry) => Some(entry.checkpoint_id.clone()),
-                PrefixReuse::Mint => None,
+        let attached: Vec<String> = group
+            .iter()
+            .filter_map(|s| match reuse.get(&s.id) {
+                Some(PrefixReuse::Attach(entry)) => Some(entry.checkpoint_id.clone()),
+                _ => None,
             })
             .collect();
         if attached.is_empty() {
-            break;
+            return Err(e);
         }
         let named: Vec<String> = attached
-            .into_iter()
+            .iter()
             .filter(|id| message.contains(id.as_str()))
+            .cloned()
             .collect();
+        let dropping = if named.is_empty() { attached } else { named };
         tracing::warn!(
             "prefill with cached prefixes failed ({message}); retrying without {}",
-            if named.is_empty() {
-                "any of them".to_string()
-            } else {
-                named.join(", ")
-            }
+            dropping.join(", ")
         );
-        reuse.retain(|_, r| match r {
-            PrefixReuse::Attach(entry) => {
-                let drop = named.is_empty() || named.contains(&entry.checkpoint_id);
-                if drop {
+        for s in &group {
+            if let Some(PrefixReuse::Attach(entry)) = reuse.get(&s.id) {
+                if dropping.contains(&entry.checkpoint_id) {
                     index.forget(&entry.checkpoint_id);
+                    reuse.remove(&s.id);
                 }
-                !drop
             }
-            PrefixReuse::Mint => true,
-        });
+        }
+        let handles: Vec<String> = group.iter().map(|s| s.id.clone()).collect();
         let _ = engine
             .release_sessions(build_release_request(worker, &handles))
             .await;
-        result = engine
-            .generate_batch_prefill(build_batch_prefill_request(batch_id, worker, specs, &reuse))
-            .await;
+        let regrouped = prefill_groups(&group, &rows_to_prefill(full, reuse), budget);
+        for g in regrouped.into_iter().rev() {
+            queue.push_front(g);
+        }
     }
-    let events = result?;
-    record_prefix_checkpoints(engine, worker, &events, index).await;
     Ok(events)
 }
 
@@ -684,7 +777,7 @@ async fn prefill_once(
 /// being minted in this same batch wait a round: round 1 prefills everything else,
 /// round 2 attaches them to what round 1 checkpointed — so a cold batch of N
 /// requests with a common system turn prefills it once, not N times. They still
-/// decode together; only prefill is split.
+/// decode together; only prefill is split, by rounds and by the row budget.
 async fn prefill_with_prefix_reuse(
     engine: &mut DaemonEngine,
     batch_id: &str,
@@ -692,7 +785,9 @@ async fn prefill_with_prefix_reuse(
     specs: &[SessionSpec],
     index: &mut PrefixIndex,
 ) -> anyhow::Result<Vec<serde_json::Value>> {
-    if !prefix_cache_enabled() {
+    let use_cache = prefix_cache_enabled();
+    let budget = prefill_row_budget();
+    if !use_cache && budget == 0 {
         let request = build_batch_prefill_request(batch_id, worker, specs, &HashMap::new());
         return engine.generate_batch_prefill(request).await;
     }
@@ -700,7 +795,8 @@ async fn prefill_with_prefix_reuse(
     let mut events = Vec::new();
     let mut pending: Vec<SessionSpec> = specs.to_vec();
     for round in 0..MAX_ROUNDS {
-        let (reuse, mut deferred) = plan_prefix_reuse(engine, worker, &pending, index).await;
+        let (mut reuse, mut deferred, full) =
+            plan_prefix_reuse(engine, worker, &pending, index, use_cache).await;
         if round + 1 == MAX_ROUNDS {
             deferred.clear();
         }
@@ -711,7 +807,9 @@ async fn prefill_with_prefix_reuse(
         } else {
             format!("{batch_id}-r{round}")
         };
-        events.extend(prefill_once(engine, &id, worker, &now, &reuse, index).await?);
+        events.extend(
+            prefill_budgeted(engine, &id, worker, &now, &mut reuse, &full, budget, index).await?,
+        );
         if later.is_empty() {
             break;
         }
@@ -1866,6 +1964,40 @@ mod tests {
             index.lookup("w", &next).unwrap().checkpoint_id,
             "ck-next-step"
         );
+    }
+
+    #[test]
+    fn prefill_groups_respect_the_row_budget() {
+        let specs: Vec<SessionSpec> = (0..5).map(|i| spec(&format!("s{i}"))).collect();
+        let rows: HashMap<String, usize> = [
+            ("s0", 3000),
+            ("s1", 3000),
+            ("s2", 3000),
+            ("s3", 20000),
+            ("s4", 100),
+        ]
+        .iter()
+        .map(|(k, v)| (k.to_string(), *v))
+        .collect();
+        let ids = |g: &Vec<Vec<SessionSpec>>| -> Vec<Vec<String>> {
+            g.iter()
+                .map(|v| v.iter().map(|s| s.id.clone()).collect())
+                .collect()
+        };
+        // 3000+3000 fits 8192, a third does not; the 20000-row session goes alone.
+        assert_eq!(
+            ids(&prefill_groups(&specs, &rows, 8192)),
+            vec![vec!["s0", "s1"], vec!["s2"], vec!["s3"], vec!["s4"]]
+        );
+        // Unknown rows count as a full budget, so that session goes alone.
+        let mut partial = rows.clone();
+        partial.remove("s1");
+        assert_eq!(
+            ids(&prefill_groups(&specs[..3], &partial, 8192)),
+            vec![vec!["s0"], vec!["s1"], vec!["s2"]]
+        );
+        // 0 disables the budget.
+        assert_eq!(prefill_groups(&specs, &rows, 0).len(), 1);
     }
 
     #[test]

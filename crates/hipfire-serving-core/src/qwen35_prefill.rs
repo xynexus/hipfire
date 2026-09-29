@@ -681,6 +681,22 @@ pub fn qwen35_prefill_suffix_batch(
         backend,
         Qwen35PrefillBatchBackend::FusedDense | Qwen35PrefillBatchBackend::FusedGroupedMoe
     ) {
+        let longest = prepared
+            .iter()
+            .map(|s| s.cached_prefix_tokens + s.tokens.len())
+            .max()
+            .unwrap_or(0);
+        if let Some(reason) = crate::session::kvarn_fused_context_refusal(m, longest) {
+            tracing::debug!("fused prefill routed to serial: {reason}");
+            return qwen35_prefill_suffix_batch_serial_reference(
+                m,
+                gpu,
+                batch_id,
+                prepared,
+                plan,
+                Qwen35PrefillBatchBackend::SerialReference,
+            );
+        }
         if let Err(err) = qwen35_fused_prefill_boundary_cuts(prepared) {
             if std::env::var_os("HIPFIRE_DEBUG_PREFIX_BOUNDARIES").is_some() {
                 tracing::warn!("fused prefill boundary checkpoint fallback: {err}");

@@ -531,6 +531,16 @@ pub fn validate_qwen35_decode_resident_sessions(
     envelope: &GenerateBatchDecodeEnvelope,
     backend_label: &str,
 ) -> Result<(), String> {
+    // A decode step attends over logical_position + 1 positions.
+    let longest = envelope
+        .sessions
+        .iter()
+        .map(|s| s.logical_position + 1)
+        .max()
+        .unwrap_or(0);
+    if let Some(reason) = crate::session::kvarn_fused_context_refusal(m, longest) {
+        return Err(reason);
+    }
     for session in &envelope.sessions {
         let state = m
             .q35_registry
@@ -559,6 +569,16 @@ pub fn validate_qwen35_fused_dense_decode_resident_sessions(
     m: &LoadedModel,
     envelope: &GenerateBatchDecodeEnvelope,
 ) -> Result<(), String> {
+    // A decode step attends over logical_position + 1 positions.
+    let longest = envelope
+        .sessions
+        .iter()
+        .map(|s| s.logical_position + 1)
+        .max()
+        .unwrap_or(0);
+    if let Some(reason) = crate::session::kvarn_fused_context_refusal(m, longest) {
+        return Err(reason);
+    }
     let config = m
         .q35_config
         .as_ref()

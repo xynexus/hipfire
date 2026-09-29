@@ -1800,6 +1800,30 @@ pub(crate) fn qwen35_mixer_profile(layer_types: &[LayerType]) -> MixerProfile {
 /// Allocate (or reuse) the resident session-state slot for a session id,
 /// parking any other active session first; the entry point that makes a session
 /// the live one before prefill.
+/// Longest context the fused batched KVarN attention takes. It holds a whole
+/// context of scores in LDS (`attention_kvarn_routed_batched`: `scores[seq_len]`),
+/// and past 64 KiB (~15.9K positions at head_dim 256) the launch fails outright —
+/// measured at 16.8K: `shared=69176B ... invalid argument`, which failed the batch.
+/// Past this the fused prefill and decode route to the serial path, whose
+/// flash-tiled attention has no such cap. Matches the q8 guard's LDS_CTX_LIMIT.
+/// ponytail: a streaming-softmax variant of the routed kernel would lift the cap
+/// and keep long-context batches fused.
+pub const KVARN_FUSED_ATTENTION_CTX_MAX: usize = 15000;
+
+/// Why a fused KVarN batch cannot take a context of `longest` positions, if it
+/// cannot. Not KVarN, or within the cap: `None`.
+pub fn kvarn_fused_context_refusal(m: &LoadedModel, longest: usize) -> Option<String> {
+    let kvarn = m
+        .q35_kv_mode
+        .as_deref()
+        .is_some_and(|k| k.starts_with("kvarn"));
+    (kvarn && longest > KVARN_FUSED_ATTENTION_CTX_MAX).then(|| {
+        format!(
+            "context {longest} exceeds the fused KVarN attention's {KVARN_FUSED_ATTENTION_CTX_MAX}-position LDS cap"
+        )
+    })
+}
+
 /// Page-backed KVarN session caches; `HIPFIRE_KV_PAGED=0` keeps pooled buffers.
 fn paged_kv_enabled() -> bool {
     !matches!(
