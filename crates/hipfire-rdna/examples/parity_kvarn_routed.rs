@@ -317,7 +317,7 @@ fn main() {
         .unwrap();
     gpu.attention_kvarn_routed_batched_chunked(
         false, &qd, &recp, &winp, &vp, &out_c, &rsid, &posd, 1, 0, N_HEADS, N_KV_HEADS, HEAD_DIM,
-        MAX_SEQ, n_rows, 4, 0, 64,
+        MAX_SEQ, n_rows, 4, 0, 64, false,
     )
     .unwrap();
     gpu.device_synchronize().unwrap();
@@ -332,6 +332,28 @@ fn main() {
     }
     println!("parity_kvarn_routed chunked(64): max-abs-err={max_abs_c:.2e}");
     max_abs = max_abs.max(max_abs_c);
+
+    // GQA-grouped variant (one workgroup per KV head), also at 64-position chunks.
+    gpu.attention_kvarn_routed_batched_chunked(
+        false, &qd, &recp, &winp, &vp, &out_c, &rsid, &posd, 1, 0, N_HEADS, N_KV_HEADS, HEAD_DIM,
+        MAX_SEQ, n_rows, 4, 0, 64, true,
+    )
+    .unwrap();
+    gpu.device_synchronize().unwrap();
+    let got_g = gpu.download_f32(&out_c).unwrap();
+    let mut max_abs_g = 0.0f32;
+    for (r, &sess) in row_sessions.iter().enumerate() {
+        let rr = &got_g[r * N_HEADS * HEAD_DIM..(r + 1) * N_HEADS * HEAD_DIM];
+        let rf = &ref_out[sess as usize];
+        for i in 0..N_HEADS * HEAD_DIM {
+            max_abs_g = max_abs_g.max((rr[i] - rf[i]).abs());
+        }
+    }
+    let same = got_g == got_c;
+    println!(
+        "parity_kvarn_routed gqa(64): max-abs-err={max_abs_g:.2e} bit-identical-to-chunked={same}"
+    );
+    max_abs = max_abs.max(max_abs_g);
     let pass = max_abs < 2e-3;
     println!("parity_kvarn_routed on {}: routed-vs-single-session max-abs-err={max_abs:.2e} (rows->sessions {row_sessions:?}) -> {}",
         gpu.arch, if pass { "PASS" } else { "FAIL" });
