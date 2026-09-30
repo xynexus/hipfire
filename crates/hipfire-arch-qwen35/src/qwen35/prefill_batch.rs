@@ -248,14 +248,6 @@ pub struct DensePrefillSessionBatchExecutionPlan {
     pub multi_state_rounds: usize,
     pub multi_state_prefix_rounds: usize,
     pub multi_state_prefix_rows: usize,
-    pub singleton_tail: Option<DensePrefillSessionBatchSingletonTail>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DensePrefillSessionBatchSingletonTail {
-    pub start_round: usize,
-    pub session_index: usize,
-    pub rows: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -2191,9 +2183,19 @@ pub fn validate_dense_prefill_session_batch_state_signatures(
                 .to_string(),
         );
     }
-    let expected = signatures[0];
+    // Capacity is per session, not a batch property: no batched kernel or pointer
+    // table reads it (attention is launched with the batch's max context), and the
+    // fused paths bound each row by its own `physical_cap`. Comparing it made the
+    // batch fall off the fused path whenever sessions were sized to their own
+    // prompt + max_tokens — i.e. whenever prompts differed in length.
+    let uniform =
+        |s: &DensePrefillSessionBatchStateSignature| DensePrefillSessionBatchStateSignature {
+            kv_physical_cap: 0,
+            ..*s
+        };
+    let expected = uniform(&signatures[0]);
     for (idx, signature) in signatures.iter().enumerate().skip(1) {
-        if *signature != expected {
+        if uniform(signature) != expected {
             return Err(format!(
                 "dense session prefill batch row {idx} has incompatible KV/DeltaNet state signature: expected {:?}, got {:?}",
                 expected,
@@ -2544,11 +2546,7 @@ pub fn build_calibration_session_batch_execution_plan(
     max_batch: usize,
 ) -> Result<DensePrefillSessionBatchExecutionPlan, String> {
     let rounds = build_prefill_session_batch_rounds(inputs, max_batch, 1)?;
-    let mut plan = prefill_session_batch_execution_plan_from_rounds(rounds);
-    plan.multi_state_prefix_rounds = plan.rounds.len();
-    plan.multi_state_prefix_rows = plan.total_rows;
-    plan.singleton_tail = None;
-    Ok(plan)
+    Ok(prefill_session_batch_execution_plan_from_rounds(rounds))
 }
 
 fn prefill_session_batch_execution_plan_from_rounds(
@@ -2558,7 +2556,6 @@ fn prefill_session_batch_execution_plan_from_rounds(
     let mut max_rows_per_round = 0usize;
     let mut multi_state_rounds = 0usize;
     let mut state_routes = Vec::with_capacity(rounds.len());
-    let mut last_multi_state_round = None;
     for round in &rounds {
         total_rows += round.rows.len();
         max_rows_per_round = max_rows_per_round.max(round.rows.len());
@@ -2568,42 +2565,18 @@ fn prefill_session_batch_execution_plan_from_rounds(
             DensePrefillSessionBatchRoundStateRoute::MultiSession { .. }
         ) {
             multi_state_rounds += 1;
-            last_multi_state_round = Some(state_routes.len());
         }
         state_routes.push(route);
     }
-    let multi_state_prefix_rounds = last_multi_state_round.map(|idx| idx + 1).unwrap_or(0);
-    let multi_state_prefix_rows: usize = rounds[..multi_state_prefix_rounds]
-        .iter()
-        .map(|round| round.rows.len())
-        .sum();
-    let singleton_tail =
-        last_multi_state_round.and_then(|last_multi| {
-            let start_round = last_multi + 1;
-            if start_round >= state_routes.len() {
-                return None;
-            }
-            let session_index = match state_routes[start_round] {
-                DensePrefillSessionBatchRoundStateRoute::SingleSession { session_index } => {
-                    session_index
-                }
-                DensePrefillSessionBatchRoundStateRoute::MultiSession { .. } => return None,
-            };
-            let mut rows = 0usize;
-            for route in &state_routes[start_round..] {
-                match route {
-                    DensePrefillSessionBatchRoundStateRoute::SingleSession {
-                        session_index: idx,
-                    } if *idx == session_index => rows += 1,
-                    _ => return None,
-                }
-            }
-            Some(DensePrefillSessionBatchSingletonTail {
-                start_round,
-                session_index,
-                rows,
-            })
-        });
+    // Every round runs fused, including the ragged tail where only the longest
+    // session still has rows: the routed kernels take a one-session round like
+    // any other. The plan used to stop at the last multi-session round and name
+    // the rest a `singleton_tail` for a serial fallback that was never written,
+    // so the longest session silently lost its last (longest - second longest)
+    // prompt tokens while its cursor advanced past them — a KV/DeltaNet hole
+    // and logits taken from the wrong row. Invisible with equal-length prompts.
+    let multi_state_prefix_rounds = rounds.len();
+    let multi_state_prefix_rows = total_rows;
     DensePrefillSessionBatchExecutionPlan {
         rounds,
         state_routes,
@@ -2612,7 +2585,6 @@ fn prefill_session_batch_execution_plan_from_rounds(
         multi_state_rounds,
         multi_state_prefix_rounds,
         multi_state_prefix_rows,
-        singleton_tail,
     }
 }
 

@@ -103,7 +103,6 @@ pub fn validate_qwen35_fused_dense_decode_session_signatures(
         multi_state_rounds: 1,
         multi_state_prefix_rounds: 1,
         multi_state_prefix_rows: session_count,
-        singleton_tail: None,
     };
     qwen35::validate_dense_prefill_session_batch_fused_prefix_full_precision_contract(
         config,
@@ -130,7 +129,6 @@ pub fn validate_qwen35_grouped_moe_decode_session_signatures(
         multi_state_rounds: 1,
         multi_state_prefix_rounds: 1,
         multi_state_prefix_rows: session_count,
-        singleton_tail: None,
     };
     qwen35::validate_grouped_moe_prefill_session_batch_state_contract(
         config,

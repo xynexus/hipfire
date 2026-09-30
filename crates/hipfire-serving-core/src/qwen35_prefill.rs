@@ -1118,9 +1118,9 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
                 // (`validate_dense_prefill_session_batch_shape`). Banding
                 // naively on the longest session strands the ragged tail as a
                 // one-row dispatch and the whole prefill fails — measured, not
-                // predicted. The batch kernel has its own `singleton_tail`
-                // handling for that tail, but only inside a call that started
-                // with two or more rows, so the banding must not split it out.
+                // predicted. The batch kernel runs that ragged tail itself, but
+                // only inside a call that started with two or more sessions, so
+                // the banding must not split it out.
                 //
                 // So: cut bands inside the SHORTEST session, and let the final
                 // band run to each session's own end. Every band then carries
