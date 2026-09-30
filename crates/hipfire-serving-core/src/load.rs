@@ -2652,6 +2652,7 @@ pub fn load_model(
                     active_session_id: Some(crate::session::LFM2_LEGACY_SESSION_ID.to_string()),
                     allocation_epoch: next_qwen35_state_allocation_epoch(),
                     kv_caps: Default::default(),
+                    ..Default::default()
                 },
                 lfm2moe_eos_tok: eos_tok,
                 dots_ocr_config: None,
@@ -3027,6 +3028,7 @@ pub fn load_model(
                 active_session_id: Some(QWEN35_LEGACY_SESSION_ID.to_string()),
                 allocation_epoch: next_qwen35_state_allocation_epoch(),
                 kv_caps: Default::default(),
+                ..Default::default()
             },
             llama_config: None,
             llama_weights: None,

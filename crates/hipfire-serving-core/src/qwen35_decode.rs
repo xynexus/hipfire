@@ -540,7 +540,9 @@ pub fn validate_qwen35_decode_resident_sessions(
                     session.session_id
                 )
             })?;
-        let logical_position = state.cursor.seq_pos + state.kv_cache().compact_offset;
+        let logical_position = state.cursor.seq_pos
+            + state.kv_cache().compact_offset
+            + crate::qwen35_batch_spec::spec_pending_len(m, &session.session_id);
         if logical_position != session.logical_position {
             return Err(format!(
                 "decode session {} logical_position mismatch: expected={} resident={}",
@@ -573,7 +575,9 @@ pub fn validate_qwen35_fused_dense_decode_resident_sessions(
                     session.session_id
                 )
             })?;
-        let logical_position = state.cursor.seq_pos + state.kv_cache().compact_offset;
+        let logical_position = state.cursor.seq_pos
+            + state.kv_cache().compact_offset
+            + crate::qwen35_batch_spec::spec_pending_len(m, &session.session_id);
         if logical_position != session.logical_position {
             return Err(format!(
                 "decode session {} logical_position mismatch: expected={} resident={}",
@@ -665,6 +669,14 @@ pub fn run_generate_batch_decode_step_qwen35(
     }
     let requested_backend =
         std::env::var("HIPFIRE_QWEN35_DECODE_BATCH").unwrap_or_else(|_| "auto".to_string());
+    // Fused grouped-MoE decode starts at 4 sessions, where it beats per-session
+    // decode on its own. With speculation it wins from 2: drafts need the fused
+    // verify, and measured on the 35B-A3B, 2 sessions copying code ran 12.5s
+    // serial vs 4.5s fused + speculation, with prose unchanged (10.0s both).
+    let moe_decode_gate =
+        qwen35_grouped_moe_decode_auto_latency_gate_passed(envelope.session_count)
+            || (crate::qwen35_batch_spec::batch_ngram_spec_enabled()
+                && envelope.session_count >= 2);
     let mut backend = select_qwen35_decode_batch_backend(
         requested_backend.as_str(),
         m.arch_id,
@@ -678,7 +690,7 @@ pub fn run_generate_batch_decode_step_qwen35(
     }
     if qwen35_decode_batch_requested_auto(requested_backend.as_str())
         && is_qwen35_moe_arch_id(m.arch_id)
-        && qwen35_grouped_moe_decode_auto_latency_gate_passed(envelope.session_count)
+        && moe_decode_gate
     {
         qwen35_save_active_session(m, gpu)?;
     }
@@ -708,7 +720,7 @@ pub fn run_generate_batch_decode_step_qwen35(
     }
     if qwen35_decode_batch_requested_auto(requested_backend.as_str())
         && is_qwen35_moe_arch_id(m.arch_id)
-        && qwen35_grouped_moe_decode_auto_latency_gate_passed(envelope.session_count)
+        && moe_decode_gate
         && validate_qwen35_grouped_moe_decode_model_capability(
             m,
             envelope.session_count,
@@ -729,7 +741,40 @@ pub fn run_generate_batch_decode_step_qwen35(
     if std::env::var("HIPFIRE_KV_HIERARCHICAL").ok().as_deref() == Some("1") {
         backend = Qwen35DecodeBatchBackend::SerialReference;
     }
-    if backend == Qwen35DecodeBatchBackend::FusedDenseLayerChunked {
+    // A lone dense session speculates too: its drafts are what turn one row a
+    // step into several, and the fused forward takes one session.
+    let single_spec = envelope.session_count == 1
+        && crate::qwen35_batch_spec::batch_ngram_spec_enabled()
+        && qwen35_decode_batch_requested_auto(requested_backend.as_str())
+        && std::env::var("HIPFIRE_KV_HIERARCHICAL").ok().as_deref() != Some("1")
+        && (validate_qwen35_fused_dense_decode_model_capability(m, 2).is_ok()
+            || validate_qwen35_grouped_moe_decode_model_capability(m, 2, gpu.arch.as_str())
+                .is_ok());
+    if single_spec {
+        qwen35_save_active_session(m, gpu)?;
+        backend = if is_qwen35_moe_arch_id(m.arch_id) {
+            Qwen35DecodeBatchBackend::FusedGroupedMoeLayerChunked
+        } else {
+            Qwen35DecodeBatchBackend::FusedDenseLayerChunked
+        };
+    }
+    // Pending speculative tokens (`qwen35_batch_spec`) are consumed only by the
+    // speculative fused dense step; every other path needs them fed first.
+    if !matches!(
+        backend,
+        Qwen35DecodeBatchBackend::FusedDenseLayerChunked
+            | Qwen35DecodeBatchBackend::FusedGroupedMoeLayerChunked
+    ) || !crate::qwen35_batch_spec::batch_ngram_spec_enabled()
+    {
+        for session in &envelope.sessions {
+            crate::qwen35_batch_spec::flush_spec_pending(m, gpu, &session.session_id)?;
+        }
+    }
+    // `single_spec` was validated as a 2-session batch when it was chosen; the
+    // speculative step's forward takes the one session through its calibration
+    // schedule, which these checks' two-session minimum does not know about.
+    if single_spec {
+    } else if backend == Qwen35DecodeBatchBackend::FusedDenseLayerChunked {
         validate_qwen35_fused_dense_decode_model_capability(m, envelope.session_count)?;
     } else if backend == Qwen35DecodeBatchBackend::FusedGroupedMoeLayerChunked {
         validate_qwen35_grouped_moe_decode_model_capability(
@@ -754,6 +799,17 @@ pub fn run_generate_batch_decode_step_qwen35(
     };
     let t0 = Instant::now();
     let step_result = match backend {
+        _ if single_spec => Qwen35DecodeBatchStepResult {
+            session_lines: crate::qwen35_batch_spec::qwen35_decode_step_fused_dense_spec_chunk(
+                m,
+                gpu,
+                envelope,
+                &envelope.sessions,
+                im_end_token,
+            )?,
+            chunk_count: 1,
+            chunk_size: 1,
+        },
         Qwen35DecodeBatchBackend::SerialReference => Qwen35DecodeBatchStepResult {
             session_lines: qwen35_decode_step_serial_reference(
                 m,
@@ -1093,13 +1149,19 @@ pub fn qwen35_decode_step_fused_dense_native_chunks(
     let mut session_lines = Vec::with_capacity(envelope.sessions.len());
 
     for (start, end) in &chunks {
-        let mut chunk_lines = qwen35_decode_step_fused_dense_native_chunk(
-            m,
-            gpu,
-            envelope,
-            &envelope.sessions[*start..*end],
-            im_end_token,
-        )?;
+        let chunk = &envelope.sessions[*start..*end];
+        let mut chunk_lines =
+            if chunk.len() >= 2 && crate::qwen35_batch_spec::batch_ngram_spec_enabled() {
+                crate::qwen35_batch_spec::qwen35_decode_step_fused_dense_spec_chunk(
+                    m,
+                    gpu,
+                    envelope,
+                    chunk,
+                    im_end_token,
+                )?
+            } else {
+                qwen35_decode_step_fused_dense_native_chunk(m, gpu, envelope, chunk, im_end_token)?
+            };
         session_lines.append(&mut chunk_lines);
     }
 
@@ -1122,23 +1184,32 @@ pub fn qwen35_decode_step_fused_grouped_moe_native_chunks(
 
     for (start, end) in &chunks {
         let chunk = &envelope.sessions[*start..*end];
-        let mut chunk_lines = if chunk.len() == 1 {
-            qwen35_decode_step_fused_dense_native_singleton(
-                m,
-                gpu,
-                envelope,
-                &chunk[0],
-                im_end_token,
-            )?
-        } else {
-            qwen35_decode_step_fused_grouped_moe_native_chunk(
-                m,
-                gpu,
-                envelope,
-                chunk,
-                im_end_token,
-            )?
-        };
+        let mut chunk_lines =
+            if crate::qwen35_batch_spec::batch_ngram_spec_enabled() && chunk.len() >= 2 {
+                crate::qwen35_batch_spec::qwen35_decode_step_fused_dense_spec_chunk(
+                    m,
+                    gpu,
+                    envelope,
+                    chunk,
+                    im_end_token,
+                )?
+            } else if chunk.len() == 1 {
+                qwen35_decode_step_fused_dense_native_singleton(
+                    m,
+                    gpu,
+                    envelope,
+                    &chunk[0],
+                    im_end_token,
+                )?
+            } else {
+                qwen35_decode_step_fused_grouped_moe_native_chunk(
+                    m,
+                    gpu,
+                    envelope,
+                    chunk,
+                    im_end_token,
+                )?
+            };
         session_lines.append(&mut chunk_lines);
     }
 
@@ -1656,6 +1727,7 @@ pub fn qwen35_decode_step_fused_dense_native_singleton(
     session: &GenerateBatchDecodeSession,
     im_end_token: Option<u32>,
 ) -> Result<Vec<serde_json::Value>, String> {
+    crate::qwen35_batch_spec::flush_spec_pending(m, gpu, &session.session_id)?;
     qwen35_activate_session(m, gpu, &session.session_id)?;
     let mut state = Qwen35RequestSessionState::take_from_loaded(m, gpu)?;
 

@@ -72,6 +72,17 @@ pub struct SessionRegistry<S> {
     /// by session id and consumed when that happens. Absent = the model's full
     /// `physical_cap`. Set by the batch prefill once it knows prompt + max_tokens.
     pub kv_caps: std::collections::HashMap<String, usize>,
+    /// Batched n-gram speculation (`qwen35_batch_spec`), per session id: the
+    /// drafter (history = the session's committed tokens) and its acceptance.
+    pub spec_sessions:
+        std::collections::HashMap<String, crate::qwen35_batch_spec::BatchSpecSession>,
+    /// Committed tokens not yet fed into the session's KV/DeltaNet state: a
+    /// verify that rejected a draft restores the pre-step state and the accepted
+    /// tokens ride the next step as rows instead of a second forward. The
+    /// session's logical position is `seq_pos + compact_offset + pending`, and
+    /// its `logits` are stale until they are fed — every decode path must feed
+    /// them first (`qwen35_decode::flush_spec_pending`).
+    pub spec_pending: std::collections::HashMap<String, Vec<u32>>,
 }
 
 // Manual `Default` (not derived) so it does not impose `S: Default` — the
@@ -83,6 +94,8 @@ impl<S> Default for SessionRegistry<S> {
             active_session_id: None,
             allocation_epoch: 0,
             kv_caps: std::collections::HashMap::new(),
+            spec_sessions: std::collections::HashMap::new(),
+            spec_pending: std::collections::HashMap::new(),
         }
     }
 }

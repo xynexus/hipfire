@@ -1621,6 +1621,9 @@ async fn run_batch_cycle(
     let mut cached_prefix_tokens = None;
     let mut fallback_reason = None;
     let mut steps: u32 = 0;
+    // Batched speculation (daemon `qwen35_batch_spec`): drafts proposed and
+    // accepted, and tokens committed, over the cycle.
+    let (mut spec_drafted, mut spec_accepted, mut committed_total) = (0u64, 0u64, 0u64);
     while !active.is_empty() {
         // Drop sessions whose client disconnected (response receiver closed):
         // stop decoding, and don't park/resume them. A session that was parked
@@ -1678,8 +1681,19 @@ async fn run_batch_cycle(
                     let _ = tx.send(BatchEvent::Token(text.to_string()));
                 }
             }
+            // A speculative step commits `tokens` (0..=n: a step that only
+            // feeds a pending run emits none); the plain step, one `token`.
+            let committed = ev
+                .get("tokens")
+                .and_then(|v| v.as_array())
+                .map_or(1, Vec::len);
+            committed_total += committed as u64;
+            if let Some(spec) = ev.get("spec") {
+                spec_drafted += spec.get("drafted").and_then(|v| v.as_u64()).unwrap_or(0);
+                spec_accepted += spec.get("accepted").and_then(|v| v.as_u64()).unwrap_or(0);
+            }
             let rem = remaining.get_mut(id).map(|r| {
-                *r = r.saturating_sub(1);
+                *r = r.saturating_sub(committed);
                 *r
             });
             if stop || rem == Some(0) {
@@ -1797,6 +1811,14 @@ async fn run_batch_cycle(
         }
     }
 
+    tracing::debug!(
+        steps,
+        committed_total,
+        spec_drafted,
+        spec_accepted,
+        "decode cycle done ({:.2} tokens/session-step)",
+        committed_total as f64 / f64::from(steps.max(1)) / specs.len().max(1) as f64
+    );
     // All requests finished: release the sessions and record the batch.
     let handles: Vec<String> = specs.iter().map(|s| s.id.clone()).collect();
     let _ = engine

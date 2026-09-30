@@ -1220,6 +1220,12 @@ pub fn grouped_moe_prefix_supports_attention(layer: &DeltaNetMoeLayerWeights) ->
     all(DType::Q8_0)
         || all(DType::MQ4G256)
         || all(DType::MQ6G256)
+        // Opus W8A8 (the oq4.25++ artifacts, e.g. the 35B-A3B): no fused qkvza
+        // kernel, so these take the four separate GEMMs of the last arm, whose
+        // `dense_session_prefill_gemm_full_precision` rotates and dispatches them.
+        // Refusing them kept every 35B-A3B batch — prefill and decode — serial.
+        || all(DType::OqCompactG256)
+        || all(DType::Oq8G256)
         || dtypes
             .iter()
             .all(|d| matches!(d, DType::F32 | DType::F16 | DType::BF16 | DType::Raw))
@@ -1295,6 +1301,146 @@ pub fn dense_prefill_session_batch_final_logits_full_precision(
     result
 }
 
+/// The grouped-MoE lm_head over the first `row_count` rows of `pbs.x_batch`
+/// (output norm, then the lm_head arm for its dtype) into `batch_logits`.
+fn grouped_moe_prefill_session_batch_row_logits(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    pbs: &PrefillBatchScratch,
+    batch_logits: &GpuTensor,
+    row_count: usize,
+) -> HipResult<()> {
+    // Formats with no arm below that the dense lm_head handles (the oq4.25++
+    // artifacts' OqCompact, the packed bf16 LUT3): same norm + GEMM, one owner.
+    if matches!(
+        weights.output.gpu_dtype,
+        DType::OqCompactG256 | DType::Oq8G256 | DType::Bf16L3
+    ) {
+        return dense_prefill_session_batch_logits_full_precision(
+            gpu,
+            weights,
+            config,
+            pbs,
+            batch_logits,
+            row_count,
+        );
+    }
+    let normed_rows = pbs.x_norm_batch.sub_offset(0, row_count * config.dim);
+    gpu.rmsnorm_batched(
+        &pbs.x_batch,
+        &weights.output_norm,
+        &normed_rows,
+        row_count,
+        config.dim,
+        config.norm_eps,
+    )?;
+
+    match weights.output.gpu_dtype {
+        DType::F32 => gpu.gemm_f32_register_tiled(
+            &weights.output.buf,
+            &normed_rows,
+            batch_logits,
+            weights.output.m,
+            weights.output.k,
+            row_count,
+        ),
+        DType::F16 | DType::Raw => gpu.gemm_f16_batched_lmhead(
+            &weights.output.buf,
+            &normed_rows,
+            batch_logits,
+            weights.output.m,
+            weights.output.k,
+            row_count,
+        ),
+        DType::BF16 => gpu.gemm_bf16_x_bf16_wmma(
+            &weights.output.buf,
+            &normed_rows,
+            batch_logits,
+            weights.output.m,
+            weights.output.k,
+            row_count,
+        ),
+        DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(
+            &weights.output.buf,
+            &normed_rows,
+            batch_logits,
+            weights.output.m,
+            weights.output.k,
+            row_count,
+        ),
+        DType::MQ4G256 => {
+            let rotated = pbs.x_rot_batch.sub_offset(0, row_count * config.dim);
+            rotate_x_mq_batched_for(
+                gpu,
+                &weights.output,
+                &normed_rows,
+                &rotated,
+                config.dim,
+                row_count,
+            )
+            .and_then(|()| {
+                gpu.gemm_hfq4g256(
+                    &weights.output.buf,
+                    &rotated,
+                    batch_logits,
+                    weights.output.m,
+                    weights.output.k,
+                    row_count,
+                )
+            })
+        }
+        DType::MQ6G256 => {
+            let rotated = pbs.x_rot_batch.sub_offset(0, row_count * config.dim);
+            rotate_x_mq_batched_for(
+                gpu,
+                &weights.output,
+                &normed_rows,
+                &rotated,
+                config.dim,
+                row_count,
+            )
+            .and_then(|()| {
+                gpu.gemm_hfq6g256_batched_lmhead(
+                    &weights.output.buf,
+                    &rotated,
+                    batch_logits,
+                    weights.output.m,
+                    weights.output.k,
+                    row_count,
+                )
+            })
+        }
+        DType::MQ3G256 => {
+            let rotated = pbs.x_rot_batch.sub_offset(0, row_count * config.dim);
+            rotate_x_mq_batched_for(
+                gpu,
+                &weights.output,
+                &normed_rows,
+                &rotated,
+                config.dim,
+                row_count,
+            )
+            .and_then(|()| {
+                gpu.gemm_hfq3g256_batched_lmhead(
+                    &weights.output.buf,
+                    &rotated,
+                    batch_logits,
+                    weights.output.m,
+                    weights.output.k,
+                    row_count,
+                )
+            })
+        }
+        other => Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "grouped MoE session prefill final logits does not yet support lm_head dtype {other:?}; use serial_reference backend"
+            ),
+        )),
+    }
+}
+
 pub fn grouped_moe_prefill_session_batch_final_logits(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
@@ -1326,120 +1472,15 @@ pub fn grouped_moe_prefill_session_batch_final_logits(
     let identity = compact_session_last_rows(gpu, pbs, device_tables, config.dim, sessions)?;
     let row_count = sessions;
 
-    let normed_rows = pbs.x_norm_batch.sub_offset(0, row_count * config.dim);
-    gpu.rmsnorm_batched(
-        &pbs.x_batch,
-        &weights.output_norm,
-        &normed_rows,
-        row_count,
-        config.dim,
-        config.norm_eps,
-    )?;
-
     let batch_logits = gpu.alloc_owned(&[row_count * config.vocab_size], DType::F32)?;
-    match weights.output.gpu_dtype {
-        DType::F32 => gpu.gemm_f32_register_tiled(
-            &weights.output.buf,
-            &normed_rows,
-            &batch_logits,
-            weights.output.m,
-            weights.output.k,
-            row_count,
-        ),
-        DType::F16 | DType::Raw => gpu.gemm_f16_batched_lmhead(
-            &weights.output.buf,
-            &normed_rows,
-            &batch_logits,
-            weights.output.m,
-            weights.output.k,
-            row_count,
-        ),
-        DType::BF16 => gpu.gemm_bf16_x_bf16_wmma(
-            &weights.output.buf,
-            &normed_rows,
-            &batch_logits,
-            weights.output.m,
-            weights.output.k,
-            row_count,
-        ),
-        DType::Q8_0 => gpu.gemm_q8_0_batched_chunked(
-            &weights.output.buf,
-            &normed_rows,
-            &batch_logits,
-            weights.output.m,
-            weights.output.k,
-            row_count,
-        ),
-        DType::MQ4G256 => {
-            let rotated = pbs.x_rot_batch.sub_offset(0, row_count * config.dim);
-            rotate_x_mq_batched_for(
-                gpu,
-                &weights.output,
-                &normed_rows,
-                &rotated,
-                config.dim,
-                row_count,
-            )
-            .and_then(|()| {
-                gpu.gemm_hfq4g256(
-                    &weights.output.buf,
-                    &rotated,
-                    &batch_logits,
-                    weights.output.m,
-                    weights.output.k,
-                    row_count,
-                )
-            })
-        }
-        DType::MQ6G256 => {
-            let rotated = pbs.x_rot_batch.sub_offset(0, row_count * config.dim);
-            rotate_x_mq_batched_for(
-                gpu,
-                &weights.output,
-                &normed_rows,
-                &rotated,
-                config.dim,
-                row_count,
-            )
-            .and_then(|()| {
-                gpu.gemm_hfq6g256_batched_lmhead(
-                    &weights.output.buf,
-                    &rotated,
-                    &batch_logits,
-                    weights.output.m,
-                    weights.output.k,
-                    row_count,
-                )
-            })
-        }
-        DType::MQ3G256 => {
-            let rotated = pbs.x_rot_batch.sub_offset(0, row_count * config.dim);
-            rotate_x_mq_batched_for(
-                gpu,
-                &weights.output,
-                &normed_rows,
-                &rotated,
-                config.dim,
-                row_count,
-            )
-            .and_then(|()| {
-                gpu.gemm_hfq3g256_batched_lmhead(
-                    &weights.output.buf,
-                    &rotated,
-                    &batch_logits,
-                    weights.output.m,
-                    weights.output.k,
-                    row_count,
-                )
-            })
-        }
-        other => Err(hip_bridge::HipError::new(
-            0,
-            &format!(
-                "grouped MoE session prefill final logits does not yet support lm_head dtype {other:?}; use serial_reference backend"
-            ),
-        )),
-    }?;
+    grouped_moe_prefill_session_batch_row_logits(
+        gpu,
+        weights,
+        config,
+        pbs,
+        &batch_logits,
+        row_count,
+    )?;
     let scattered = gpu.scatter_session_last_logits_f32(
         &batch_logits,
         &device_tables.logits_ptrs,
@@ -3616,6 +3657,51 @@ pub fn forward_prefill_dense_session_batch(
     )
 }
 
+/// [`forward_prefill_dense_session_batch`] returning logits for EVERY row, not
+/// just each session's last: speculative verify needs the model's choice after
+/// each drafted token. Rows come back in the batch's round-major order (round j
+/// holds token j of every session that has one — see
+/// `build_dense_prefill_session_batch_rounds`); the caller frees the tensor and
+/// owns copying each session's last row into its `logits`, which this does not
+/// write.
+pub fn forward_prefill_dense_session_batch_all_row_logits(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    rows: &mut [DensePrefillSessionBatchRow<'_>],
+    pbs: &PrefillBatchScratch,
+) -> HipResult<GpuTensor> {
+    let total_rows: usize = rows.iter().map(|row| row.tokens.len()).sum();
+    // One session is fine here (a lone request verifying its drafts): the
+    // calibration schedule is the same round plan without the serving path's
+    // two-session minimum, and the routed kernels take any session count.
+    let single_session = rows.len() == 1;
+    forward_prefill_dense_session_batch_impl(
+        gpu,
+        weights,
+        config,
+        rows,
+        pbs,
+        false,
+        single_session,
+        None,
+        None,
+    )?;
+    let batch_logits = gpu.alloc_tensor(&[total_rows * config.vocab_size], DType::F32)?;
+    if let Err(e) = dense_prefill_session_batch_logits_full_precision(
+        gpu,
+        weights,
+        config,
+        pbs,
+        &batch_logits,
+        total_rows,
+    ) {
+        let _ = gpu.free_tensor(batch_logits);
+        return Err(e);
+    }
+    Ok(batch_logits)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn forward_prefill_dense_session_batch_with_capture(
     gpu: &mut Gpu,
@@ -3656,6 +3742,7 @@ fn forward_prefill_grouped_moe_session_batch_prefix_quantized_kv(
     max_ctx_len: usize,
     kvarn: Option<&KvarnBatchFlushContext<'_>>,
     delta_f16: bool,
+    finalize_logits: bool,
 ) -> HipResult<()> {
     forward_grouped_moe_session_batch_layers(
         gpu,
@@ -3670,7 +3757,7 @@ fn forward_prefill_grouped_moe_session_batch_prefix_quantized_kv(
         None,
         None,
         true,
-        true,
+        finalize_logits,
         None,
         None,
         true,
@@ -3968,7 +4055,7 @@ fn forward_grouped_moe_session_batch_layers(
                 if !grouped_moe_prefix_supports_attention(layer) {
                     return Err(hip_bridge::HipError::new(
                         0,
-                        "grouped MoE session fused prefix supports raw F32/F16/BF16, Q8, MQ4, or MQ6 DeltaNet-MoE attention weights",
+                        "grouped MoE session fused prefix supports raw F32/F16/BF16, Q8, MQ4, MQ6, Oq8 or OqCompact DeltaNet-MoE attention weights",
                     ));
                 }
                 // Past the check above the four are one format (raw never includes
@@ -4304,7 +4391,12 @@ fn forward_grouped_moe_session_batch_layers(
                     gpu.add_inplace_f32(&x_n, &scratch)?;
                 } else if matches!(
                     layer.wo.gpu_dtype,
-                    DType::F32 | DType::F16 | DType::BF16 | DType::Raw
+                    DType::F32
+                        | DType::F16
+                        | DType::BF16
+                        | DType::Raw
+                        | DType::Oq8G256
+                        | DType::OqCompactG256
                 ) {
                     dense_session_prefill_gemm_full_precision_residual(
                         gpu,
@@ -4366,15 +4458,25 @@ fn forward_grouped_moe_session_batch_layers(
                 let attn_is_mq6 = matches!(layer.wq.gpu_dtype, DType::MQ6G256)
                     && matches!(layer.wk.gpu_dtype, DType::MQ6G256)
                     && matches!(layer.wv.gpu_dtype, DType::MQ6G256);
+                // Raw, or Opus W8A8: both go through the per-weight fallback arm
+                // below (`dense_session_prefill_gemm_full_precision` rotates Opus).
                 let attn_is_raw = [layer.wq.gpu_dtype, layer.wk.gpu_dtype, layer.wv.gpu_dtype]
                     .into_iter()
                     .all(|dtype| {
-                        matches!(dtype, DType::F32 | DType::F16 | DType::BF16 | DType::Raw)
+                        matches!(
+                            dtype,
+                            DType::F32
+                                | DType::F16
+                                | DType::BF16
+                                | DType::Raw
+                                | DType::Oq8G256
+                                | DType::OqCompactG256
+                        )
                     });
                 if !attn_is_q8 && !attn_is_mq4 && !attn_is_mq6 && !attn_is_raw {
                     return Err(hip_bridge::HipError::new(
                         0,
-                        "grouped MoE session fused prefix supports raw F32/F16/BF16, Q8, MQ4, or MQ6 FullAttention-MoE attention weights",
+                        "grouped MoE session fused prefix supports raw F32/F16/BF16, Q8, MQ4, MQ6, Oq8 or OqCompact FullAttention-MoE attention weights",
                     ));
                 }
                 if attn_is_mq4 || attn_is_mq6 {
@@ -4778,7 +4880,12 @@ fn forward_grouped_moe_session_batch_layers(
                     gpu.add_inplace_f32(&x_n, &scratch)?;
                 } else if matches!(
                     layer.wo.gpu_dtype,
-                    DType::F32 | DType::F16 | DType::BF16 | DType::Raw
+                    DType::F32
+                        | DType::F16
+                        | DType::BF16
+                        | DType::Raw
+                        | DType::Oq8G256
+                        | DType::OqCompactG256
                 ) {
                     dense_session_prefill_gemm_full_precision_residual(
                         gpu,
@@ -4865,8 +4972,54 @@ pub fn forward_prefill_grouped_moe_session_batch(
     _scratch: &Qwen35Scratch,
     pbs: &PrefillBatchScratch,
 ) -> HipResult<DensePrefillSessionBatchShape> {
-    let shape = validate_dense_prefill_session_batch_rows_for_config(rows, pbs, config)
-        .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+    forward_prefill_grouped_moe_session_batch_impl(gpu, weights, config, rows, pbs, true)
+}
+
+/// Grouped-MoE sibling of [`forward_prefill_dense_session_batch_all_row_logits`]:
+/// logits for every row, round-major, caller frees; `logits` are not written.
+pub fn forward_prefill_grouped_moe_session_batch_all_row_logits(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    rows: &mut [DensePrefillSessionBatchRow<'_>],
+    pbs: &PrefillBatchScratch,
+) -> HipResult<GpuTensor> {
+    let total_rows: usize = rows.iter().map(|row| row.tokens.len()).sum();
+    forward_prefill_grouped_moe_session_batch_impl(gpu, weights, config, rows, pbs, false)?;
+    let batch_logits = gpu.alloc_tensor(&[total_rows * config.vocab_size], DType::F32)?;
+    if let Err(e) = grouped_moe_prefill_session_batch_row_logits(
+        gpu,
+        weights,
+        config,
+        pbs,
+        &batch_logits,
+        total_rows,
+    ) {
+        let _ = gpu.free_tensor(batch_logits);
+        return Err(e);
+    }
+    Ok(batch_logits)
+}
+
+fn forward_prefill_grouped_moe_session_batch_impl(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    rows: &mut [DensePrefillSessionBatchRow<'_>],
+    pbs: &PrefillBatchScratch,
+    finalize_logits: bool,
+) -> HipResult<DensePrefillSessionBatchShape> {
+    // One session only from the speculative decode step (a lone request
+    // verifying drafts), through the calibration schedule: the same round plan
+    // without the serving path's two-session minimum. The dense path does the
+    // same (`forward_prefill_dense_session_batch_all_row_logits`).
+    let single_session = rows.len() == 1;
+    let shape = if single_session {
+        validate_dense_calibration_session_rows_for_config(rows, pbs, config)
+    } else {
+        validate_dense_prefill_session_batch_rows_for_config(rows, pbs, config)
+    }
+    .map_err(|e| hip_bridge::HipError::new(0, &e))?;
     let kvarn_bits = kvarn_batch_bits(rows);
     let inputs: Vec<DensePrefillSessionBatchInput<'_>> = rows
         .iter()
@@ -4875,8 +5028,12 @@ pub fn forward_prefill_grouped_moe_session_batch(
             start_pos: row.start_pos,
         })
         .collect();
-    let execution_plan = build_dense_prefill_session_batch_execution_plan(&inputs, pbs.max_batch)
-        .map_err(|e| hip_bridge::HipError::new(0, &e))?;
+    let execution_plan = if single_session {
+        build_calibration_session_batch_execution_plan(&inputs, pbs.max_batch)
+    } else {
+        build_dense_prefill_session_batch_execution_plan(&inputs, pbs.max_batch)
+    }
+    .map_err(|e| hip_bridge::HipError::new(0, &e))?;
     let signatures: Vec<DensePrefillSessionBatchStateSignature> = rows
         .iter()
         .map(|row| DensePrefillSessionBatchStateSignature {
@@ -4893,9 +5050,14 @@ pub fn forward_prefill_grouped_moe_session_batch(
         })
         .collect();
     let kvarn_fused = qwen35_kvarn_fused_batch_enabled();
+    let contract_signatures = if single_session {
+        vec![signatures[0], signatures[0]]
+    } else {
+        signatures.clone()
+    };
     validate_grouped_moe_prefill_session_batch_state_contract(
         config,
-        &signatures,
+        &contract_signatures,
         &execution_plan,
         gpu.arch.as_str(),
         kvarn_fused,
@@ -5036,6 +5198,7 @@ pub fn forward_prefill_grouped_moe_session_batch(
         max_ctx_len,
         kvarn_ctx.as_ref(),
         delta_f16,
+        finalize_logits,
     );
     drop(kvarn_ctx);
     if let Some((_, _, tiles)) = kvarn_state {
