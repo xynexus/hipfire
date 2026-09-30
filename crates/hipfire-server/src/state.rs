@@ -170,6 +170,25 @@ pub struct AppState {
     pub usage_writer: Option<UsageWriter>,
 }
 
+impl AppState {
+    /// Lock the daemon engine slot, waiting out a batch cycle. The batch runner
+    /// checks the engine out for a whole cycle, so with a model loaded an empty
+    /// slot means "in use", not "gone" — a request that treated it as gone failed
+    /// with "daemon not running" whenever it landed mid-cycle (every streaming or
+    /// spec-decode request under load). A daemon that died clears
+    /// `loaded_models`, so that case still returns the empty slot.
+    pub async fn lock_engine(&self) -> tokio::sync::MutexGuard<'_, Option<DaemonEngine>> {
+        loop {
+            let guard = self.engine.lock().await;
+            if guard.is_some() || self.loaded_models.lock().await.is_empty() {
+                return guard;
+            }
+            drop(guard);
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+    }
+}
+
 pub struct AccessRuntime {
     store: std::sync::RwLock<Option<AccessStore>>,
     credentials: std::sync::RwLock<Option<Arc<CredentialSnapshot>>>,
@@ -378,3 +397,41 @@ impl AppState {
 }
 
 pub type SharedState = Arc<AppState>;
+
+#[cfg(test)]
+mod lock_engine_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn lock_engine_waits_out_a_checked_out_engine() {
+        let state = AppState::new(HipfireConfig::default());
+        // No model loaded: an empty slot is "no daemon", returned at once.
+        assert!(state.lock_engine().await.is_none());
+
+        // A model loaded but the slot empty: the batch runner has the engine.
+        state.loaded_models.lock().await.insert(
+            "m".into(),
+            LoadedModelState {
+                worker_key_id: None,
+                cache_capable: false,
+                max_seq: 0,
+                arch: None,
+                batch_prefill_capable: None,
+                has_draft_model: false,
+            },
+        );
+        let waited =
+            tokio::time::timeout(std::time::Duration::from_millis(100), state.lock_engine());
+        assert!(
+            waited.await.is_err(),
+            "must wait while the engine is checked out"
+        );
+
+        // The daemon died (loaded_models cleared): the wait ends.
+        let s2 = state.clone();
+        let waiter = tokio::spawn(async move { s2.lock_engine().await.is_none() });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        state.loaded_models.lock().await.clear();
+        assert!(waiter.await.unwrap());
+    }
+}

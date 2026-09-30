@@ -532,18 +532,10 @@ pub(crate) async fn ensure_model_loaded(
         }
     }
 
-    let mut engine_guard = state.engine.lock().await;
-    // The batch runner checks the engine out for a whole cycle. With a model loaded
-    // a daemon exists, so an empty slot means "in use", not "none": wait for it.
-    // Spawning instead ran into the daemon's machine-wide lock (`FATAL: hipfire
-    // daemon already running`), failing requests for a second model — the swarm's
-    // coder model — whenever they arrived mid-cycle. A daemon that died clears
-    // `loaded_models`, so that case still falls through to a respawn.
-    while engine_guard.is_none() && !state.loaded_models.lock().await.is_empty() {
-        drop(engine_guard);
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        engine_guard = state.engine.lock().await;
-    }
+    // Waits out a batch cycle: spawning instead ran into the daemon's machine-wide
+    // lock (`FATAL: hipfire daemon already running`), failing requests for a
+    // second model — the swarm's coder model — whenever they arrived mid-cycle.
+    let mut engine_guard = state.lock_engine().await;
 
     if let Some(eng) = engine_guard.as_mut() {
         match eng.ping().await {
@@ -2204,7 +2196,7 @@ where
         )
     };
 
-    let mut engine_guard = state.engine.lock().await;
+    let mut engine_guard = state.lock_engine().await;
     // Borrow the engine, never move it out: a client disconnect drops this whole
     // future (axum cancels the handler task, and `/v1/responses` awaits us
     // inline rather than on a spawned task), and an owned `DaemonEngine` would
@@ -2574,7 +2566,7 @@ async fn stream_chat(
         let mut structured_tool_calls_emitted = false;
         let mut next_tool_call_index = 0usize;
 
-        let mut engine_guard = state.engine.lock().await;
+        let mut engine_guard = state.lock_engine().await;
         let mut engine = match engine_guard.take() {
             Some(e) => e,
             None => {

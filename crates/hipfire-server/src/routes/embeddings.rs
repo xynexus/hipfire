@@ -132,7 +132,7 @@ pub async fn post_embeddings(
                 Err(_) => return server_error("embed job dropped before completion"),
             }
         } else {
-            let mut engine_guard = state.engine.lock().await;
+            let mut engine_guard = state.lock_engine().await;
             let Some(engine) = engine_guard.as_mut() else {
                 return server_error("daemon engine unavailable after model load");
             };
@@ -191,7 +191,7 @@ pub async fn post_rerank(
         Ok(loaded) => loaded,
         Err(e) => return server_error(format!("load failed: {e}")),
     };
-    let mut engine_guard = state.engine.lock().await;
+    let mut engine_guard = state.lock_engine().await;
     let Some(engine) = engine_guard.as_mut() else {
         return server_error("daemon engine unavailable after model load");
     };

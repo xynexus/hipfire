@@ -689,7 +689,7 @@ async fn prewarm_model(state: &SharedState, target: &PrewarmTarget) {
     };
     match routes::chat::ensure_model_loaded(state, model, required_max_seq).await {
         Ok(loaded) => {
-            let mut engine_guard = state.engine.lock().await;
+            let mut engine_guard = state.lock_engine().await;
             let Some(engine) = engine_guard.as_mut() else {
                 tracing::warn!("pre-warm loaded model but daemon engine is unavailable");
                 return;

@@ -607,7 +607,7 @@ async fn stream_responses(
             )))
             .await;
 
-        let mut engine_guard = state.engine.lock().await;
+        let mut engine_guard = state.lock_engine().await;
         // Borrowed, never moved out — an owned `DaemonEngine` dropped on any
         // early exit would `kill_on_drop` (SIGKILL) the inference worker.
         let engine = match engine_guard.as_mut() {
