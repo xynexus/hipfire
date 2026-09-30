@@ -1235,6 +1235,35 @@ impl Gpu {
         let win_f16_i = i32::from(window_f16);
         let bits_i = bits as i32;
         let row_offset_i = row_offset as i32;
+        if shared_mem > KVARN_ROUTED_LDS_MAX {
+            // scores[max_ctx_len] no longer fits in LDS: stream the context in
+            // chunks with an online softmax instead. Contexts that fit keep the
+            // kernel below and its exact arithmetic.
+            static ONCE: std::sync::Once = std::sync::Once::new();
+            ONCE.call_once(|| {
+                eprintln!("attention_kvarn_routed_batched: context {max_ctx_len} overflows LDS; using the chunked kernel")
+            });
+            return self.attention_kvarn_routed_batched_chunked(
+                window_f16,
+                q,
+                rec_ptrs,
+                win_ptrs,
+                v_ptrs,
+                out,
+                row_session_indices,
+                positions,
+                ptr_layer_stride,
+                layer_index,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_seq,
+                batch_size,
+                bits,
+                row_offset,
+                8192,
+            );
+        }
         self.launch_kernargs(
             "attention_kvarn_routed_batched",
             [n_heads as u32, batch_size as u32, 1],
@@ -1245,6 +1274,96 @@ impl Gpu {
                 ptr out_ptr, ptr rsi_ptr, ptr pos_ptr,
                 i32 ptr_stride, i32 layer, i32 nh, i32 nkv, i32 hd, i32 ms, f32 sc, i32 rb, i32 gp,
                 i32 win_f16_i, i32 bits_i, i32 row_offset_i
+            ],
+        )
+    }
+
+    /// `attention_kvarn_routed_batched` over any context: `chunk` positions at a
+    /// time with an online softmax, so LDS is chunk-sized. Public so the parity
+    /// example can force several chunks at small contexts.
+    pub fn attention_kvarn_routed_batched_chunked(
+        &mut self,
+        window_f16: bool,
+        q: &GpuTensor,
+        rec_ptrs: &GpuTensor,
+        win_ptrs: &GpuTensor,
+        v_ptrs: &GpuTensor,
+        out: &GpuTensor,
+        row_session_indices: &GpuTensor,
+        positions: &GpuTensor,
+        ptr_layer_stride: usize,
+        layer_index: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        batch_size: usize,
+        bits: usize,
+        row_offset: usize,
+        chunk: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let func = "attention_kvarn_routed_batched_chunked";
+        self.ensure_kernel(
+            "attention_kvarn_routed_batched",
+            kernels::ATTENTION_KVARN_ROUTED_BATCHED_SRC,
+            func,
+        )?;
+        const GROUP: usize = 128;
+        assert!(
+            bits == 2 || bits == 4 || bits == 8,
+            "{func}: bits must be 2, 4 or 8, got {bits}"
+        );
+        let block_size = 256u32;
+        // KVARN_CHUNK_MAX_D in the kernel: output dims per thread.
+        assert!(
+            head_dim <= block_size as usize * 4,
+            "{func}: head_dim {head_dim} too wide"
+        );
+        let rec_bytes = (head_dim * GROUP).div_ceil(8 / bits) + head_dim * 2 * 2 + GROUP * 2;
+        let shared_mem = ((chunk + block_size as usize + head_dim) * 4) as u32;
+        assert!(
+            shared_mem <= KVARN_ROUTED_LDS_MAX,
+            "{func}: chunk {chunk} overflows LDS"
+        );
+        let (q_ptr, rec_ptrs_ptr, win_ptrs_ptr, v_ptrs_ptr) = (
+            q.buf.as_ptr(),
+            rec_ptrs.buf.as_ptr(),
+            win_ptrs.buf.as_ptr(),
+            v_ptrs.buf.as_ptr(),
+        );
+        let (out_ptr, rsi_ptr, pos_ptr) = (
+            out.buf.as_ptr(),
+            row_session_indices.buf.as_ptr(),
+            positions.buf.as_ptr(),
+        );
+        let (ptr_stride, layer, nh, nkv, hd, ms) = (
+            ptr_layer_stride as i32,
+            layer_index as i32,
+            n_heads as i32,
+            n_kv_heads as i32,
+            head_dim as i32,
+            max_seq as i32,
+        );
+        let sc = 1.0f32 / (head_dim as f32).sqrt();
+        let (rb, gp, win_f16_i, bits_i, row_offset_i, chunk_i) = (
+            rec_bytes as i32,
+            GROUP as i32,
+            i32::from(window_f16),
+            bits as i32,
+            row_offset as i32,
+            chunk as i32,
+        );
+        self.launch_kernargs(
+            func,
+            [n_heads as u32, batch_size as u32, 1],
+            [block_size, 1, 1],
+            shared_mem,
+            &kernargs![
+                ptr q_ptr, ptr rec_ptrs_ptr, ptr win_ptrs_ptr, ptr v_ptrs_ptr,
+                ptr out_ptr, ptr rsi_ptr, ptr pos_ptr,
+                i32 ptr_stride, i32 layer, i32 nh, i32 nkv, i32 hd, i32 ms, f32 sc, i32 rb, i32 gp,
+                i32 win_f16_i, i32 bits_i, i32 row_offset_i, i32 chunk_i
             ],
         )
     }
@@ -5818,3 +5937,8 @@ mod head_dim_guard_tests {
         }
     }
 }
+
+/// LDS per workgroup on RDNA. The whole-context routed KVarN kernel keeps
+/// scores[ctx] in LDS and its launch fails past this; the dispatch then uses the
+/// chunked (online-softmax) variant.
+const KVARN_ROUTED_LDS_MAX: u32 = 64 * 1024;

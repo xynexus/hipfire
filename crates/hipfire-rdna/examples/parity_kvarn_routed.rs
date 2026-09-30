@@ -306,6 +306,32 @@ fn main() {
         }
     }
     let _ = kv_dim;
+
+    // Chunked (online-softmax) variant, forced at 64-position chunks so every
+    // session spans several, including a partial last one.
+    let out_c = gpu
+        .upload_raw(
+            &vec![0u8; n_rows * N_HEADS * HEAD_DIM * 4],
+            &[n_rows * N_HEADS * HEAD_DIM],
+        )
+        .unwrap();
+    gpu.attention_kvarn_routed_batched_chunked(
+        false, &qd, &recp, &winp, &vp, &out_c, &rsid, &posd, 1, 0, N_HEADS, N_KV_HEADS, HEAD_DIM,
+        MAX_SEQ, n_rows, 4, 0, 64,
+    )
+    .unwrap();
+    gpu.device_synchronize().unwrap();
+    let got_c = gpu.download_f32(&out_c).unwrap();
+    let mut max_abs_c = 0.0f32;
+    for (r, &sess) in row_sessions.iter().enumerate() {
+        let rr = &got_c[r * N_HEADS * HEAD_DIM..(r + 1) * N_HEADS * HEAD_DIM];
+        let rf = &ref_out[sess as usize];
+        for i in 0..N_HEADS * HEAD_DIM {
+            max_abs_c = max_abs_c.max((rr[i] - rf[i]).abs());
+        }
+    }
+    println!("parity_kvarn_routed chunked(64): max-abs-err={max_abs_c:.2e}");
+    max_abs = max_abs.max(max_abs_c);
     let pass = max_abs < 2e-3;
     println!("parity_kvarn_routed on {}: routed-vs-single-session max-abs-err={max_abs:.2e} (rows->sessions {row_sessions:?}) -> {}",
         gpu.arch, if pass { "PASS" } else { "FAIL" });

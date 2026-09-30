@@ -181,3 +181,175 @@ extern "C" __global__ void attention_kvarn_routed_batched(
         out_head[d] = val;
     }
 }
+
+// ── Chunked (streaming-softmax) variant ─────────────────────────────────────
+// The kernel above keeps scores[seq_len] in LDS, so its launch fails once
+// (seq_len + nthreads + head_dim) floats pass 64 KiB — about 15.9K positions at
+// head_dim 256. This variant walks the context in `chunk`-position pieces with a
+// running max m and running sum l (online softmax): each chunk's scores go to a
+// chunk-sized LDS buffer, and the output accumulators already built are rescaled
+// by exp(m_old - m_new) before the chunk's V is added. LDS is chunk-sized, so any
+// context fits. Only launched when the kernel above cannot be (see the dispatch):
+// every context it can take keeps its exact arithmetic.
+//
+// Each thread owns output dims d = tid, tid + nthreads, ...; KVARN_CHUNK_MAX_D
+// bounds how many (head_dim 512 over 256 threads is 2).
+#define KVARN_CHUNK_MAX_D 4
+
+__device__ __forceinline__ float kvarn_routed_qk(
+    const float* q_shared, const uint8_t* records, const float* window, int window_f16,
+    int t, int win_base, int group, int n_kv_heads, int kv_h, int kv_dim, int head_dim,
+    int rec_bytes, int bits, int cpb_shift, int cpb_mask, int codemask,
+    int off_scale, int off_zp, int off_scol
+) {
+    float dot = 0.0f;
+    if (t < win_base) {
+        const int block = t / group;
+        const int t_local = t - block * group;
+        const uint8_t* rec = records + (size_t)(block * n_kv_heads + kv_h) * rec_bytes;
+        const __half* scale_abs = (const __half*)(rec + off_scale);
+        const __half* zp_abs = (const __half*)(rec + off_zp);
+        const __half* s_col = (const __half*)(rec + off_scol);
+        const float sc = __half2float(s_col[t_local]);
+        for (int d = 0; d < head_dim; d++) {
+            const int idx = d * group + t_local;
+            const uint8_t byte = rec[idx >> cpb_shift];
+            const float qv = (float)((byte >> (bits * (idx & cpb_mask))) & codemask);
+            const float k = (qv * __half2float(scale_abs[d]) + __half2float(zp_abs[d])) * sc;
+            dot += q_shared[d] * k;
+        }
+    } else if (window_f16) {
+        const _Float16* kt = reinterpret_cast<const _Float16*>(window)
+            + (size_t)(t - win_base) * kv_dim + kv_h * head_dim;
+        for (int d = 0; d < head_dim; d++) dot += q_shared[d] * (float)kt[d];
+    } else {
+        const float* kt = window + (size_t)(t - win_base) * kv_dim + kv_h * head_dim;
+        for (int d = 0; d < head_dim; d++) dot += q_shared[d] * kt[d];
+    }
+    return dot;
+}
+
+extern "C" __global__ void attention_kvarn_routed_batched_chunked(
+    const float* __restrict__ q,
+    const uint64_t* __restrict__ rec_ptrs,
+    const uint64_t* __restrict__ win_ptrs,
+    const uint64_t* __restrict__ v_ptrs,
+    float* __restrict__ out,
+    const int* __restrict__ row_session_indices,
+    const int* __restrict__ positions,
+    int ptr_layer_stride,
+    int layer_index,
+    int n_heads,
+    int n_kv_heads,
+    int head_dim,
+    int max_seq,
+    float scale_attn,
+    int rec_bytes,
+    int group,
+    int window_f16,
+    int bits,
+    int row_offset,
+    int chunk
+) {
+    const int h = blockIdx.x;
+    const int b = blockIdx.y + row_offset;
+    if (h >= n_heads) return;
+
+    const int session_idx = row_session_indices[b];
+    const size_t slot = (size_t)session_idx * ptr_layer_stride + layer_index;
+    const uint8_t* records = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(rec_ptrs[slot]));
+    const float* window = reinterpret_cast<const float*>(static_cast<uintptr_t>(win_ptrs[slot]));
+    const unsigned char* v_cache = reinterpret_cast<const unsigned char*>(static_cast<uintptr_t>(v_ptrs[slot]));
+
+    const int seq_len = positions[b] + 1;
+    const int win_base = (seq_len / group) * group;
+    extern __shared__ float sdata[];
+
+    const int kv_h = h / (n_heads / n_kv_heads);
+    const int tid = threadIdx.x;
+    const int nthreads = blockDim.x;
+    const int q_stride = n_heads * head_dim;
+    const int kv_dim = n_kv_heads * head_dim;
+    const float* q_head = q + (long long)b * q_stride + h * head_dim;
+
+    const int blocks_per_head = head_dim / 32;
+    const int total_blocks_per_pos = n_kv_heads * blocks_per_head;
+    const int kv_head_block_start = kv_h * blocks_per_head;
+    const int cpb = 8 / bits;
+    const int cpb_shift = (bits == 8) ? 0 : ((bits == 4) ? 1 : 2);
+    const int cpb_mask = cpb - 1;
+    const int codemask = (1 << bits) - 1;
+    const int off_scale = (head_dim * group + cpb - 1) / cpb;
+    const int off_zp = off_scale + head_dim * 2;
+    const int off_scol = off_zp + head_dim * 2;
+
+    float* scores = sdata;                    // [chunk]
+    float* workspace = sdata + chunk;         // [nthreads]
+    float* q_shared = workspace + nthreads;   // [head_dim]
+
+    for (int d = tid; d < head_dim; d += nthreads) q_shared[d] = q_head[d];
+    __syncthreads();
+
+    float m = -INFINITY;   // running max over every chunk so far
+    float l = 0.0f;        // running sum of exp(s - m)
+    float acc[KVARN_CHUNK_MAX_D];
+    for (int k = 0; k < KVARN_CHUNK_MAX_D; k++) acc[k] = 0.0f;
+
+    for (int c0 = 0; c0 < seq_len; c0 += chunk) {
+        const int n = min(chunk, seq_len - c0);
+
+        float local_max = -INFINITY;
+        for (int i = tid; i < n; i += nthreads) {
+            const float s = kvarn_routed_qk(q_shared, records, window, window_f16, c0 + i,
+                win_base, group, n_kv_heads, kv_h, kv_dim, head_dim, rec_bytes, bits,
+                cpb_shift, cpb_mask, codemask, off_scale, off_zp, off_scol) * scale_attn;
+            scores[i] = s;
+            local_max = fmaxf(local_max, s);
+        }
+        workspace[tid] = local_max;
+        __syncthreads();
+        for (int s = nthreads / 2; s > 0; s >>= 1) {
+            if (tid < s) workspace[tid] = fmaxf(workspace[tid], workspace[tid + s]);
+            __syncthreads();
+        }
+        const float m_new = fmaxf(m, workspace[0]);
+        const float alpha = expf(m - m_new);   // 0 on the first chunk (m = -inf)
+        __syncthreads();
+
+        float local_sum = 0.0f;
+        for (int i = tid; i < n; i += nthreads) {
+            const float e = expf(scores[i] - m_new);
+            scores[i] = e;
+            local_sum += e;
+        }
+        workspace[tid] = local_sum;
+        __syncthreads();
+        for (int s = nthreads / 2; s > 0; s >>= 1) {
+            if (tid < s) workspace[tid] += workspace[tid + s];
+            __syncthreads();
+        }
+        l = l * alpha + workspace[0];
+        m = m_new;
+
+        int k = 0;
+        for (int d = tid; d < head_dim && k < KVARN_CHUNK_MAX_D; d += nthreads, k++) {
+            const int bi = d / 32;
+            const int bj = d % 32;
+            float val = 0.0f;
+            for (int i = 0; i < n; i++) {
+                const unsigned char* blk = v_cache + (size_t)(c0 + i) * total_blocks_per_pos * 34
+                                          + (kv_head_block_start + bi) * 34;
+                const float vd = (float)*((const _Float16*)blk) * (float)(signed char)blk[2 + bj];
+                val += scores[i] * vd;
+            }
+            acc[k] = acc[k] * alpha + val;
+        }
+        __syncthreads();   // scores/workspace are reused by the next chunk
+    }
+
+    float* out_head = out + (long long)b * q_stride + h * head_dim;
+    int k = 0;
+    for (int d = tid; d < head_dim && k < KVARN_CHUNK_MAX_D; d += nthreads, k++) {
+        out_head[d] = acc[k] / l;
+    }
+}
