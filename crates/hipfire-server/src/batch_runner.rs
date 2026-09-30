@@ -369,8 +369,8 @@ pub struct PrefixIndex {
 
 /// Checkpoints held for reuse, per server. Each is a resident daemon session — on
 /// the 27B ~72 MB of DeltaNet state plus ~13 KB per prefix token of KV — and the
-/// daemon evicts resident sessions over `HIPFIRE_SCHED_RESIDENT_STATE_MAX` (32),
-/// so keep this under that.
+/// daemon evicts checkpoints over `HIPFIRE_SCHED_RESIDENT_STATE_MAX` (96, sized
+/// for this plus a full batch of fresh mints), so keep this well under that.
 /// ponytail: a count, not bytes; a byte budget once prefixes get long (a 30K-token
 /// prefix is ~0.4 GB of KV per checkpoint).
 fn prefix_cache_max() -> usize {
@@ -955,14 +955,24 @@ impl BatchTelemetry {
 /// | 32 | 9.96 | ~18 (capped by session residency, not by this) |
 /// | 64 | 2.22 | collapses — 20/64 sessions survive |
 ///
-/// 16 is the measured optimum and also where achieved width stops tracking
-/// demand: past it the limit is session residency, and at 64 the batch collapses
-/// outright. Raising this further would only widen envelopes the runtime cannot
-/// fill, so the default stops here rather than at the largest value that "works".
+/// 16 was where achieved width stopped tracking demand: past it the limit was
+/// session residency, and at 64 the batch collapsed outright.
+///
+/// **64 since 2026-09-30.** The collapse was the daemon's resident-session
+/// eviction counting live sessions of the batch's other prefill groups (and the
+/// shared prefix checkpoint) against a budget of 32; it now budgets checkpoints
+/// only. Measured, `Qwen3.8-27B--oq4.25++`, gfx1151, KVarN, decode tok/s:
+///
+/// | concurrent | cap 16 | cap 64 |
+/// |---|---|---|
+/// | 16, short prompts | 101.3 | 101.5 |
+/// | 32, short prompts | 83.5 (3 batches) | 93.3 |
+/// | 64, short prompts | 93.8 (5 batches) | 121.0 |
+/// | 64, 8K shared prefix | — | 82.1 (all 64 correct; 42.7 at 16) |
 ///
 /// Raising the cap does not itself allocate: the sessions are already resident,
 /// this only governs how many of them fuse into one step.
-const BATCH_MAX_DEFAULT: usize = 16;
+const BATCH_MAX_DEFAULT: usize = 64;
 
 /// Spawn the continuous-batching runner. Call once at serve startup when
 /// `HIPFIRE_SERVER_PREFILL_BATCH` is enabled. The runner owns `state.engine`
@@ -1816,6 +1826,7 @@ async fn run_batch_cycle(
         committed_total,
         spec_drafted,
         spec_accepted,
+        decode_ms,
         "decode cycle done ({:.2} tokens/session-step)",
         committed_total as f64 / f64::from(steps.max(1)) / specs.len().max(1) as f64
     );

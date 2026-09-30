@@ -2161,7 +2161,18 @@ pub fn run_generate_batch_prefill_serial_qwen35(
     // The sessions just prefilled are about to decode and are never candidates.
     // Counted in, any batch over the limit (8) lost its oldest sessions here and
     // the whole batch failed at its first decode step (`resident=0`).
-    let in_use: Vec<&str> = envelope.sessions.iter().map(|s| s.id.as_str()).collect();
+    //
+    // Nor are the checkpoints this call attached: a wide batch mints a boundary
+    // checkpoint per session before the server can release the ones its prefix
+    // index drops, and oldest-first then took the shared prefix every session
+    // had just forked from — so the NEXT batch re-prefilled it from scratch.
+    let in_use: Vec<&str> = envelope
+        .sessions
+        .iter()
+        .flat_map(|s| {
+            std::iter::once(s.id.as_str()).chain(s.state_handle.runtime_state_handle.as_deref())
+        })
+        .collect();
     match crate::session::qwen35_evict_sessions_over_limit(
         m,
         gpu,

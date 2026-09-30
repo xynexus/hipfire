@@ -2517,16 +2517,55 @@ fn eviction_victims(sessions: &[(String, u64)], active: Option<&str>, limit: usi
         .collect()
 }
 
+/// [`eviction_victims`] for qwen35, where two kinds of state share the registry
+/// and need different budgets. Prefix checkpoints are a cache: `checkpoint_limit`
+/// of them, oldest out first. Request sessions are live — every one belongs to a
+/// request the server is still running, parking, or about to release — so they
+/// get only `session_limit`, a leak guard for ones nothing releases (a prefill
+/// error, an abandoned park). A single budget over both evicted live sessions
+/// whenever a batch outgrew it: the sessions of the prefill groups already run
+/// are not "in use" by the next group's call, and with 48+ sessions the shared
+/// prefix checkpoint went too, so every session re-prefilled the whole prompt
+/// (a 64-session, 8K-prefix batch took 53 minutes, then failed).
+fn qwen35_eviction_victims(
+    sessions: &[(String, u64)],
+    active: Option<&str>,
+    checkpoint_limit: usize,
+    session_limit: usize,
+) -> Vec<String> {
+    let (checkpoints, requests): (Vec<_>, Vec<_>) = sessions
+        .iter()
+        .cloned()
+        .partition(|(id, _)| id.starts_with("qwen35-checkpoint:"));
+    let mut victims = eviction_victims(&checkpoints, active, checkpoint_limit);
+    victims.extend(eviction_victims(&requests, active, session_limit));
+    victims
+}
+
+/// Leak guard on resident qwen35 request sessions (see
+/// [`qwen35_eviction_victims`]). Well above any batch the server forms
+/// (`HIPFIRE_SERVER_PREFILL_BATCH_MAX`) plus the requests it parks.
+fn resident_request_session_limit() -> usize {
+    std::env::var("HIPFIRE_SCHED_RESIDENT_SESSION_MAX")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(256)
+        .max(1)
+}
+
 fn resident_session_limit() -> usize {
     static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
     *V.get_or_init(|| {
         std::env::var("HIPFIRE_SCHED_RESIDENT_STATE_MAX")
             .ok()
             .and_then(|v| v.trim().parse::<usize>().ok())
-            // Counts only sessions not in use by the current batch, so it is the
-            // parked + checkpoint budget; the server keeps up to 16 checkpoints.
-            .unwrap_or(32)
-            .clamp(1, 64)
+            // For qwen35 this budgets prefix checkpoints only; request sessions
+            // have their own leak guard (`resident_request_session_limit`). The
+            // server indexes up to 16, but a prefill mints one per session before
+            // the server releases what it drops, so the budget has to hold the
+            // index plus a full batch (`HIPFIRE_SERVER_PREFILL_BATCH_MAX`, 64).
+            .unwrap_or(96)
+            .clamp(1, 256)
     })
 }
 
@@ -2568,7 +2607,12 @@ pub fn qwen35_evict_sessions_over_limit(
         .filter(|(id, _)| !in_use.contains(&id.as_str()))
         .map(|(id, session)| (id.clone(), session.allocation_epoch))
         .collect();
-    let victims = eviction_victims(&sessions, active.as_deref(), limit);
+    let victims = qwen35_eviction_victims(
+        &sessions,
+        active.as_deref(),
+        limit,
+        resident_request_session_limit(),
+    );
     if victims.is_empty() {
         return Ok(0);
     }
@@ -2948,7 +2992,29 @@ impl SessionServingBackend for LoadedModel {
 
 #[cfg(test)]
 mod eviction_tests {
-    use super::{eviction_victims, LFM2_LEGACY_SESSION_ID, QWEN35_LEGACY_SESSION_ID};
+    use super::{
+        eviction_victims, qwen35_eviction_victims, LFM2_LEGACY_SESSION_ID, QWEN35_LEGACY_SESSION_ID,
+    };
+
+    #[test]
+    fn live_request_sessions_are_not_evicted_to_make_room_for_checkpoints() {
+        // 40 live request sessions and 3 checkpoints, checkpoint budget 2: only
+        // the oldest checkpoint goes. The live sessions are under their guard.
+        let mut sessions: Vec<(String, u64)> =
+            (0..40).map(|i| (format!("req-{i}"), 100 + i)).collect();
+        for (i, epoch) in [(0, 5u64), (1, 50), (2, 200)] {
+            sessions.push((format!("qwen35-checkpoint:b:{i}"), epoch));
+        }
+        assert_eq!(
+            qwen35_eviction_victims(&sessions, None, 2, 256),
+            vec!["qwen35-checkpoint:b:0".to_string()]
+        );
+        // The leak guard still bounds request sessions, oldest first.
+        assert_eq!(
+            qwen35_eviction_victims(&sessions, None, 8, 38),
+            vec!["req-0".to_string(), "req-1".to_string()]
+        );
+    }
 
     fn s(id: &str, epoch: u64) -> (String, u64) {
         (id.to_string(), epoch)
