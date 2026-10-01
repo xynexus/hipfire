@@ -200,11 +200,18 @@ __launch_bounds__(256) extern "C" __global__ void oq_compact_overlay_correct_t(
 // a full line.
 //
 //   grid  [ceil(M/32), ceil(B/128)]   block 256 (8 wave32, 4 rows per wave)
-//   LDS   32 x 129 f32 = 16.5 kB      (+1 pad: a [32][128] stride is 128 dwords,
+//   LDS   32 x 129 f32 = 16.5 kB      (+1 pad: a [rows][128] stride is 128 dwords,
 //                                      which is 0 mod 64 -- every lane on ONE
 //                                      bank, a 32-way conflict on the readback)
+// GROUP-OUTER: a wave loads a group's activation scales (XsT[g][b0..b0+3]) once
+// and applies them to all 4 of its rows; row-outer reloaded them per row. Each
+// row still sums its groups in the same order, so the result is bit-identical
+// (parity_oq_overlay_tr hashes match). Measured at 512 rows: down 4.54 -> 4.18 ms,
+// qkv/wo -4..5%, gate/up even. 64 rows per block (8 per wave, 33 kB LDS) was
+// SLOWER (gate/up 3.97 -> 4.63 ms): half the blocks and more registers.
 #define OQCO_ROWS 32
 #define OQCO_BB   128
+#define OQCO_RPW  (OQCO_ROWS / 8)
 
 __launch_bounds__(256) extern "C" __global__ void oq_compact_overlay_correct_tr(
     const uint8_t* __restrict__ W,
@@ -226,20 +233,29 @@ __launch_bounds__(256) extern "C" __global__ void oq_compact_overlay_correct_tr(
     const int n_ov_all = (side_stride - 2) >> 1;
     const int n_ov = (n_ov_all < OQCO_MAX_OV) ? n_ov_all : OQCO_MAX_OV;
     const long long side_base = (long long)M * n_groups * nib_bytes;
+    const int rl0 = wid * OQCO_RPW;
 
+    float acc[OQCO_RPW][4];
     #pragma unroll
-    for (int r = 0; r < OQCO_ROWS / 8; ++r) {
-        const int rl  = wid * (OQCO_ROWS / 8) + r;
-        const int row = row0 + rl;
-        float acc[4] = {0.f, 0.f, 0.f, 0.f};
-        if (row < M && b0 < B) {
-            const uint8_t* s_row = W + side_base
-                                 + (long long)row * n_groups * (long long)side_stride;
-            for (int g = 0; g < n_groups; ++g) {
-                const uint8_t* sb = s_row + (long long)g * side_stride;
+    for (int r = 0; r < OQCO_RPW; ++r)
+        #pragma unroll
+        for (int t = 0; t < 4; ++t) acc[r][t] = 0.f;
+
+    if (b0 < B) {
+        for (int g = 0; g < n_groups; ++g) {
+            const float* xsg = XsT + (long long)g * B + b0;
+            float xs[4];
+            #pragma unroll
+            for (int t = 0; t < 4; ++t) xs[t] = xsg[t];
+            const int kbase = g * group;
+            #pragma unroll
+            for (int r = 0; r < OQCO_RPW; ++r) {
+                const int row = row0 + rl0 + r;
+                if (row >= M) break;
+                const uint8_t* sb = W + side_base
+                                  + ((long long)row * n_groups + g) * (long long)side_stride;
                 const uint8_t* table = sb + 2;
                 const float sw = oqcot_f16(sb);
-                const int kbase = g * group;
                 int isum[4] = {0, 0, 0, 0};
                 #pragma unroll
                 for (int e = 0; e < OQCO_MAX_OV; ++e) {
@@ -252,22 +268,23 @@ __launch_bounds__(256) extern "C" __global__ void oq_compact_overlay_correct_tr(
                     for (int t = 0; t < 4; ++t)
                         isum[t] += val * (int)(int8_t)((w4 >> (t * 8)) & 0xff);
                 }
-                const float* xsg = XsT + (long long)g * B;
                 #pragma unroll
                 for (int t = 0; t < 4; ++t)
-                    acc[t] += (float)isum[t] * sw * xsg[b0 + t];
+                    acc[r][t] += (float)isum[t] * sw * xs[t];
             }
         }
-        #pragma unroll
-        for (int t = 0; t < 4; ++t) acc_s[rl][(lane << 2) + t] = acc[t];
     }
+    #pragma unroll
+    for (int r = 0; r < OQCO_RPW; ++r)
+        #pragma unroll
+        for (int t = 0; t < 4; ++t) acc_s[rl0 + r][(lane << 2) + t] = acc[r][t];
     __syncthreads();
 
     // Transposed drain: consecutive threads take consecutive ROWS, so each
     // 32-thread run writes 32 contiguous floats of Y -- one full 128 B line.
     for (int i = threadIdx.x; i < OQCO_ROWS * OQCO_BB; i += 256) {
         const int rr = i & (OQCO_ROWS - 1);
-        const int bl = i >> 5;
+        const int bl = i / OQCO_ROWS;
         const int row = row0 + rr;
         const int b = blockIdx.y * OQCO_BB + bl;
         if (row < M && b < B) Y[(long long)b * M + row] += acc_s[rr][bl];
