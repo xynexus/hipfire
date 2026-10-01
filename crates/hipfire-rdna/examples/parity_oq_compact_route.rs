@@ -3,7 +3,7 @@
 
 //! Parity of the batched-serving routes of `gemm_oq_compact_act_batched` —
 //! the wide multicol (<= 24 rows) and the BN=64 wave64 tile (25..=64 rows) —
-//! against the default BN=128 tile, which the same rows padded to B=100 take.
+//! against the default BN=128 tile, which the same rows padded to B=300 take.
 //! The narrow tile must match bit for bit (same per-element K order); the
 //! multicol sums in a different order, so it gets a rounding tolerance.
 //!
@@ -20,7 +20,7 @@ fn main() {
     };
     let (group, n_out) = (256usize, 3usize);
     let stride = 2 + group / 2 + 2 * n_out;
-    const PAD: usize = 100;
+    const PAD: usize = 300;
     let mut fail = false;
     for &(m, k) in &[(1536usize, 5120usize), (1024, 17408)] {
         let ng = k / group;
@@ -66,6 +66,55 @@ fn main() {
         gpu.gemm_oq_compact_act_batched(&wb, &xb, &yref, m, k, PAD, stride)
             .unwrap();
         let reference = gpu.download_f32(&yref).unwrap();
+        // The tiled activation transpose must reproduce the per-byte one exactly
+        // (it only moves bytes): whole-GEMM output, both ways, past the tiles'
+        // edges (B and K not multiples of 64 at B=33/100, B=257 spans tiles).
+        for &b in &[33usize, 100, 257] {
+            let xs = gpu.upload_f32(&x[..b * k], &[b * k]).expect("x");
+            let y = gpu.alloc_tensor(&[b * m], DType::F32).expect("y");
+            let mut outs = Vec::new();
+            for tiled in ["1", "0"] {
+                std::env::set_var("HIPFIRE_OQ_XT_TILED", tiled);
+                gpu.gemm_oq_compact_act_batched(&wb, &xs, &y, m, k, b, stride)
+                    .unwrap();
+                outs.push(gpu.download_f32(&y).unwrap());
+            }
+            std::env::remove_var("HIPFIRE_OQ_XT_TILED");
+            let same = outs[0]
+                .iter()
+                .zip(&outs[1])
+                .all(|(a, c)| a.to_bits() == c.to_bits());
+            fail |= !same;
+            println!(
+                "M={m} K={k} B={b:>3} tiled transpose vs per-byte: bit_exact={same} -> {}",
+                if same { "PASS" } else { "FAIL" }
+            );
+            let _ = gpu.free_tensor(xs);
+            let _ = gpu.free_tensor(y);
+        }
+        // Row chunking (512) of a wide batch: rows are independent, so a chunked
+        // B=1100 must reproduce, bit for bit, the same rows computed unchunked
+        // (the first 300 rows of `reference`, B=300 < one chunk).
+        {
+            let b = 1100usize;
+            let xw: Vec<f32> = x.iter().cycle().take(b * k).copied().collect();
+            let xs = gpu.upload_f32(&xw, &[b * k]).expect("x");
+            let y = gpu.alloc_tensor(&[b * m], DType::F32).expect("y");
+            gpu.gemm_oq_compact_act_batched(&wb, &xs, &y, m, k, b, stride)
+                .unwrap();
+            let got = gpu.download_f32(&y).unwrap();
+            let same = got[..PAD * m]
+                .iter()
+                .zip(&reference)
+                .all(|(a, c)| a.to_bits() == c.to_bits());
+            fail |= !same;
+            println!(
+                "M={m} K={k} B={b} chunked vs unchunked rows: bit_exact={same} -> {}",
+                if same { "PASS" } else { "FAIL" }
+            );
+            let _ = gpu.free_tensor(xs);
+            let _ = gpu.free_tensor(y);
+        }
         for &b in &[1usize, 8, 20, 24, 25, 33, 40, 64] {
             let xs = gpu.upload_f32(&x[..b * k], &[b * k]).expect("x");
             let y = gpu.alloc_tensor(&[b * m], DType::F32).expect("y");

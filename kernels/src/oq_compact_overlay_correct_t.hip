@@ -355,3 +355,80 @@ __launch_bounds__(256) extern "C" __global__ void oq_compact_overlay_correct_trs
         if (r < M && b < B) Y[(long long)b * M + r] += acc_s[rr][bl];
     }
 }
+
+// ---------------------------------------------------------------------------
+// TILED x8 transpose: [B, K] int8 -> [K, B], [B, ng] f32 -> [ng, B].
+//
+// `oq_compact_x8_transpose` above maps a thread to one (b, k) byte with b
+// fastest, so its writes are contiguous but every read is a lone byte K apart
+// from its neighbour's. At prefill width that is the most expensive kernel in
+// the whole forward: B=7584, K=17408 (down_proj) moved 132 MB in 143 ms
+// (~0.9 GB/s), twice the GEMM it feeds; over a 41K-token prefill the transpose
+// was 35% of all GPU time, more than the GEMMs.
+//
+// A 64x64-byte tile through LDS: each thread reads 16 contiguous bytes of a
+// row (4 threads per 64-byte row segment) and writes 16 bytes of a transposed
+// row from LDS, so both global streams are line-contiguous. Same values in the
+// same places as the naive kernel — a pure layout change.
+//
+//   grid  [ceil(K/64), ceil(B/64)]   block 256
+#define OQXT_T 64
+
+__launch_bounds__(256) extern "C" __global__ void oq_compact_x8_transpose_tiled(
+    const int8_t* __restrict__ X,
+    const float*  __restrict__ Xs,
+    int8_t*       __restrict__ XT,
+    float*        __restrict__ XsT,
+    int B, int K, int n_groups
+) {
+    __shared__ int8_t tile[OQXT_T][OQXT_T + 4];
+    const int k0 = blockIdx.x * OQXT_T;
+    const int b0 = blockIdx.y * OQXT_T;
+    const int t = threadIdx.x;
+    const int r = t >> 2;              // 0..63
+    const int c = (t & 3) << 4;        // 0, 16, 32, 48
+
+    // Load: row b0+r, bytes k0+c .. k0+c+15.
+    {
+        const int b = b0 + r;
+        if (b < B && k0 + c + 15 < K && ((((long long)b * K + k0 + c) & 15) == 0)) {
+            const int4 v = *(const int4*)(X + (long long)b * K + k0 + c);
+            const int8_t* pv = (const int8_t*)&v;
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) tile[r][c + i] = pv[i];
+        } else {
+            #pragma unroll
+            for (int i = 0; i < 16; ++i) {
+                const int k = k0 + c + i;
+                tile[r][c + i] = (b < B && k < K) ? X[(long long)b * K + k] : (int8_t)0;
+            }
+        }
+    }
+    __syncthreads();
+    // Store: XT row k0+r, columns b0+c .. b0+c+15 (from tile column r).
+    {
+        const int k = k0 + r;
+        if (k < K) {
+            int8_t* dst = XT + (long long)k * B + b0 + c;
+            if (b0 + c + 15 < B && ((((long long)k * B + b0 + c) & 15) == 0)) {
+                int4 v;
+                int8_t* pv = (int8_t*)&v;
+                #pragma unroll
+                for (int i = 0; i < 16; ++i) pv[i] = tile[c + i][r];
+                *(int4*)dst = v;
+            } else {
+                #pragma unroll
+                for (int i = 0; i < 16; ++i)
+                    if (b0 + c + i < B) dst[i] = tile[c + i][r];
+            }
+        }
+    }
+    // Scales ride the first column of tiles: [B, ng] -> [ng, B], tiny.
+    if (blockIdx.x == 0) {
+        for (int i = t; i < OQXT_T * n_groups; i += 256) {
+            const int g = i / OQXT_T;
+            const int b = b0 + (i - g * OQXT_T);
+            if (b < B) XsT[(long long)g * B + b] = Xs[(long long)b * n_groups + g];
+        }
+    }
+}

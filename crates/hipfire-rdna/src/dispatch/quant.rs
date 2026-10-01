@@ -722,6 +722,28 @@ impl Gpu {
         block_stride: usize,
     ) -> HipResult<()> {
         const GROUP: usize = 256;
+        // Wide batches go in 512-row chunks. Past ~1K rows the int8 activation
+        // outgrows the 32 MB MALL (down_proj: 2048 x 17408 = 36 MB), so the GEMM
+        // re-reads it from DRAM for every M-block and the overlay correction's
+        // gathers miss: measured on the 27B shapes, GEMM alone fell from 29 TOPS
+        // at B=512 to 12 at B=4096 (down), and the correction grew 13x from
+        // B=1024 to 4096 for 4x the rows. Swept 512/1024/2048 vs unchunked at
+        // B=2048..7584: 512 held ~21 TOPS at every width and halved the
+        // unchunked time (gate/up at 7584: 120 -> 63 ms, down 142 -> 66).
+        // A chunk costs one more weight sweep (~45 MB). Rows are independent,
+        // so chunking changes no value.
+        let chunk = oq_compact_row_chunk();
+        if n > chunk {
+            let mut r0 = 0;
+            while r0 < n {
+                let rows = chunk.min(n - r0);
+                let xc = x_rot.sub_offset(r0 * k, rows * k);
+                let yc = y.sub_offset(r0 * m, rows * m);
+                self.gemm_oq_compact_act_batched(w_blocks, &xc, &yc, m, k, rows, block_stride)?;
+                r0 += rows;
+            }
+            return Ok(());
+        }
         self.quantize_act_oq8_batched_interleaved(x_rot, m, k, n)?;
         let ng = k / GROUP;
         let xq = GpuTensor {
@@ -965,10 +987,19 @@ impl Gpu {
         n_groups: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // Tiled through LDS (64x64 bytes): the per-byte kernel's reads were a
+        // lone byte K apart per lane — 143 ms for B=7584 at K=17408, twice the
+        // GEMM it feeds. Same bytes, same places. =0 restores it for A/B.
+        let tiled = std::env::var("HIPFIRE_OQ_XT_TILED").as_deref() != Ok("0");
+        let func = if tiled {
+            "oq_compact_x8_transpose_tiled"
+        } else {
+            "oq_compact_x8_transpose"
+        };
         self.ensure_kernel(
             "oq_compact_x8_transpose",
             kernels::OQ_COMPACT_OVERLAY_CORRECT_T_SRC,
-            "oq_compact_x8_transpose",
+            func,
         )?;
         let (xp, xsp, xtp, xstp) = (
             x_i8.buf.as_ptr(),
@@ -977,9 +1008,14 @@ impl Gpu {
             xst.buf.as_ptr(),
         );
         let (bi, ki, ngi) = (b as i32, k as i32, n_groups as i32);
+        let grid = if tiled {
+            [(k as u32).div_ceil(64), (b as u32).div_ceil(64), 1]
+        } else {
+            [(b as u32).div_ceil(256), k as u32, 1]
+        };
         self.launch_kernargs(
-            "oq_compact_x8_transpose",
-            [(b as u32).div_ceil(256), k as u32, 1],
+            func,
+            grid,
             [256, 1, 1],
             0,
             &kernargs![ptr xp, ptr xsp, ptr xtp, ptr xstp, i32 bi, i32 ki, i32 ngi],
@@ -2879,4 +2915,20 @@ mod tests {
 /// activation group would silently misalign the two.
 fn oq_compact_a4() -> bool {
     std::env::var("HIPFIRE_OQ_COMPACT_A4").as_deref() == Ok("1")
+}
+
+/// Row chunk for wide Opus-compact batches (see `gemm_oq_compact_act_batched`).
+/// `HIPFIRE_OQ_COMPACT_ROW_CHUNK` overrides; 0 disables chunking.
+fn oq_compact_row_chunk() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        match std::env::var("HIPFIRE_OQ_COMPACT_ROW_CHUNK")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            Some(0) => usize::MAX,
+            Some(n) => n,
+            None => 512,
+        }
+    })
 }
