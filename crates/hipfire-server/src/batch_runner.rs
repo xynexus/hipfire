@@ -430,8 +430,13 @@ impl PrefixIndex {
         self.entries.push(entry);
         let mut evicted = Vec::new();
         while self.entries.len() > prefix_cache_max() {
-            let victim = self
-                .entries
+            // Never the entry just inserted (last). Once every older entry had been
+            // attached at least once — a tool loop's chain does exactly that — the
+            // new checkpoint was the only never-attached one and evicted itself,
+            // so each step re-prefilled the whole conversation since the system
+            // turn. With no never-attached candidate, take the least recently used.
+            let older = self.entries.len() - 1;
+            let victim = self.entries[..older]
                 .iter()
                 .enumerate()
                 .filter(|(_, e)| e.hits == 0)
@@ -2191,6 +2196,39 @@ mod tests {
             index.lookup("w", &next).unwrap().checkpoint_id,
             "ck-next-step"
         );
+    }
+
+    #[test]
+    fn a_new_checkpoint_survives_an_index_full_of_attached_ones() {
+        // A tool loop: every step attaches the previous step's checkpoint (hits > 0)
+        // and mints its own. Once the index is full, the new mint must displace the
+        // least recently used attached entry, not itself.
+        let mut index = PrefixIndex::default();
+        for i in 0..=prefix_cache_max() {
+            let hash = format!("step-{i}");
+            let released = index.insert(PrefixEntry {
+                worker: "w".into(),
+                prefix_hash: serde_json::json!({"value": hash, "prefix_len": 1000 + i}),
+                prefix_len: 1000 + i,
+                checkpoint_id: format!("ck-{hash}"),
+                hits: 0,
+                batch: i as u64 + 1,
+                mint_at: None,
+            });
+            assert!(
+                !released.contains(&format!("ck-{hash}")),
+                "step {i}'s fresh checkpoint evicted itself: {released:?}"
+            );
+            let next = [serde_json::json!({"value": hash})];
+            assert_eq!(
+                index.lookup("w", &next).unwrap().checkpoint_id,
+                format!("ck-{hash}")
+            );
+        }
+        // The oldest step went, as least recently used.
+        assert!(index
+            .lookup("w", &[serde_json::json!({"value": "step-0"})])
+            .is_none());
     }
 
     #[test]
