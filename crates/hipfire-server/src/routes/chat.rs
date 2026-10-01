@@ -1307,19 +1307,25 @@ fn parse_inline_tool_calls(text: &str, req_id: &str) -> (String, Vec<Value>) {
     if tool_calls.is_empty() {
         return (text.to_string(), tool_calls);
     }
+    // The text before the call gets the same special-token cleanup as the call body: a
+    // quantized Qwen3.8-27B emits a stray `<|im_start|>` ahead of `<tool_call>`, and as
+    // content it was handed back to the client, which replays it as an assistant turn.
     let content = text
         .split_once("<tool_call>")
-        .map(|(before, _)| before.trim().to_string())
+        .map(|(before, _)| strip_chat_specials(before).trim().to_string())
         .unwrap_or_default();
     (content, tool_calls)
 }
 
-fn parse_one_inline_tool_call(raw: &str) -> Option<(String, Value)> {
-    let cleaned = raw
-        .replace("<|im_start|>", "")
+fn strip_chat_specials(text: &str) -> String {
+    text.replace("<|im_start|>", "")
         .replace("<|im_end|>", "")
         .replace("<|endoftext|>", "")
-        .replace("<|im_sep|>", "");
+        .replace("<|im_sep|>", "")
+}
+
+fn parse_one_inline_tool_call(raw: &str) -> Option<(String, Value)> {
+    let cleaned = strip_chat_specials(raw);
     let raw = cleaned.trim();
     if let Ok(value) = serde_json::from_str::<Value>(raw) {
         if let Some(name) = value.get("name").and_then(Value::as_str) {
@@ -3150,6 +3156,15 @@ mod tests {
 
         assert_eq!(content, "Before");
         assert_eq!(tool_calls.len(), 1);
+        let (stray, calls) = parse_inline_tool_calls(
+            "<|im_start|><tool_call>{\"name\":\"lookup\",\"arguments\":{}}</tool_call>",
+            "req",
+        );
+        assert_eq!(
+            (stray.as_str(), calls.len()),
+            ("", 1),
+            "a stray special token is not content"
+        );
         assert_eq!(tool_calls[0]["type"], "function");
         assert_eq!(tool_calls[0]["function"]["name"], "lookup");
         assert_eq!(
