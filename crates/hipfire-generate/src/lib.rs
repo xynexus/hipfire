@@ -458,6 +458,12 @@ pub struct GenerateBatchPrefillSession {
     /// `None` keeps the full size.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<usize>,
+    /// Absolute prompt positions (chat-turn boundaries) to checkpoint in
+    /// addition to the default ones. An attached session otherwise checkpoints
+    /// only its last boundary, which is its own; the server asks for the deepest
+    /// boundary it shares with a sibling, so the siblings can attach it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checkpoint_at: Vec<usize>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -920,10 +926,23 @@ pub fn validate_generate_batch_prefill(
             .and_then(|v| v.as_u64())
             .map(|v| v as usize);
 
+        let checkpoint_at = session
+            .get("params")
+            .and_then(|p| p.get("checkpoint_at"))
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .collect()
+            })
+            .unwrap_or_default();
+
         parsed_sessions.push(GenerateBatchPrefillSession {
             id: session_id.to_string(),
             raw,
             max_tokens,
+            checkpoint_at,
             prompt: session
                 .get("prompt")
                 .and_then(|v| v.as_str())
@@ -1709,6 +1728,7 @@ mod tests {
             id: id.to_string(),
             raw: None,
             max_tokens: None,
+            checkpoint_at: Vec::new(),
             prompt: Some("hello".to_string()),
             suffix_tokens: None,
             system_prompt: None,

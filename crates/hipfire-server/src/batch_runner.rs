@@ -349,6 +349,10 @@ pub struct PrefixEntry {
     pub hits: u32,
     /// Which prefill minted it (the index's batch counter). Decides eviction too.
     pub batch: u64,
+    /// Set only on a session's attach PLAN, never in the index: an extra
+    /// boundary (absolute prompt position) for the daemon to checkpoint — the
+    /// deepest one this session shares with a sibling that waits to attach it.
+    pub mint_at: Option<usize>,
 }
 
 impl PrefixEntry {
@@ -476,6 +480,9 @@ fn session_json(s: &SessionSpec, reuse: Option<&PrefixReuse>) -> serde_json::Val
         handle["cached_prefix_tokens"] = serde_json::json!(entry.prefix_len);
         handle["runtime_state_handle"] = serde_json::json!(entry.checkpoint_id);
         handle["prefix_hash"] = entry.prefix_hash.clone();
+        if let Some(at) = entry.mint_at {
+            session["params"]["checkpoint_at"] = serde_json::json!([at]);
+        }
     }
     if let Some(obj) = session.as_object_mut() {
         if let Some(history) = &s.messages_history {
@@ -556,6 +563,9 @@ async fn plan_prefix_reuse(
     let mut full = HashMap::new();
     // Boundary hashes some earlier session in this batch will checkpoint.
     let mut minting: Vec<String> = Vec::new();
+    // Preflight every session first, so planning can see which boundaries the
+    // batch's sessions share.
+    let mut preflighted: Vec<(&SessionSpec, Vec<serde_json::Value>)> = Vec::new();
     for spec in specs {
         let reply = match engine
             .prefix_hash_preflight(build_prefix_preflight_request(worker, spec))
@@ -584,7 +594,48 @@ async fn plan_prefix_reuse(
                     .collect()
             })
             .unwrap_or_default();
+        preflighted.push((spec, boundaries));
+    }
+    let mut shared: HashMap<String, usize> = HashMap::new();
+    for (_, boundaries) in &preflighted {
+        for b in boundaries {
+            if let Some(h) = b["value"].as_str() {
+                *shared.entry(h.to_string()).or_default() += 1;
+            }
+        }
+    }
+    for (spec, boundaries) in preflighted {
         if let Some(entry) = index.lookup(worker, &boundaries) {
+            // Siblings that hit the same cached prefix and then share more of
+            // the prompt (`p1 + p3 + pD/pE/pF`: all hit `p1`) used to each
+            // prefill the shared part. An attached session checkpoints only its
+            // last boundary, which is its own (the final message differs), so the
+            // first session that shares a deeper boundary with another one in
+            // this batch asks the daemon to checkpoint that boundary too
+            // (`mint_at`), and the rest wait a round to attach it.
+            let mut entry = entry;
+            let deeper_shared = boundaries
+                .iter()
+                .filter(|b| b["prefix_len"].as_u64().unwrap_or(0) as usize > entry.prefix_len)
+                .filter(|b| {
+                    b["value"]
+                        .as_str()
+                        .is_some_and(|h| shared.get(h) > Some(&1))
+                })
+                .max_by_key(|b| b["prefix_len"].as_u64().unwrap_or(0));
+            if let Some(b) = deeper_shared {
+                let h = b["value"].as_str().unwrap_or_default().to_string();
+                if minting.contains(&h) {
+                    tracing::debug!(
+                        "session {}: deferred; a sibling checkpoints its deeper prefix",
+                        spec.id
+                    );
+                    deferred.push(spec.id.clone());
+                    continue;
+                }
+                minting.push(h);
+                entry.mint_at = b["prefix_len"].as_u64().map(|n| n as usize);
+            }
             tracing::debug!(
                 "session {}: attaching cached prefix {} ({} tokens)",
                 spec.id,
@@ -844,6 +895,7 @@ async fn record_prefix_checkpoints(
                 checkpoint_id: id.to_string(),
                 hits: 0,
                 batch,
+                mint_at: None,
             }));
         }
     }
@@ -1496,6 +1548,144 @@ fn fail_all(txs: &HashMap<String, mpsc::UnboundedSender<BatchEvent>>, msg: &str)
     }
 }
 
+/// Fold a batch prefill's per-session results into the cycle's cursors: each
+/// session's logical position, and its remaining budget clamped to the rows its
+/// KV cache has left (a decode step writes one KV row, and the request's
+/// max_tokens is not that bound — the default far exceeds max_seq).
+fn fold_prefill_events(
+    events: &[serde_json::Value],
+    positions: &mut HashMap<String, usize>,
+    remaining: &mut HashMap<String, usize>,
+) {
+    for ev in events {
+        if ev.get("type").and_then(|t| t.as_str()) == Some("generate_batch_prefill_session_done") {
+            if let (Some(sid), Some(pos)) = (
+                ev.get("session_id").and_then(|v| v.as_str()),
+                ev.get("logical_position").and_then(|v| v.as_u64()),
+            ) {
+                positions.insert(sid.to_string(), pos as usize);
+                // `/health` has no prefix-cache counters; this is where reuse shows.
+                tracing::debug!(
+                    "session {sid}: prefilled {} token(s), {} reused from a cached prefix",
+                    ev.get("prefill_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                    ev.get("cached_prefix_tokens")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0),
+                );
+                // Each decode step writes one KV row, so a session can generate
+                // only as many tokens as its cache has rows left. The request's
+                // max_tokens is not that bound (the default far exceeds max_seq).
+                if let (Some(cap), Some(rem)) = (
+                    ev.get("kv_capacity").and_then(|v| v.as_u64()),
+                    remaining.get_mut(sid),
+                ) {
+                    *rem = (*rem).min(cap.saturating_sub(pos) as usize);
+                }
+            }
+        }
+    }
+}
+
+/// Whether a running text cycle admits queued requests between decode steps.
+/// `HIPFIRE_SERVER_MIDCYCLE_ADMIT=0` restores cycle-granular batching.
+fn midcycle_admit_enabled() -> bool {
+    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        !matches!(
+            std::env::var("HIPFIRE_SERVER_MIDCYCLE_ADMIT").as_deref(),
+            Ok("0") | Ok("false") | Ok("off")
+        )
+    })
+}
+
+/// Take up to `room` queued text requests the running cycle can absorb (same
+/// worker, priority at least as urgent as `running_priority`) and prefill them,
+/// reusing cached prefixes. Returns each with its logical position and remaining
+/// budget. A failed prefill fails and releases only the newcomers.
+async fn admit_into_cycle(
+    engine: &mut DaemonEngine,
+    state: &SharedState,
+    worker: &str,
+    batch_id: &str,
+    running_priority: u8,
+    room: usize,
+    prefix_index: &mut PrefixIndex,
+) -> Vec<(PendingRequest, usize, usize)> {
+    if room == 0 {
+        return Vec::new();
+    }
+    let taken = state
+        .work_scheduler
+        .lock()
+        .await
+        .take_microbatch_compatible(
+            hipfire_scheduler::WorkloadClass::TokenPrefill,
+            worker,
+            running_priority,
+            room,
+        );
+    if taken.is_empty() {
+        return Vec::new();
+    }
+    let newcomers: Vec<PendingRequest> = {
+        let mut inbox = state.batch_inbox.lock().await;
+        taken
+            .iter()
+            .filter_map(|w| match inbox.remove(&w.id) {
+                Some(ScheduledJob::Text(p)) if p.worker_key_id == worker => Some(p),
+                // TokenPrefill workloads are text requests on this worker; anything
+                // else goes back where it came from.
+                Some(other) => {
+                    inbox.insert(w.id.clone(), other);
+                    None
+                }
+                None => None,
+            })
+            .collect()
+    };
+    if newcomers.is_empty() {
+        return Vec::new();
+    }
+    tracing::debug!(
+        "admitted {} request(s) into the running batch",
+        newcomers.len()
+    );
+    let specs: Vec<SessionSpec> = newcomers.iter().map(|p| p.spec.clone()).collect();
+    let mut positions = HashMap::new();
+    let mut remaining: HashMap<String, usize> = specs
+        .iter()
+        .map(|s| (s.id.clone(), s.max_tokens.max(1)))
+        .collect();
+    match prefill_with_prefix_reuse(engine, batch_id, worker, &specs, prefix_index).await {
+        Ok(events) => fold_prefill_events(&events, &mut positions, &mut remaining),
+        Err(e) => {
+            let handles: Vec<String> = specs.iter().map(|s| s.id.clone()).collect();
+            let _ = engine
+                .release_sessions(build_release_request(worker, &handles))
+                .await;
+            for p in &newcomers {
+                let _ = p.tx.send(BatchEvent::Error(format!("batch prefill: {e}")));
+            }
+            return Vec::new();
+        }
+    }
+    newcomers
+        .into_iter()
+        .filter_map(|p| {
+            let Some(&pos) = positions.get(&p.spec.id) else {
+                let _ = p.tx.send(BatchEvent::Error(
+                    "batch prefill produced no session state".to_string(),
+                ));
+                return None;
+            };
+            let rem = remaining[&p.spec.id];
+            Some((p, pos, rem))
+        })
+        .collect()
+}
+
 /// One fused prefill + decode cycle over `batch`. Runs to completion unless
 /// `can_park` and a higher-priority (lower number than `running_priority`)
 /// workload appears after the min-quantum floor, in which case the still-active
@@ -1512,7 +1702,7 @@ async fn run_batch_cycle(
     let worker = batch[0].worker_key_id.clone();
     let batch_id = format!("batch-{}", batch[0].spec.id);
     let resuming = batch[0].resume_position.is_some();
-    let specs: Vec<SessionSpec> = batch.iter().map(|p| p.spec.clone()).collect();
+    let mut specs: Vec<SessionSpec> = batch.iter().map(|p| p.spec.clone()).collect();
     tracing::debug!(
         "{} {} request(s) into one batch",
         if resuming { "resumed" } else { "coalesced" },
@@ -1560,37 +1750,7 @@ async fn run_batch_cycle(
                 return CycleOutcome::Completed;
             }
         };
-        for ev in &events {
-            if ev.get("type").and_then(|t| t.as_str())
-                == Some("generate_batch_prefill_session_done")
-            {
-                if let (Some(sid), Some(pos)) = (
-                    ev.get("session_id").and_then(|v| v.as_str()),
-                    ev.get("logical_position").and_then(|v| v.as_u64()),
-                ) {
-                    positions.insert(sid.to_string(), pos as usize);
-                    // `/health` has no prefix-cache counters; this is where reuse shows.
-                    tracing::debug!(
-                        "session {sid}: prefilled {} token(s), {} reused from a cached prefix",
-                        ev.get("prefill_tokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0),
-                        ev.get("cached_prefix_tokens")
-                            .and_then(|v| v.as_u64())
-                            .unwrap_or(0),
-                    );
-                    // Each decode step writes one KV row, so a session can generate
-                    // only as many tokens as its cache has rows left. The request's
-                    // max_tokens is not that bound (the default far exceeds max_seq).
-                    if let (Some(cap), Some(rem)) = (
-                        ev.get("kv_capacity").and_then(|v| v.as_u64()),
-                        remaining.get_mut(sid),
-                    ) {
-                        *rem = (*rem).min(cap.saturating_sub(pos) as usize);
-                    }
-                }
-            }
-        }
+        fold_prefill_events(&events, &mut positions, &mut remaining);
     }
 
     let mut active: Vec<String> = specs
@@ -1758,6 +1918,39 @@ async fn run_batch_cycle(
                 .map(str::to_string);
         }
         active = still_active;
+
+        // Mid-cycle admission: take queued requests this batch can run (same
+        // worker, at least as urgent) and prefill them in, so they decode from
+        // the next step instead of waiting for the whole batch to finish. Runs
+        // before the preemption check: a more urgent request on this worker joins
+        // rather than parking the batch.
+        if midcycle_admit_enabled() && !active.is_empty() {
+            let admitted = admit_into_cycle(
+                engine,
+                state,
+                &worker,
+                &format!("{batch_id}-a{steps}"),
+                running_priority,
+                batch_max().saturating_sub(active.len()),
+                prefix_index,
+            )
+            .await;
+            for (p, pos, rem) in admitted {
+                let id = p.spec.id.clone();
+                txs.insert(id.clone(), p.tx.clone());
+                positions.insert(id.clone(), pos);
+                remaining.insert(id.clone(), rem);
+                specs_by_id.insert(id.clone(), p.spec.clone());
+                specs.push(p.spec);
+                if rem > 0 {
+                    active.push(id);
+                } else {
+                    let _ = p.tx.send(BatchEvent::Done(
+                        serde_json::json!({ "finish_reason": "length" }),
+                    ));
+                }
+            }
+        }
 
         // Cooperative preemption: past the min-quantum floor, yield to a
         // strictly-higher-priority waiter. Park the still-active sessions
@@ -1951,6 +2144,7 @@ mod tests {
             checkpoint_id: format!("ck-{hash}"),
             hits: 0,
             batch: 1,
+            mint_at: None,
         };
         let mut index = PrefixIndex::default();
         // One prefill mints every boundary of its prompt, shortest (the shared

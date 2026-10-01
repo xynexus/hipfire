@@ -2060,17 +2060,25 @@ pub fn run_generate_batch_prefill_serial_qwen35(
                 // attaches. Checkpointing every boundary had 16 concurrent attaches
                 // mint ~40 checkpoints, past the resident limit, evicting the shared
                 // prefix they had all just attached to.
-                boundary_checkpoints =
-                    qwen35_semantic_boundary_checkpoints(m, session, &full_tokens)?
-                        .into_iter()
-                        .filter(|boundary| boundary.prefix_len > prefix_len)
-                        .max_by_key(|boundary| boundary.prefix_len)
-                        .map(|mut boundary| {
-                            boundary.prefix_len -= prefix_len;
-                            boundary
-                        })
-                        .into_iter()
-                        .collect();
+                //
+                // Plus any boundary the server asked for (`checkpoint_at`): the
+                // deepest one this session shares with a sibling in the batch,
+                // which the sibling waits to attach.
+                let past: Vec<_> = qwen35_semantic_boundary_checkpoints(m, session, &full_tokens)?
+                    .into_iter()
+                    .filter(|boundary| boundary.prefix_len > prefix_len)
+                    .collect();
+                let last = past.iter().map(|b| b.prefix_len).max();
+                boundary_checkpoints = past
+                    .into_iter()
+                    .filter(|b| {
+                        Some(b.prefix_len) == last || session.checkpoint_at.contains(&b.prefix_len)
+                    })
+                    .map(|mut boundary| {
+                        boundary.prefix_len -= prefix_len;
+                        boundary
+                    })
+                    .collect();
                 full_tokens[prefix_len..].to_vec()
             } else if session.state_handle.logical_position != 0
                 || session.state_handle.cached_prefix_tokens != 0
