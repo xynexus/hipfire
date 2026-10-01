@@ -433,11 +433,22 @@ impl PrefixIndex {
             self.entries.push(held);
             return vec![entry.checkpoint_id];
         }
+        // The cap is PER WORKER, and only this worker's entries are evicted: the
+        // ids returned are released to this worker's daemon session registry.
+        // Evicting across workers sent a 35B checkpoint's release to the 27B (a
+        // no-op there) and the 35B's checkpoints piled up -- 40 resident against a
+        // cap of 16, GTT 98 GiB, over one two-model CAE swarm turn.
+        let worker = entry.worker.clone();
         self.entries.push(entry);
         let mut evicted = Vec::new();
-        while self.entries.len() > prefix_cache_max() {
+        while self.entries.iter().filter(|e| e.worker == worker).count() > prefix_cache_max() {
             // Front = least recently used; the entry just inserted is at the back.
-            evicted.push(self.entries.remove(0).checkpoint_id);
+            let victim = self
+                .entries
+                .iter()
+                .position(|e| e.worker == worker)
+                .expect("this worker has entries");
+            evicted.push(self.entries.remove(victim).checkpoint_id);
         }
         evicted
     }
@@ -2327,6 +2338,36 @@ mod tests {
                 index.insert(mk(format!("c{chain}-s{step}"), 1000 * (step + 1) + chain));
             }
         }
+    }
+
+    #[test]
+    fn eviction_stays_within_the_inserting_worker() {
+        // Two models share the index; one's mints must never evict (and hand back
+        // for release to the wrong daemon session registry) the other's.
+        let mut index = PrefixIndex::default();
+        let mk = |worker: &str, hash: String| PrefixEntry {
+            worker: worker.into(),
+            prefix_hash: serde_json::json!({"value": hash}),
+            prefix_len: 1,
+            checkpoint_id: format!("ck-{worker}-{hash}"),
+            hits: 0,
+            batch: 0,
+            mint_at: None,
+        };
+        for i in 0..prefix_cache_max() {
+            assert!(index.insert(mk("b", format!("{i}"))).is_empty());
+        }
+        for i in 0..3 * prefix_cache_max() {
+            for id in index.insert(mk("a", format!("{i}"))) {
+                assert!(id.starts_with("ck-a-"), "worker a's insert evicted {id}");
+            }
+        }
+        let b_left = index.entries.iter().filter(|e| e.worker == "b").count();
+        assert_eq!(
+            b_left,
+            prefix_cache_max(),
+            "worker b lost entries to a's inserts"
+        );
     }
 
     #[test]
