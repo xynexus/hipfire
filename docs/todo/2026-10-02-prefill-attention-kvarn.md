@@ -1,6 +1,7 @@
 # TODO: a real prefill attention kernel for KVarN (query-tiled, WMMA)
 
-Status: TODO (profiled, not started).
+Status: v1 DONE (`f8ab1c334`) — see "Result". GQA sharing and double buffering
+are the open follow-ups.
 Date: 2026-10-02
 Model: Qwen3.8-27B--oq4.25++ (16/64 layers carry KV, KVarN 4-bit K + Q8 V), gfx1151.
 
@@ -59,3 +60,26 @@ at prefill widths — the same overlay-at-weight-decode idea as candidate 1 in
   the tiny-prefill gate.
 - Kernel trace of the same prompt: attention share and total time recorded here.
 - Corrode CAE tool-step prefill (attached 9-28K contexts) re-measured.
+
+## Result (v1, `f8ab1c334`)
+
+`attention_prefill_kvarn_wmma` — 64 rows x 1 head per workgroup, 16-token K/V
+sub-tiles dequantized into LDS, f16 WMMA, online softmax, causal by `positions`;
+routed inside `attention_flash_kvarn_batched_masked` (>= 32 rows, no tree bias,
+head_dim 256, gfx11). Parity: `parity_kvarn_prefill_wmma` (2.6e-5..4.8e-4 vs an
+f64 reference, ~2x the f32 path's error from f16 staging).
+
+End to end, cold, Qwen3.8-27B, same first output token both ways:
+
+| prompt | old path | WMMA | tok/s |
+|---|---|---|---|
+| 8.3K-token Corrode tool step (64 out) | 47.8 s | 31.2 s | ~175 -> ~270 |
+| 18K-token captured conversation (1 out) | 148.2 s | 66.5 s | ~121 -> ~271 |
+
+Prefill throughput no longer falls with context at these lengths.
+
+Open:
+- GQA: each of the G=6 query heads of a KV head re-dequantizes the same K/V
+  sub-tile. One workgroup per KV head (G heads x 16 rows, or 64 rows looped over
+  heads) would cut the dequant work 6x.
+- No double buffering: stage, barrier, compute, barrier per 16-token sub-tile.
