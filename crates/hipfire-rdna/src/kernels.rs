@@ -2856,6 +2856,11 @@ pub const ATTENTION_FLASH_F16K_Q8V_TILE_BATCHED_SRC: &str =
 /// the v1 build_kcache pass + shadow buffer. See attention_flash_kvarn_tile_batched.hip.
 pub const ATTENTION_FLASH_KVARN_TILE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_kvarn_tile_batched.hip");
+/// Causal KVarN prefill attention on WMMA (head_dim 256): one workgroup per 64
+/// query rows of a head, K/V dequantized once per 16-token sub-tile into LDS,
+/// online softmax, no partials/reduce. See attention_prefill_kvarn_wmma.hip.
+pub const ATTENTION_PREFILL_KVARN_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/attention_prefill_kvarn_wmma.hip");
 pub const ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_asym_reduce_batched.hip");
 

@@ -1714,6 +1714,32 @@ impl Gpu {
         bits: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // Prefill-sized batches (one session's rows, no tree bias) take the
+        // query-tiled WMMA kernel: this tile+reduce path runs the decode kernel
+        // once per ROW, re-dequantizing every K/V tile per row (42% of a cold
+        // 8.3K-token 27B prefill). `HIPFIRE_KVARN_PREFILL_WMMA=0` keeps this path.
+        if tree_bias.is_none()
+            && head_dim == 256
+            && batch_size >= KVARN_PREFILL_WMMA_MIN_ROWS
+            && matches!(bits, 2 | 4 | 8)
+            && self.arch_caps.has_wmma_w32()
+            && kvarn_prefill_wmma_enabled()
+        {
+            return self.attention_prefill_kvarn_wmma(
+                q,
+                records,
+                window,
+                v_cache,
+                out,
+                positions,
+                n_heads,
+                n_kv_heads,
+                batch_size,
+                n_full_blocks,
+                rec_bytes,
+                bits,
+            );
+        }
         const TILE_SIZE: usize = 128; // == KVARN_GROUP
         let max_tiles = max_ctx_len.div_ceil(TILE_SIZE);
         let stride = 2 + head_dim;
@@ -1828,6 +1854,56 @@ impl Gpu {
             offset += chunk;
         }
         Ok(())
+    }
+    /// Causal prefill attention over KVarN storage on WMMA (head_dim 256, gfx11):
+    /// `batch_size` query rows of ONE session at `positions`, K from the
+    /// `n_full_blocks` records + the f32/f16 `window`, V Q8_0. Writes `out`
+    /// directly (no partials). See `kernels/src/attention_prefill_kvarn_wmma.hip`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_prefill_kvarn_wmma(
+        &mut self,
+        q: &GpuTensor,
+        records: &GpuTensor,
+        window: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        batch_size: usize,
+        n_full_blocks: usize,
+        rec_bytes: usize,
+        bits: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(n_heads % n_kv_heads == 0);
+        const KERNEL: &str = "attention_prefill_kvarn_wmma";
+        self.ensure_kernel(KERNEL, kernels::ATTENTION_PREFILL_KVARN_WMMA_SRC, KERNEL)?;
+        const HD: usize = 256;
+        // Q_lds 64x264 + K_lds 16x264 + V_T 256x24 + P 4x16x24 halfs, + maxpos.
+        let lds = (64 * 264 + 16 * 264 + 256 * 24 + 4 * 16 * 24) * 2 + 16;
+        let win_f16 = i32::from(window.dtype == crate::DType::F16);
+        let scale = 1.0f32 / (HD as f32).sqrt();
+        let (qp, rp, wp, vp, op, pp) = (
+            q.buf.as_ptr(),
+            records.buf.as_ptr(),
+            window.buf.as_ptr(),
+            v_cache.buf.as_ptr(),
+            out.buf.as_ptr(),
+            positions.buf.as_ptr(),
+        );
+        let (b, nh, nkv) = (batch_size as i32, n_heads as i32, n_kv_heads as i32);
+        let (nfb, rb, bt) = (n_full_blocks as i32, rec_bytes as i32, bits as i32);
+        self.launch_kernargs(
+            KERNEL,
+            [n_heads as u32, batch_size.div_ceil(64) as u32, 1],
+            [128, 1, 1],
+            lds as u32,
+            &kernargs![
+                ptr qp, ptr rp, ptr wp, ptr vp, ptr op, ptr pp,
+                i32 b, i32 nh, i32 nkv, f32 scale, i32 nfb, i32 rb, i32 bt, i32 win_f16
+            ],
+        )
     }
     /// Flash attention with Q8_0 KV cache — tile + reduce two-kernel path.
     /// Tiles seq_len into chunks of `tile_size`, launches [n_heads, n_tiles]
@@ -5924,3 +6000,14 @@ const KVARN_ROUTED_LDS_MAX: u32 = 64 * 1024;
 /// shape, 16 sessions at 16.8K): 256 beat 128 and 512 by 1.3-1.5x at 450 rows and
 /// tied 512 at 16; 2048 was 2-5x slower (LDS starves occupancy).
 const KVARN_ROUTED_CHUNK: usize = 256;
+
+/// Rows at which a KVarN attention call counts as prefill and takes the WMMA kernel.
+const KVARN_PREFILL_WMMA_MIN_ROWS: usize = 32;
+
+/// `HIPFIRE_KVARN_PREFILL_WMMA=0` keeps prefill on the per-row tile+reduce path.
+fn kvarn_prefill_wmma_enabled() -> bool {
+    !matches!(
+        std::env::var("HIPFIRE_KVARN_PREFILL_WMMA").as_deref(),
+        Ok("0" | "off" | "false")
+    )
+}
