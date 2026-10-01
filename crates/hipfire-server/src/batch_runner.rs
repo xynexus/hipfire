@@ -411,38 +411,33 @@ impl PrefixIndex {
     /// duplicate of a hash already held, or the evictions that bring the index
     /// back under its cap.
     ///
-    /// Eviction takes never-attached entries first — from the oldest minting batch,
-    /// and within a batch the longest — and only then the least recently used.
-    /// Within a batch, longest-first keeps the shared system turn over the
-    /// request-specific tails minted beside it (plain LRU evicted it first, as it
-    /// is minted first). Across batches, oldest-first keeps a conversation's
-    /// fresh checkpoint over stale leftovers: longest-first alone evicted the new
-    /// tail a tool loop's next step needed whenever older, shorter entries filled
-    /// the index.
+    /// Least recently used goes first; a lookup, an insert, and a duplicate mint
+    /// of a held hash all count as use. `record_prefix_checkpoints` inserts one
+    /// prefill's checkpoints longest first, so its shortest boundary — the shared
+    /// system turn — is the most recent of them, and every later prompt that shares
+    /// it refreshes it again.
+    ///
+    /// History: this used to evict never-attached entries first (oldest batch,
+    /// then longest), to protect the shared system turn. Under concurrent tool
+    /// loops that is backwards: each chain's newest checkpoint is never-attached
+    /// until that chain's next step, so one chain's insert evicted another's fresh
+    /// tail and the victim re-prefilled thousands of tokens per step (measured: 3
+    /// research chains on CAE pinned to checkpoints 3-6 steps old).
     pub fn insert(&mut self, entry: PrefixEntry) -> Vec<String> {
-        if self
+        if let Some(i) = self
             .entries
             .iter()
-            .any(|e| e.worker == entry.worker && e.hash_value() == entry.hash_value())
+            .position(|e| e.worker == entry.worker && e.hash_value() == entry.hash_value())
         {
+            let held = self.entries.remove(i);
+            self.entries.push(held);
             return vec![entry.checkpoint_id];
         }
         self.entries.push(entry);
         let mut evicted = Vec::new();
         while self.entries.len() > prefix_cache_max() {
-            // Never the entry just inserted (last). Once every older entry had been
-            // attached at least once — a tool loop's chain does exactly that — the
-            // new checkpoint was the only never-attached one and evicted itself,
-            // so each step re-prefilled the whole conversation since the system
-            // turn. With no never-attached candidate, take the least recently used.
-            let older = self.entries.len() - 1;
-            let victim = self.entries[..older]
-                .iter()
-                .enumerate()
-                .filter(|(_, e)| e.hits == 0)
-                .min_by_key(|(_, e)| (e.batch, std::cmp::Reverse(e.prefix_len)))
-                .map_or(0, |(i, _)| i);
-            evicted.push(self.entries.remove(victim).checkpoint_id);
+            // Front = least recently used; the entry just inserted is at the back.
+            evicted.push(self.entries.remove(0).checkpoint_id);
         }
         evicted
     }
@@ -888,6 +883,9 @@ async fn record_prefix_checkpoints(
         let Some(checkpoints) = ev["state_handle"]["prefix_checkpoints"].as_array() else {
             continue;
         };
+        // Longest first: the shortest (most shared) boundary ends up most recent.
+        let mut checkpoints: Vec<&serde_json::Value> = checkpoints.iter().collect();
+        checkpoints.sort_by_key(|c| std::cmp::Reverse(c["prefix_len"].as_u64().unwrap_or(0)));
         for c in checkpoints {
             let (Some(id), Some(len)) = (c["checkpoint_id"].as_str(), c["prefix_len"].as_u64())
             else {
@@ -917,6 +915,22 @@ fn prefix_cache_enabled() -> bool {
         std::env::var("HIPFIRE_SERVER_PREFIX_CACHE").as_deref(),
         Ok("0" | "off" | "false" | "no")
     )
+}
+
+/// A request's terminal payload: why it stopped, and its usage in tokens.
+fn done_payload(
+    finish_reason: &str,
+    prompt_tokens: Option<&usize>,
+    completion_tokens: usize,
+) -> serde_json::Value {
+    let mut done = serde_json::json!({
+        "finish_reason": finish_reason,
+        "completion_tokens": completion_tokens,
+    });
+    if let Some(n) = prompt_tokens {
+        done["prompt_tokens"] = serde_json::json!(n);
+    }
+    done
 }
 
 /// Build one `generate_batch_decode_step` request: advance every resident
@@ -1757,6 +1771,16 @@ async fn run_batch_cycle(
         };
         fold_prefill_events(&events, &mut positions, &mut remaining);
     }
+    // Usage for each request's Done: its prompt length (the position prefill left
+    // it at) and the tokens it committed. A resumed (parked) session's prompt
+    // length is not known here; its usage reports this cycle's tokens only.
+    // ponytail: per-cycle counts; carry them on PendingRequest if parking is common.
+    let mut prompt_len: HashMap<String, usize> = if resuming {
+        HashMap::new()
+    } else {
+        positions.clone()
+    };
+    let mut generated: HashMap<String, usize> = HashMap::new();
 
     let mut active: Vec<String> = specs
         .iter()
@@ -1770,9 +1794,11 @@ async fn run_batch_cycle(
             return true;
         }
         if let Some(tx) = txs.get(id) {
-            let _ = tx.send(BatchEvent::Done(
-                serde_json::json!({ "finish_reason": "length" }),
-            ));
+            let _ = tx.send(BatchEvent::Done(done_payload(
+                "length",
+                prompt_len.get(id),
+                0,
+            )));
         }
         false
     });
@@ -1840,9 +1866,11 @@ async fn run_batch_cycle(
             let Some(ev) = done_ev else {
                 // No per-session event this step: end the request cleanly.
                 if let Some(tx) = txs.get(id) {
-                    let _ = tx.send(BatchEvent::Done(
-                        serde_json::json!({ "finish_reason": "stop" }),
-                    ));
+                    let _ = tx.send(BatchEvent::Done(done_payload(
+                        "stop",
+                        prompt_len.get(id),
+                        generated.get(id).copied().unwrap_or(0),
+                    )));
                 }
                 continue;
             };
@@ -1863,6 +1891,7 @@ async fn run_batch_cycle(
                 .and_then(|v| v.as_array())
                 .map_or(1, Vec::len);
             committed_total += committed as u64;
+            *generated.entry(id.clone()).or_default() += committed;
             if let Some(spec) = ev.get("spec") {
                 spec_drafted += spec.get("drafted").and_then(|v| v.as_u64()).unwrap_or(0);
                 spec_accepted += spec.get("accepted").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -1879,9 +1908,11 @@ async fn run_batch_cycle(
                     .and_then(|v| v.as_str())
                     .unwrap_or(if stop { "stop" } else { "length" });
                 if let Some(tx) = txs.get(id) {
-                    let _ = tx.send(BatchEvent::Done(serde_json::json!({
-                        "finish_reason": finish_reason
-                    })));
+                    let _ = tx.send(BatchEvent::Done(done_payload(
+                        finish_reason,
+                        prompt_len.get(id),
+                        generated.get(id).copied().unwrap_or(0),
+                    )));
                 }
             } else {
                 still_active.push(id.clone());
@@ -1944,15 +1975,15 @@ async fn run_batch_cycle(
                 let id = p.spec.id.clone();
                 txs.insert(id.clone(), p.tx.clone());
                 positions.insert(id.clone(), pos);
+                prompt_len.insert(id.clone(), pos);
                 remaining.insert(id.clone(), rem);
                 specs_by_id.insert(id.clone(), p.spec.clone());
                 specs.push(p.spec);
                 if rem > 0 {
                     active.push(id);
                 } else {
-                    let _ = p.tx.send(BatchEvent::Done(
-                        serde_json::json!({ "finish_reason": "length" }),
-                    ));
+                    let _ =
+                        p.tx.send(BatchEvent::Done(done_payload("length", Some(&pos), 0)));
                 }
             }
         }
@@ -2152,12 +2183,16 @@ mod tests {
             mint_at: None,
         };
         let mut index = PrefixIndex::default();
-        // One prefill mints every boundary of its prompt, shortest (the shared
-        // system turn) first; fill the index past its cap with such batches.
+        // Each cold prompt mints its own tail and the shared system turn, recorded
+        // longest first; from the second prompt on the system turn is a duplicate,
+        // released, and refreshes the held one. Fill the index past its cap so.
         let mut released = Vec::new();
         released.extend(index.insert(entry(603, "system")));
         for i in 0..prefix_cache_max() {
             released.extend(index.insert(entry(622, &format!("tail-{i}"))));
+            let mut dup = entry(603, "system");
+            dup.checkpoint_id = format!("ck-system-dup{i}");
+            assert_eq!(index.insert(dup), vec![format!("ck-system-dup{i}")]);
         }
         assert!(
             !released.contains(&"ck-system".to_string()),
@@ -2229,6 +2264,42 @@ mod tests {
         assert!(index
             .lookup("w", &[serde_json::json!({"value": "step-0"})])
             .is_none());
+    }
+
+    #[test]
+    fn concurrent_tool_loops_each_keep_their_newest_checkpoint() {
+        // Three conversations step in turn: each attaches its previous checkpoint
+        // and mints the next. Never-attached-first eviction let one chain's mint
+        // evict another's not-yet-attached newest checkpoint.
+        let mut index = PrefixIndex::default();
+        let mk = |hash: String, len: usize| PrefixEntry {
+            worker: "w".into(),
+            prefix_hash: serde_json::json!({"value": hash, "prefix_len": len}),
+            prefix_len: len,
+            checkpoint_id: format!("ck-{hash}"),
+            hits: 0,
+            batch: 0,
+            mint_at: None,
+        };
+        // Stale attached leftovers fill the index.
+        for i in 0..prefix_cache_max() {
+            index.insert(mk(format!("old-{i}"), 100 + i));
+            index.lookup("w", &[serde_json::json!({"value": format!("old-{i}")})]);
+        }
+        for step in 0..10 {
+            for chain in 0..3 {
+                if step > 0 {
+                    let prev = format!("c{chain}-s{}", step - 1);
+                    let hit = index.lookup("w", &[serde_json::json!({"value": prev})]);
+                    assert!(
+                        hit.is_some(),
+                        "chain {chain} lost its step-{} checkpoint",
+                        step - 1
+                    );
+                }
+                index.insert(mk(format!("c{chain}-s{step}"), 1000 * (step + 1) + chain));
+            }
+        }
     }
 
     #[test]

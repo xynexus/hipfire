@@ -2129,6 +2129,7 @@ where
 
         let mut text = String::new();
         let mut finish_reason = "stop".to_string();
+        let mut done_json = Value::Null;
         loop {
             if should_cancel() {
                 state.batch_inbox.lock().await.remove(&req_id);
@@ -2142,6 +2143,7 @@ where
                         .and_then(|v| v.as_str())
                         .unwrap_or("stop")
                         .to_string();
+                    done_json = done;
                     break;
                 }
                 Some(crate::batch_runner::BatchEvent::Error(e)) => {
@@ -2150,7 +2152,16 @@ where
                 None => break,
             }
         }
-        let token_count = text.split_whitespace().count() as u32;
+        // The runner counts committed tokens; the word count is only a fallback
+        // for a Done that carries none.
+        let token_count = done_json
+            .get("completion_tokens")
+            .and_then(Value::as_u64)
+            .map_or_else(|| text.split_whitespace().count() as u32, |n| n as u32);
+        let prompt_tokens = done_json
+            .get("prompt_tokens")
+            .and_then(Value::as_u64)
+            .map(|n| n as u32);
         let final_text = strip_visible_thinking(text, preserve_thinking, true);
         // The daemon's batch decode returns text only, so parse calls the way the
         // legacy path does when the daemon hands it none.
@@ -2159,7 +2170,7 @@ where
             id: req_id.clone(),
             tokens: token_count,
             tok_s: None,
-            prefill_tokens: None,
+            prefill_tokens: prompt_tokens,
             prefill_ms: None,
             prefill_tok_s: None,
             decode_tok_s: None,
