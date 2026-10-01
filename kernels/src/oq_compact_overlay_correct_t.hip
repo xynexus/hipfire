@@ -273,3 +273,85 @@ __launch_bounds__(256) extern "C" __global__ void oq_compact_overlay_correct_tr(
         if (row < M && b < B) Y[(long long)b * M + row] += acc_s[rr][bl];
     }
 }
+
+// ---------------------------------------------------------------------------
+// SMALL-B ROW-COALESCED VARIANT.
+//
+// `_tr` maps a wave's 32 lanes across 128 b (4 per lane) and walks its rows one
+// at a time. At a decode step's width (25..64 rows) most of those lanes have no
+// b: at B=33 nine of 32 are live, so the kernel is a serial per-row walk over
+// n_groups x n_ov dependent gathers with 72% of each wave masked off — ~0.18 ms
+// on gate/up where its traffic is ~8 MB (~40 us).
+//
+// Same gather, same per-element order (group-major, overlay entries in table
+// order), so the result is bit-identical to `_tr`; only the lane mapping moves.
+// A wave takes 8 rows at once, 4 lanes per row x 4 b per lane = 16 b.
+//
+//   grid  [ceil(M/64), ceil(B/16)]   block 256 (8 wave32, 8 rows per wave)
+//   LDS   64 x 17 f32 = 4.3 kB
+#define OQCOS_ROWS 64
+#define OQCOS_BB   16
+
+__launch_bounds__(256) extern "C" __global__ void oq_compact_overlay_correct_trs(
+    const uint8_t* __restrict__ W,
+    const int8_t*  __restrict__ XT,
+    const float*   __restrict__ XsT,
+    float*         __restrict__ Y,
+    int M, int K, int B, int group, int block_stride
+) {
+    __shared__ float acc_s[OQCOS_ROWS][OQCOS_BB + 1];
+
+    const int wid  = threadIdx.x >> 5;
+    const int lane = threadIdx.x & 31;
+    const int rl   = wid * 8 + (lane >> 2);
+    const int row  = blockIdx.x * OQCOS_ROWS + rl;
+    const int bl0  = (lane & 3) << 2;
+    const int b0   = blockIdx.y * OQCOS_BB + bl0;
+
+    const int n_groups = K / group;
+    const int nib_bytes = group >> 1;
+    const int side_stride = block_stride - nib_bytes;
+    const int n_ov_all = (side_stride - 2) >> 1;
+    const int n_ov = (n_ov_all < OQCO_MAX_OV) ? n_ov_all : OQCO_MAX_OV;
+    const long long side_base = (long long)M * n_groups * nib_bytes;
+
+    float acc[4] = {0.f, 0.f, 0.f, 0.f};
+    if (row < M && b0 < B) {
+        const uint8_t* s_row = W + side_base
+                             + (long long)row * n_groups * (long long)side_stride;
+        for (int g = 0; g < n_groups; ++g) {
+            const uint8_t* sb = s_row + (long long)g * side_stride;
+            const uint8_t* table = sb + 2;
+            const float sw = oqcot_f16(sb);
+            const int kbase = g * group;
+            int isum[4] = {0, 0, 0, 0};
+            #pragma unroll
+            for (int e = 0; e < OQCO_MAX_OV; ++e) {
+                if (e >= n_ov) break;
+                const int idx = (int)table[2 * e];
+                const int val = (int)(int8_t)table[2 * e + 1];
+                const uint32_t w4 =
+                    *(const uint32_t*)(XT + (long long)(kbase + idx) * B + b0);
+                #pragma unroll
+                for (int t = 0; t < 4; ++t)
+                    isum[t] += val * (int)(int8_t)((w4 >> (t * 8)) & 0xff);
+            }
+            const float* xsg = XsT + (long long)g * B;
+            #pragma unroll
+            for (int t = 0; t < 4; ++t)
+                acc[t] += (float)isum[t] * sw * xsg[b0 + t];
+        }
+    }
+    #pragma unroll
+    for (int t = 0; t < 4; ++t) acc_s[rl][bl0 + t] = acc[t];
+    __syncthreads();
+
+    // Consecutive threads take consecutive ROWS: 64 contiguous floats of Y.
+    for (int i = threadIdx.x; i < OQCOS_ROWS * OQCOS_BB; i += 256) {
+        const int rr = i & (OQCOS_ROWS - 1);
+        const int bl = i >> 6;
+        const int r = blockIdx.x * OQCOS_ROWS + rr;
+        const int b = blockIdx.y * OQCOS_BB + bl;
+        if (r < M && b < B) Y[(long long)b * M + r] += acc_s[rr][bl];
+    }
+}

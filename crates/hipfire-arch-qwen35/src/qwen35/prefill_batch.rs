@@ -3427,7 +3427,40 @@ fn forward_prefill_dense_session_batch_prefix_full_precision(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Batched serving: marks the GEMM dispatcher (`Gpu::oq_batch_serving`) for the
+/// forward's duration, restoring it on every exit.
 fn forward_prefill_dense_session_batch_impl(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    rows: &mut [DensePrefillSessionBatchRow<'_>],
+    pbs: &PrefillBatchScratch,
+    finalize_logits: bool,
+    calibration_schedule: bool,
+    dense_capture: Option<(
+        &hipfire_runtime::calibration::CalibCollector,
+        &hipfire_runtime::calibration::contracts::CaptureRegistry,
+    )>,
+    post_layer_capture: Option<&mut DensePostLayerCapture<'_>>,
+) -> HipResult<DensePrefillSessionBatchShape> {
+    let prev = gpu.set_oq_batch_serving(true);
+    let result = forward_prefill_dense_session_batch_impl_inner(
+        gpu,
+        weights,
+        config,
+        rows,
+        pbs,
+        finalize_logits,
+        calibration_schedule,
+        dense_capture,
+        post_layer_capture,
+    );
+    gpu.set_oq_batch_serving(prev);
+    result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_prefill_dense_session_batch_impl_inner(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
     config: &Qwen35Config,
@@ -5002,6 +5035,27 @@ pub fn forward_prefill_grouped_moe_session_batch_all_row_logits(
 }
 
 fn forward_prefill_grouped_moe_session_batch_impl(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    rows: &mut [DensePrefillSessionBatchRow<'_>],
+    pbs: &PrefillBatchScratch,
+    finalize_logits: bool,
+) -> HipResult<DensePrefillSessionBatchShape> {
+    let prev = gpu.set_oq_batch_serving(true);
+    let result = forward_prefill_grouped_moe_session_batch_impl_inner(
+        gpu,
+        weights,
+        config,
+        rows,
+        pbs,
+        finalize_logits,
+    );
+    gpu.set_oq_batch_serving(prev);
+    result
+}
+
+fn forward_prefill_grouped_moe_session_batch_impl_inner(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
     config: &Qwen35Config,

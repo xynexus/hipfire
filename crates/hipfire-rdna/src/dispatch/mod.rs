@@ -624,6 +624,14 @@ pub struct Gpu {
     // not. `oq_act_gen` starts at 1 so a fresh Gpu never matches.
     pub oq_act_gen: u64,
     pub oq_xt_gen: u64,
+    /// Batched serving (the continuous-batching session forwards) is running:
+    /// Opus-compact GEMMs may use the wide multicol GEMV for small batches even
+    /// when `flags.oq_compact_multicol_wide` is off. That flag stays off for the
+    /// single-request speculative path, whose verify is byte-identical to plain
+    /// decode only with the narrow kernel's summation order; the batched path
+    /// has no such property (fused and serial already differ at near-ties).
+    /// Set through [`Gpu::set_oq_batch_serving`].
+    pub oq_batch_serving: bool,
     pub oq_xt_ng: usize,
     pub oq_xt_n: usize,
     // Plain-basis DFLASH W4A8/W8A8 staging. The activation is quantized once
@@ -1061,6 +1069,7 @@ impl Gpu {
             oq_xilv_batch: None,
             oq_act_gen: 1,
             oq_xt_gen: 0,
+            oq_batch_serving: false,
             oq_xt_ng: 0,
             oq_xt_n: 0,
             dflash_oq_xq_batch: None,
@@ -1670,6 +1679,12 @@ impl Gpu {
     /// Compile and load a kernel if missing. Public variant of `ensure_kernel`
     /// for callers that need to JIT a kernel by name from outside the crate
     /// (primarily the hipGraph capture/replay path).
+    /// Mark batched serving on or off (see `oq_batch_serving`); returns the
+    /// previous value so a caller can restore it.
+    pub fn set_oq_batch_serving(&mut self, on: bool) -> bool {
+        std::mem::replace(&mut self.oq_batch_serving, on)
+    }
+
     pub fn ensure_kernel_public(
         &mut self,
         module_name: &str,
