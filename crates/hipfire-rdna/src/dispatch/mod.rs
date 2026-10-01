@@ -2395,7 +2395,7 @@ impl Gpu {
     /// a warning, not an unwind through a Drop or a mailbox drain.
     fn dispose(&mut self, buf: DeviceBuffer) {
         match buf.origin() {
-            BufferOrigin::Pooled => self.pool.free(buf),
+            BufferOrigin::Pooled => self.pool.free(&self.hip, buf),
             BufferOrigin::Direct => {
                 if let Err(e) = self.hip.free(buf) {
                     eprintln!("  warning: hipFree failed during dispose: {e:?}");

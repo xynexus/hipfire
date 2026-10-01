@@ -1767,6 +1767,29 @@ pub fn qwen35_release_sessions(
         }
     }
 
+    // What stays resident is the first thing to know when device memory climbs.
+    let (pool, _) = gpu.pool_stats();
+    tracing::debug!(
+        "qwen35 release: freed {released}, {} session(s) resident ({} checkpoint(s)); pool cached {} MiB in {} buffers, {} MiB ever allocated",
+        m.q35_registry.sessions.len(),
+        m.q35_registry
+            .sessions
+            .keys()
+            .filter(|k| k.starts_with("qwen35-checkpoint:"))
+            .count(),
+        pool.free_bytes >> 20,
+        pool.free_buffers,
+        pool.total_allocated >> 20,
+    );
+    tracing::trace!(
+        "qwen35 resident non-checkpoint sessions: {:?}",
+        m.q35_registry
+            .sessions
+            .keys()
+            .filter(|k| !k.starts_with("qwen35-checkpoint:"))
+            .collect::<Vec<_>>()
+    );
+
     Ok(released)
 }
 

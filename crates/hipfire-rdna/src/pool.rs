@@ -24,6 +24,31 @@ pub fn pool_headroom_bytes() -> usize {
 }
 use std::collections::HashMap;
 
+/// Bytes the pool may keep parked on its free lists, `HIPFIRE_POOL_CACHE_MAX_MB`
+/// (default 4096). Past it, a returned buffer goes straight back to HIP.
+///
+/// Uncapped, a freed buffer stayed cached until device memory itself ran short.
+/// On an APU "device memory" is host RAM (gfx1151: a 116 GiB GTT cap of 125 GiB),
+/// so the cache of freed per-request KV caches and state snapshots -- every one a
+/// different size, so rarely reused -- grew GTT toward all of RAM before the
+/// headroom check saw anything: 24 -> 94 GiB over one Corrode swarm turn, with
+/// the host down to 23 GB free.
+pub fn pool_cache_max_bytes() -> usize {
+    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *V.get_or_init(|| {
+        std::env::var("HIPFIRE_POOL_CACHE_MAX_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(4096)
+            * 1024
+            * 1024
+    })
+}
+
+/// A buffer this large is never cached: it is a KV cache or a state snapshot
+/// sized to one request, not decode scratch.
+const POOL_CACHE_MAX_BUFFER: usize = 256 * 1024 * 1024;
+
 const MIN_ALLOC: usize = 256;
 
 /// A pool of GPU buffers, bucketed by size.
@@ -36,6 +61,8 @@ pub struct GpuPool {
     pub total_allocated: usize,
     pub total_reused: usize,
     pub total_new: usize,
+    /// Bytes currently parked on `free_lists`.
+    cached_bytes: usize,
 }
 
 /// A snapshot of pool accounting, for leak hunting.
@@ -86,6 +113,7 @@ impl GpuPool {
             total_allocated: 0,
             total_reused: 0,
             total_new: 0,
+            cached_bytes: 0,
         }
     }
 
@@ -121,6 +149,7 @@ impl GpuPool {
             // to HIP — better to re-allocate at the right size than to
             // carry undersized buffers around.
             while let Some(buf) = list.pop() {
+                self.cached_bytes -= buf.size();
                 if buf.size() >= size {
                     self.total_reused += 1;
                     return Ok(buf);
@@ -173,7 +202,7 @@ impl GpuPool {
     /// capacity is what gets reused — we key the free-list by the
     /// power-of-2 bucket so same-size-shaped requests hit the same
     /// slot.
-    pub fn free(&mut self, buf: DeviceBuffer) {
+    pub fn free(&mut self, hip: &HipRuntime, buf: DeviceBuffer) {
         // `Gpu::dispose` routes on the tag, so only pooled buffers should arrive.
         // A Direct one here is the #253 leak (a hipMalloc buffer piling into a
         // list nothing draws from); a NonOwning one is the #262 corruption.
@@ -184,12 +213,22 @@ impl GpuPool {
             buf.as_ptr(),
             buf.size()
         );
-        let bucket = Self::bucket_key(buf.size());
-        self.free_lists.entry(bucket).or_default().push(buf);
+        let size = buf.size();
+        if size >= POOL_CACHE_MAX_BUFFER || self.cached_bytes + size > pool_cache_max_bytes() {
+            // Ownership leaves the pool for HIP; stamp to match.
+            let _ = hip.free(buf.with_origin(BufferOrigin::Direct));
+            return;
+        }
+        self.cached_bytes += size;
+        self.free_lists
+            .entry(Self::bucket_key(size))
+            .or_default()
+            .push(buf);
     }
 
     /// Actually free all pooled buffers (call on cleanup).
     pub fn drain(&mut self, hip: &HipRuntime) {
+        self.cached_bytes = 0;
         for (_, list) in self.free_lists.drain() {
             for buf in list {
                 // Ownership leaves the pool for HIP; stamp to match.

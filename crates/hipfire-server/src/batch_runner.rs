@@ -1953,6 +1953,20 @@ async fn run_batch_cycle(
                 .and_then(|v| v.as_str())
                 .map(str::to_string);
         }
+        // Release what finished this step now, not at cycle end. With mid-cycle
+        // admission a cycle runs as long as requests keep arriving -- for a whole
+        // swarm turn -- and every finished request's KV stayed resident until it
+        // ended: 18+ dead sessions and ~30 GiB of GTT over one CAE turn.
+        let finished: Vec<String> = active
+            .iter()
+            .filter(|id| !still_active.contains(id))
+            .cloned()
+            .collect();
+        if !finished.is_empty() {
+            let _ = engine
+                .release_sessions(build_release_request(&worker, &finished))
+                .await;
+        }
         active = still_active;
 
         // Mid-cycle admission: take queued requests this batch can run (same
