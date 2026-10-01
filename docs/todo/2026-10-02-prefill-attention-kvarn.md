@@ -83,3 +83,26 @@ Open:
   sub-tile. One workgroup per KV head (G heads x 16 rows, or 64 rows looped over
   heads) would cut the dequant work 6x.
 - No double buffering: stage, barrier, compute, barrier per 16-token sub-tile.
+
+## After v1: where a cold 8.3K prefill goes (rocprofv3, 27.0 s kernel time)
+
+| kernel | time | share |
+|---|---|---|
+| `gemm_oq_compact_iu4x2_w64` | 13.2 s | 49% |
+| `oq_compact_overlay_correct_tr` | 5.7 s | 21% |
+| `attention_prefill_kvarn_wmma` | 2.7 s | 10% |
+| `gated_delta_net_f16` | 1.7 s | 6% |
+
+Follow-ups measured the same night:
+- Overlay `_tr` group-outer (`9f97972bc`): bit-identical, down -8% at 512 rows,
+  qkv/wo -4..5%. 64 rows per block was slower.
+- GEMM tile sweep at 256/512/1024 rows: a 128x64 tile (WARPS_M 4, WARPS_N 1) is
+  bit-identical and -12% gate/up, -10% qkv, -5% down at 512+, but mixed at 256.
+  Prefill calls the GEMM with at most `PREFILL_MAX_BATCH` = 256 rows, so it is
+  enabled only at >= 384 rows (fused multi-session prefill hits 512-row calls).
+- `HIPFIRE_PREFILL_MAX_BATCH=512` (with that tile): 8.3K 30.2 -> 29.5 s, 18K
+  64.6 -> 61.5 s, same output. Not made the default: shared by every Qwen3.5
+  family prefill and it moves the DeltaNet f16 rounding points (see
+  prefill_batch.rs near PREFILL_MAX_BATCH); worth a parity pass first.
+- The GEMM core itself runs at ~30 int8 TOPS at these widths; the remaining big
+  lever is the overlay (scattered int8 gathers), see the decode-width GEMM doc.

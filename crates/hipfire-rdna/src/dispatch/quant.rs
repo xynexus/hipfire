@@ -1751,6 +1751,43 @@ impl Gpu {
         // 0.47/0.53, qkv 0.37/0.38 -> 0.15/0.16. Past 64 it would read the
         // weights twice (down at 128: 0.89 -> 1.21), so the default takes over.
         let narrow_n = batch_size <= 64;
+        // Experiment hook: `HIPFIRE_OQ_W64_TILE=wm,wn,wmt,wnt` compiles that tile
+        // for B > 64 (prefill widths), to sweep shapes without code edits.
+        if !narrow_n {
+            if let Some((wm, wn, wmt, wnt)) = w64_tile_override() {
+                let name = format!("gemm_oq_compact_iu4x2_w64_t{wm}_{wn}_{wmt}_{wnt}");
+                if !self.functions.contains_key(&name) {
+                    let src = format!(
+                        "#define WARPS_M {wm}\n#define WARPS_N {wn}\n#define WMt {wmt}\n#define WNt {wnt}\n{}",
+                        kernels::GEMM_OQ_COMPACT_IU4X2_W64_SRC.replace(
+                            "void gemm_oq_compact_iu4x2_w64(",
+                            &format!("void {name}(")
+                        )
+                    );
+                    self.ensure_kernel(&name, &src, &name)?;
+                }
+                return self.launch_iu4x2_w64(
+                    &name,
+                    w_blocks,
+                    x_i8,
+                    x_scales,
+                    y_f32,
+                    m,
+                    k,
+                    batch_size,
+                    block_stride,
+                    (wm, wn, wmt, wnt),
+                );
+            }
+        }
+        // Prefill chunks (>= 384 rows) take a 128 x 64 tile (4 M-warps, 1 N-warp):
+        // swept at 512 rows, GEMM only, 27B shapes -- gate/up 3.03 -> 2.67 ms,
+        // qkv 1.14 -> 1.03, down 3.13 -> 2.96, wo 0.95 -> 0.92; neutral at 256
+        // (down slower), hence the threshold. Bit-identical (each output's K
+        // accumulation order is the tile-independent strip order).
+        // `HIPFIRE_OQ_W64_WIDE=0` keeps the default tile.
+        let wide_m =
+            batch_size >= 384 && std::env::var("HIPFIRE_OQ_W64_WIDE").as_deref() != Ok("0");
         let (func_name, warps_m, warps_n, w_mt, w_nt) = if narrow_n {
             (
                 "gemm_oq_compact_iu4x2_w64_n64",
@@ -1759,6 +1796,8 @@ impl Gpu {
                 2usize,
                 4usize,
             )
+        } else if wide_m {
+            ("gemm_oq_compact_iu4x2_w64_m128", 4, 1, 2, 4)
         } else {
             ("gemm_oq_compact_iu4x2_w64", 2, 2, 2, 4)
         };
@@ -1774,6 +1813,18 @@ impl Gpu {
                 )
             });
             self.ensure_kernel(func_name, src, func_name)?;
+        } else if wide_m {
+            static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+            let src = SRC.get_or_init(|| {
+                format!(
+                    "#define WARPS_M 4\n#define WARPS_N 1\n#define WMt 2\n#define WNt 4\n{}",
+                    kernels::GEMM_OQ_COMPACT_IU4X2_W64_SRC.replace(
+                        "void gemm_oq_compact_iu4x2_w64(",
+                        "void gemm_oq_compact_iu4x2_w64_m128("
+                    )
+                )
+            });
+            self.ensure_kernel(func_name, src, func_name)?;
         } else {
             self.ensure_kernel(
                 "gemm_oq_compact_iu4x2_w64",
@@ -1781,6 +1832,34 @@ impl Gpu {
                 "gemm_oq_compact_iu4x2_w64",
             )?;
         }
+        self.launch_iu4x2_w64(
+            func_name,
+            w_blocks,
+            x_i8,
+            x_scales,
+            y_f32,
+            m,
+            k,
+            batch_size,
+            block_stride,
+            (warps_m, warps_n, w_mt, w_nt),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn launch_iu4x2_w64(
+        &mut self,
+        func_name: &str,
+        w_blocks: &GpuTensor,
+        x_i8: &GpuTensor,
+        x_scales: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        block_stride: usize,
+        (warps_m, warps_n, w_mt, w_nt): (usize, usize, usize, usize),
+    ) -> HipResult<()> {
         let wp = w_blocks.buf.as_ptr();
         let xp = x_i8.buf.as_ptr();
         let xsp = x_scales.buf.as_ptr();
@@ -2931,4 +3010,11 @@ fn oq_compact_row_chunk() -> usize {
             None => 512,
         }
     })
+}
+
+/// `HIPFIRE_OQ_W64_TILE=wm,wn,wmt,wnt`: the iu4x2 w64 GEMM tile for B > 64.
+fn w64_tile_override() -> Option<(usize, usize, usize, usize)> {
+    let v = std::env::var("HIPFIRE_OQ_W64_TILE").ok()?;
+    let p: Vec<usize> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+    (p.len() == 4).then(|| (p[0], p[1], p[2], p[3]))
 }

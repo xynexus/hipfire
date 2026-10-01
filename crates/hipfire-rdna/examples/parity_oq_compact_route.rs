@@ -92,6 +92,32 @@ fn main() {
             let _ = gpu.free_tensor(xs);
             let _ = gpu.free_tensor(y);
         }
+        // The 128x64 prefill tile (>= 384 rows) must reproduce the default tile
+        // exactly: every output accumulates its K strips in the same order.
+        for &b in &[384usize, 513] {
+            let xw: Vec<f32> = x.iter().cycle().take(b * k).copied().collect();
+            let xs = gpu.upload_f32(&xw, &[b * k]).expect("x");
+            let y = gpu.alloc_tensor(&[b * m], DType::F32).expect("y");
+            let mut outs = Vec::new();
+            for wide in ["1", "0"] {
+                std::env::set_var("HIPFIRE_OQ_W64_WIDE", wide);
+                gpu.gemm_oq_compact_act_batched(&wb, &xs, &y, m, k, b, stride)
+                    .unwrap();
+                outs.push(gpu.download_f32(&y).unwrap());
+            }
+            std::env::remove_var("HIPFIRE_OQ_W64_WIDE");
+            let same = outs[0]
+                .iter()
+                .zip(&outs[1])
+                .all(|(a, c)| a.to_bits() == c.to_bits());
+            fail |= !same;
+            println!(
+                "M={m} K={k} B={b} 128x64 tile vs default tile: bit_exact={same} -> {}",
+                if same { "PASS" } else { "FAIL" }
+            );
+            let _ = gpu.free_tensor(xs);
+            let _ = gpu.free_tensor(y);
+        }
         // Row chunking (512) of a wide batch: rows are independent, so a chunked
         // B=1100 must reproduce, bit for bit, the same rows computed unchunked
         // (the first 300 rows of `reference`, B=300 < one chunk).
