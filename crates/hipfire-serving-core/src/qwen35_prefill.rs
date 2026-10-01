@@ -543,6 +543,32 @@ pub fn qwen35_semantic_boundary_checkpoints(
         .collect())
 }
 
+/// Checkpoints a cold prefill may take, `HIPFIRE_PREFIX_MINT_MAX` (default 4; 0 = no
+/// cap). Each is a full snapshot — ~72 MB of DeltaNet state on the 27B plus the KV up
+/// to that boundary — and a long tool conversation has a boundary per turn: one cold
+/// 28.7K-token Corrode conversation minted ~45 at once, most released straight back
+/// (the server keeps 16), and two of them together drove GTT to 107 GiB.
+fn cold_mint_max() -> usize {
+    std::env::var("HIPFIRE_PREFIX_MINT_MAX")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(4)
+}
+
+/// Keep the first `max - 1` boundaries and the last. The early ones are what other
+/// requests share (system turn, then stacked shared turns: `p1`, `p1 + p2`); the last
+/// is where this conversation's next step attaches. The middle of one conversation is
+/// reached by nobody else.
+fn cap_cold_boundaries<T>(mut boundaries: Vec<T>, max: usize) -> Vec<T> {
+    if max == 0 || boundaries.len() <= max {
+        return boundaries;
+    }
+    let last = boundaries.pop();
+    boundaries.truncate(max - 1);
+    boundaries.extend(last);
+    boundaries
+}
+
 /// Handle a `prefix_hash_preflight` request: compute the candidate hashes for a
 /// prompt and report which prefix lengths the client can reuse, before any GPU
 /// prefill work.
@@ -2090,8 +2116,10 @@ pub fn run_generate_batch_prefill_serial_qwen35(
             } else {
                 let _ = created;
                 sequence_state_arena_reset_active_session(arena_backend, m, gpu)?;
-                boundary_checkpoints =
-                    qwen35_semantic_boundary_checkpoints(m, session, &full_tokens)?;
+                boundary_checkpoints = cap_cold_boundaries(
+                    qwen35_semantic_boundary_checkpoints(m, session, &full_tokens)?,
+                    cold_mint_max(),
+                );
                 full_tokens
             }
         } else {
@@ -2230,4 +2258,18 @@ pub fn run_generate_batch_prefill_serial_qwen35(
     let _ = writeln!(stdout, "{done}");
     let _ = stdout.flush();
     Ok(())
+}
+
+#[cfg(test)]
+mod cold_mint_tests {
+    use super::cap_cold_boundaries;
+
+    #[test]
+    fn a_cold_mint_keeps_the_shared_head_and_the_conversation_end() {
+        let all: Vec<usize> = (0..45).collect();
+        assert_eq!(cap_cold_boundaries(all.clone(), 4), vec![0, 1, 2, 44]);
+        assert_eq!(cap_cold_boundaries(all.clone(), 1), vec![44]);
+        assert_eq!(cap_cold_boundaries(all.clone(), 0).len(), 45, "0 = no cap");
+        assert_eq!(cap_cold_boundaries(vec![7, 9], 4), vec![7, 9]);
+    }
 }
