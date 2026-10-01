@@ -1305,7 +1305,7 @@ fn parse_inline_tool_calls(text: &str, req_id: &str) -> (String, Vec<Value>) {
     }
 
     if tool_calls.is_empty() {
-        return (text.to_string(), tool_calls);
+        return (clean_reply_text(text), tool_calls);
     }
     // The text before the call gets the same special-token cleanup as the call body: a
     // quantized Qwen3.8-27B emits a stray `<|im_start|>` ahead of `<tool_call>`, and as
@@ -1315,6 +1315,30 @@ fn parse_inline_tool_calls(text: &str, req_id: &str) -> (String, Vec<Value>) {
         .map(|(before, _)| strip_chat_specials(before).trim().to_string())
         .unwrap_or_default();
     (content, tool_calls)
+}
+
+/// A reply's message text with stray chat-template structure removed. The quantized
+/// Qwen3.x models occasionally pick a turn header as a near-tie under greedy batched
+/// decode (6 of ~140 Corrode replies): `<|im_start|>assistant\n\n# Answer…` — a
+/// header in front of a real answer, kept — or `<|im_start|>user`, the start of a
+/// turn that is not theirs, cut there. See
+/// docs/todo/2026-10-02-stray-im-start-and-chat-template-check.md.
+fn clean_reply_text(text: &str) -> String {
+    let mut rest = text;
+    if let Some(after) = rest.strip_prefix("<|im_start|>") {
+        rest = after;
+        for role in ["assistant", "user", "system", "tool"] {
+            if let Some(after) = rest.strip_prefix(role) {
+                rest = after;
+                break;
+            }
+        }
+        rest = rest.trim_start_matches('\n');
+    }
+    if let Some(at) = rest.find("<|im_start|>") {
+        rest = &rest[..at];
+    }
+    strip_chat_specials(rest)
 }
 
 fn strip_chat_specials(text: &str) -> String {
@@ -3165,6 +3189,20 @@ mod tests {
             ("", 1),
             "a stray special token is not content"
         );
+        let (kept, _) = parse_inline_tool_calls("<|im_start|>assistant\n\n\n# Summary\n- a", "req");
+        assert_eq!(
+            kept, "# Summary\n- a",
+            "a header in front of a real answer is dropped, the answer kept"
+        );
+        let (gone, _) = parse_inline_tool_calls("<|im_start|>user", "req");
+        assert_eq!(
+            gone, "",
+            "a reply that only opens someone else's turn is empty"
+        );
+        let (cut, _) = parse_inline_tool_calls("Done.<|im_end|>\n<|im_start|>user\nthanks", "req");
+        assert_eq!(cut, "Done.\n", "a hallucinated next turn is cut off");
+        let (plain, _) = parse_inline_tool_calls("No markup here.", "req");
+        assert_eq!(plain, "No markup here.");
         assert_eq!(tool_calls[0]["type"], "function");
         assert_eq!(tool_calls[0]["function"]["name"], "lookup");
         assert_eq!(

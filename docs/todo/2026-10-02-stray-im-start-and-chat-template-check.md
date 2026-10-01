@@ -1,6 +1,7 @@
 # TODO: stray `<|im_start|>` in replies; verify the chat template for both swarm models
 
-Status: TODO (not started).
+Status: PARTLY DONE (2026-10-02) — templates checked, symptom handled; a per-model
+render-vs-reference test is still open (see "Still open").
 Date: 2026-10-02
 Models: Qwen3.8-27B--oq4.25++ (reasoning roles), Qwen3.6-35B-A3B--oq4.25++ (coder),
 both with `jinja_chat: "on"`, `max_seq: 32768` in `~/.hipfire/config.json`.
@@ -62,3 +63,34 @@ only; message replies (no tool call) still carry it, and Corrode replays them.
 - If a stray header still appears with a correct prompt, it is the quantized model,
   not the template: then strip leading special tokens from all message text (not
   only before a tool call) and say so here.
+
+## Findings (2026-10-02)
+
+- `HIPFIRE_DEBUG_RENDER_DIR=<dir>` (new) writes the exact batch-prefill render per
+  session (`qwen35_materialize_batch_prefill_prompt`). NB: the daemon runs from the
+  `hipfire` CLI binary — rebuild `-p hipfire-cli --bin hipfire`, not only
+  `hipfire-daemon`, or the change is not in the running daemon.
+- Both offending captured requests re-rendered: the 35B (7 items) and the 27B (38
+  items, ~25K tokens). Both well-formed: tools block in the system turn, XML
+  `<tool_call><function=…><parameter=…>` assistant turns, `<tool_response>` user
+  turns, every turn closed, and the prompt ENDS in the generation prompt
+  `<|im_start|>assistant\n<think>\n\n</think>\n\n` (`reasoning_effort: none` ->
+  `max_think_tokens = 1` -> `enable_thinking = false`, honoured). So the template is
+  not opening the turn for the model.
+- Replays of both are clean (the 35B one three times). Every batch path picks
+  tokens by argmax, so the header was a greedy near-tie that flipped under that
+  run's batch composition — the known fused-vs-serial numerics gap — not a stop or
+  speculation bug (the spec path truncates at a terminator inside accepted drafts;
+  checked). "1 output token" on the 35B reply is the batch path's whitespace word
+  count, not a token count.
+- Handled at the reply: `clean_reply_text` (routes/chat.rs) drops a leading
+  `<|im_start|>{role}` header and keeps what follows (the 27B's `# Per-crate summary`
+  was a real answer behind one), and cuts at a later `<|im_start|>` (a hallucinated
+  next turn). Applies to every non-streamed chat/Responses reply.
+
+## Still open
+
+- Streamed replies (`stream: true`) are not cleaned — deltas go out as generated.
+- The byte-for-byte render test per model against a reference Jinja render.
+- Suppressing `<|im_start|>` at the logits (argmax kernels) instead of after the
+  fact, if a cleaned-but-empty reply (`<|im_start|>user` -> "") shows up often.

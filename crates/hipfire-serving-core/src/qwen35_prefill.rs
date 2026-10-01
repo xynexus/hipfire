@@ -344,7 +344,14 @@ pub fn qwen35_materialize_batch_prefill_prompt(
             frame.render()
         };
         match render_result {
-            Ok(rendered) => Ok(tokenizer.encode(&rendered)),
+            Ok(rendered) => {
+                // Diagnostic: the exact rendered prompt, one file per session.
+                if let Some(dir) = std::env::var_os("HIPFIRE_DEBUG_RENDER_DIR") {
+                    let path = std::path::Path::new(&dir).join(format!("{}.txt", session.id));
+                    let _ = std::fs::write(path, &rendered);
+                }
+                Ok(tokenizer.encode(&rendered))
+            }
             Err(e) => {
                 tracing::warn!("batch-prefill jinja render failed ({e}) -- falling back to Plain");
                 Ok(prompt_frame::ChatFrame {
