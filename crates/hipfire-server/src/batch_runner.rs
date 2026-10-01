@@ -1256,6 +1256,11 @@ async fn batch_runner_loop(state: SharedState) {
                 if batch.len() > fit_cap && batch[0].resume_position.is_none() {
                     parked.push((batch.split_off(fit_cap), running_priority));
                 }
+                // Let a caller blocked on the engine have it first (it polls every
+                // 20 ms; taking it straight back would starve it again).
+                while state.engine_wanted() {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
                 let mut engine = match state.engine.lock().await.take() {
                     Some(e) => e,
                     None => {
@@ -1974,7 +1979,7 @@ async fn run_batch_cycle(
         // the next step instead of waiting for the whole batch to finish. Runs
         // before the preemption check: a more urgent request on this worker joins
         // rather than parking the batch.
-        if midcycle_admit_enabled() && !active.is_empty() {
+        if midcycle_admit_enabled() && !active.is_empty() && !state.engine_wanted() {
             let admitted = admit_into_cycle(
                 engine,
                 state,
@@ -2012,11 +2017,19 @@ async fn run_batch_cycle(
                 .lock()
                 .await
                 .peek_next_priority(now_ms());
-            if waiter.is_some_and(|top| top < running_priority) {
+            // A caller blocked on the engine (another model's load) is waited for
+            // like a more urgent request: nothing else ends a cycle that keeps
+            // admitting work.
+            let engine_wanted = state.engine_wanted();
+            if engine_wanted || waiter.is_some_and(|top| top < running_priority) {
                 tracing::debug!(
                     "parked {} session(s) at step {steps}: pri {running_priority} yields to {}",
                     active.len(),
-                    waiter.unwrap()
+                    if engine_wanted {
+                        "an engine waiter".to_string()
+                    } else {
+                        format!("pri {}", waiter.unwrap_or_default())
+                    }
                 );
                 let parked: Vec<PendingRequest> = active
                     .iter()

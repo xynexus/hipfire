@@ -78,6 +78,11 @@ pub struct LoadedModelState {
 pub struct AppState {
     /// Serializes all daemon I/O. Phase A: one request at a time.
     pub engine: Mutex<Option<DaemonEngine>>,
+    /// Callers blocked in `lock_engine` on an engine the batch runner has checked
+    /// out (a model load, a non-batched request). The runner yields to them: a
+    /// decode cycle with mid-cycle admission otherwise never ends while work keeps
+    /// arriving, and a request for another model starved behind it for 40+ min.
+    pub engine_waiters: std::sync::atomic::AtomicUsize,
     pub loaded_config: Mutex<LoadedConfig>,
     pub config: Mutex<HipfireConfig>,
     /// Worker key ID of the currently loaded model, if any.
@@ -178,14 +183,35 @@ impl AppState {
     /// spec-decode request under load). A daemon that died clears
     /// `loaded_models`, so that case still returns the empty slot.
     pub async fn lock_engine(&self) -> tokio::sync::MutexGuard<'_, Option<DaemonEngine>> {
+        // Counted as a waiter only while actually blocked; the ticket's Drop
+        // uncounts it even if this future is cancelled mid-wait.
+        struct Ticket<'a>(&'a std::sync::atomic::AtomicUsize);
+        impl Drop for Ticket<'_> {
+            fn drop(&mut self) {
+                self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+        let mut ticket = None;
         loop {
             let guard = self.engine.lock().await;
             if guard.is_some() || self.loaded_models.lock().await.is_empty() {
                 return guard;
             }
             drop(guard);
+            if ticket.is_none() {
+                self.engine_waiters
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                ticket = Some(Ticket(&self.engine_waiters));
+            }
             tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
+    }
+
+    /// Whether some caller is blocked waiting for the engine (see `engine_waiters`).
+    pub fn engine_wanted(&self) -> bool {
+        self.engine_waiters
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0
     }
 }
 
@@ -306,6 +332,7 @@ impl AppState {
         let usage_writer = access.store().ok().map(UsageWriter::spawn);
         Arc::new(Self {
             engine: Mutex::new(None),
+            engine_waiters: std::sync::atomic::AtomicUsize::new(0),
             loaded_config: Mutex::new(loaded_config),
             config: Mutex::new(config),
             loaded_model_path: Mutex::new(None),
@@ -426,12 +453,19 @@ mod lock_engine_tests {
             waited.await.is_err(),
             "must wait while the engine is checked out"
         );
+        // The timed-out (cancelled) wait does not leave a waiter counted.
+        assert!(!state.engine_wanted(), "a cancelled wait stays counted");
 
         // The daemon died (loaded_models cleared): the wait ends.
         let s2 = state.clone();
         let waiter = tokio::spawn(async move { s2.lock_engine().await.is_none() });
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(
+            state.engine_wanted(),
+            "a blocked caller is visible to the runner"
+        );
         state.loaded_models.lock().await.clear();
         assert!(waiter.await.unwrap());
+        assert!(!state.engine_wanted());
     }
 }
