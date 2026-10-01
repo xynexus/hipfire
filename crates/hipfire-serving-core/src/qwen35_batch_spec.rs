@@ -298,7 +298,21 @@ fn step(
         .ok_or("generate_batch_decode_step requires a tokenizer")?;
     let vocab = config.vocab_size;
 
-    // 1. What each session feeds, and its drafts.
+    // 1. What each session feeds, and its drafts. The fresh tokens of every
+    // session without a pending run come from ONE batched argmax: per session it
+    // was a 256-thread launch over the vocab plus a blocking readback, 5.6% of
+    // a 64-session step.
+    let fresh_logits: Vec<&hipfire_rdna::GpuTensor> = states
+        .iter()
+        .zip(pendings.iter())
+        .filter(|(_, p)| p.is_empty())
+        .map(|((_, st), _)| &st.logits)
+        .collect();
+    let mut fresh_tokens = gpu
+        .argmax_f32_many(&fresh_logits, vocab)
+        .map_err(|e| format!("qwen35 decode argmax: {e:?}"))?
+        .into_iter();
+    drop(fresh_logits);
     let mut plans = Vec::with_capacity(states.len());
     for ((session, state), pending) in states.iter().zip(pendings.iter_mut()) {
         let physical = state.cursor.seq_pos + state.kv_cache().compact_offset;
@@ -313,9 +327,9 @@ fn step(
         }
         let remaining = session.max_tokens_remaining;
         let mut plan = if pending.is_empty() {
-            let token = gpu
-                .argmax_f32(&state.logits, vocab)
-                .map_err(|e| format!("qwen35 decode argmax: {e:?}"))?;
+            let token = fresh_tokens
+                .next()
+                .ok_or("qwen35 decode argmax: missing a session's token")?;
             let stop = is_terminator(config, tokenizer, im_end_token, token) || remaining <= 1;
             SessionPlan {
                 feed: vec![token],
