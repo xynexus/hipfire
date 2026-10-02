@@ -1359,6 +1359,19 @@ impl Gpu {
                 .div_ceil(base)
                 .clamp(1, max_seq.div_ceil(split_len).max(1))
         };
+        // Each split walks an equal share of the capacity, never less than
+        // split_len. Fixed split_len-long splits covered the context only when
+        // the capacity clamp above bound; when the occupancy term did (27B, 8
+        // sessions x 4 KV heads -> 8 splits x 2048 = 16384 positions), the rest
+        // of every longer context -- its newest tokens included -- was never
+        // read, and nothing reported it.
+        let split_len = if n_splits > 1 {
+            let c = chunk.max(1);
+            split_len.max(max_seq.div_ceil(n_splits).div_ceil(c) * c)
+        } else {
+            split_len
+        };
+        debug_assert!(n_splits == 1 || n_splits * split_len >= max_seq);
         let partials = if n_splits > 1 {
             Some(self.alloc_tensor(
                 &[batch_size * n_kv_heads * n_splits * g * (2 + head_dim)],
