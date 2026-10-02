@@ -74,23 +74,34 @@ fn main() {
             dev[d..d + 2].copy_from_slice(&blocks[src..src + 2]);
             dev[d + 2..d + side].copy_from_slice(&blocks[src + 2 + group / 2..src + stride]);
         }
-        let wb = gpu.upload_raw(&dev, &[dev.len()]).expect("w");
+        // HIPFIRE_BENCH_COLD=1 cycles through enough weight copies (>= 96 MB,
+        // 3x the 32 MB MALL) that no iteration finds its weights cached -- as in
+        // serving, where a step streams every layer's weights. Without it a
+        // shape that fits the MALL (qkv 16.8 MB, wo) is timed warm.
+        let copies = if std::env::var("HIPFIRE_BENCH_COLD").as_deref() == Ok("1") {
+            (96usize << 20).div_ceil(dev.len())
+        } else {
+            1
+        };
+        let wbs: Vec<_> = (0..copies)
+            .map(|_| gpu.upload_raw(&dev, &[dev.len()]).expect("w"))
+            .collect();
         for &b in &bs {
             let x: Vec<f32> = (0..b * k)
                 .map(|_| (rnd() % 2000) as f32 * 1e-3 - 1.0)
                 .collect();
             let xb = gpu.upload_f32(&x, &[x.len()]).expect("x");
             let yb = gpu.alloc_tensor(&[b * m], DType::F32).expect("y");
-            let run = |gpu: &mut Gpu| {
-                gpu.gemm_oq_compact_act_batched(&wb, &xb, &yb, m, k, b, stride)
+            let run = |gpu: &mut Gpu, i: usize| {
+                gpu.gemm_oq_compact_act_batched(&wbs[i % copies], &xb, &yb, m, k, b, stride)
                     .expect("gemm")
             };
-            run(&mut gpu);
+            run(&mut gpu, 0);
             gpu.device_synchronize().unwrap();
-            let iters = if b <= 32 { 20 } else { 10 };
+            let iters = if b <= 32 { 20 } else { 10 }.max(copies);
             let t0 = Instant::now();
-            for _ in 0..iters {
-                run(&mut gpu);
+            for i in 0..iters {
+                run(&mut gpu, i + 1);
             }
             gpu.device_synchronize().unwrap();
             let ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
@@ -103,6 +114,8 @@ fn main() {
             let _ = gpu.free_tensor(xb);
             let _ = gpu.free_tensor(yb);
         }
-        let _ = gpu.free_tensor(wb);
+        for wb in wbs {
+            let _ = gpu.free_tensor(wb);
+        }
     }
 }

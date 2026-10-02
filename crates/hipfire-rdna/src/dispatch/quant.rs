@@ -1805,7 +1805,7 @@ impl Gpu {
             static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
             let src = SRC.get_or_init(|| {
                 format!(
-                    "#define WARPS_M 2\n#define WARPS_N 1\n#define WMt 2\n#define WNt 4\n{}",
+                    "#define A_GROUP_LINE 1\n#define WARPS_M 2\n#define WARPS_N 1\n#define WMt 2\n#define WNt 4\n{}",
                     kernels::GEMM_OQ_COMPACT_IU4X2_W64_SRC.replace(
                         "void gemm_oq_compact_iu4x2_w64(",
                         "void gemm_oq_compact_iu4x2_w64_n64("

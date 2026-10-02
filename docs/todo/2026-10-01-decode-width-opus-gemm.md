@@ -67,9 +67,10 @@ serving up to 24 rows (`395fe0a66`), small-B overlay correction `_trs`
   max_rel 1.6e-4..3.8e-4, vs an overlay term ~1e3 rel) and same occupancy (3
   waves/SIMD on `_n64`, no spills), but **40-50% slower on every shape**:
   gate/up B=64 0.65 -> 0.93 ms, down 0.66 -> 0.83, qkv B=512 1.34 -> 2.01. Why:
-  on RDNA3.5 WMMA executes on the SIMD's own VALU, and this GEMM is
-  WMMA-throughput-bound at decode widths (~22 int8 TOPS), so every VALU op the
-  overlay adds is taken straight from the matmul. The output-stationary lane
+  on RDNA3.5 WMMA executes on the SIMD's own VALU, so every VALU op the overlay
+  adds sits in the same issue stream as the matmul. (Not because the GEMM is
+  WMMA-bound -- it runs ~37% of WMMA peak at B=64; see the memory finding
+  below.) The output-stationary lane
   map makes it worse (a wave's 4 row-groups diverge: ~64 body runs per group
   each with 8 LDS byte loads + ~24 VALU, for 96 real MACs). A row-uniform remap
   (scalar-loaded entries, lane = column, a side f32 accumulator merged through
@@ -79,6 +80,28 @@ serving up to 24 rows (`395fe0a66`), small-B overlay correction `_trs`
   overlay stays a separate pass unless it can ride the WMMA itself.
 - **`_trs` correction past 64 rows**: 2-6x worse than `_tr` (side-plane re-reads
   per 16-column block). Keep the B<=64 threshold.
+
+## Landed: the B<=64 tile was bandwidth-bound on over-fetch (2026-10-02)
+
+`GL2C_EA_RDREQ_*` counters (rocprofv3 `--pmc`) on the BN=64 tile at B=64
+showed it pulling **~2.1x its weight bytes** from memory: gate/up 99.5 MB for
+47.7 MB of nibbles+scales, i.e. ~200 GB/s -- at the DRAM limit, on waste. Two
+sources: (1) each strip read 32 B per weight row and relied on L2 holding the
+128-byte line for the next three strips; (2) the weight stream evicted the
+side table between group folds (ablating the scale reads dropped 18 MB: a
+6.5x over-fetch of a 2.8 MB plane). Fix (`A_GROUP_LINE`, `_n64` only): read
+each row's whole group line once, non-temporally, into registers and slice it
+into LDS per strip. EA traffic now 48.8 / 49.0 / 17.1 MB (gate/up / down /
+qkv, ~ideal). Bit-exact. Route, `HIPFIRE_BENCH_COLD=1` (weights not MALL-warm,
+as in serving), B=25..64: gate/up -12..16%, down -9..12%, qkv -5..7%.
+
+Not for multi-N-block grids (B > 64): other workgroups reuse those lines, and
+non-temporal reads evict them (m128 at B=512: 97 -> 230 MB, slower). Also
+tried and neutral: padding the A tile in LDS (halved the 38% bank-conflict
+rate, no time change -- LDS is not the limiter), double-buffering the group
+line (no gain). Bench note: without `HIPFIRE_BENCH_COLD=1`, shapes that fit
+the 32 MB MALL (qkv, wo) are timed warm and mislead -- wo is 0.155 ms warm,
+0.33 cold at B<=64 (~32 GB/s; its K<5120 wave32 path is the next suspect).
 
 ## Scope of the redesign
 
