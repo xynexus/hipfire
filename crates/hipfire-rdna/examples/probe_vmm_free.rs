@@ -26,6 +26,35 @@ fn main() {
     let page = (128 * 1024usize).div_ceil(g) * g; // kv_page_bytes default
     let pages = (256usize << 20) / page;
     println!("page {page} B, {pages} pages = 256 MiB");
+    // Alias rounds: B maps A's pages (hipMemRetainAllocationHandle + hipMemMap),
+    // the way a fork shares a checkpoint's prefix; free B, then A. Every page
+    // should be gone once both regions are freed.
+    for round in 0..4 {
+        let g0 = gtt_mib();
+        let mut a = VmmRegion::reserve(&gpu.hip, pages * page, page).unwrap();
+        a.ensure_mapped(&gpu.hip, pages * page).unwrap();
+        let mut b = VmmRegion::reserve(&gpu.hip, pages * page, page).unwrap();
+        let shared = b.alias_prefix_from(&gpu.hip, &a, pages * page).unwrap();
+        let g1 = gtt_mib();
+        // Odd rounds free the SOURCE first (a checkpoint evicted while a fork
+        // still maps its prefix), even rounds the alias first.
+        let (fb, g2, fa) = if round % 2 == 1 {
+            let fa = a.free(&gpu.hip);
+            let g2 = gtt_mib();
+            (b.free(&gpu.hip), g2, fa)
+        } else {
+            let fb = b.free(&gpu.hip);
+            let g2 = gtt_mib();
+            (fb, g2, a.free(&gpu.hip))
+        };
+        let g3 = gtt_mib();
+        println!(
+            "alias round {round} ({}): shared {} MiB; GTT {g0} -> mapped {g1} -> after first free {g2} -> after both {g3} (still +{} MiB); free = {fb:?}/{fa:?}",
+            if round % 2 == 1 { "source first" } else { "alias first" },
+            shared >> 20,
+            g3.saturating_sub(g0)
+        );
+    }
     for round in 0..3 {
         let g0 = gtt_mib();
         let mut r = VmmRegion::reserve(&gpu.hip, pages * page, page).unwrap();

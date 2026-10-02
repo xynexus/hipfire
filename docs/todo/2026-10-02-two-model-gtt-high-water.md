@@ -85,3 +85,12 @@ now) if running heavier than this.
   no measurable change on this replay (93.6 vs 94-95 GiB) because it caps outputs
   at 256 tokens; real Corrode requests carry up to 8K tokens of headroom, so it
   should matter there -- not yet measured.
+- `--scratch-memory-trace` over the same replay wrote no scratch records: no
+  runtime scratch allocations, so not that.
+- Aliased pages free correctly in both orders (`probe_vmm_free` alias rounds: a
+  region aliasing another's pages via hipMemRetainAllocationHandle+hipMemMap, freed
+  alias-first or source-first -- GTT returns either way).
+- Next step needs root: at the plateau, `sudo cat
+  /sys/kernel/debug/dri/1/amdgpu_gem_info` lists every buffer object per process
+  with its size -- group the daemon's by size and compare against the trace's live
+  set to see which BOs nothing in HIP still references.
