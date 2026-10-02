@@ -117,3 +117,15 @@ to the HIP allocation trace (which sees the freed pieces as freed).
 No errors, same throughput (same requests left at 600 s), cold 8.3K prefill
 30.5 s vs 30.2 s. The daemon is now spawned with it set by default
 (hipfire-daemon-adapter; an operator value, `=0` included, wins).
+
+## Cost of the fix, and the follow-up
+
+With the fragment allocator off, 64-session 27B decode is ~6% slower (152.6 ->
+143.5 tok/s prose), 3 sessions at 25K context ~3% (26.7 -> 25.9), 1 session not at
+all (15.2 vs 15.1). Ruled out as the cause: the pool (bucket-sized allocations
+changed nothing), session-release hipFrees (now pooled, `c079fa60d`), paged KV (512
+KiB pages or paging off: unchanged), weights (N=1 unaffected). Most likely: each
+session's state now lives in many small buffer objects instead of a few 2 MiB
+fragment blocks, and kernels that walk 64 sessions' state pay for the spread
+(TLB). Follow-up: one contiguous arena per session (DeltaNet state + KV windows +
+logits), carved into views -- that keeps the 50 GiB and should recover the 6%.
