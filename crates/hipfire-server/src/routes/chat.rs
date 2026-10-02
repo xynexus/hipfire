@@ -532,7 +532,10 @@ pub(crate) async fn ensure_model_loaded(
         }
     }
 
-    let mut engine_guard = state.engine.lock().await;
+    // Waits out a batch cycle: spawning instead ran into the daemon's machine-wide
+    // lock (`FATAL: hipfire daemon already running`), failing requests for a
+    // second model — the swarm's coder model — whenever they arrived mid-cycle.
+    let mut engine_guard = state.lock_engine().await;
 
     if let Some(eng) = engine_guard.as_mut() {
         match eng.ping().await {
@@ -1302,21 +1305,51 @@ fn parse_inline_tool_calls(text: &str, req_id: &str) -> (String, Vec<Value>) {
     }
 
     if tool_calls.is_empty() {
-        return (text.to_string(), tool_calls);
+        return (clean_reply_text(text), tool_calls);
     }
+    // The text before the call gets the same special-token cleanup as the call body: a
+    // quantized Qwen3.8-27B emits a stray `<|im_start|>` ahead of `<tool_call>`, and as
+    // content it was handed back to the client, which replays it as an assistant turn.
     let content = text
         .split_once("<tool_call>")
-        .map(|(before, _)| before.trim().to_string())
+        .map(|(before, _)| strip_chat_specials(before).trim().to_string())
         .unwrap_or_default();
     (content, tool_calls)
 }
 
-fn parse_one_inline_tool_call(raw: &str) -> Option<(String, Value)> {
-    let cleaned = raw
-        .replace("<|im_start|>", "")
+/// A reply's message text with stray chat-template structure removed. The quantized
+/// Qwen3.x models occasionally pick a turn header as a near-tie under greedy batched
+/// decode (6 of ~140 Corrode replies): `<|im_start|>assistant\n\n# Answer…` — a
+/// header in front of a real answer, kept — or `<|im_start|>user`, the start of a
+/// turn that is not theirs, cut there. See
+/// docs/todo/2026-10-02-stray-im-start-and-chat-template-check.md.
+fn clean_reply_text(text: &str) -> String {
+    let mut rest = text;
+    if let Some(after) = rest.strip_prefix("<|im_start|>") {
+        rest = after;
+        for role in ["assistant", "user", "system", "tool"] {
+            if let Some(after) = rest.strip_prefix(role) {
+                rest = after;
+                break;
+            }
+        }
+        rest = rest.trim_start_matches('\n');
+    }
+    if let Some(at) = rest.find("<|im_start|>") {
+        rest = &rest[..at];
+    }
+    strip_chat_specials(rest)
+}
+
+fn strip_chat_specials(text: &str) -> String {
+    text.replace("<|im_start|>", "")
         .replace("<|im_end|>", "")
         .replace("<|endoftext|>", "")
-        .replace("<|im_sep|>", "");
+        .replace("<|im_sep|>", "")
+}
+
+fn parse_one_inline_tool_call(raw: &str) -> Option<(String, Value)> {
+    let cleaned = strip_chat_specials(raw);
     let raw = cleaned.trim();
     if let Ok(value) = serde_json::from_str::<Value>(raw) {
         if let Some(name) = value.get("name").and_then(Value::as_str) {
@@ -2055,6 +2088,7 @@ where
             assistant_prefix,
             max_think_tokens,
             max_tokens: request_max_tokens as usize,
+            tools: body.tools.clone(),
         };
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let worker_key_id = loaded.worker_key_id.clone().unwrap_or_default();
@@ -2095,6 +2129,7 @@ where
 
         let mut text = String::new();
         let mut finish_reason = "stop".to_string();
+        let mut done_json = Value::Null;
         loop {
             if should_cancel() {
                 state.batch_inbox.lock().await.remove(&req_id);
@@ -2108,6 +2143,7 @@ where
                         .and_then(|v| v.as_str())
                         .unwrap_or("stop")
                         .to_string();
+                    done_json = done;
                     break;
                 }
                 Some(crate::batch_runner::BatchEvent::Error(e)) => {
@@ -2116,13 +2152,25 @@ where
                 None => break,
             }
         }
-        let token_count = text.split_whitespace().count() as u32;
+        // The runner counts committed tokens; the word count is only a fallback
+        // for a Done that carries none.
+        let token_count = done_json
+            .get("completion_tokens")
+            .and_then(Value::as_u64)
+            .map_or_else(|| text.split_whitespace().count() as u32, |n| n as u32);
+        let prompt_tokens = done_json
+            .get("prompt_tokens")
+            .and_then(Value::as_u64)
+            .map(|n| n as u32);
         let final_text = strip_visible_thinking(text, preserve_thinking, true);
+        // The daemon's batch decode returns text only, so parse calls the way the
+        // legacy path does when the daemon hands it none.
+        let (final_text, tool_calls) = parse_inline_tool_calls(&final_text, &req_id);
         let done = hipfire_generate::DoneEvent {
             id: req_id.clone(),
             tokens: token_count,
             tok_s: None,
-            prefill_tokens: None,
+            prefill_tokens: prompt_tokens,
             prefill_ms: None,
             prefill_tok_s: None,
             decode_tok_s: None,
@@ -2137,7 +2185,7 @@ where
             model: model_arg,
             text: final_text,
             done,
-            tool_calls: Vec::new(),
+            tool_calls,
             request_max_tokens,
         }));
     }
@@ -2189,7 +2237,7 @@ where
         )
     };
 
-    let mut engine_guard = state.engine.lock().await;
+    let mut engine_guard = state.lock_engine().await;
     // Borrow the engine, never move it out: a client disconnect drops this whole
     // future (axum cancels the handler task, and `/v1/responses` awaits us
     // inline rather than on a spawned task), and an owned `DaemonEngine` would
@@ -2559,7 +2607,7 @@ async fn stream_chat(
         let mut structured_tool_calls_emitted = false;
         let mut next_tool_call_index = 0usize;
 
-        let mut engine_guard = state.engine.lock().await;
+        let mut engine_guard = state.lock_engine().await;
         let mut engine = match engine_guard.take() {
             Some(e) => e,
             None => {
@@ -3143,6 +3191,29 @@ mod tests {
 
         assert_eq!(content, "Before");
         assert_eq!(tool_calls.len(), 1);
+        let (stray, calls) = parse_inline_tool_calls(
+            "<|im_start|><tool_call>{\"name\":\"lookup\",\"arguments\":{}}</tool_call>",
+            "req",
+        );
+        assert_eq!(
+            (stray.as_str(), calls.len()),
+            ("", 1),
+            "a stray special token is not content"
+        );
+        let (kept, _) = parse_inline_tool_calls("<|im_start|>assistant\n\n\n# Summary\n- a", "req");
+        assert_eq!(
+            kept, "# Summary\n- a",
+            "a header in front of a real answer is dropped, the answer kept"
+        );
+        let (gone, _) = parse_inline_tool_calls("<|im_start|>user", "req");
+        assert_eq!(
+            gone, "",
+            "a reply that only opens someone else's turn is empty"
+        );
+        let (cut, _) = parse_inline_tool_calls("Done.<|im_end|>\n<|im_start|>user\nthanks", "req");
+        assert_eq!(cut, "Done.\n", "a hallucinated next turn is cut off");
+        let (plain, _) = parse_inline_tool_calls("No markup here.", "req");
+        assert_eq!(plain, "No markup here.");
         assert_eq!(tool_calls[0]["type"], "function");
         assert_eq!(tool_calls[0]["function"]["name"], "lookup");
         assert_eq!(

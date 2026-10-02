@@ -885,6 +885,9 @@ fn embed_device_token_into(
         weights::EmbeddingFormat::Q8_0 => {
             gpu.embedding_lookup_q8_batched(&weights.token_embd, out, token_id, 1, dim)
         }
+        weights::EmbeddingFormat::Oq8G256 => {
+            gpu.embedding_lookup_q8_batched(&weights.token_embd, out, token_id, 1, dim)
+        }
         weights::EmbeddingFormat::BF16 => {
             gpu.embedding_lookup_bf16_batched(&weights.token_embd, out, token_id, 1, dim)
         }
@@ -917,6 +920,9 @@ fn embed_device_token_into_drafter(
             gpu.embedding_lookup_hfq4g256_batched(mirrored_embd, out, token_id, 1, dim)
         }
         EmbeddingFormat::Q8_0 => {
+            gpu.embedding_lookup_q8_batched(mirrored_embd, out, token_id, 1, dim)
+        }
+        EmbeddingFormat::Oq8G256 => {
             gpu.embedding_lookup_q8_batched(mirrored_embd, out, token_id, 1, dim)
         }
         EmbeddingFormat::BF16 => {
@@ -3336,6 +3342,10 @@ fn drafter_embed_lookup(
     n_embd: usize,
 ) -> HipResult<()> {
     match drafter_state.embd_format {
+        EmbeddingFormat::Oq8G256 => panic!(
+            "Oq8G256 embedding gather is wired for qwen3.5 only; this arch has no \
+             oq8 gather path. Rebuild the artifact with --embed-precision q8."
+        ),
         EmbeddingFormat::HFQ4G256 => drafter_gpu.embedding_lookup_hfq4g256(
             &drafter_state.mirrored_token_embd,
             &drafter_state.step_embd,

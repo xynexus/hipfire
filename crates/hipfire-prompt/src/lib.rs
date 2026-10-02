@@ -280,24 +280,28 @@ pub fn resolve_chat_template(
     })
 }
 
-/// Is Jinja chat rendering enabled? Mirrors the check at every render site
-/// (`generate.rs`, `qwen35_prefill.rs`); a resolved template drives the PROMPT only when
-/// this is on, and otherwise feeds stop-policy profiling alone.
-fn jinja_chat_enabled() -> bool {
-    std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() == Some("1")
-}
-
-pub fn log_resolved_chat_template_source(source: &ChatTemplateSource) {
+/// Report what a resolved template will actually do. `rendering` is the ALREADY
+/// RESOLVED answer — pass `resolve_jinja_chat`'s verdict, never a fresh env read.
+///
+/// This used to call a local `jinja_chat_enabled()` that did
+/// `env::var("HIPFIRE_JINJA_CHAT") == Some("1")` itself, which made this crate a
+/// second, disagreeing authority on a setting `jinja_chat` already owns. The
+/// daemon printed `HIPFIRE_JINJA_CHAT=1 ignored: want one of auto|off|on` — the
+/// config layer rejecting the value — and then rendered with it anyway, because
+/// this read accepted exactly the spelling config refuses. An operator was told
+/// the opposite of what happened. `hipfire-prompt` is a leaf crate with no
+/// hipfire dependencies and no business reading process env at all: the one
+/// caller lives beside the resolver, so it passes the answer down.
+pub fn log_resolved_chat_template_source(source: &ChatTemplateSource, rendering: bool) {
     // "using X" used to be printed whatever `HIPFIRE_JINJA_CHAT` said, so a template that
     // could not reach the prompt was reported as adopted. That is a worse failure than
     // the flag being off: it makes "force a known-good template" look verified when the
     // template was never applied, and the only way to notice is a canary in the template
     // itself. The line now says what the template will actually do.
-    let rendering = jinja_chat_enabled();
     let effect = if rendering {
         "prompt rendering + stop policy"
     } else {
-        "stop policy ONLY (prompt rendering needs HIPFIRE_JINJA_CHAT=1)"
+        "stop policy ONLY (prompt rendering needs jinja_chat=on)"
     };
     match source {
         ChatTemplateSource::EnvFile(path) => {
@@ -315,7 +319,7 @@ pub fn log_resolved_chat_template_source(source: &ChatTemplateSource) {
     // not, since nobody asked for it.
     if !rendering && !matches!(source, ChatTemplateSource::Embedded) {
         eprintln!(
-            "[chat_template] WARNING: an override is set but HIPFIRE_JINJA_CHAT is not 1, \
+            "[chat_template] WARNING: an override is set but jinja_chat is not on, \
              so the prompt is built by the hand-rolled ChatFrame and the override does NOT \
              affect what the model sees."
         );

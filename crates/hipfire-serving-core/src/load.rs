@@ -271,9 +271,14 @@ fn lfm2_triattn_kv_layer_ids(config: &lfm2moe::config::Lfm2MoeConfig) -> Vec<usi
 /// through to config, where it used to mean "off" on one set of paths and "on" on the
 /// other.
 pub fn resolve_jinja_chat(configured: Option<bool>) -> Option<bool> {
+    // Accept the SCHEMA's vocabulary (auto|off|on) as well as the historical
+    // 1/0. Two vocabularies for one setting is what let the config layer print
+    // "HIPFIRE_JINJA_CHAT=1 ignored: want one of auto|off|on" while this
+    // function honoured that exact value.
     match std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() {
-        Some("1") => Some(true),
-        Some("0") => Some(false),
+        Some("1") | Some("on") => Some(true),
+        Some("0") | Some("off") => Some(false),
+        Some("auto") => configured,
         _ => configured,
     }
 }
@@ -294,7 +299,14 @@ pub fn resolve_chat_template(
 ) -> Option<String> {
     match prompt_frame::resolve_chat_template(model_path, hfq.chat_template()) {
         Some(resolved) => {
-            prompt_frame::log_resolved_chat_template_source(&resolved.source);
+            // One authority: the resolver above, never a second env read inside
+            // the prompt crate. `None` (env says nothing) keeps this seed line's
+            // historical answer of "not rendering"; the daemon recomputes the
+            // real decision with resolved config in `handlers::lifecycle`.
+            prompt_frame::log_resolved_chat_template_source(
+                &resolved.source,
+                resolve_jinja_chat(None).unwrap_or(false),
+            );
             Some(resolved.template)
         }
         None => {
@@ -732,7 +744,10 @@ fn load_headroom_verdict(need: u64, available: u64, reserve: u64) -> Result<(), 
 ///
 /// Still approximate: it omits the KV cache and scratch (the reserve absorbs
 /// those, ~6 GiB measured across three models) and over-counts when
-/// `paged_experts` is on and most experts stay on host. A guard against the
+/// `paged_experts` is on and most experts stay on host. Bytes the forward pass
+/// streams from drive rather than uploading (the qwen4_exp n-gram table) are
+/// subtracted via [`estimated_on_drive_bytes`], because counting those as
+/// resident refused the one model whose design depends on them. A guard against the
 /// catastrophic case, not a precise admission test. Anything unreadable (no
 /// `/proc`, no `stat`, an index that will not parse) skips the check: never
 /// block a load because a diagnostic could not be read.
@@ -758,7 +773,15 @@ fn check_load_headroom(path: &str) -> Result<(), String> {
         Ok(index) => {
             let (resident, on_disk) =
                 hipfire_runtime::weight_pager::estimated_module_resident_bytes(&index);
-            meta.len().saturating_sub(on_disk).saturating_add(resident)
+            // Tensors the forward pass streams from drive are not resident and
+            // must not be priced as if they were. Without this the qwen4_exp
+            // 180B is refused at 172.2 GiB when it actually sits near 20 GiB:
+            // its 102 GB n-gram table is read per token, never uploaded.
+            let on_drive = hipfire_runtime::weight_pager::estimated_on_drive_bytes(&index);
+            meta.len()
+                .saturating_sub(on_disk)
+                .saturating_sub(on_drive)
+                .saturating_add(resident)
         }
         Err(_) => meta.len(),
     };
@@ -2628,6 +2651,8 @@ pub fn load_model(
                     sessions: std::collections::HashMap::new(),
                     active_session_id: Some(crate::session::LFM2_LEGACY_SESSION_ID.to_string()),
                     allocation_epoch: next_qwen35_state_allocation_epoch(),
+                    kv_caps: Default::default(),
+                    ..Default::default()
                 },
                 lfm2moe_eos_tok: eos_tok,
                 dots_ocr_config: None,
@@ -3002,6 +3027,8 @@ pub fn load_model(
                 sessions: std::collections::HashMap::new(),
                 active_session_id: Some(QWEN35_LEGACY_SESSION_ID.to_string()),
                 allocation_epoch: next_qwen35_state_allocation_epoch(),
+                kv_caps: Default::default(),
+                ..Default::default()
             },
             llama_config: None,
             llama_weights: None,
@@ -4646,6 +4673,18 @@ mod admission_tests {
         assert_eq!(resolve_jinja_chat(Some(false)), Some(true));
         std::env::set_var("HIPFIRE_JINJA_CHAT", "0");
         assert_eq!(resolve_jinja_chat(Some(true)), Some(false));
+        // The SCHEMA's own vocabulary must mean the same thing here. When it did
+        // not, the config layer rejected `1` ("want one of auto|off|on") while
+        // this function honoured it, and the operator was told the opposite of
+        // what ran.
+        std::env::set_var("HIPFIRE_JINJA_CHAT", "on");
+        assert_eq!(resolve_jinja_chat(Some(false)), Some(true));
+        std::env::set_var("HIPFIRE_JINJA_CHAT", "off");
+        assert_eq!(resolve_jinja_chat(Some(true)), Some(false));
+        // `auto` is "no opinion" — it must defer, not force a default.
+        std::env::set_var("HIPFIRE_JINJA_CHAT", "auto");
+        assert_eq!(resolve_jinja_chat(Some(true)), Some(true));
+        assert_eq!(resolve_jinja_chat(Some(false)), Some(false));
         std::env::set_var("HIPFIRE_JINJA_CHAT", "yes");
         assert_eq!(resolve_jinja_chat(Some(true)), Some(true));
         assert_eq!(resolve_jinja_chat(None), None);

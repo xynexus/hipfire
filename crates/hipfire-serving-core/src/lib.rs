@@ -43,6 +43,7 @@ pub mod model;
 pub mod moe_quality;
 pub mod output_filter;
 pub mod pooling;
+pub mod qwen35_batch_spec;
 pub mod qwen35_decode;
 pub mod qwen35_prefill;
 pub mod qwen3_embedding;

@@ -163,6 +163,124 @@ fn load_all(path: &str) -> (u32, String, Vec<Tensor>) {
 }
 
 /// Entry point for the standalone `hfq` binary.
+/// A filename for a tensor that is stable, ordered, and cannot collide.
+///
+/// The index prefix preserves container order (which `implode` must reproduce —
+/// the index and the payload are written in the same order) and makes two
+/// tensors that sanitise to the same string distinct anyway. Anything outside
+/// `[A-Za-z0-9._-]` becomes `_`, so a name carrying a path separator cannot
+/// escape the directory.
+fn tensor_filename(i: usize, name: &str) -> String {
+    let safe: String = name
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || c == '.' || c == '_' || c == '-' {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    format!("{i:04}.{safe}.bin")
+}
+
+/// `explode`: one file per tensor plus a manifest, so the payload can be
+/// inspected or edited with ordinary tools and put back with `implode`.
+///
+/// The manifest keeps the FULL source metadata, including any `hfqm_modules`
+/// layout table. `implode` is what drops that (see `strip_layout_metadata`),
+/// because it rewrites the payload at its own offsets and every absolute range
+/// in that table would then point at the wrong bytes.
+fn cmd_explode(input: &str, dir: &str) {
+    let (arch, meta, tensors) = load_all(input);
+    let root = Path::new(dir);
+    let tdir = root.join("tensors");
+    std::fs::create_dir_all(&tdir).unwrap_or_else(|e| panic!("create {}: {e}", tdir.display()));
+    let mut entries = Vec::with_capacity(tensors.len());
+    for (i, t) in tensors.iter().enumerate() {
+        let fname = tensor_filename(i, &t.name);
+        std::fs::write(tdir.join(&fname), &t.data).unwrap_or_else(|e| panic!("write {fname}: {e}"));
+        entries.push(serde_json::json!({
+            "name": t.name,
+            "quant_type": t.quant_type,
+            "shape": t.shape,
+            "group_size": t.group_size,
+            "bytes": t.data.len(),
+            "file": format!("tensors/{fname}"),
+        }));
+    }
+    let manifest = serde_json::json!({
+        "hfq_explode_version": 1,
+        "arch_id": arch,
+        "metadata_json": meta,
+        "tensors": entries,
+    });
+    let mpath = root.join("manifest.json");
+    std::fs::write(
+        &mpath,
+        serde_json::to_vec_pretty(&manifest).expect("serialize manifest"),
+    )
+    .unwrap_or_else(|e| panic!("write {}: {e}", mpath.display()));
+    println!(
+        "exploded {} tensors (arch {arch}) to {}",
+        tensors.len(),
+        root.display()
+    );
+}
+
+/// `implode`: rebuild a container from an `explode` directory.
+///
+/// Tensor order, names, quant types, shapes and group sizes come from the
+/// manifest; only the payload bytes come from the files, so editing a tensor in
+/// place round-trips as long as its length is unchanged. A length that no longer
+/// matches the manifest is refused rather than written — the index would say one
+/// thing and the payload another, and nothing downstream would notice.
+fn cmd_implode(dir: &str, output: &str) {
+    let root = Path::new(dir);
+    let raw = std::fs::read(root.join("manifest.json"))
+        .unwrap_or_else(|e| panic!("read {}/manifest.json: {e}", root.display()));
+    let m: serde_json::Value = serde_json::from_slice(&raw).expect("parse manifest.json");
+    let arch = m["arch_id"].as_u64().expect("manifest arch_id") as u32;
+    let meta = m["metadata_json"].as_str().unwrap_or("{}").to_string();
+    let list = m["tensors"].as_array().expect("manifest tensors");
+    let mut tensors = Vec::with_capacity(list.len());
+    for e in list {
+        let name = e["name"].as_str().expect("tensor name").to_string();
+        let file = e["file"].as_str().expect("tensor file");
+        let data =
+            std::fs::read(root.join(file)).unwrap_or_else(|err| panic!("read {file}: {err}"));
+        if let Some(expected) = e["bytes"].as_u64() {
+            assert_eq!(
+                data.len() as u64,
+                expected,
+                "{name}: {file} is {} bytes, manifest says {expected} — the index would \
+                 disagree with the payload",
+                data.len()
+            );
+        }
+        tensors.push(Tensor {
+            name,
+            quant_type: e["quant_type"].as_u64().expect("quant_type") as u8,
+            shape: e["shape"]
+                .as_array()
+                .expect("shape")
+                .iter()
+                .map(|d| d.as_u64().expect("shape dim") as u32)
+                .collect(),
+            group_size: e["group_size"].as_u64().expect("group_size") as u32,
+            data,
+        });
+    }
+    // Same reason `extract` strips it: the payload is rewritten at this writer's
+    // offsets, so a layout table of absolute ranges from the source file is wrong.
+    let meta = strip_layout_metadata(&meta);
+    write_hfq(output, arch, &meta, &tensors).unwrap_or_else(|e| panic!("write {output}: {e}"));
+    println!(
+        "imploded {} tensors (arch {arch}) into {output}",
+        tensors.len()
+    );
+}
+
 pub fn main() {
     main_with_args(&std::env::args().collect::<Vec<_>>());
 }
@@ -215,6 +333,16 @@ pub fn main_with_args(argv: &[String]) {
                 println!("{bad} tensor(s) failed");
                 std::process::exit(1);
             }
+        }
+        "explode" => {
+            let input = argv.get(2).expect("usage: hfq explode <in.hfq> <dir>");
+            let dir = argv.get(3).expect("usage: hfq explode <in.hfq> <dir>");
+            cmd_explode(input, dir);
+        }
+        "implode" => {
+            let dir = argv.get(2).expect("usage: hfq implode <dir> <out.hfq>");
+            let output = argv.get(3).expect("usage: hfq implode <dir> <out.hfq>");
+            cmd_implode(dir, output);
         }
         "list" => {
             let path = argv.get(2).expect("usage: hfq list <file>");
@@ -398,9 +526,95 @@ pub fn main_with_args(argv: &[String]) {
   hfq verify <file>\n  hfq extract <in> <out> --tensor <pat>...\n\
                  \x20 hfq meta-set <in> <out> --key <k> (--value <v> | --value-file <f>) [--json]\n\
                  \x20 hfq meta-get <file> [--key <k>]\n\
-                 \x20 hfq rearch <in> <out> --arch-id <id>"
+                 \x20 hfq rearch <in> <out> --arch-id <id>\n\
+                 \x20 hfq explode <in.hfq> <dir>     one file per tensor + manifest.json\n\
+                 \x20 hfq implode <dir> <out.hfq>    rebuild a container from that directory"
             );
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn scratch(name: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!("hfq-explode-test-{name}"));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// explode -> implode must preserve the payload AND the index, in order.
+    /// The index is the half that fails silently: a wrong quant_type or group
+    /// size still writes a container that opens, and only decodes to garbage.
+    #[test]
+    fn explode_implode_round_trips_payload_and_index() {
+        let dir = scratch("roundtrip");
+        let src = dir.join("src.hfq");
+        let tensors = vec![
+            Tensor {
+                name: "model.embed_tokens.weight".to_string(),
+                quant_type: 7,
+                shape: vec![4, 8],
+                group_size: 32,
+                data: (0u8..32).collect(),
+            },
+            // A name with characters that must not reach the filesystem verbatim.
+            Tensor {
+                name: "model/layers.0..weight".to_string(),
+                quant_type: 1,
+                shape: vec![2],
+                group_size: 0,
+                data: vec![9, 9, 9, 9],
+            },
+        ];
+        write_hfq(src.to_str().unwrap(), 5, r#"{"k":"v"}"#, &tensors).unwrap();
+
+        let ex = dir.join("ex");
+        cmd_explode(src.to_str().unwrap(), ex.to_str().unwrap());
+        // The separator became `_`, so nothing escaped `tensors/`.
+        assert!(ex.join("tensors/0001.model_layers.0..weight.bin").exists());
+
+        let out = dir.join("out.hfq");
+        cmd_implode(ex.to_str().unwrap(), out.to_str().unwrap());
+
+        let (arch, _meta, back) = load_all(out.to_str().unwrap());
+        assert_eq!(arch, 5);
+        assert_eq!(back.len(), tensors.len());
+        for (a, b) in tensors.iter().zip(back.iter()) {
+            assert_eq!(a.name, b.name);
+            assert_eq!(a.quant_type, b.quant_type);
+            assert_eq!(a.shape, b.shape);
+            assert_eq!(a.group_size, b.group_size);
+            assert_eq!(a.data, b.data);
+        }
+    }
+
+    /// An edited tensor of the wrong length is refused, not written: the index
+    /// would claim one size and the payload hold another, and no reader checks.
+    #[test]
+    #[should_panic(expected = "manifest says")]
+    fn implode_refuses_a_tensor_whose_length_changed() {
+        let dir = scratch("badlen");
+        let src = dir.join("src.hfq");
+        write_hfq(
+            src.to_str().unwrap(),
+            5,
+            "{}",
+            &[Tensor {
+                name: "w".to_string(),
+                quant_type: 1,
+                shape: vec![4],
+                group_size: 0,
+                data: vec![1, 2, 3, 4],
+            }],
+        )
+        .unwrap();
+        let ex = dir.join("ex");
+        cmd_explode(src.to_str().unwrap(), ex.to_str().unwrap());
+        std::fs::write(ex.join("tensors/0000.w.bin"), [1u8, 2, 3]).unwrap();
+        cmd_implode(ex.to_str().unwrap(), dir.join("out.hfq").to_str().unwrap());
     }
 }

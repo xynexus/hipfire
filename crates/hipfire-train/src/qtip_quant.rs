@@ -178,3 +178,48 @@ pub fn qtip_group_requant(group: &[f32], bits: u32, beam: usize, cb: &[f32]) -> 
     let s = optimal_scale_bits(group, &sym, cb, bits);
     decode_group_bits(&sym, s, cb, bits)
 }
+
+/// On-disk `Qtip3G256` record: `[f32 scale][32 × 3 B]`, each 3-byte chunk
+/// holding eight 3-bit trellis symbols. Mirrors
+/// `hipfire_quantize::qtip::pack_qtip3_group`.
+pub const QTIP3_BLOCK_BYTES: usize = 100;
+
+/// Decode a packed `Qtip3G256` tensor's bytes to **plain, un-rotated** f32 —
+/// the host counterpart of the `gemv_qtip3g256` / `gemm_qtip3g256` kernels, and
+/// what a trainer needs to load a frozen student base straight from the served
+/// artifact instead of re-simulating the quantization.
+///
+/// QTIP-3 symbols are encoded in the FWHT-rotated frame (`cpu_fwht_256` with
+/// the engine-fixed seeds 42/1042, applied before the Viterbi search) and the
+/// kernels rotate the activation to match, so this applies the inverse rotation
+/// (signs swapped) after decode.
+///
+/// A `.lr_u`/`.lr_v` low-rank residual sidecar, if the quantizer emitted one for
+/// this tensor, is a separate tensor and is NOT folded in here.
+pub fn dequant_qtip3g256(data: &[u8], n: usize) -> Vec<f32> {
+    let cb = build_codebook();
+    let s1 = gen_fwht_signs(42, GROUP);
+    let s2 = gen_fwht_signs(1042, GROUP);
+    let mut out = vec![0.0f32; n];
+    for b in 0..n / GROUP {
+        let off = b * QTIP3_BLOCK_BYTES;
+        if off + QTIP3_BLOCK_BYTES > data.len() {
+            break;
+        }
+        let scale = f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
+        let mut symbols = [0u8; GROUP];
+        for chunk in 0..32 {
+            let bo = off + 4 + chunk * 3;
+            let packed =
+                (data[bo] as u32) | ((data[bo + 1] as u32) << 8) | ((data[bo + 2] as u32) << 16);
+            for j in 0..8 {
+                symbols[chunk * 8 + j] = ((packed >> (3 * j)) & 7) as u8;
+            }
+        }
+        let mut grp = decode_group_bits(&symbols, scale, &cb, 3);
+        // Back to the original (un-rotated) weight basis.
+        cpu_fwht_256(&mut grp, &s2, &s1);
+        out[b * GROUP..(b + 1) * GROUP].copy_from_slice(&grp);
+    }
+    out
+}

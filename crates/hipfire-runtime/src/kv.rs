@@ -215,6 +215,28 @@ pub struct KvCache {
     /// the model config). When `Some(s)` with `s.enabled`, the KVarN decode path
     /// uses the hot-ring + 4-bit cold-segment two-tier read. See `kv_hier`.
     pub hier: Option<crate::kv_hier::HierKvState>,
+    /// Page-backed K/V: per layer, the regions behind `k_gpu[l]` / `v_gpu[l]`, which
+    /// are then non-owning views. `None` (the default everywhere but paged KVarN
+    /// sessions) means ordinary pooled buffers. See [`Self::new_gpu_kvarn_paged`].
+    pub pages: Option<Vec<Option<KvLayerPages>>>,
+}
+
+/// The two page-backed regions of one attention layer.
+pub struct KvLayerPages {
+    pub k: hip_bridge::vmm::VmmRegion,
+    pub v: hip_bridge::vmm::VmmRegion,
+}
+
+/// Physical page size for paged KV, `HIPFIRE_KV_PAGE_KIB` (default 128). It is the
+/// unit a fork shares at: smaller shares more of a prefix and costs more maps
+/// (~6 us each measured on gfx1151). Rounded to the device's granularity.
+pub fn kv_page_bytes(granularity: usize) -> usize {
+    let kib = std::env::var("HIPFIRE_KV_PAGE_KIB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&k| k > 0)
+        .unwrap_or(128);
+    (kib * 1024).div_ceil(granularity) * granularity
 }
 
 impl KvCache {
@@ -286,6 +308,7 @@ impl KvCache {
             kvarn_shadow: None,
             kvarn_tiles: None,
             hier: None,
+            pages: None,
         })
     }
 
@@ -356,6 +379,7 @@ impl KvCache {
             kvarn_shadow: None,
             kvarn_tiles: None,
             hier: None,
+            pages: None,
         })
     }
 
@@ -409,6 +433,7 @@ impl KvCache {
             kvarn_shadow: None,
             kvarn_tiles: None,
             hier: None,
+            pages: None,
         })
     }
 
@@ -485,6 +510,7 @@ impl KvCache {
             kvarn_shadow: None,
             kvarn_tiles: None,
             hier: None,
+            pages: None,
         })
     }
 
@@ -591,6 +617,7 @@ impl KvCache {
             kvarn_shadow: None,
             kvarn_tiles: None,
             hier: None,
+            pages: None,
         })
     }
 
@@ -642,6 +669,7 @@ impl KvCache {
             kvarn_shadow: None,
             kvarn_tiles: None,
             hier: None,
+            pages: None,
         })
     }
 
@@ -693,6 +721,7 @@ impl KvCache {
             kvarn_shadow: None,
             kvarn_tiles: None,
             hier: None,
+            pages: None,
         })
     }
 
@@ -746,6 +775,7 @@ impl KvCache {
             kvarn_shadow: None,
             kvarn_tiles: None,
             hier: None,
+            pages: None,
         })
     }
 
@@ -801,6 +831,7 @@ impl KvCache {
             kvarn_shadow: None,
             kvarn_tiles: None,
             hier: None,
+            pages: None,
         })
     }
 
@@ -904,6 +935,7 @@ impl KvCache {
             kvarn_shadow: None,
             kvarn_tiles: None,
             hier: None,
+            pages: None,
         })
     }
 
@@ -980,6 +1012,7 @@ impl KvCache {
             kvarn_shadow: None,
             kvarn_tiles: None,
             hier: None,
+            pages: None,
         })
     }
 
@@ -1057,6 +1090,7 @@ impl KvCache {
             kvarn_shadow: None,
             kvarn_tiles: None,
             hier: None,
+            pages: None,
         })
     }
 
@@ -1161,6 +1195,7 @@ impl KvCache {
             kvarn_shadow: None,
             kvarn_tiles: None,
             hier: None,
+            pages: None,
         })
     }
 
@@ -1418,7 +1453,320 @@ impl KvCache {
             kvarn_shadow: None,
             kvarn_tiles: None,
             hier: None,
+            pages: None,
         })
+    }
+
+    /// A KVarN cache whose K and V live in page-backed regions reserved for
+    /// `max_seq_len` positions, with pages mapped for `physical_cap` of them.
+    ///
+    /// Kernels see the same contiguous per-layer buffers as the pooled constructor —
+    /// a region is one virtual range — so no reader or writer changes. What changes is
+    /// what the cache can do: [`Self::grow_paged`] maps more pages in place, and
+    /// [`Self::fork_paged`] shares the pages behind already-written positions.
+    /// `None` when this runtime or device has no virtual memory management.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_gpu_kvarn_paged(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+        bits: usize,
+    ) -> HipResult<Option<Self>> {
+        let Some(mut kv) = Self::new_gpu_kvarn_paged_empty(
+            gpu,
+            is_kv_layer,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            bits,
+        )?
+        else {
+            return Ok(None);
+        };
+        if let Err(e) = kv.grow_paged(gpu, physical_cap) {
+            kv.free_gpu(gpu);
+            return Err(e);
+        }
+        Ok(Some(kv))
+    }
+
+    /// Reserved but unmapped: every region empty, `physical_cap` 0. The windows and
+    /// placeholder layers come from the pooled filtered constructor, which this then
+    /// strips of its (1-position) K/V for attention layers.
+    fn new_gpu_kvarn_paged_empty(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        bits: usize,
+    ) -> HipResult<Option<Self>> {
+        let Some(granularity) = gpu.hip.vmm_granularity() else {
+            return Ok(None);
+        };
+        let page = kv_page_bytes(granularity);
+        let mut kv = Self::new_gpu_kvarn_capped_filtered(
+            gpu,
+            is_kv_layer,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            1,
+            bits,
+        )?;
+        let (k_max, v_max) = kv.kvarn_layer_bytes(max_seq_len);
+        let mut pages = Vec::with_capacity(is_kv_layer.len());
+        for (layer, &is_kv) in is_kv_layer.iter().enumerate() {
+            if !is_kv {
+                pages.push(None);
+                continue;
+            }
+            let regions =
+                hip_bridge::vmm::VmmRegion::reserve(&gpu.hip, k_max, page).and_then(|k| {
+                    match hip_bridge::vmm::VmmRegion::reserve(&gpu.hip, v_max, page) {
+                        Ok(v) => Ok(KvLayerPages { k, v }),
+                        Err(e) => {
+                            let _ = k.free(&gpu.hip);
+                            Err(e)
+                        }
+                    }
+                });
+            match regions {
+                Ok(r) => {
+                    let _ = gpu.free_tensor(std::mem::replace(
+                        &mut kv.k_gpu[layer],
+                        Self::region_view(&r.k),
+                    ));
+                    let _ = gpu.free_tensor(std::mem::replace(
+                        &mut kv.v_gpu[layer],
+                        Self::region_view(&r.v),
+                    ));
+                    pages.push(Some(r));
+                }
+                Err(e) => {
+                    kv.pages = Some(pages);
+                    kv.free_gpu(gpu);
+                    return Err(e);
+                }
+            }
+        }
+        kv.pages = Some(pages);
+        kv.physical_cap = 0;
+        Ok(Some(kv))
+    }
+
+    /// K-record and V bytes one attention layer needs for `positions`.
+    fn kvarn_layer_bytes(&self, positions: usize) -> (usize, usize) {
+        let rec_bytes = Self::kvarn_k_record_bytes_bits(self.head_dim, self.kvarn_bits);
+        let v_bpp = self.n_kv_heads * (self.head_dim / 32) * 34;
+        (
+            positions.div_ceil(Self::KVARN_GROUP) * self.n_kv_heads * rec_bytes,
+            positions * v_bpp,
+        )
+    }
+
+    /// A non-owning F32 view of a region's mapped bytes (kernels address K and V as
+    /// byte buffers typed F32, exactly as the pooled constructor allocates them).
+    fn region_view(region: &hip_bridge::vmm::VmmRegion) -> GpuTensor {
+        GpuTensor {
+            buf: region.buffer(),
+            shape: vec![region.mapped_bytes() / 4],
+            dtype: DType::F32,
+        }
+    }
+
+    /// Map pages so a paged cache holds `physical_cap` positions — in place: the
+    /// buffers keep their addresses and nothing is copied. New bytes are zeroed, as
+    /// the pooled constructor's are. A no-op if it already holds that many.
+    pub fn grow_paged(&mut self, gpu: &mut Gpu, physical_cap: usize) -> HipResult<()> {
+        assert!(physical_cap <= self.max_seq, "grow_paged past max_seq");
+        if physical_cap <= self.physical_cap {
+            return Ok(());
+        }
+        let (k_bytes, v_bytes) = self.kvarn_layer_bytes(physical_cap);
+        // Pages bypass the pool, so they take the same headroom check it does
+        // (`hipfire_rdna::pool::pool_headroom_bytes`): fail cleanly while the
+        // runtime still has room, never map the device dry.
+        let headroom = hipfire_rdna::pool::pool_headroom_bytes();
+        if headroom > 0 {
+            let n_kv = self
+                .pages
+                .as_ref()
+                .map_or(0, |p| p.iter().flatten().count());
+            let (k_have, v_have) = self.kvarn_layer_bytes(self.physical_cap);
+            let need = n_kv * (k_bytes.saturating_sub(k_have) + v_bytes.saturating_sub(v_have));
+            if let Ok((free, _)) = gpu.hip.get_vram_info() {
+                if free < need + headroom {
+                    return Err(hip_bridge::HipError::new(
+                        hip_bridge::HIP_ERROR_OUT_OF_MEMORY,
+                        &format!(
+                            "paged KV growth to {physical_cap} positions needs up to {:.1} MiB, {:.1} MiB free under the {} MiB headroom (hipError=2)",
+                            need as f64 / 1048576.0,
+                            free as f64 / 1048576.0,
+                            headroom / 1048576
+                        ),
+                    ));
+                }
+            }
+        }
+        let pages = self.pages.as_mut().expect("grow_paged on a pooled KvCache");
+        for (layer, entry) in pages.iter_mut().enumerate() {
+            let Some(r) = entry else { continue };
+            for (region, bytes) in [(&mut r.k, k_bytes), (&mut r.v, v_bytes)] {
+                let start = region.ensure_mapped(&gpu.hip, bytes)?;
+                let new = region.mapped_bytes() - start;
+                if new > 0 {
+                    let tail = unsafe {
+                        hip_bridge::DeviceBuffer::from_raw(
+                            (region.buffer().as_ptr() as *mut u8).add(start)
+                                as *mut std::ffi::c_void,
+                            new,
+                        )
+                    };
+                    gpu.hip.memset(&tail, 0, new)?;
+                }
+            }
+            self.k_gpu[layer] = Self::region_view(&r.k);
+            self.v_gpu[layer] = Self::region_view(&r.v);
+        }
+        self.physical_cap = physical_cap;
+        Ok(())
+    }
+
+    /// A new paged cache holding `physical_cap` positions whose first `sealed`
+    /// positions read what this one holds — sharing memory rather than copying it.
+    ///
+    /// Shared are only the pages wholly inside what `sealed` makes immutable: V rows
+    /// below it, and K records of the 128-token blocks it completes. Neither side
+    /// writes there again — positions only ever advance, and a fork starts at
+    /// `sealed`. The page straddling that point is copied, since both sides will
+    /// write its remainder; the recent window (the open block) is copied whole.
+    pub fn fork_paged(&self, gpu: &mut Gpu, sealed: usize, physical_cap: usize) -> HipResult<Self> {
+        assert!(
+            sealed <= self.physical_cap,
+            "fork_paged: sealed past what is mapped"
+        );
+        let src_pages = self.pages.as_ref().expect("fork_paged on a pooled KvCache");
+        let is_kv_layer: Vec<bool> = src_pages.iter().map(Option::is_some).collect();
+        let mut fork = Self::new_gpu_kvarn_paged_empty(
+            gpu,
+            &is_kv_layer,
+            self.n_kv_heads,
+            self.head_dim,
+            self.max_seq,
+            self.kvarn_bits,
+        )?
+        .expect("paged source implies virtual memory management");
+        let result = (|| -> HipResult<()> {
+            let full_blocks = sealed / Self::KVARN_GROUP;
+            let (k_sealed, _) = self.kvarn_layer_bytes(full_blocks * Self::KVARN_GROUP);
+            let (_, v_sealed) = self.kvarn_layer_bytes(sealed);
+            let mut shared = Vec::with_capacity(is_kv_layer.len());
+            for (src, dst) in src_pages
+                .iter()
+                .zip(fork.pages.as_mut().unwrap().iter_mut())
+            {
+                let (Some(src), Some(dst)) = (src, dst) else {
+                    shared.push((0, 0));
+                    continue;
+                };
+                shared.push((
+                    dst.k.alias_prefix_from(&gpu.hip, &src.k, k_sealed)?,
+                    dst.v.alias_prefix_from(&gpu.hip, &src.v, v_sealed)?,
+                ));
+            }
+            fork.physical_cap = 0;
+            fork.grow_paged(gpu, physical_cap.max(sealed))?;
+            // Sealed bytes past the last shared page: one partial page per buffer.
+            let pages = fork.pages.as_ref().unwrap();
+            for ((src, dst), (k_shared, v_shared)) in src_pages.iter().zip(pages).zip(shared) {
+                let (Some(src), Some(dst)) = (src, dst) else {
+                    continue;
+                };
+                for (s, d, from, to) in [
+                    (&src.k, &dst.k, k_shared, k_sealed),
+                    (&src.v, &dst.v, v_shared, v_sealed),
+                ] {
+                    if to > from {
+                        gpu.hip
+                            .memcpy_dtod_at(&d.buffer(), from, &s.buffer(), from, to - from)?;
+                    }
+                }
+            }
+            for (d, s) in fork.k_window.iter().zip(&self.k_window) {
+                gpu.hip
+                    .memcpy_dtod_at(&d.buf, 0, &s.buf, 0, s.numel() * s.dtype.size())?;
+            }
+            fork.compact_offset = self.compact_offset;
+            Ok(())
+        })();
+        match result {
+            Ok(()) => Ok(fork),
+            Err(e) => {
+                fork.free_gpu(gpu);
+                Err(e)
+            }
+        }
+    }
+
+    /// This KVarN cache re-homed into one holding `physical_cap` positions, for a
+    /// session that must hold more than it was sized for. `is_kv_layer` must be
+    /// the mask this cache was built with (all-true for the unfiltered ctor).
+    ///
+    /// KVarN buffers are position-major — V by token, K by 128-token block then
+    /// head (`(block * n_kv_heads + head) * rec_bytes`, as the attention kernels
+    /// index it) — and the recent window is fixed-size. So a smaller cache is a
+    /// byte prefix of a larger one and every buffer copies straight across,
+    /// without knowing how many positions are in use.
+    pub fn grow_kvarn(
+        &self,
+        gpu: &mut Gpu,
+        physical_cap: usize,
+        is_kv_layer: &[bool],
+    ) -> HipResult<Self> {
+        assert!(self.quant_kvarn, "grow_kvarn on a non-KVarN cache");
+        assert!(
+            physical_cap >= self.physical_cap,
+            "grow_kvarn cannot shrink"
+        );
+        assert_eq!(
+            is_kv_layer.len(),
+            self.k_gpu.len(),
+            "layer mask does not match cache"
+        );
+        let mut grown = Self::new_gpu_kvarn_capped_filtered(
+            gpu,
+            is_kv_layer,
+            self.n_kv_heads,
+            self.head_dim,
+            self.max_seq,
+            physical_cap,
+            self.kvarn_bits,
+        )?;
+        grown.compact_offset = self.compact_offset;
+        let pairs = grown
+            .k_gpu
+            .iter()
+            .zip(&self.k_gpu)
+            .chain(grown.v_gpu.iter().zip(&self.v_gpu))
+            .chain(grown.k_window.iter().zip(&self.k_window));
+        let mut copied = Ok(());
+        for (dst, src) in pairs {
+            copied = gpu.memcpy_dtod_auto(&dst.buf, &src.buf, src.numel() * src.dtype.size());
+            if copied.is_err() {
+                break;
+            }
+        }
+        match copied {
+            Ok(()) => Ok(grown),
+            Err(e) => {
+                grown.free_gpu(gpu);
+                Err(e)
+            }
+        }
     }
 
     /// Filtered variant of [`new_gpu_kvarn`]: only `is_kv_layer[i] == true`
@@ -1523,6 +1871,7 @@ impl KvCache {
             kvarn_shadow: None,
             kvarn_tiles: None,
             hier: None,
+            pages: None,
         })
     }
 
@@ -1635,6 +1984,7 @@ impl KvCache {
             kvarn_shadow: None,
             kvarn_tiles: None,
             hier: None,
+            pages: None,
         })
     }
 
@@ -1707,6 +2057,7 @@ impl KvCache {
             kvarn_shadow: None,
             kvarn_tiles: None,
             hier: None,
+            pages: None,
         })
     }
 
@@ -1785,6 +2136,7 @@ impl KvCache {
             kvarn_shadow: None,
             kvarn_tiles: None,
             hier: None,
+            pages: None,
         })
     }
 
@@ -1873,6 +2225,7 @@ impl KvCache {
             kvarn_shadow: None,
             kvarn_tiles: None,
             hier: None,
+            pages: None,
         })
     }
 
@@ -1943,6 +2296,7 @@ impl KvCache {
             kvarn_shadow: None,
             kvarn_tiles: None,
             hier: None,
+            pages: None,
         })
     }
 
@@ -2020,6 +2374,7 @@ impl KvCache {
             kvarn_shadow: None,
             kvarn_tiles: None,
             hier: None,
+            pages: None,
         })
     }
 
@@ -2031,10 +2386,42 @@ impl KvCache {
     /// Free all GPU tensors in this cache. Call before drop to return VRAM.
     /// After calling, follow with gpu.drain_pool() to actually release memory.
     pub fn free_gpu(self, gpu: &mut Gpu) {
-        for t in self.k_gpu {
+        // Paged layers' `k_gpu`/`v_gpu` are views: unmapping the regions is what
+        // frees them (and only the pages no other session still maps).
+        let paged: Vec<bool> = match self.pages {
+            Some(pages) => pages
+                .into_iter()
+                .map(|layer| match layer {
+                    Some(KvLayerPages { k, v }) => {
+                        let _ = k.free(&gpu.hip);
+                        let _ = v.free(&gpu.hip);
+                        true
+                    }
+                    None => false,
+                })
+                .collect(),
+            None => Vec::new(),
+        };
+        let is_paged = |i: usize| paged.get(i).copied().unwrap_or(false);
+        for (i, t) in self.k_gpu.into_iter().enumerate() {
+            if !is_paged(i) {
+                let _ = gpu.free_tensor(t);
+            }
+        }
+        for (i, t) in self.v_gpu.into_iter().enumerate() {
+            if !is_paged(i) {
+                let _ = gpu.free_tensor(t);
+            }
+        }
+        // Never freed before: every released KVarN session leaked its windows
+        // (128 x kv_dim per layer) and the lazily built read-side scratch.
+        for t in self.k_window {
             let _ = gpu.free_tensor(t);
         }
-        for t in self.v_gpu {
+        if let Some(t) = self.kvarn_shadow {
+            let _ = gpu.free_tensor(t);
+        }
+        if let Some(t) = self.kvarn_tiles {
             let _ = gpu.free_tensor(t);
         }
         for t in self.k_scales {
@@ -2155,6 +2542,7 @@ impl KvCache {
             kvarn_shadow: None,
             kvarn_tiles: None,
             hier: None,
+            pages: None,
         })
     }
 
@@ -2200,6 +2588,7 @@ impl KvCache {
             kvarn_shadow: None,
             kvarn_tiles: None,
             hier: None,
+            pages: None,
         })
     }
 
@@ -2264,6 +2653,7 @@ impl KvCache {
             kvarn_shadow: None,
             kvarn_tiles: None,
             hier: None,
+            pages: None,
         })
     }
 
@@ -2309,6 +2699,7 @@ impl KvCache {
             kvarn_shadow: None,
             kvarn_tiles: None,
             hier: None,
+            pages: None,
         })
     }
 
@@ -2354,6 +2745,7 @@ impl KvCache {
             kvarn_shadow: None,
             kvarn_tiles: None,
             hier: None,
+            pages: None,
         })
     }
 
@@ -2404,6 +2796,7 @@ impl KvCache {
             kvarn_shadow: None,
             kvarn_tiles: None,
             hier: None,
+            pages: None,
         })
     }
 
@@ -2454,6 +2847,7 @@ impl KvCache {
             kvarn_shadow: None,
             kvarn_tiles: None,
             hier: None,
+            pages: None,
         })
     }
 
@@ -2525,6 +2919,7 @@ impl KvCache {
             kvarn_shadow: None,
             kvarn_tiles: None,
             hier: None,
+            pages: None,
         })
     }
 
@@ -2596,6 +2991,7 @@ impl KvCache {
             kvarn_shadow: None,
             kvarn_tiles: None,
             hier: None,
+            pages: None,
         })
     }
 
@@ -2667,6 +3063,7 @@ impl KvCache {
             kvarn_shadow: None,
             kvarn_tiles: None,
             hier: None,
+            pages: None,
         })
     }
 
@@ -2746,6 +3143,7 @@ impl KvCache {
             kvarn_shadow: None,
             kvarn_tiles: None,
             hier: None,
+            pages: None,
         })
     }
 
@@ -2818,6 +3216,7 @@ impl KvCache {
             kvarn_shadow: None,
             kvarn_tiles: None,
             hier: None,
+            pages: None,
         })
     }
 
@@ -2889,6 +3288,7 @@ impl KvCache {
             kvarn_shadow: None,
             kvarn_tiles: None,
             hier: None,
+            pages: None,
         })
     }
 }

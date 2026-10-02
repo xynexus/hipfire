@@ -362,9 +362,40 @@ thread_local! {
 ///
 /// Opt-in rather than default: the device factorizations run in f32, and the
 /// agreement with the f64 reference degrades as the Hessian gets worse
-/// (3.6e-5 relative at k=256/ridge 1e-1, 4.4e-4 at k=512/ridge 1e-2). Whether
-/// that matters is a KLD question, not a norm question, so it ships behind a
-/// flag until measured on a real artifact.
+/// (3.6e-5 relative at k=256/ridge 1e-1, 4.4e-4 at k=512/ridge 1e-2).
+///
+/// MEASURED 2026-09-05 on halo (gfx1151, 32 cores), and the answer is: leave it
+/// off. Both halves of the question are now settled.
+///
+/// QUALITY is a non-issue. Qwen3.5-0.8B oq4.25++ built each way and scored
+/// against its own 32-chunk bf16 references:
+///
+///   wikitext   f64 kld 0.044851  ppl 15.604  argmax 88.62%
+///              f32 kld 0.044752  ppl 15.618  argmax 88.56%
+///   multi      f64 kld 0.036012  ppl 13.480  argmax 90.43%
+///              f32 kld 0.035990  ppl 13.483  argmax 90.32%
+///
+/// KLD moves -0.22%/-0.06% (i.e. slightly BETTER), ppl +0.09%/+0.02%, argmax
+/// within 0.11 points. The signs disagree across metrics, which is noise rather
+/// than degradation.
+///
+/// SPEED is why it stays off: the device path is SLOWER on an idle box, and the
+/// deficit grows with size.
+///
+///   0.8B oq4.25++   cpu f64  50s   gpu f32  71s   (1.42x slower)
+///   4B   oq4.25++   cpu f64 647s   gpu f32 1063s  (1.64x slower)
+///
+/// An earlier measurement showed the GPU path 1.26x FASTER, and it was an
+/// artifact: it was taken while a 27B quantize held all 32 cores, starving
+/// faer. Give the CPU its cores back and faer wins. Any future comparison here
+/// must state the machine's load, not just its name.
+///
+/// The trailing SYRK is not the bottleneck — `chol_syrk_trailing_tiled` made
+/// that kernel 2.2x faster at k=8192/12288 and the end-to-end numbers above
+/// already include it. What costs is the per-block structure: gather, download
+/// the panel, factor it on the host in f64, upload, scatter, synchronise, once
+/// per 128 columns. Making this win needs the round-trips removed (panel
+/// factorization on device, or several panels in flight), not a faster SYRK.
 fn inv_cholesky_dispatch(h: &[f64], k: usize, damp: f64) -> Option<Mat<f64>> {
     #[cfg(feature = "gpu")]
     {
@@ -1208,6 +1239,117 @@ mod chol_tests {
     /// same matrix. Tolerance is f32-scale, not f64: the trailing update runs in
     /// f32 by design, so exact agreement is not the claim — agreement to within
     /// single precision is, and that is what decides whether this is usable.
+    /// The tiled trailing update must agree with the scalar one it replaces,
+    /// and be faster. Same f32 arithmetic, so the only expected difference is
+    /// reassociation over the BK chunks — bounded by a few ULP times jb, not by
+    /// a precision change. A tolerance that passes a garbage kernel would make
+    /// this test worthless, so it is tight.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_tiled_syrk_matches_scalar_and_is_faster() {
+        let Ok(mut gpu) = hipfire_rdna::Gpu::init() else {
+            eprintln!("no GPU; skipping");
+            return;
+        };
+        syrk_compare_at(&mut gpu, 512);
+    }
+
+    /// The same comparison at sizes that actually rank the tiles: 4096 is a 9B
+    /// hidden dim, 12288 a 27B `down_proj`. Separate and `#[ignore]`d because
+    /// each size allocates k*k f32 on the device (604 MB at 12288) and the run
+    /// is minutes, which does not belong in a routine `cargo test`.
+    ///
+    ///   cargo test -p hipfire-quantize --features gpu syrk_tile_sweep -- --ignored --nocapture
+    #[cfg(feature = "gpu")]
+    #[test]
+    #[ignore = "allocates up to 604 MB of VRAM per size; run deliberately"]
+    fn gpu_tiled_syrk_tile_sweep() {
+        let Ok(mut gpu) = hipfire_rdna::Gpu::init() else {
+            eprintln!("no GPU; skipping");
+            return;
+        };
+        for k in [4096usize, 8192, 12288] {
+            eprintln!("k={k}");
+            syrk_compare_at(&mut gpu, k);
+        }
+    }
+
+    /// Run all three trailing-update kernels over the same input, report timings,
+    /// and assert both tiled variants match the scalar one.
+    ///
+    /// At k=512 the trailing region is only 384 wide, so the 64-tile launches
+    /// ~18 working blocks and is occupancy-starved — fine for CORRECTNESS,
+    /// useless for ranking speed. Use the sweep above for that.
+    #[cfg(feature = "gpu")]
+    fn syrk_compare_at(gpu: &mut hipfire_rdna::Gpu, k: usize) {
+        let (j0, jb) = (0usize, 128usize);
+        // Deterministic, well-scaled, and NOT symmetric-trivial: a constant
+        // matrix would hide an indexing bug that swaps i and j.
+        let mut host = vec![0.0f32; k * k];
+        for r in 0..k {
+            for c in 0..k {
+                host[r * k + c] = (((r * 7 + c * 13) % 97) as f32 - 48.0) / 64.0;
+            }
+        }
+        let mut run = |gpu: &mut hipfire_rdna::Gpu, which: u8| -> Vec<f32> {
+            let d = gpu.upload_owned_f32(&host, &[k, k]).expect("upload");
+            let t = std::time::Instant::now();
+            for _ in 0..8 {
+                match which {
+                    0 => gpu.chol_syrk_trailing(&d, k, j0, jb).expect("scalar"),
+                    1 => gpu.chol_syrk_trailing_tiled(&d, k, j0, jb).expect("t64"),
+                    _ => gpu
+                        .chol_syrk_trailing_tiled128(&d, k, j0, jb)
+                        .expect("t128"),
+                }
+            }
+            gpu.device_synchronize().expect("sync");
+            let ms = t.elapsed().as_secs_f64() * 1000.0 / 8.0;
+            let lbl = match which {
+                0 => "scalar   ",
+                1 => "tiled 64 ",
+                _ => "tiled 128",
+            };
+            eprintln!("  {lbl} {ms:.3} ms/call");
+            let out = gpu.download_f32(&d).expect("download");
+            gpu.reclaim_pending();
+            out
+        };
+        let scalar = run(gpu, 0);
+        let tiled = run(gpu, 1);
+        let tiled128 = run(gpu, 2);
+
+        let mut worst = 0.0f32;
+        for r in (j0 + jb)..k {
+            // Lower triangle only: the kernels leave the upper half alone, and
+            // comparing it would pass regardless of what either wrote.
+            for c in (j0 + jb)..=r {
+                let d = (scalar[r * k + c] - tiled[r * k + c]).abs();
+                if d > worst {
+                    worst = d;
+                }
+            }
+        }
+        let mut worst128 = 0.0f32;
+        for r in (j0 + jb)..k {
+            for c in (j0 + jb)..=r {
+                let d = (scalar[r * k + c] - tiled128[r * k + c]).abs();
+                if d > worst128 {
+                    worst128 = d;
+                }
+            }
+        }
+        eprintln!("  worst |scalar - tiled64| = {worst:.3e}  |scalar - tiled128| = {worst128:.3e}");
+        assert!(
+            worst < 1e-3,
+            "tiled64 SYRK diverged from scalar: {worst:.3e}"
+        );
+        assert!(
+            worst128 < 1e-3,
+            "tiled128 SYRK diverged from scalar: {worst128:.3e}"
+        );
+    }
+
     #[cfg(feature = "gpu")]
     #[test]
     fn gpu_right_looking_matches_faer_llt() {
@@ -1532,6 +1674,84 @@ mod tests {
         eprintln!("inv-cholesky: max|diag-1|={max_diag_err:.2e} max|offdiag|={max_off:.2e}");
         assert!(max_diag_err < 1e-4, "diag err {max_diag_err}");
         assert!(max_off < 1e-4, "offdiag err {max_off}");
+    }
+
+    /// `targets` must be what the symbols were CHOSEN to represent.
+    ///
+    /// This is the seam three bugs lived in, all invisible to the encoder's own
+    /// unit tests. `BeamLdlq` re-aims every column c>0 inside a block at a
+    /// residual that already absorbed columns 0..c, so for the FIRST block —
+    /// where no cross-block feedback has happened yet — its targets must differ
+    /// from the input weights. Returning the unadjusted weights instead meant
+    /// the caller refit the per-group scale against the wrong values and the
+    /// block loop pushed an already-compensated error forward a second time.
+    ///
+    /// `Greedy` is the control: it has no within-block feedback by design, so
+    /// its first block must be EXACTLY the input. An implementation that
+    /// adjusted both, or neither, fails one half of this.
+    #[test]
+    fn beamldlq_reports_the_targets_it_actually_encoded() {
+        let (m, k) = (2usize, 256usize);
+        let mut rng = Lcg(0x9e37);
+        let mut w = vec![0.0f32; m * k];
+        for row in 0..m {
+            let mut prev = 0.0f64;
+            for c in 0..k {
+                prev = 0.8 * prev + rng.next();
+                w[row * k + c] = prev as f32;
+            }
+        }
+        // Correlated SPD Hessian: a diagonal one would make L diagonal and the
+        // feedback a no-op, so the test would pass on a broken implementation.
+        let mut h = vec![0.0f32; k * k];
+        for row in 0..m {
+            for i in 0..k {
+                for j in 0..k {
+                    h[i * k + j] += w[row * k + i] * w[row * k + j];
+                }
+            }
+        }
+        for i in 0..k {
+            h[i * k + i] += 1e-2;
+        }
+        let s1 = crate::gen_fwht_signs(42, 256);
+        let s2 = crate::gen_fwht_signs(1042, 256);
+        let cb = crate::qtip::build_codebook_3inst();
+
+        let run = |mode| {
+            qtip_conditioned_encode(
+                &w,
+                m,
+                k,
+                &h,
+                &s1,
+                &s2,
+                1e-2,
+                &cb,
+                8,
+                crate::qtip::BITS_PER_WEIGHT,
+                mode,
+                None,
+            )
+            .expect("encode")
+        };
+        let (_, t_beam) = run(QtipCondMode::BeamLdlq);
+        let (_, t_greedy) = run(QtipCondMode::Greedy);
+
+        // The encode runs on the ROTATED weights, so compare the two modes to
+        // each other rather than to `w`: Greedy's targets are the rotated input
+        // untouched, which is the reference BeamLdlq must deviate from.
+        let moved = t_beam
+            .iter()
+            .zip(&t_greedy)
+            .filter(|(a, b)| (**a - **b).abs() > 1e-6)
+            .count();
+        assert!(
+            moved > k / 4,
+            "BeamLdlq targets barely differ from the unadjusted ones ({moved} of {} positions) \
+             — within-block feedback is not reaching `targets`",
+            m * k
+        );
     }
 
     /// The LDLQ claim: OBS feedback (real H) reduces the H-weighted *output*
@@ -1912,15 +2132,54 @@ pub fn qtip_conditioned_encode(
                 let scale = crate::qtip::optimal_scale_bits(&grp, &sym, cb, bits);
                 let deq = crate::qtip::decode_group_bits(&sym, scale, cb, bits);
                 let mut err = vec![0.0f64; 256];
-                for c in 0..256 {
-                    let lcc = l[(c0 + c, c0 + c)];
-                    err[c] = if lcc > 0.0 {
-                        (grp[c] as f64 - deq[c] as f64) / lcc
-                    } else {
-                        0.0
-                    };
+                let mut tgt = grp.clone();
+                if mode == QtipCondMode::BeamLdlq {
+                    // REPLAY the winning path's within-block feedback, at the
+                    // FINAL scale, and read both outputs off it.
+                    //
+                    // Three things were wrong without this. (a) The encoder
+                    // re-aims every column c>0 at a residual that already
+                    // absorbed columns 0..c, so `grp[c] - deq[c]` is not the
+                    // error this column leaves — pushing it to later blocks
+                    // double-counts the compensation this block already made.
+                    // (b) `grp` is then also the wrong thing to hand back as
+                    // `targets`, which the caller must refit the scale against;
+                    // inside a block it is just the unadjusted weights, i.e.
+                    // exactly the "quietly degrade to RTN-with-extra-steps"
+                    // trap this function's own contract warns about. (c) The
+                    // encoder fed error forward against `scale0`, but the
+                    // artifact ships `scale` — so every compensation was
+                    // computed against a reconstruction that never existed.
+                    //
+                    // Replaying with `deq` (final scale) fixes all three at
+                    // once and costs one O(256^2) pass per group.
+                    let mut res: Vec<f64> = grp.iter().map(|&v| v as f64).collect();
+                    for c in 0..256 {
+                        tgt[c] = res[c] as f32;
+                        let d = res[c] - deq[c] as f64;
+                        let lcc = l_block[c * 256 + c];
+                        err[c] = if lcc > 0.0 { d / lcc } else { 0.0 };
+                        if lcc > 0.0 && c + 1 < 256 {
+                            let e = d / lcc;
+                            for f in (c + 1)..256 {
+                                let lfc = l_block[f * 256 + c];
+                                if lfc != 0.0 {
+                                    res[f] -= e * lfc;
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    for c in 0..256 {
+                        let lcc = l[(c0 + c, c0 + c)];
+                        err[c] = if lcc > 0.0 {
+                            (grp[c] as f64 - deq[c] as f64) / lcc
+                        } else {
+                            0.0
+                        };
+                    }
                 }
-                (sym, grp, err)
+                (sym, tgt, err)
             })
             .collect();
 
@@ -2035,7 +2294,14 @@ pub fn llt_lower_right_looking_gpu(
         let back_dev = gpu.upload_owned_f32(&back, &[rows, jb]).ok()?;
         gpu.chol_panel_scatter(&dev, &back_dev, k, j0, jb, rows)
             .ok()?;
-        gpu.chol_syrk_trailing(&dev, k, j0, jb).ok()?;
+        // 64-tile, not the scalar kernel and not the 128-tile. Measured on an
+        // idle box: 1.69x / 2.27x / 2.23x over scalar at k = 4096 / 8192 / 12288,
+        // where the 128-tile manages 1.35x / 2.41x / 1.95x — it wins only at
+        // 8192, by 6%, and loses at the size that matters most (12288 is a 27B
+        // down_proj). Its acc[8][8] is 64 accumulator VGPRs against 16, which
+        // costs a block per CU; `reference_gfx1151_iu4_gemm_tuning` records the
+        // same register-blocking dead end on this part.
+        gpu.chol_syrk_trailing_tiled(&dev, k, j0, jb).ok()?;
         gpu.device_synchronize().ok()?;
         j0 += jb;
     }

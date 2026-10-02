@@ -196,6 +196,50 @@ impl Gpu {
             &kernargs![ptr ap, ptr cp, ptr rp, i32 dg, i32 eos],
         )
     }
+    /// [`Self::argmax_f32`] over many tensors in one launch and one readback,
+    /// each result identical to what `argmax_f32` returns for that tensor (same
+    /// kernel body; block b takes `data[b]`). For a batched decode step's
+    /// per-session logits, which are separate tensors.
+    pub fn argmax_f32_many(&mut self, data: &[&GpuTensor], n: usize) -> HipResult<Vec<u32>> {
+        if data.len() <= 1 || self.arch_caps.is_gfx1103() {
+            // gfx1103 reduces differently (`argmax_f32_gfx1103`); keep its exact
+            // tie behaviour rather than mixing kernels.
+            return data.iter().map(|t| self.argmax_f32(t, n)).collect();
+        }
+        self.bind_thread()?;
+        self.ensure_kernel("argmax_f32", kernels::ARGMAX_SRC, "argmax_f32_ptrs")?;
+        let ptrs: Vec<u8> = data
+            .iter()
+            .flat_map(|t| (t.buf.as_ptr() as usize as u64).to_le_bytes())
+            .collect();
+        let count = data.len();
+        // Pooled, not hipMalloc/hipFree: this runs every decode step, and hipFree
+        // synchronises the device.
+        let ptr_t = self.alloc_tensor(&[count * 2], crate::DType::F32)?;
+        let result_t = self.alloc_tensor(&[count], crate::DType::F32)?;
+        let (ptr_buf, result_buf) = (&ptr_t.buf, &result_t.buf);
+        let launched = self.hip.memcpy_htod(ptr_buf, &ptrs).and_then(|()| {
+            let (pp, rp, nn) = (ptr_buf.as_ptr(), result_buf.as_ptr(), n as i32);
+            self.launch_kernargs(
+                "argmax_f32_ptrs",
+                [count as u32, 1, 1],
+                [256, 1, 1],
+                256 * 8,
+                &kernargs![ptr pp, ptr rp, i32 nn],
+            )
+        });
+        let mut out = vec![0i32; count];
+        let read = launched.and_then(|()| {
+            let bytes: &mut [u8] =
+                unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, count * 4) };
+            self.hip.memcpy_dtoh(bytes, result_buf)
+        });
+        let _ = self.free_tensor(ptr_t);
+        let _ = self.free_tensor(result_t);
+        read?;
+        Ok(out.into_iter().map(|v| v as u32).collect())
+    }
+
     /// GPU-side argmax: returns index of max value. Avoids downloading full logits.
     pub fn argmax_f32(&mut self, data: &GpuTensor, n: usize) -> HipResult<u32> {
         self.bind_thread()?;

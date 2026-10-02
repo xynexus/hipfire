@@ -1850,6 +1850,125 @@ impl Gpu {
             &kernargs![ptr a_ptr, ptr x_ptr, ptr y_ptr, i32 m_val, i32 k_val],
         )
     }
+    /// Batched QTIP-3 GEMM: `y[N,M] = A[M,K] · x[N,K]ᵀ`, decoding each weight
+    /// once and reusing it across up to 32 activation columns per pass.
+    ///
+    /// `x` is `[n, K]` row-major and `y` is `[n, M]` row-major, matching
+    /// `gemm_bf16l3_xf32`. Columns are processed in tiles of 32; the caller
+    /// walks `col_base` in steps of 32 (`n_cols` is the size of the final,
+    /// possibly short, tile). With `n_cols == 1` this is bit-identical to
+    /// `gemv_qtip3g256` on that column -- which is what the parity example
+    /// checks.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qtip3g256(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        assert_eq!(
+            k % 256,
+            0,
+            "gemm_qtip3g256 requires K % 256 == 0, got K={k}"
+        );
+        if n == 0 {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_qtip3g256",
+            kernels::GEMM_QTIP3G256_SRC,
+            "gemm_qtip3g256",
+        )?;
+        const NT: usize = 32; // must match QTIP3_NT in the kernel
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let (m_val, k_val, n_val) = (m as i32, k as i32, n as i32);
+        let bytes = crate::profile::hfq4g256_weight_bytes(m, k);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qtip3g256", bytes);
+        let mut col = 0usize;
+        let mut result = Ok(());
+        while col < n {
+            let cols = NT.min(n - col);
+            let (cb, nc) = (col as i32, cols as i32);
+            result = self.launch_kernargs(
+                "gemm_qtip3g256",
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                &kernargs![ptr a_ptr, ptr x_ptr, ptr y_ptr, i32 m_val, i32 k_val,
+                           i32 n_val, i32 cb, i32 nc],
+            );
+            if result.is_err() {
+                break;
+            }
+            col += cols;
+        }
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Residual form of [`Self::gemm_qtip3g256`]: `y += A·x`, for projections
+    /// that write straight back into the residual stream. Same decode, same
+    /// tiling; only the store accumulates. `x` must be FWHT-rotated.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_qtip3g256_residual(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        assert_eq!(k % 256, 0, "gemm_qtip3g256_residual requires K % 256 == 0");
+        if n == 0 {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_qtip3g256_residual",
+            kernels::GEMM_QTIP3G256_SRC,
+            "gemm_qtip3g256_residual",
+        )?;
+        const NT: usize = 32;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let (m_val, k_val, n_val) = (m as i32, k as i32, n as i32);
+        let bytes = crate::profile::hfq4g256_weight_bytes(m, k);
+        let timer =
+            crate::profile::begin_timer(&self.hip, "gemm", "gemm_qtip3g256_residual", bytes);
+        let mut col = 0usize;
+        let mut result = Ok(());
+        while col < n {
+            let cols = NT.min(n - col);
+            let (cb, nc) = (col as i32, cols as i32);
+            result = self.launch_kernargs(
+                "gemm_qtip3g256_residual",
+                [m as u32, 1, 1],
+                [32, 1, 1],
+                0,
+                &kernargs![ptr a_ptr, ptr x_ptr, ptr y_ptr, i32 m_val, i32 k_val,
+                           i32 n_val, i32 cb, i32 nc],
+            );
+            if result.is_err() {
+                break;
+            }
+            col += cols;
+        }
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// QTIP-3 GEMV with fused residual add (y += W·x). Same decode as
     /// `gemv_qtip3g256`; the kernel's final store accumulates.
     pub fn gemv_qtip3g256_residual(
@@ -1948,6 +2067,76 @@ impl Gpu {
             &kernargs![ptr a_ptr, i32 ki, i32 j0i, i32 jbi],
         )
     }
+    /// LDS-tiled trailing update: same math as [`Self::chol_syrk_trailing`],
+    /// same f32 precision class, but each 64x64 output tile reads the panel rows
+    /// once instead of once per element.
+    ///
+    /// The scalar kernel is bandwidth-starved (0.125 FLOP/byte); this is ~16.
+    /// Results differ from the scalar version only by summation order.
+    pub fn chol_syrk_trailing_tiled(
+        &mut self,
+        a: &GpuTensor,
+        k: usize,
+        j0: usize,
+        jb: usize,
+    ) -> HipResult<()> {
+        let start = j0 + jb;
+        if start >= k {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "chol_syrk_trailing_tiled",
+            kernels::CHOL_SYRK_TRAILING_SRC,
+            "chol_syrk_trailing_tiled",
+        )?;
+        let a_ptr = a.buf.as_ptr();
+        let (ki, j0i, jbi) = (k as i32, j0 as i32, jb as i32);
+        let n = k - start;
+        // One block per 64x64 tile. Blocks strictly above the diagonal exit
+        // immediately, which is cheaper than computing a triangular grid.
+        let g = n.div_ceil(64) as u32;
+        self.launch_kernargs(
+            "chol_syrk_trailing_tiled",
+            [g, g, 1],
+            [16, 16, 1],
+            0,
+            &kernargs![ptr a_ptr, i32 ki, i32 j0i, i32 jbi],
+        )
+    }
+
+    /// 128x128-tile variant: halves the panel re-read traffic against the
+    /// 64x64 tile, at 64 accumulator VGPRs instead of 16.
+    pub fn chol_syrk_trailing_tiled128(
+        &mut self,
+        a: &GpuTensor,
+        k: usize,
+        j0: usize,
+        jb: usize,
+    ) -> HipResult<()> {
+        let start = j0 + jb;
+        if start >= k {
+            return Ok(());
+        }
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "chol_syrk_trailing_tiled128",
+            kernels::CHOL_SYRK_TRAILING_SRC,
+            "chol_syrk_trailing_tiled128",
+        )?;
+        let a_ptr = a.buf.as_ptr();
+        let (ki, j0i, jbi) = (k as i32, j0 as i32, jb as i32);
+        let n = k - start;
+        let g = n.div_ceil(128) as u32;
+        self.launch_kernargs(
+            "chol_syrk_trailing_tiled128",
+            [g, g, 1],
+            [16, 16, 1],
+            0,
+            &kernargs![ptr a_ptr, i32 ki, i32 j0i, i32 jbi],
+        )
+    }
+
     /// Gather the Cholesky panel (rows `j0..k`, cols `j0..j0+jb`) into a
     /// contiguous `[rows, jb]` buffer.
     pub fn chol_panel_gather(

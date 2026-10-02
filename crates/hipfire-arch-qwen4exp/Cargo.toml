@@ -18,3 +18,6 @@ hipfire-rdna = { path = "../hipfire-rdna", features = ["deltanet"] }
 # so this edge does not cycle — same shape as `hipfire-arch-deepseek4`.
 hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-quant-format = { path = "../hipfire-quant-format" }
+# Examples tokenize a real text corpus for calibration; teacher-forcing real
+# tokens is what keeps XtX full-rank (self-generated greedy text repeats).
+hipfire-model = { path = "../hipfire-model" }

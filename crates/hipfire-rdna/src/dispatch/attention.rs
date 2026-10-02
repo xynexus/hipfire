@@ -1190,63 +1190,224 @@ impl Gpu {
         n_kv_heads: usize,
         head_dim: usize,
         max_seq: usize,
-        max_ctx_len: usize,
+        // Unused since the kernel went chunked (LDS no longer scales with it);
+        // kept so the call sites read the same as the other routed attentions.
+        _max_ctx_len: usize,
         batch_size: usize,
         bits: usize,
         row_offset: usize,
     ) -> HipResult<()> {
+        // Chunked online softmax, one workgroup per (row, KV head). It replaced
+        // a whole-context kernel (scores[ctx] in LDS, one workgroup per query
+        // head) that could not launch past ~15.9K positions and, measured on
+        // gfx1151 with the 27B's 24q/4kv heads over 16 sessions, was 1.7-7x
+        // slower at every context from 512 up: its LDS capped occupancy and its
+        // query heads each re-streamed their shared KV head's K and V.
+        self.attention_kvarn_routed_batched_chunked(
+            window_f16,
+            q,
+            rec_ptrs,
+            win_ptrs,
+            v_ptrs,
+            out,
+            row_session_indices,
+            positions,
+            ptr_layer_stride,
+            layer_index,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_seq,
+            batch_size,
+            bits,
+            row_offset,
+            KVARN_ROUTED_CHUNK,
+            true,
+        )
+    }
+
+    /// `attention_kvarn_routed_batched` over any context: `chunk` positions at a
+    /// time with an online softmax, so LDS is chunk-sized. Public so the parity
+    /// example can force several chunks at small contexts.
+    pub fn attention_kvarn_routed_batched_chunked(
+        &mut self,
+        window_f16: bool,
+        q: &GpuTensor,
+        rec_ptrs: &GpuTensor,
+        win_ptrs: &GpuTensor,
+        v_ptrs: &GpuTensor,
+        out: &GpuTensor,
+        row_session_indices: &GpuTensor,
+        positions: &GpuTensor,
+        ptr_layer_stride: usize,
+        layer_index: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq: usize,
+        batch_size: usize,
+        bits: usize,
+        row_offset: usize,
+        chunk: usize,
+        // One workgroup per (row, KV head) serving its whole query-head group,
+        // rather than per (row, query head): K/V streamed once per group.
+        gqa: bool,
+    ) -> HipResult<()> {
         self.bind_thread()?;
+        const GQA: [&str; 8] = [
+            "attention_kvarn_routed_batched_gqa1",
+            "attention_kvarn_routed_batched_gqa2",
+            "attention_kvarn_routed_batched_gqa3",
+            "attention_kvarn_routed_batched_gqa4",
+            "attention_kvarn_routed_batched_gqa5",
+            "attention_kvarn_routed_batched_gqa6",
+            "attention_kvarn_routed_batched_gqa7",
+            "attention_kvarn_routed_batched_gqa8",
+        ];
+        let group_heads = n_heads / n_kv_heads.max(1);
+        let gqa = gqa && n_heads % n_kv_heads == 0 && (1..=8).contains(&group_heads);
+        let func = if gqa {
+            GQA[group_heads - 1]
+        } else {
+            "attention_kvarn_routed_batched_chunked"
+        };
         self.ensure_kernel(
             "attention_kvarn_routed_batched",
             kernels::ATTENTION_KVARN_ROUTED_BATCHED_SRC,
-            "attention_kvarn_routed_batched",
+            func,
         )?;
         const GROUP: usize = 128;
-        // MUST agree with KvCache::kvarn_k_record_bytes_bits — this used to pin
-        // `cpb` to 2, i.e. bits=4, so the flush wrote 17152-byte records at
-        // kvarn8 while this strode 8960 through them.
         assert!(
             bits == 2 || bits == 4 || bits == 8,
-            "attention_kvarn_routed_batched: bits must be 2, 4 or 8, got {bits}"
+            "{func}: bits must be 2, 4 or 8, got {bits}"
         );
-        let cpb = 8 / bits;
-        let rec_bytes = (head_dim * GROUP).div_ceil(cpb) + head_dim * 2 * 2 + GROUP * 2;
-        let scale = 1.0f32 / (head_dim as f32).sqrt();
-        let q_ptr = q.buf.as_ptr();
-        let rec_ptrs_ptr = rec_ptrs.buf.as_ptr();
-        let win_ptrs_ptr = win_ptrs.buf.as_ptr();
-        let v_ptrs_ptr = v_ptrs.buf.as_ptr();
-        let out_ptr = out.buf.as_ptr();
-        let rsi_ptr = row_session_indices.buf.as_ptr();
-        let pos_ptr = positions.buf.as_ptr();
-        let ptr_stride = ptr_layer_stride as i32;
-        let layer = layer_index as i32;
-        let nh = n_heads as i32;
-        let nkv = n_kv_heads as i32;
-        let hd = head_dim as i32;
-        let ms = max_seq as i32;
-        let sc = scale;
-        let rb = rec_bytes as i32;
-        let gp = GROUP as i32;
-        let block_size = (max_ctx_len.max(head_dim) as u32)
-            .next_power_of_two()
-            .min(256);
-        let shared_mem = ((max_ctx_len + block_size as usize + head_dim) * 4) as u32;
-        let win_f16_i = i32::from(window_f16);
-        let bits_i = bits as i32;
-        let row_offset_i = row_offset as i32;
-        self.launch_kernargs(
-            "attention_kvarn_routed_batched",
-            [n_heads as u32, batch_size as u32, 1],
+        let block_size = 256u32;
+        // KVARN_CHUNK_MAX_D in the kernel: output dims per thread.
+        assert!(
+            head_dim <= block_size as usize * 4,
+            "{func}: head_dim {head_dim} too wide"
+        );
+        let rec_bytes = (head_dim * GROUP).div_ceil(8 / bits) + head_dim * 2 * 2 + GROUP * 2;
+        // Query heads per workgroup: KVARN_GQA_MAX_G / KVARN_GQA_MAX_D in the kernel.
+        let g = if gqa { group_heads } else { 1 };
+        if gqa {
+            assert!(
+                head_dim <= block_size as usize * 2,
+                "{func}: head_dim {head_dim} too wide"
+            );
+        }
+        let shared_mem = (g * (chunk + block_size as usize + head_dim) * 4) as u32;
+        assert!(
+            shared_mem <= KVARN_ROUTED_LDS_MAX,
+            "{func}: chunk {chunk} overflows LDS"
+        );
+        let (q_ptr, rec_ptrs_ptr, win_ptrs_ptr, v_ptrs_ptr) = (
+            q.buf.as_ptr(),
+            rec_ptrs.buf.as_ptr(),
+            win_ptrs.buf.as_ptr(),
+            v_ptrs.buf.as_ptr(),
+        );
+        let (out_ptr, rsi_ptr, pos_ptr) = (
+            out.buf.as_ptr(),
+            row_session_indices.buf.as_ptr(),
+            positions.buf.as_ptr(),
+        );
+        let (ptr_stride, layer, nh, nkv, hd, ms) = (
+            ptr_layer_stride as i32,
+            layer_index as i32,
+            n_heads as i32,
+            n_kv_heads as i32,
+            head_dim as i32,
+            max_seq as i32,
+        );
+        let sc = 1.0f32 / (head_dim as f32).sqrt();
+        let (rb, gp, win_f16_i, bits_i, row_offset_i, chunk_i) = (
+            rec_bytes as i32,
+            GROUP as i32,
+            i32::from(window_f16),
+            bits as i32,
+            row_offset as i32,
+            chunk as i32,
+        );
+        if !gqa {
+            return self.launch_kernargs(
+                func,
+                [n_heads as u32, batch_size as u32, 1],
+                [block_size, 1, 1],
+                shared_mem,
+                &kernargs![
+                    ptr q_ptr, ptr rec_ptrs_ptr, ptr win_ptrs_ptr, ptr v_ptrs_ptr,
+                    ptr out_ptr, ptr rsi_ptr, ptr pos_ptr,
+                    i32 ptr_stride, i32 layer, i32 nh, i32 nkv, i32 hd, i32 ms, f32 sc, i32 rb, i32 gp,
+                    i32 win_f16_i, i32 bits_i, i32 row_offset_i, i32 chunk_i
+                ],
+            );
+        }
+        // Split-K over the context: one workgroup per (row, KV head) left the GPU
+        // idle at long context (3 sessions at 25K positions: 12 workgroups, attention
+        // 71% of a decode step). Splits past a row's context exit at once.
+        // Only as many splits as it takes to fill the GPU: 64 sessions x 4 KV heads
+        // are already 256 workgroups, and splitting them anyway (empty workgroups
+        // past short contexts, plus the reduce) cost ~5% of 64-session decode.
+        const TARGET_WORKGROUPS: usize = 256;
+        let split_len = kvarn_decode_split_len(chunk);
+        let n_splits = if split_len == 0 {
+            1
+        } else {
+            let base = (batch_size * n_kv_heads).max(1);
+            TARGET_WORKGROUPS
+                .div_ceil(base)
+                .clamp(1, max_seq.div_ceil(split_len).max(1))
+        };
+        let partials = if n_splits > 1 {
+            Some(self.alloc_tensor(
+                &[batch_size * n_kv_heads * n_splits * g * (2 + head_dim)],
+                DType::F32,
+            )?)
+        } else {
+            None
+        };
+        let part_ptr = partials
+            .as_ref()
+            .map_or(std::ptr::null_mut(), |t| t.buf.as_ptr());
+        let split_i = split_len as i32;
+        let launched = self.launch_kernargs(
+            func,
+            [n_kv_heads as u32, batch_size as u32, n_splits as u32],
             [block_size, 1, 1],
             shared_mem,
             &kernargs![
                 ptr q_ptr, ptr rec_ptrs_ptr, ptr win_ptrs_ptr, ptr v_ptrs_ptr,
                 ptr out_ptr, ptr rsi_ptr, ptr pos_ptr,
                 i32 ptr_stride, i32 layer, i32 nh, i32 nkv, i32 hd, i32 ms, f32 sc, i32 rb, i32 gp,
-                i32 win_f16_i, i32 bits_i, i32 row_offset_i
+                i32 win_f16_i, i32 bits_i, i32 row_offset_i, i32 chunk_i,
+                ptr part_ptr, i32 split_i
             ],
-        )
+        );
+        let reduced = match (&launched, &partials) {
+            (Ok(()), Some(_)) => {
+                self.ensure_kernel(
+                    "attention_kvarn_routed_batched",
+                    kernels::ATTENTION_KVARN_ROUTED_BATCHED_SRC,
+                    "attention_kvarn_split_reduce",
+                )?;
+                let ns = n_splits as i32;
+                self.launch_kernargs(
+                    "attention_kvarn_split_reduce",
+                    [n_heads as u32, batch_size as u32, 1],
+                    [256, 1, 1],
+                    0,
+                    &kernargs![
+                        ptr part_ptr, ptr out_ptr, i32 nh, i32 nkv, i32 hd, i32 ns, i32 row_offset_i
+                    ],
+                )
+            }
+            _ => Ok(()),
+        };
+        if let Some(t) = partials {
+            let _ = self.free_tensor(t);
+        }
+        launched.and(reduced)
     }
     /// FP32 causal attention specialized for GQA groups where four query heads
     /// share one KV head. This is a full-precision KLD prefill fast path: it
@@ -1616,6 +1777,32 @@ impl Gpu {
         bits: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // Prefill-sized batches (one session's rows, no tree bias) take the
+        // query-tiled WMMA kernel: this tile+reduce path runs the decode kernel
+        // once per ROW, re-dequantizing every K/V tile per row (42% of a cold
+        // 8.3K-token 27B prefill). `HIPFIRE_KVARN_PREFILL_WMMA=0` keeps this path.
+        if tree_bias.is_none()
+            && head_dim == 256
+            && batch_size >= KVARN_PREFILL_WMMA_MIN_ROWS
+            && matches!(bits, 2 | 4 | 8)
+            && self.arch_caps.has_wmma_w32()
+            && kvarn_prefill_wmma_enabled()
+        {
+            return self.attention_prefill_kvarn_wmma(
+                q,
+                records,
+                window,
+                v_cache,
+                out,
+                positions,
+                n_heads,
+                n_kv_heads,
+                batch_size,
+                n_full_blocks,
+                rec_bytes,
+                bits,
+            );
+        }
         const TILE_SIZE: usize = 128; // == KVARN_GROUP
         let max_tiles = max_ctx_len.div_ceil(TILE_SIZE);
         let stride = 2 + head_dim;
@@ -1730,6 +1917,56 @@ impl Gpu {
             offset += chunk;
         }
         Ok(())
+    }
+    /// Causal prefill attention over KVarN storage on WMMA (head_dim 256, gfx11):
+    /// `batch_size` query rows of ONE session at `positions`, K from the
+    /// `n_full_blocks` records + the f32/f16 `window`, V Q8_0. Writes `out`
+    /// directly (no partials). See `kernels/src/attention_prefill_kvarn_wmma.hip`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn attention_prefill_kvarn_wmma(
+        &mut self,
+        q: &GpuTensor,
+        records: &GpuTensor,
+        window: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        batch_size: usize,
+        n_full_blocks: usize,
+        rec_bytes: usize,
+        bits: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(n_heads % n_kv_heads == 0);
+        const KERNEL: &str = "attention_prefill_kvarn_wmma";
+        self.ensure_kernel(KERNEL, kernels::ATTENTION_PREFILL_KVARN_WMMA_SRC, KERNEL)?;
+        const HD: usize = 256;
+        // Q_lds 64x264 + K_lds 16x264 + V_T 256x24 + P 4x16x24 halfs, + maxpos.
+        let lds = (64 * 264 + 16 * 264 + 256 * 24 + 4 * 16 * 24) * 2 + 16;
+        let win_f16 = i32::from(window.dtype == crate::DType::F16);
+        let scale = 1.0f32 / (HD as f32).sqrt();
+        let (qp, rp, wp, vp, op, pp) = (
+            q.buf.as_ptr(),
+            records.buf.as_ptr(),
+            window.buf.as_ptr(),
+            v_cache.buf.as_ptr(),
+            out.buf.as_ptr(),
+            positions.buf.as_ptr(),
+        );
+        let (b, nh, nkv) = (batch_size as i32, n_heads as i32, n_kv_heads as i32);
+        let (nfb, rb, bt) = (n_full_blocks as i32, rec_bytes as i32, bits as i32);
+        self.launch_kernargs(
+            KERNEL,
+            [n_heads as u32, batch_size.div_ceil(64) as u32, 1],
+            [128, 1, 1],
+            lds as u32,
+            &kernargs![
+                ptr qp, ptr rp, ptr wp, ptr vp, ptr op, ptr pp,
+                i32 b, i32 nh, i32 nkv, f32 scale, i32 nfb, i32 rb, i32 bt, i32 win_f16
+            ],
+        )
     }
     /// Flash attention with Q8_0 KV cache — tile + reduce two-kernel path.
     /// Tiles seq_len into chunks of `tile_size`, launches [n_heads, n_tiles]
@@ -5816,5 +6053,38 @@ mod head_dim_guard_tests {
                 "the refusal must name the constraint: {err}"
             );
         }
+    }
+}
+
+/// LDS per workgroup on RDNA; the chunk must fit in it.
+const KVARN_ROUTED_LDS_MAX: u32 = 64 * 1024;
+
+/// Positions per chunk of the routed KVarN attention. Measured on gfx1151 (27B
+/// shape, 16 sessions at 16.8K): 256 beat 128 and 512 by 1.3-1.5x at 450 rows and
+/// tied 512 at 16; 2048 was 2-5x slower (LDS starves occupancy).
+const KVARN_ROUTED_CHUNK: usize = 256;
+
+/// Rows at which a KVarN attention call counts as prefill and takes the WMMA kernel.
+const KVARN_PREFILL_WMMA_MIN_ROWS: usize = 32;
+
+/// `HIPFIRE_KVARN_PREFILL_WMMA=0` keeps prefill on the per-row tile+reduce path.
+fn kvarn_prefill_wmma_enabled() -> bool {
+    !matches!(
+        std::env::var("HIPFIRE_KVARN_PREFILL_WMMA").as_deref(),
+        Ok("0" | "off" | "false")
+    )
+}
+
+/// Positions each split-K workgroup of the routed KVarN decode attention walks,
+/// `HIPFIRE_KVARN_DECODE_SPLIT` (default 2048; 0 = no split). Rounded to `chunk`.
+fn kvarn_decode_split_len(chunk: usize) -> usize {
+    let v = std::env::var("HIPFIRE_KVARN_DECODE_SPLIT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(2048);
+    if v == 0 {
+        0
+    } else {
+        v.div_ceil(chunk.max(1)) * chunk.max(1)
     }
 }

@@ -6,7 +6,7 @@ use axum::{
         IntoResponse, Json, Response,
     },
 };
-use hipfire_prompt::{Message, Role};
+use hipfire_prompt::{Message, Role, ToolCall};
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::convert::Infallible;
@@ -400,10 +400,14 @@ fn response_json(
 ) -> Value {
     let prompt_tokens = done.prefill_tokens.unwrap_or(0);
     let completion_tokens = done.tokens;
+    // A reply cut off by the token budget (or the session's KV capacity) is not a
+    // finished answer. Reporting it `completed` let a client act on half a reply.
+    let truncated = done.finish_reason.as_deref() == Some("length");
+    let status = if truncated { "incomplete" } else { "completed" };
     let mut message = json!({
         "id": format!("msg_{response_id}"),
         "type": "message",
-        "status": "completed",
+        "status": status,
         "role": "assistant",
         "content": [{
             "type": "output_text",
@@ -429,11 +433,11 @@ fn response_json(
         output.push(message);
     }
     output.extend(calls);
-    json!({
+    let mut response = json!({
         "id": response_id,
         "object": "response",
         "model": model,
-        "status": "completed",
+        "status": status,
         "output": output,
         "output_text": text,
         "usage": {
@@ -441,7 +445,11 @@ fn response_json(
             "output_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
         }
-    })
+    });
+    if truncated {
+        response["incomplete_details"] = json!({ "reason": "max_output_tokens" });
+    }
+    response
 }
 
 async fn stream_responses(
@@ -599,7 +607,7 @@ async fn stream_responses(
             )))
             .await;
 
-        let mut engine_guard = state.engine.lock().await;
+        let mut engine_guard = state.lock_engine().await;
         // Borrowed, never moved out — an owned `DaemonEngine` dropped on any
         // early exit would `kill_on_drop` (SIGKILL) the inference worker.
         let engine = match engine_guard.as_mut() {
@@ -714,9 +722,14 @@ async fn stream_responses(
                         response_output_item_done_json(&response_id, &message_id, &output_text),
                     )))
                     .await;
+                let final_event = if done.finish_reason.as_deref() == Some("length") {
+                    "response.incomplete"
+                } else {
+                    "response.completed"
+                };
                 let _ = tx
                     .send(Ok(sse_json_event(
-                        "response.completed",
+                        final_event,
                         response_json(
                             &response_id,
                             &model_arg,
@@ -909,7 +922,7 @@ fn responses_input_to_chat_messages(input: &Value) -> Result<Vec<Message>, Strin
         Value::Array(items) => {
             let mut out = Vec::new();
             for item in items {
-                out.push(response_item_to_message(item)?);
+                push_response_item(&mut out, item)?;
             }
             if out.is_empty() {
                 return Err("responses input must contain at least one item".to_string());
@@ -922,7 +935,7 @@ fn responses_input_to_chat_messages(input: &Value) -> Result<Vec<Message>, Strin
             };
             let mut out = Vec::new();
             for item in messages {
-                out.push(response_item_to_message(item)?);
+                push_response_item(&mut out, item)?;
             }
             if out.is_empty() {
                 return Err("responses input.messages must contain at least one item".to_string());
@@ -931,6 +944,63 @@ fn responses_input_to_chat_messages(input: &Value) -> Result<Vec<Message>, Strin
         }
         _ => Err("responses input must be a string, array, or messages object".to_string()),
     }
+}
+
+/// Append one Responses input item. `function_call` and `function_call_output`
+/// are typed items with no `role`; read as role messages they became empty USER
+/// turns, so a replayed tool conversation reached the template as nonsense and
+/// every step re-prefilled its whole transcript inside one message.
+///
+/// A `function_call` joins the assistant message it follows, as the Responses API
+/// splits one assistant turn into a message item plus its call items.
+fn push_response_item(out: &mut Vec<Message>, item: &Value) -> Result<(), String> {
+    match item.get("type").and_then(Value::as_str) {
+        Some("function_call") => {
+            let name = item
+                .get("name")
+                .and_then(Value::as_str)
+                .ok_or_else(|| "function_call item needs a name".to_string())?;
+            let arguments = match item.get("arguments") {
+                Some(Value::String(raw)) => {
+                    serde_json::from_str(raw).unwrap_or_else(|_| json!({"_raw": raw}))
+                }
+                Some(value) => value.clone(),
+                None => json!({}),
+            };
+            let call = ToolCall {
+                id: item
+                    .get("call_id")
+                    .and_then(Value::as_str)
+                    .map(str::to_string),
+                name: name.to_string(),
+                arguments,
+            };
+            match out.last_mut() {
+                Some(last) if last.role == Role::Assistant => last.tool_calls.push(call),
+                _ => out.push(Message {
+                    role: Role::Assistant,
+                    content: String::new(),
+                    tool_calls: vec![call],
+                    tool_call_id: None,
+                }),
+            }
+        }
+        Some("function_call_output") => out.push(Message {
+            role: Role::Tool,
+            content: item
+                .get("output")
+                .map(response_content_to_text)
+                .transpose()?
+                .unwrap_or_default(),
+            tool_calls: Vec::new(),
+            tool_call_id: item
+                .get("call_id")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+        }),
+        _ => out.push(response_item_to_message(item)?),
+    }
+    Ok(())
 }
 
 fn response_item_to_message(item: &Value) -> Result<Message, String> {
@@ -1010,9 +1080,26 @@ fn prompt_message_to_chat_message(message: &Message) -> ChatMessage {
         Role::Assistant => "assistant",
         Role::Tool => "tool",
     };
+    // Carried in the OpenAI shape the chat path parses back
+    // (`parse_openai_tool_calls`); dropped here, the calls never reached the template.
+    let tool_calls = (!message.tool_calls.is_empty()).then(|| {
+        message
+            .tool_calls
+            .iter()
+            .map(|call| {
+                json!({
+                    "id": call.id,
+                    "type": "function",
+                    "function": {"name": call.name, "arguments": call.arguments.to_string()},
+                })
+            })
+            .collect()
+    });
     ChatMessage {
         role: role.to_string(),
         content: Some(Value::String(message.content.clone())),
+        tool_calls,
+        tool_call_id: message.tool_call_id.clone(),
         ..Default::default()
     }
 }
@@ -1393,6 +1480,53 @@ mod tests {
         .unwrap();
         assert_eq!(messages.len(), 1);
         assert_eq!(messages[0].content, "hello");
+    }
+
+    #[test]
+    fn a_replayed_tool_conversation_keeps_its_calls_and_results() {
+        let input = json!([
+            {"role": "system", "content": "shared prefix"},
+            {"role": "user", "content": "read lib.rs"},
+            {"type": "message", "role": "assistant", "content": "let me look"},
+            {"type": "function_call", "call_id": "c1", "name": "read_file",
+             "arguments": "{\"path\":\"src/lib.rs\"}"},
+            {"type": "function_call_output", "call_id": "c1", "output": "fn add() {}"},
+        ]);
+        let messages = responses_input_to_chat_messages(&input).unwrap();
+        let roles: Vec<Role> = messages.iter().map(|m| m.role).collect();
+        assert_eq!(
+            roles,
+            [Role::System, Role::User, Role::Assistant, Role::Tool]
+        );
+        // The call joins the assistant turn it follows rather than opening a new one.
+        assert_eq!(messages[2].content, "let me look");
+        assert_eq!(messages[2].tool_calls[0].name, "read_file");
+        assert_eq!(messages[2].tool_calls[0].arguments["path"], "src/lib.rs");
+        assert_eq!(messages[3].tool_call_id.as_deref(), Some("c1"));
+        assert_eq!(messages[3].content, "fn add() {}");
+        // And survives the hop to the chat path's message shape.
+        let chat = prompt_message_to_chat_message(&messages[2]);
+        assert_eq!(chat.tool_calls.unwrap()[0]["function"]["name"], "read_file");
+        assert_eq!(
+            prompt_message_to_chat_message(&messages[3])
+                .tool_call_id
+                .as_deref(),
+            Some("c1")
+        );
+    }
+
+    #[test]
+    fn a_reply_cut_off_at_the_token_budget_is_incomplete() {
+        let mut done = done_event();
+        done.finish_reason = Some("length".to_string());
+        let body = response_json("resp_1", "qwen", "half an ans", "", &done, &[]);
+        assert_eq!(body["status"], "incomplete");
+        assert_eq!(body["incomplete_details"]["reason"], "max_output_tokens");
+        assert_eq!(body["output"][0]["status"], "incomplete");
+
+        let body = response_json("resp_2", "qwen", "done.", "", &done_event(), &[]);
+        assert_eq!(body["status"], "completed");
+        assert!(body.get("incomplete_details").is_none());
     }
 
     #[test]

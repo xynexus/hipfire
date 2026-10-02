@@ -283,6 +283,51 @@ impl Qwen4ExpBackend {
     /// artifact whose experts were dequantised to f32 serves exactly as well and
     /// costs ~8x the memory. On the shipped geometry the experts are 97.3% of the
     /// trunk, so this one value decides whether the model fits.
+    /// One row of the trunk's embedding table, `[hidden]`.
+    ///
+    /// The MTP head shares it (`mtp_use_dedicated_embeddings` is false), so the
+    /// probe and any future drafter need the same rows the trunk gathers.
+    pub fn embed_row(&self, token: u32) -> &[f32] {
+        let h = self.cfg.hidden;
+        let o = token as usize * h;
+        &self.embed[o..o + h]
+    }
+
+    /// The uploaded trunk weights, for building a calibration capture map.
+    pub fn weights(&self) -> &TrunkWeights {
+        &self.weights
+    }
+
+    /// Apply the trunk's `lm_head` to an arbitrary collapsed hidden.
+    ///
+    /// The MTP head shares this head (`mtp_use_dedicated_embeddings` is false),
+    /// so a draft's logits must come from the same matrix the trunk uses — a
+    /// separate copy would drift and make acceptance meaningless.
+    pub fn logits_of(&self, gpu: &mut Gpu, hidden: &GpuTensor) -> Result<Vec<f32>, String> {
+        hipfire_runtime::weights::weight_gemv(
+            gpu,
+            &self.weights.lm_head,
+            hidden,
+            self.scratch.logits(),
+        )
+        .map_err(|e| format!("qwen4_exp lm_head: {e:?}"))?;
+        gpu.download_f32(self.scratch.logits())
+            .map_err(|e| format!("qwen4_exp logits download: {e:?}"))
+    }
+
+    /// Last-position logits, `[vocab]`.
+    pub fn trunk_logits(&self) -> &GpuTensor {
+        self.scratch.logits()
+    }
+
+    /// The trunk's wide residual and collapsed hidden from the last step.
+    ///
+    /// Exposed for the MTP probe: the head reads the wide stream, and its own
+    /// output is compared against the collapsed one.
+    pub fn trunk_states(&self) -> (&GpuTensor, &GpuTensor) {
+        (self.scratch.wide(), self.scratch.collapsed())
+    }
+
     pub fn routed_expert_dtype(&self) -> Option<hipfire_rdna::DType> {
         self.weights.layers.first().map(|l| l.moe.gate_up.dtype())
     }

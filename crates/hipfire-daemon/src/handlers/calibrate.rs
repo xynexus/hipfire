@@ -625,6 +625,7 @@ pub(crate) fn kld_eval(daemon_state: &mut DaemonState, msg: &serde_json::Value) 
                 "n_chunk": $out.n_chunk, "total_scored": $out.total_scored,
                 "mean_kld": $out.mean_kld, "p99_kld": $out.p99_kld,
                 "mean_nll": $out.mean_nll, "ppl": ($out.mean_nll as f64).exp(),
+                "argmax_match_rate": $out.argmax_match_rate,
                 "seq_output": $seq, "compat_findings": $findings,
             });
             daemon_state.out.emit(resp);

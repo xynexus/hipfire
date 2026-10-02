@@ -481,10 +481,11 @@ impl WeightSource for DequantHfq<'_> {
             3 => hipfire_runtime::quant::dequant_q8f16(bytes.as_ref(), n),
             34 => hipfire_runtime::quant::dequant_oq4g256(bytes.as_ref(), n),
             35 => hipfire_runtime::quant::dequant_oq8g256(bytes.as_ref(), n),
+            54 => hipfire_runtime::quant::dequant_oq8g128(bytes.as_ref(), n),
             other => {
                 return Err(format!(
                     "tensor {name}: quant_type {other} has no host dequantizer here; \
-                     Oq4G256 (34), Oq8G256 (35) and Q8F16 (3) are wired"
+                     Oq4G256 (34), Oq8G256 (35), Oq8G128 (54) and Q8F16 (3) are wired"
                 ))
             }
         };

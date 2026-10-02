@@ -602,6 +602,13 @@ struct PreparedExpertModule {
     bytes: Vec<u8>,
     gate_up_rel: usize,
     down_rel: usize,
+    /// Byte length of each role's OWN region, not "the rest of the module".
+    /// A consumer that derives a block stride from the view length (the compact
+    /// Opus GEMV does: `block_stride = byte_size / blocks`) reads a wrong stride
+    /// from an over-long view, and a wrong stride reads the same bytes as a
+    /// different format -- silent garbage, not an error.
+    gate_up_len: usize,
+    down_len: usize,
 }
 
 fn module_tensor_shape(tensor: &HfqModuleTensor) -> Result<(usize, usize), WeightPagerError> {
@@ -748,16 +755,52 @@ pub mod page_timing {
         EnsureResident = 2,
         /// Rewriting the device-side expert pointer table.
         PatchPtrTable = 3,
+        // ── per-EXPERT path (qwen4_exp): one round trip per routed expert,
+        // rather than one pointer-table patch per layer. These NEST, so they are
+        // reported as absolutes and per-call means, never as shares of a sum.
+        /// Whole `expert_pair` call: the per-access cost being hunted.
+        ExpertPair = 4,
+        /// Acquiring the shared pager mutex.
+        MutexWait = 5,
+        /// `ensure_expert_module_resident` on a RESIDENT module: hash + LRU touch.
+        EnsureWarm = 6,
+        /// `ensure_expert_module_resident` on a MISS: budget, fetch, repack, upload.
+        EnsureCold = 7,
+        /// `resident_expert_views` plus building the two `WeightTensor` views.
+        Views = 8,
+        /// The two `weight_gemv` calls the pair feeds — the compute denominator.
+        ExpertGemv = 9,
+        // ── inside EnsureCold. Splits the one phase that turned out to BE the
+        // cost, so "cold load is 798 us" becomes "which of the three".
+        /// `transport.read_host`: pulling the module's bytes off drive.
+        ColdRead = 10,
+        /// `prepare_expert_module`: the CPU host repack into the device form.
+        ColdRepack = 11,
+        /// `upload_raw_pooled`: the H2D copy.
+        ColdUpload = 12,
     }
 
-    const N: usize = 4;
-    static NANOS: [AtomicU64; N] = [
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
-        AtomicU64::new(0),
+    const N: usize = 13;
+    const PHASE_NAMES: [&str; N] = [
+        "topk_readback",
+        "would_fit",
+        "ensure_resident",
+        "patch_ptrs",
+        "expert_pair(total)",
+        "  mutex_wait",
+        "  ensure_warm",
+        "  ensure_cold",
+        "  views",
+        "expert_gemv",
+        "    cold_read",
+        "    cold_repack",
+        "    cold_upload",
     ];
-    static CALLS: AtomicU64 = AtomicU64::new(0);
+    static NANOS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
+    /// Per-phase call counts. A single global counter cannot produce a per-call
+    /// mean, which is the number that distinguishes "a lot of cheap calls" from
+    /// "a few expensive ones" — and that distinction is the whole question here.
+    static COUNTS: [AtomicU64; N] = [const { AtomicU64::new(0) }; N];
     static ADMISSIONS: AtomicU64 = AtomicU64::new(0);
     static WARNED: AtomicBool = AtomicBool::new(false);
 
@@ -782,7 +825,7 @@ pub mod page_timing {
             return;
         }
         NANOS[phase as usize].fetch_add(nanos, Ordering::Relaxed);
-        CALLS.fetch_add(1, Ordering::Relaxed);
+        COUNTS[phase as usize].fetch_add(1, Ordering::Relaxed);
     }
 
     /// Call once per `ensure_paged_experts_resident`; prints on a cadence.
@@ -795,28 +838,37 @@ pub mod page_timing {
             return;
         }
         let vals: Vec<u64> = NANOS.iter().map(|a| a.load(Ordering::Relaxed)).collect();
-        let total: u64 = vals.iter().sum();
-        if total == 0 {
+        let cnts: Vec<u64> = COUNTS.iter().map(|a| a.load(Ordering::Relaxed)).collect();
+        if vals.iter().all(|v| *v == 0) {
             if !WARNED.swap(true, Ordering::Relaxed) {
-                tracing::debug!("no phase time recorded — is the paged path live?");
+                eprintln!("[pager-timing] no phase time recorded — is the paged path live?");
             }
             return;
         }
-        let pct = |v: u64| (v as f64) * 100.0 / (total as f64);
-        tracing::debug!(
-            "admissions={n} last_set={experts_admitted} total={:.2}s | \
-             topk_readback {:.2}s ({:.1}%) | would_fit {:.2}s ({:.1}%) | \
-             ensure_resident {:.2}s ({:.1}%) | patch_ptrs {:.2}s ({:.1}%)",
-            total as f64 / 1e9,
-            vals[0] as f64 / 1e9,
-            pct(vals[0]),
-            vals[1] as f64 / 1e9,
-            pct(vals[1]),
-            vals[2] as f64 / 1e9,
-            pct(vals[2]),
-            vals[3] as f64 / 1e9,
-            pct(vals[3]),
+        // eprintln, not tracing: this is env-gated diagnostic output, and the
+        // examples that exercise the paged path install no tracing subscriber,
+        // so a `debug!` here printed nothing and read as "no phase time".
+        eprintln!(
+            "[pager-timing] admissions={n} last_set={experts_admitted}\n{:<20} {:>10} {:>10} {:>12}",
+            "phase", "calls", "total_s", "mean_us"
         );
+        for i in 0..N {
+            if cnts[i] == 0 && vals[i] == 0 {
+                continue;
+            }
+            let mean_us = if cnts[i] > 0 {
+                (vals[i] as f64 / cnts[i] as f64) / 1e3
+            } else {
+                0.0
+            };
+            eprintln!(
+                "[pager-timing] {:<20} {:>10} {:>10.3} {:>12.3}",
+                PHASE_NAMES[i],
+                cnts[i],
+                vals[i] as f64 / 1e9,
+                mean_us
+            );
+        }
     }
 
     /// Time `f`, attributing its wall time to `phase`.
@@ -828,6 +880,26 @@ pub mod page_timing {
         let out = f();
         record(phase, t.elapsed().as_nanos() as u64);
         out
+    }
+}
+
+/// Attributes a cold page-in to `Phase::EnsureCold` on scope exit.
+///
+/// A Drop guard rather than a `timed()` closure because the cold path is a long
+/// run of `?` early returns (budget refusal, eviction failure, a malformed
+/// module); wrapping it in a closure would mean restructuring the function, and
+/// timing only the success path would under-report exactly the failures worth
+/// seeing.
+struct ColdGuard(Option<std::time::Instant>);
+
+impl Drop for ColdGuard {
+    fn drop(&mut self) {
+        if let Some(t) = self.0 {
+            page_timing::record(
+                page_timing::Phase::EnsureCold,
+                t.elapsed().as_nanos() as u64,
+            );
+        }
     }
 }
 
@@ -1075,7 +1147,15 @@ pub fn estimated_module_resident_bytes(hfq: &HfqFile) -> (u64, u64) {
                 // layer on those would reject every real artifact.
                 .filter(|t| !t.name.contains("awq_scale"))
                 .all(|t| {
+                    // Both compact groups qualify: `split_compact_planes` only
+                    // reorders bytes at 256 AND at 128. Omitting G128 here
+                    // priced a qwen4_exp `oq4.25++` artifact as if its 24576
+                    // ragged-K `down_proj` experts expanded to Oq8, which is the
+                    // 1.80x this function exists to avoid -- the daemon then
+                    // refused a 172 GB model needing "124.8 GiB" that the
+                    // serving path loads with 8.4 GiB of experts resident.
                     t.quant_type == QuantType::OqPlusCompact.code()
+                        || t.quant_type == QuantType::OqPlusCompactG128.code()
                         || t.quant_type == QuantType::Oq8G256.code()
                 })
         });
@@ -1088,7 +1168,9 @@ pub fn estimated_module_resident_bytes(hfq: &HfqFile) -> (u64, u64) {
             // the byte count exactly. Asking the pager's question here would
             // over-estimate a compact artifact by 1.80x and refuse a load that
             // now fits -- which is precisely the 122B.
-            let len = if compact_resident && tensor.quant_type == QuantType::OqPlusCompact.code() {
+            let compact_tensor = tensor.quant_type == QuantType::OqPlusCompact.code()
+                || tensor.quant_type == QuantType::OqPlusCompactG128.code();
+            let len = if compact_resident && compact_tensor {
                 tensor.data_size
             } else {
                 module_tensor_resident_len(tensor, ExpertResidentLayout::IndexedMoeBlocks)
@@ -1098,6 +1180,33 @@ pub fn estimated_module_resident_bytes(hfq: &HfqFile) -> (u64, u64) {
         }
     }
     (resident, on_disk)
+}
+
+/// Bytes that are NEVER resident: read from drive during the forward pass
+/// rather than uploaded at load.
+///
+/// The qwen4_exp n-gram table is ~102 GB — 41% of that model's parameters — and
+/// `ngram_store` reads exactly `heads` 4 KiB blocks per token with `O_DIRECT`
+/// instead of holding it. "Keeping it on drive rather than resident is what
+/// makes the model fit" (see `ngram_store`), so pricing it as resident is what
+/// made `check_load_headroom` refuse the 180B: it estimated 172.2 GiB against
+/// 121.7 GiB available, while the same load path actually sits near 20 GiB.
+///
+/// Matched by name, as `estimated_module_resident_bytes` already matches
+/// `awq_scale` and `qwen4exp-gate.sh` matches these same shards. These tensors
+/// are not module members, so this never double-counts against that function's
+/// `on_disk`; `on_drive_is_disjoint_from_modules` pins that.
+pub fn estimated_on_drive_bytes(hfq: &HfqFile) -> u64 {
+    hfq.tensors()
+        .iter()
+        .filter(|t| on_drive_tensor(&t.name))
+        .map(|t| t.data_size as u64)
+        .sum()
+}
+
+/// Is this tensor read from drive per token rather than uploaded at load?
+pub(crate) fn on_drive_tensor(name: &str) -> bool {
+    name.contains("ngram_embedding.shard_")
 }
 
 fn module_resident_len(
@@ -1148,6 +1257,8 @@ fn prepare_expert_module(
     let mut bytes = Vec::with_capacity(capacity);
     let mut gate_up_rel = None;
     let mut down_rel = None;
+    let mut gate_up_len = None;
+    let mut down_len = None;
 
     for tensor in tensors {
         let source_end = tensor
@@ -1230,8 +1341,14 @@ fn prepare_expert_module(
         };
         bytes.extend_from_slice(&transformed);
         match expert_module_tensor_role(&tensor.name) {
-            Some(ExpertRole::GateUp) => gate_up_rel = Some(resident_rel),
-            Some(ExpertRole::Down) => down_rel = Some(resident_rel),
+            Some(ExpertRole::GateUp) => {
+                gate_up_rel = Some(resident_rel);
+                gate_up_len = Some(transformed.len());
+            }
+            Some(ExpertRole::Down) => {
+                down_rel = Some(resident_rel);
+                down_len = Some(transformed.len());
+            }
             None => {}
         }
     }
@@ -1257,6 +1374,8 @@ fn prepare_expert_module(
                 module.module_id
             ))
         })?,
+        gate_up_len: gate_up_len.unwrap_or(0),
+        down_len: down_len.unwrap_or(0),
     })
 }
 
@@ -1516,6 +1635,8 @@ struct ResidentModule {
     bytes: u64,
     gate_up_ptr: u64,
     down_ptr: u64,
+    gate_up_len: usize,
+    down_len: usize,
 }
 
 /// One resident routed expert, addressed the way a per-expert consumer needs.
@@ -1528,6 +1649,10 @@ pub struct ResidentExpertViews<'a> {
     pub buf: &'a GpuTensor,
     pub gate_up_rel: usize,
     pub down_rel: usize,
+    /// Each role's OWN byte length. Slice to THIS, not to the end of `buf`:
+    /// see `PreparedExpertModule::gate_up_len`.
+    pub gate_up_len: usize,
+    pub down_len: usize,
 }
 
 /// What one role's weights look like ONCE RESIDENT, answered from the module
@@ -1817,11 +1942,20 @@ impl WeightPager {
         gpu: &mut Gpu,
     ) -> Result<(), WeightPagerError> {
         if self.resident_modules.contains_key(&key) {
+            let t = page_timing::enabled().then(std::time::Instant::now);
             self.touch_module_lru(key);
             self.module_stats.module_cache_hits =
                 self.module_stats.module_cache_hits.saturating_add(1);
+            if let Some(t) = t {
+                page_timing::record(
+                    page_timing::Phase::EnsureWarm,
+                    t.elapsed().as_nanos() as u64,
+                );
+            }
             return Ok(());
         }
+        let t_cold = page_timing::enabled().then(std::time::Instant::now);
+        let _cold = ColdGuard(t_cold);
         let module = self
             .module_catalog
             .get(&key)
@@ -1841,49 +1975,63 @@ impl WeightPager {
             self.evict_lru_until(need, gpu)?;
         }
         let layout = self.config.expert_layout;
-        let (tensor, gate_up_rel, down_rel) = if module_requires_host_repack(&module, layout) {
-            let disk_bytes = self
-                .transport
-                .read_host(module.data_offset, module.data_size, gpu)?;
-            let prepared = prepare_expert_module(&module, &disk_bytes, layout)?;
-            // POOLED, not `upload_raw`. Eviction returns the buffer via
-            // `free_tensor` -> `pool.free`, so allocating outside the pool means
-            // every cold load takes fresh GTT while every eviction piles into a
-            // free-list nothing draws from. `upload_raw_pooled` exists for this
-            // call site and its doc says so; the pager just never used it.
-            //
-            // This is the host-repack branch, and `module_requires_host_repack`
-            // is true for exactly Oq4G256 / Oq8G256 / OqPlusCompact — every Opus
-            // artifact — so it is the branch a paging Opus MoE actually takes.
-            // Its sibling `else` was already pooled, which is why the bug needed
-            // a paging Opus model to show up at all.
-            //
-            // Found twice independently, so both measurements are kept:
-            //   * paged 122B: ~9.6 MB leaked per page-in, system memory climbing
-            //     ~1.1 GB/s to 116 GB, then OOM on a 9 MiB allocation — while the
-            //     pager's own accounting sat correctly at its 8 GiB budget and
-            //     the daemon's RSS stayed at 0 (it is GTT, so it never shows in
-            //     RSS).
-            //   * 32768-token KLD of Qwen3.6-35B-A3B--oq4 at a 6144 MB expert
-            //     cache: died at ~1 min before, runs 1h49m to completion after,
-            //     returning a KLD bit-identical to the same score with paging
-            //     disabled. A SMALLER cache died FASTER — backwards for a budget,
-            //     and the signature of a leak proportional to eviction count.
-            // `cargo run -p hipfire-rdna --example pool_churn_upload_raw` bounds
-            // it: 200 unpooled cycles strand 400 MiB, 4000 pooled cycles strand
-            // nothing.
-            let tensor = gpu.upload_raw_pooled(&prepared.bytes, &[prepared.bytes.len()])?;
-            (tensor, prepared.gate_up_rel, prepared.down_rel)
-        } else {
-            let (tensor, _handle) =
-                self.transport
-                    .fetch(module.data_offset, module.data_size, gpu)?;
-            let gate_up_rel = find_module_tensor_rel_ptr(&module, ExpertRole::GateUp)
-                .ok_or_else(|| WeightPagerError::InvalidModule(module.module_id.clone()))?;
-            let down_rel = find_module_tensor_rel_ptr(&module, ExpertRole::Down)
-                .ok_or_else(|| WeightPagerError::InvalidModule(module.module_id.clone()))?;
-            (tensor, gate_up_rel, down_rel)
-        };
+        let (tensor, gate_up_rel, down_rel, gate_up_len, down_len) =
+            if module_requires_host_repack(&module, layout) {
+                let disk_bytes = page_timing::timed(page_timing::Phase::ColdRead, || {
+                    self.transport
+                        .read_host(module.data_offset, module.data_size, gpu)
+                })?;
+                let prepared = page_timing::timed(page_timing::Phase::ColdRepack, || {
+                    prepare_expert_module(&module, &disk_bytes, layout)
+                })?;
+                // POOLED, not `upload_raw`. Eviction returns the buffer via
+                // `free_tensor` -> `pool.free`, so allocating outside the pool means
+                // every cold load takes fresh GTT while every eviction piles into a
+                // free-list nothing draws from. `upload_raw_pooled` exists for this
+                // call site and its doc says so; the pager just never used it.
+                //
+                // This is the host-repack branch, and `module_requires_host_repack`
+                // is true for exactly Oq4G256 / Oq8G256 / OqPlusCompact — every Opus
+                // artifact — so it is the branch a paging Opus MoE actually takes.
+                // Its sibling `else` was already pooled, which is why the bug needed
+                // a paging Opus model to show up at all.
+                //
+                // Found twice independently, so both measurements are kept:
+                //   * paged 122B: ~9.6 MB leaked per page-in, system memory climbing
+                //     ~1.1 GB/s to 116 GB, then OOM on a 9 MiB allocation — while the
+                //     pager's own accounting sat correctly at its 8 GiB budget and
+                //     the daemon's RSS stayed at 0 (it is GTT, so it never shows in
+                //     RSS).
+                //   * 32768-token KLD of Qwen3.6-35B-A3B--oq4 at a 6144 MB expert
+                //     cache: died at ~1 min before, runs 1h49m to completion after,
+                //     returning a KLD bit-identical to the same score with paging
+                //     disabled. A SMALLER cache died FASTER — backwards for a budget,
+                //     and the signature of a leak proportional to eviction count.
+                // `cargo run -p hipfire-rdna --example pool_churn_upload_raw` bounds
+                // it: 200 unpooled cycles strand 400 MiB, 4000 pooled cycles strand
+                // nothing.
+                let tensor = page_timing::timed(page_timing::Phase::ColdUpload, || {
+                    gpu.upload_raw_pooled(&prepared.bytes, &[prepared.bytes.len()])
+                })?;
+                (
+                    tensor,
+                    prepared.gate_up_rel,
+                    prepared.down_rel,
+                    prepared.gate_up_len,
+                    prepared.down_len,
+                )
+            } else {
+                let (tensor, _handle) =
+                    self.transport
+                        .fetch(module.data_offset, module.data_size, gpu)?;
+                let gate_up_rel = find_module_tensor_rel_ptr(&module, ExpertRole::GateUp)
+                    .ok_or_else(|| WeightPagerError::InvalidModule(module.module_id.clone()))?;
+                let down_rel = find_module_tensor_rel_ptr(&module, ExpertRole::Down)
+                    .ok_or_else(|| WeightPagerError::InvalidModule(module.module_id.clone()))?;
+                let gate_up_len = find_module_tensor_len(&module, ExpertRole::GateUp).unwrap_or(0);
+                let down_len = find_module_tensor_len(&module, ExpertRole::Down).unwrap_or(0);
+                (tensor, gate_up_rel, down_rel, gate_up_len, down_len)
+            };
         let base = tensor.buf.as_ptr() as usize;
         self.vram_used_bytes = self.vram_used_bytes.saturating_add(need);
         let gate_up_ptr = base.saturating_add(gate_up_rel) as u64;
@@ -1895,6 +2043,8 @@ impl WeightPager {
                 bytes: need,
                 gate_up_ptr,
                 down_ptr,
+                gate_up_len,
+                down_len,
             },
         );
         // Push hook 1 of 3 — page-in. The slot must be live before any kernel can
@@ -2096,6 +2246,8 @@ impl WeightPager {
             buf: &m.tensor,
             gate_up_rel: m.gate_up_ptr.saturating_sub(base) as usize,
             down_rel: m.down_ptr.saturating_sub(base) as usize,
+            gate_up_len: m.gate_up_len,
+            down_len: m.down_len,
         })
     }
 
@@ -2394,6 +2546,17 @@ fn find_module_tensor_rel_ptr(module: &HfqModuleRecord, role: ExpertRole) -> Opt
         .map(|t| t.rel_offset)
 }
 
+/// On-disk byte length of one role's tensor. Correct as a RESIDENT length only
+/// on the verbatim-fetch path, where nothing is repacked; the repacking path
+/// takes its lengths from `PreparedExpertModule`.
+fn find_module_tensor_len(module: &HfqModuleRecord, role: ExpertRole) -> Option<usize> {
+    module
+        .tensors
+        .iter()
+        .find(|t| expert_module_tensor_role(&t.name) == Some(role))
+        .map(|t| t.data_size)
+}
+
 // ---------------------------------------------------------------------------
 // Convenience: open an HfqFile by path. The loader uses the existing
 // HfqFile::open directly; this re-export keeps the module's surface minimal.
@@ -2410,6 +2573,46 @@ pub fn open_hfq(path: &Path) -> std::io::Result<HfqFile> {
 
 #[cfg(test)]
 mod tests {
+
+    /// The headroom guard subtracts module bytes AND on-drive bytes. If a name
+    /// could be both, the two subtractions would double-count and the guard
+    /// would admit a load that does not fit — the failure direction that OOM-kills
+    /// the session. Also pins the pattern against a typo: a `shard` that matched
+    /// nothing would silently return 0 bytes on drive, restoring the 172.2 GiB
+    /// refusal this function exists to fix.
+    #[test]
+    fn on_drive_is_disjoint_from_modules() {
+        use super::{expert_module_tensor_role as role, on_drive_tensor};
+
+        // Real shard names from the 180B must match, or the subtraction is a no-op.
+        for n in [
+            "model.language_model.layers.0.ple.ple_embedding.ngram_embedding.shard_0.weight",
+            "model.language_model.layers.0.ple.ple_embedding.ngram_embedding.shard_99.weight",
+        ] {
+            assert!(on_drive_tensor(n), "must be priced as on-drive: {n}");
+            assert_eq!(
+                role(n),
+                None,
+                "an on-drive tensor must not be a module member"
+            );
+        }
+
+        // Routed-expert weights are priced by estimated_module_resident_bytes.
+        for n in [
+            "model.layers.0.mlp.experts.11.gate_up_proj.weight",
+            "model.layers.0.mlp.experts.11.down_proj.weight",
+        ] {
+            assert!(
+                !on_drive_tensor(n),
+                "module weight must not be double-subtracted: {n}"
+            );
+        }
+
+        // Neighbours that stay resident must not be swept up.
+        assert!(!on_drive_tensor(
+            "model.language_model.layers.0.ple.ple_embedding.weight"
+        ));
+    }
 
     /// A sidecar must never claim the weight's slot. This is the exact bug that
     /// made paged decode ignore its own expert weights on every calibrated
@@ -2633,6 +2836,66 @@ mod tests {
                     data_size: down_len,
                 },
             ],
+        }
+    }
+
+    /// A prepared module must report each role's OWN length, not "the rest of
+    /// the module".
+    ///
+    /// `ResidentExpertViews` hands an arch two offsets into one allocation. The
+    /// arch used to slice each role to the END of that allocation, so gate_up's
+    /// view carried down_proj's bytes too. That is invisible to any consumer
+    /// that only reads forward from the offset -- and fatal to one that derives
+    /// a stride from the LENGTH, which the compact Opus arm of `weight_gemv`
+    /// does (`block_stride = byte_size / blocks`). An over-long view gives an
+    /// over-large stride, which reads the same bytes as a different format: the
+    /// 180B qwen4_exp artifact loaded fine and produced non-finite logits on the
+    /// first token.
+    ///
+    /// Asserted as "gate_up ends at or before down starts" as well as on the
+    /// exact lengths, because the containment property is the one the consumer
+    /// actually depends on.
+    #[test]
+    fn prepared_roles_report_their_own_lengths_not_the_rest_of_the_module() {
+        for (qt, group) in [
+            (QuantType::OqPlusCompact, 256usize),
+            (QuantType::OqPlusCompactG128, 128usize),
+        ] {
+            let block = 2 + group / 2 + 2 * 2;
+            let (gu_m, gu_k) = (1024usize, 2048usize);
+            let (dn_m, dn_k) = (2048usize, 512usize);
+            let gu_len = (gu_m * gu_k / group) * block;
+            let dn_len = (dn_m * dn_k / group) * block;
+            let module = routed_module_qt(qt.code(), gu_len, dn_len);
+            let disk: Vec<u8> = (0..gu_len + dn_len).map(|i| (i % 251) as u8 | 1).collect();
+
+            let prepared =
+                prepare_expert_module(&module, &disk, ExpertResidentLayout::PerExpertNative)
+                    .expect("prepare");
+
+            assert_eq!(
+                prepared.gate_up_len, gu_len,
+                "{qt:?}: compact only reorders, so gate_up keeps its disk length"
+            );
+            assert_eq!(prepared.down_len, dn_len, "{qt:?}: same for down");
+            assert!(
+                prepared.gate_up_rel + prepared.gate_up_len <= prepared.down_rel,
+                "{qt:?}: gate_up's region ({}..{}) runs into down's ({}) -- a view \
+                 sliced to gate_up_len would carry down_proj's bytes",
+                prepared.gate_up_rel,
+                prepared.gate_up_rel + prepared.gate_up_len,
+                prepared.down_rel
+            );
+            assert!(
+                prepared.down_rel + prepared.down_len <= prepared.bytes.len(),
+                "{qt:?}: down's region runs past the module"
+            );
+            assert_ne!(
+                prepared.gate_up_len,
+                prepared.bytes.len() - prepared.gate_up_rel,
+                "{qt:?}: gate_up_len equals the rest of the module, which is the \
+                 bug this test exists for"
+            );
         }
     }
 

@@ -354,6 +354,8 @@ fn stamp_calib_provenance(path: &Path) {
 static LDLQ_ATTEMPTS: AtomicUsize = AtomicUsize::new(0);
 static LDLQ_SUCCESS: AtomicUsize = AtomicUsize::new(0);
 static LDLQ_MISSING: AtomicUsize = AtomicUsize::new(0);
+/// Hessians moved into the `--rotate` frame (reported so a silent miss is visible).
+static ROTATED_HESSIANS: AtomicUsize = AtomicUsize::new(0);
 static LDLQ_K_MISMATCH: AtomicUsize = AtomicUsize::new(0);
 static LDLQ_PACK_FAILED: AtomicUsize = AtomicUsize::new(0);
 static LDLQ_DAMP_ESCALATED: AtomicUsize = AtomicUsize::new(0);
@@ -421,6 +423,22 @@ fn ldlq_skipped_expert_leaf(name: &str) -> bool {
         .any(|s| !s.is_empty() && s == leaf)
 }
 
+/// Whether `name` would actually draw a Hessian out of `idx` -- the cheap,
+/// non-logging half of `ldlq_hessian_for_tensor`.
+///
+/// Callers that need to know "does this tensor take LDLQ" WITHOUT consuming an
+/// attempt or emitting a skip line use this; `ldlq_hessian_for_tensor` both
+/// counts and logs, so probing with it would double-report every tensor.
+fn ldlq_has_hessian(idx: &Oq4LdlqHessian, name: &str, k: usize) -> bool {
+    if ldlq_skipped_expert_leaf(name) {
+        return false;
+    }
+    calibration_tensor_name_candidates(name)
+        .iter()
+        .any(|key| idx.k_of(key) == Some(k))
+        || pooled_hessian_donor(idx, name, k).is_some()
+}
+
 fn ldlq_hessian_for_tensor(idx: &Oq4LdlqHessian, name: &str, k: usize) -> Option<Vec<f32>> {
     LDLQ_ATTEMPTS.fetch_add(1, Ordering::Relaxed);
     if ldlq_skipped_expert_leaf(name) {
@@ -447,11 +465,29 @@ fn ldlq_hessian_for_tensor(idx: &Oq4LdlqHessian, name: &str, k: usize) -> Option
         eprintln!("  ldlq: skip {name} (Hessian K={hk} != weight K={k})");
         return None;
     }
-    idx.get_full(key).or_else(|| {
+    let full = idx.get_full(key).or_else(|| {
         LDLQ_MISSING.fetch_add(1, Ordering::Relaxed);
         eprintln!("  ldlq: skip {name} (Hessian entry existed but payload could not be read)");
         None
-    })
+    })?;
+    // Move the statistics into the rotated frame for tensors `--rotate` reader-rotated.
+    // Writers are rotated on their OUTPUT dim, so their input statistics are unchanged.
+    let rotated_reader = ROTATION_READERS.get().is_some_and(|set| set.contains(name));
+    match ROTATION_R1.get() {
+        Some(r1) if rotated_reader && r1.len() == k * k => {
+            ROTATED_HESSIANS.fetch_add(1, Ordering::Relaxed);
+            Some(rotate_hessian_congruence(&full, r1, k))
+        }
+        _ => Some(full),
+    }
+}
+
+/// Print how many Hessians were moved into the `--rotate` frame.
+fn report_rotated_hessians() {
+    let n = ROTATED_HESSIANS.load(Ordering::Relaxed);
+    if n > 0 {
+        eprintln!("  --rotate: {n} Hessians transformed to the rotated frame (H -> R1 H R1ᵀ)");
+    }
 }
 
 /// Count a successful LDLQ tensor, and NAME it when its factorization only
@@ -488,6 +524,7 @@ fn ldlq_record_pack_failed(name: &str) {
 }
 
 fn ldlq_report_and_validate(strict: bool) -> Result<(), String> {
+    report_rotated_hessians();
     let attempts = LDLQ_ATTEMPTS.load(Ordering::Relaxed);
     if attempts == 0 {
         if strict {
@@ -765,6 +802,49 @@ fn emit_coarse_sidecar(tensors: &mut Vec<HfqTensor>, name: &str, shape: &[u32]) 
 // the rotated tensor instead of the raw source, so every codec branch quantizes
 // the R1-rotated weights transparently. See `rotate.rs`.
 static ROTATION_OVERRIDE: OnceLock<HashMap<String, Vec<f32>>> = OnceLock::new();
+/// `R1 = FᵀM` from `--rotate`, and the tensors whose INPUT dim it rotated.
+///
+/// A reader quantized after `--rotate` consumes `R1·x`, so the calibration
+/// statistics must move to the same frame: `H → R1 H R1ᵀ`. Without this the
+/// quantizer optimizes rotated weights against a Hessian captured in the original
+/// activation basis, and the damage scales with how much the format leans on it --
+/// measured on Qwen3.5-0.8B with a Hadamard: oq8++ 1.6x worse, oq4.25++ 2.3x,
+/// qtip3 under OBS conditioning 173x. Rotations are supposed to *help* at low bits
+/// (QuaRot/QuIP#); a regression that deepens as bits drop is this bug, not the
+/// rotation.
+static ROTATION_R1: OnceLock<Vec<f32>> = OnceLock::new();
+static ROTATION_READERS: OnceLock<std::collections::HashSet<String>> = OnceLock::new();
+
+/// `H → R1 H R1ᵀ` for a `[k,k]` row-major Hessian. Composes with the codec's own
+/// `rotate_hessian` (the per-256-group FWHT `F`): afterwards the codec sees
+/// `F·R1 H R1ᵀ·Fᵀ = M H Mᵀ`, which matches the stored weights `W·Mᵀ`.
+fn rotate_hessian_congruence(h: &[f32], r1: &[f32], k: usize) -> Vec<f32> {
+    use rayon::prelude::*;
+    // tmp = R1 · H
+    let mut tmp = vec![0.0f32; k * k];
+    tmp.par_chunks_mut(k).enumerate().for_each(|(i, row)| {
+        let rrow = &r1[i * k..i * k + k];
+        for (d, &rv) in rrow.iter().enumerate() {
+            if rv == 0.0 {
+                continue;
+            }
+            let hrow = &h[d * k..d * k + k];
+            for (o, hv) in row.iter_mut().zip(hrow.iter()) {
+                *o += rv * hv;
+            }
+        }
+    });
+    // out = tmp · R1ᵀ   (out[i,j] = Σ_d tmp[i,d] R1[j,d])
+    let mut out = vec![0.0f32; k * k];
+    out.par_chunks_mut(k).enumerate().for_each(|(i, row)| {
+        let trow = &tmp[i * k..i * k + k];
+        for (j, o) in row.iter_mut().enumerate() {
+            let rrow = &r1[j * k..j * k + k];
+            *o = trow.iter().zip(rrow.iter()).map(|(a, b)| a * b).sum();
+        }
+    });
+    out
+}
 
 // ─── Safetensors Parser ─────────────────────────────────────────────────────
 
@@ -1208,14 +1288,32 @@ fn build_rotation_overrides(
     st_files: &[SafetensorsFile],
     fp8_scale_for: &HashMap<String, (usize, String)>,
 ) -> Result<(HashMap<String, Vec<f32>>, Option<Vec<f32>>), String> {
-    let h = config
-        .get("hidden_size")
-        .and_then(|v| v.as_u64())
-        .ok_or("config missing hidden_size")? as usize;
-    let vocab = config
-        .get("vocab_size")
-        .and_then(|v| v.as_u64())
-        .ok_or("config missing vocab_size")? as usize;
+    // A multimodal wrapper (Qwen3.5-VL, gemma3-vl) nests the text config, and
+    // `n_layers` at the call site already falls back the same way.
+    let cfg_u64 = |key: &str| -> Option<u64> {
+        config
+            .get(key)
+            .or_else(|| config.get("text_config").and_then(|tc| tc.get(key)))
+            .and_then(|v| v.as_u64())
+    };
+    let h = cfg_u64("hidden_size").ok_or("config missing hidden_size")? as usize;
+    let vocab = cfg_u64("vocab_size").ok_or("config missing vocab_size")? as usize;
+
+    // GemmaRMSNorm storage convention: the Qwen3.5+ family stores RAW `w` and
+    // applies `(1 + w)` — hipfire bakes the `+= 1.0` in `load_norm_weight`
+    // (qwen35/loading.rs:4530). Llama stores the effective scale directly.
+    //
+    // This is load-bearing here in TWO places, and getting it wrong is silent:
+    // fold `w` instead of `1 + w`, and write back `1.0` (which the loader turns
+    // into 2.0) instead of `0.0`, and the model merely gets quietly worse.
+    // Measured on Qwen3.5-0.8B: oq8++ scores kld 0.000676 unrotated and 20.4
+    // rotated without this correction.
+    let unit_offset_norm = config_uses_unit_offset_norm(config);
+    // The value a folded-away norm must carry so the RUNTIME sees scale 1.0.
+    let identity_norm = if unit_offset_norm { 0.0f32 } else { 1.0f32 };
+    if unit_offset_norm {
+        eprintln!("  --rotate: unit-offset RMSNorm family — folding (1+w), identity norm = 0.0");
+    }
     if h % 256 != 0 {
         return Err(format!(
             "--rotate needs hidden_size {h} %256==0 (codec FWHT)"
@@ -1245,76 +1343,163 @@ fn build_rotation_overrides(
         None
     };
 
+    // Tensor-name prefix. A VL wrapper puts the decoder under
+    // `model.language_model.`; a plain dense model uses `model.`.
+    let prefix = if st_files.iter().any(|st| {
+        st.tensor_data("model.language_model.embed_tokens.weight")
+            .is_some()
+    }) {
+        "model.language_model."
+    } else {
+        "model."
+    };
+
+    // Residual READERS: every 2D weight whose INPUT is the h-wide residual, so
+    // rotating its columns by R1 cancels the rotation the writers applied.
+    // Attention-group readers take input_layernorm; MLP readers take
+    // post_attention_layernorm. A layer carries ONE of the attention groups:
+    // `self_attn.*` on a full-attention layer, `linear_attn.in_proj_*` on a
+    // Gated-DeltaNet layer (Qwen3.5 is 18 linear to 6 full at 24 layers).
+    // Absent names are skipped, which is what lets one table serve both.
+    //
+    // Deliberately ABSENT, because they do not read the residual and rotating
+    // them would corrupt the model: `linear_attn.norm` (per-head, head_dim=128),
+    // `self_attn.{q,k,v}_norm` (head_dim=256), `linear_attn.{A_log,dt_bias}`
+    // (per-head scalars), and `linear_attn.conv1d` (acts on the QKV projection
+    // output, not on the residual).
+    const ATTN_READERS: &[&str] = &[
+        "self_attn.q_proj",
+        "self_attn.k_proj",
+        "self_attn.v_proj",
+        "linear_attn.in_proj_qkv",
+        "linear_attn.in_proj_z",
+        "linear_attn.in_proj_a",
+        "linear_attn.in_proj_b",
+    ];
+    const MLP_READERS: &[&str] = &["mlp.gate_proj", "mlp.up_proj"];
+    // Residual WRITERS: 2D weights whose OUTPUT is the h-wide residual.
+    const WRITERS: &[&str] = &["self_attn.o_proj", "linear_attn.out_proj", "mlp.down_proj"];
+
     // RMSNorm scales folded into their readers.
     let mut norm1 = Vec::with_capacity(n_layers);
     let mut norm2 = Vec::with_capacity(n_layers);
     for l in 0..n_layers {
         norm1.push(
-            get_f32(&format!("model.layers.{l}.input_layernorm.weight"))
+            get_f32(&format!("{prefix}layers.{l}.input_layernorm.weight"))
                 .ok_or_else(|| format!("missing input_layernorm for layer {l}"))?,
         );
         norm2.push(
-            get_f32(&format!("model.layers.{l}.post_attention_layernorm.weight"))
-                .ok_or_else(|| format!("missing post_attention_layernorm for layer {l}"))?,
+            get_f32(&format!(
+                "{prefix}layers.{l}.post_attention_layernorm.weight"
+            ))
+            .ok_or_else(|| format!("missing post_attention_layernorm for layer {l}"))?,
         );
     }
-    let final_norm = get_f32("model.norm.weight").ok_or("missing model.norm.weight")?;
+    let mut final_norm = get_f32(&format!("{prefix}norm.weight"))
+        .ok_or_else(|| format!("missing {prefix}norm.weight"))?;
+    // Bake the unit offset ONCE, here, so every fold below sees the effective scale.
+    if unit_offset_norm {
+        for v in norm1.iter_mut().chain(norm2.iter_mut()) {
+            for x in v.iter_mut() {
+                *x += 1.0;
+            }
+        }
+        for x in final_norm.iter_mut() {
+            *x += 1.0;
+        }
+    }
 
     let mut ov: HashMap<String, Vec<f32>> = HashMap::new();
+    // Tensors whose INPUT dim gets rotated. Their calibration statistics must move
+    // to the same frame (`H → R1 H R1ᵀ`); writers are rotated on their OUTPUT dim,
+    // so their input statistics are untouched.
+    let mut reader_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let (mut n_readers, mut n_writers) = (0usize, 0usize);
     for l in 0..n_layers {
-        // Attention readers: fold input_layernorm, then reader-rotate on h.
-        for suf in ["self_attn.q_proj", "self_attn.k_proj", "self_attn.v_proj"] {
-            let name = format!("model.layers.{l}.{suf}.weight");
-            if let Some(mut w) = get_f32(&name) {
-                let out = w.len() / h;
-                rotate::fold_cols(&mut w, &norm1[l], out, h);
-                plan.rotate_reader(&mut w, out);
-                ov.insert(name, w);
+        let (mut layer_readers, mut layer_writers) = (0usize, 0usize);
+        // Readers: fold the group's RMSNorm, then reader-rotate on h.
+        for (sufs, norm) in [(ATTN_READERS, &norm1[l]), (MLP_READERS, &norm2[l])] {
+            for suf in sufs {
+                let name = format!("{prefix}layers.{l}.{suf}.weight");
+                if let Some(mut w) = get_f32(&name) {
+                    let out = w.len() / h;
+                    rotate::fold_cols(&mut w, norm, out, h);
+                    plan.rotate_reader(&mut w, out);
+                    reader_names.insert(name.clone());
+                    ov.insert(name, w);
+                    layer_readers += 1;
+                }
             }
         }
-        // MLP readers: fold post_attention_layernorm, then reader-rotate on h.
-        for suf in ["mlp.gate_proj", "mlp.up_proj"] {
-            let name = format!("model.layers.{l}.{suf}.weight");
-            if let Some(mut w) = get_f32(&name) {
-                let out = w.len() / h;
-                rotate::fold_cols(&mut w, &norm2[l], out, h);
-                plan.rotate_reader(&mut w, out);
-                ov.insert(name, w);
-            }
-        }
-        // Writers (o_proj, down_proj): writer-rotate on the output h dim.
-        for suf in ["self_attn.o_proj", "mlp.down_proj"] {
-            let name = format!("model.layers.{l}.{suf}.weight");
+        // Writers: writer-rotate on the output h dim.
+        for suf in WRITERS {
+            let name = format!("{prefix}layers.{l}.{suf}.weight");
             if let Some(mut w) = get_f32(&name) {
                 let cols = w.len() / h;
                 plan.rotate_writer(&mut w, cols);
                 ov.insert(name, w);
+                layer_writers += 1;
             }
         }
+        // A layer that contributed nothing means the name table missed this
+        // architecture. Rotation is only correct if EVERY reader and writer of
+        // the residual is transformed: miss one and the un-rotated tensor reads
+        // a rotated residual, which is silent garbage rather than an error. Fail
+        // loudly instead.
+        if layer_readers == 0 || layer_writers == 0 {
+            return Err(format!(
+                "--rotate: layer {l} matched {layer_readers} residual readers and \
+                 {layer_writers} writers under prefix `{prefix}` — the name table does \
+                 not cover this architecture, and a partial rotation is silently wrong"
+            ));
+        }
+        n_readers += layer_readers;
+        n_writers += layer_writers;
         // Folded norms → identity (ones).
         ov.insert(
-            format!("model.layers.{l}.input_layernorm.weight"),
-            vec![1.0f32; h],
+            format!("{prefix}layers.{l}.input_layernorm.weight"),
+            vec![identity_norm; h],
         );
         ov.insert(
-            format!("model.layers.{l}.post_attention_layernorm.weight"),
-            vec![1.0f32; h],
+            format!("{prefix}layers.{l}.post_attention_layernorm.weight"),
+            vec![identity_norm; h],
         );
     }
 
     // Head: synthesize the untied lm_head (fold final_norm into the ORIGINAL embed,
     // then reader-rotate) BEFORE rotating the input embedding.
-    let mut embed = get_f32("model.embed_tokens.weight").ok_or("missing embed_tokens")?;
-    let mut lm_head = embed.clone();
+    let embed_name = format!("{prefix}embed_tokens.weight");
+    let mut embed = get_f32(&embed_name).ok_or_else(|| format!("missing {embed_name}"))?;
+    // On an UNTIED model the output head is its own tensor and must be rotated as
+    // itself. Cloning the embed here (correct only when the head IS the embed)
+    // silently replaces the trained output projection with the embedding matrix:
+    // the model still loads, still generates, and is simply wrong. Untied llama
+    // measured kld 0.058 rotated against 0.000006 unrotated purely from this.
+    let untied = ["lm_head.weight", &format!("{prefix}lm_head.weight")]
+        .iter()
+        .find_map(|n| get_f32(n).map(|w| ((*n).to_string(), w)));
+    let mut lm_head = match &untied {
+        Some((name, w)) => {
+            eprintln!("  --rotate: untied head — rotating {name} in place");
+            w.clone()
+        }
+        None => embed.clone(),
+    };
     rotate::fold_cols(&mut lm_head, &final_norm, vocab, h);
     plan.rotate_reader(&mut lm_head, vocab);
     // Input embedding: reader-rotate on h (no fold).
     plan.rotate_reader(&mut embed, vocab);
-    ov.insert("model.embed_tokens.weight".to_string(), embed);
-    ov.insert("model.norm.weight".to_string(), vec![1.0f32; h]);
+    ov.insert(embed_name, embed);
+    ov.insert(format!("{prefix}norm.weight"), vec![identity_norm; h]);
 
+    // The lm_head is reader-rotated too (it consumes the final residual).
+    reader_names.insert("lm_head.weight".to_string());
+    let _ = ROTATION_R1.set(plan.r1().to_vec());
+    let _ = ROTATION_READERS.set(reader_names);
     eprintln!(
-        "  --rotate: {} tensors folded+rotated; synthesized untied lm_head [{vocab}×{h}]",
+        "  --rotate: prefix `{prefix}`, {n_readers} residual readers + {n_writers} writers \
+         over {n_layers} layers; {} tensors folded+rotated; synthesized untied lm_head \
+         [{vocab}×{h}]",
         ov.len()
     );
     Ok((ov, Some(lm_head)))
@@ -3812,6 +3997,22 @@ impl TensorProgress {
         if !enabled {
             return;
         }
+        self.emit(message);
+    }
+
+    /// A line that prints whatever `--verbose-tensors` says.
+    ///
+    /// `detail` is for per-tensor commentary nobody needs by default. A
+    /// CORRECTNESS warning is not that: the K=128 Opus fallback silently ships
+    /// 4-bit uncalibrated experts inside an `oq8` artifact, and routing it
+    /// through `detail` meant the warning added to make that case audible only
+    /// printed under a flag nobody passes. Default runs emitted zero warnings
+    /// while 32 tensors dropped to HFQ4G128.
+    fn warn(&self, message: String) {
+        self.emit(message);
+    }
+
+    fn emit(&self, message: String) {
         if self.log_snapshots {
             eprintln!("{message}");
         } else {
@@ -4200,6 +4401,15 @@ enum HfqInputFormat {
     OqPlusCompactG128,
     Oq8,
     Oq8Plus,
+    /// `Oq8` at a 128-element group (qt 54), for K divisible by 128 but not 256.
+    ///
+    /// Carries NO AWQ sidecar, ever. `Oq8G128` declares `RotationPlan::FwhtG128`
+    /// and `RotationVariant::PlainG128` REFUSES an AWQ sidecar outright — no
+    /// 128-point AWQ rotation kernel exists, and the 256-point one does not
+    /// cancel the weights' 128-point rotation. Since AWQ weights are stored
+    /// pre-scaled, attaching one would ship an artifact that either errors at
+    /// load or computes a silently wrong answer.
+    Oq8G128,
 }
 
 fn stacked_expert_oq_format(
@@ -4228,9 +4438,20 @@ fn stacked_expert_oq_format(
             HfqInputFormat::Oq4
         })
     } else if use_oq8_plus {
-        Some(HfqInputFormat::Oq8Plus)
+        // G128 has no AWQ rotation kernel and `oq8_ldlq_pack` asserts K % 256,
+        // so the calibrated variants collapse to plain Oq8G128 here. That is
+        // still 8-bit and still Opus, where the alternative was 4-bit HFQ4G128.
+        Some(if opus_group == 128 {
+            HfqInputFormat::Oq8G128
+        } else {
+            HfqInputFormat::Oq8Plus
+        })
     } else if use_oq8 {
-        Some(HfqInputFormat::Oq8)
+        Some(if opus_group == 128 {
+            HfqInputFormat::Oq8G128
+        } else {
+            HfqInputFormat::Oq8
+        })
     } else {
         None
     }
@@ -4514,7 +4735,7 @@ fn quantize_hfq_source_tensor(
         // --embed-precision bf16|f16: keep the gather table at source precision
         // instead of Q8 (no-op under the default q8). Only the embed table — the
         // router/conv1d/non-2D tensors below stay Q8.
-        if let Some(ov) = embed_precision_override(raw, src_dtype, &f32_data) {
+        if let Some(ov) = embed_precision_override(name, raw, src_dtype, &f32_data) {
             return Ok(ov);
         }
     }
@@ -4929,6 +5150,32 @@ fn quantize_hfq_source_tensor(
             let quant_type = QuantType::oq8_for_matrix_cols(k);
             (q, quant_type, 256, "OQ8G256")
         }
+        HfqInputFormat::Oq8G128 => {
+            // Opus W8 at a 128 group (qt 54), for a K divisible by 128 but not
+            // 256 — `moe_intermediate_size` 640 (Qwen3.8-Flash-Next) and 128
+            // (the qwen3_5_moe / gemma4_moe fixtures). Before this arm those
+            // routed `down_proj` tensors left Opus for HFQ4G128 and shipped
+            // FOUR-bit uncalibrated weights inside an eight-bit artifact.
+            //
+            // Seeds 43/1043, not 42/1042: the group is the FWHT length, and
+            // `quantize_oq8g128` asserts the 128-length pair. The 256 pair
+            // rotates by a transform the forward never inverts, which reads as
+            // plausible garbage rather than an error.
+            //
+            // NO AWQ, NO LDLQ, deliberately. `RotationVariant::PlainG128`
+            // refuses an AWQ sidecar (no 128-point AWQ rotation kernel exists,
+            // and AWQ weights ship pre-scaled, so the division of x would never
+            // happen), and `oq8_ldlq_pack` asserts K % 256 == 0. Attaching
+            // either here would trade a loud 4-bit fallback for a quiet wrong
+            // answer. Plain 8-bit beats calibrated 4-bit regardless.
+            let m_dim = shape[0] as usize;
+            let signs1_128 = gen_fwht_signs(43, 128);
+            let signs2_128 = gen_fwht_signs(1043, 128);
+            let q = quantize_opus_rows(&f32_data, m_dim, k, |row| {
+                crate::codecs::quantize_oq8g128(row, &signs1_128, &signs2_128)
+            });
+            (q, QuantType::Oq8G128, 128, "OQ8G128")
+        }
         HfqInputFormat::OqPlusCompact => {
             // OQ+ magnitude-tiered W4A8: bulk int4, top-`w8_frac` weights/group at
             // int8 in the compact ~4 b/w layout (130 + 2*N_out B/group, qt=36).
@@ -4944,11 +5191,30 @@ fn quantize_hfq_source_tensor(
             // safetensors path leaves alone (`should_quantize(name) || k % 256 != 0`),
             // and the result hard-errors on first forward.
             //
-            // Fall back to Q8, matching the Oq2/Oq3/Oq6/Mq3/Mq6 arms. A K%128==0
-            // tensor could instead take OqPlusCompactG128 (qt 52) and keep ~4 b/w,
-            // but that is a per-tensor group choice this function cannot make
-            // today -- the group arrives run-wide.
+            // A K%128==0 tensor takes OqPlusCompactG128 (qt 52) and keeps ~4 b/w
+            // instead of doubling to Q8. The group arrives run-wide, but `k` is
+            // right here, so the per-tensor choice IS makeable -- the safetensors
+            // path already makes it (`stacked_expert_oq_format`); only this
+            // HFQ-source arm did not.
+            //
+            // Qwen3.8-Flash-Next is exactly this case: `moe_intermediate_size`
+            // 640, so every routed `down_proj` is ragged. At Q8 the qwen4_exp
+            // loader has no device form for the expert stack and falls back to
+            // f32 -- "8x the resident bytes" -- which OOMs the 180B before it
+            // serves a token. Q8 here is not a conservative choice, it is an
+            // unloadable one, and it was SILENT: no warning distinguished it
+            // from a clean build.
             if k % 256 != 0 {
+                if k % 128 == 0 {
+                    return quantize_hfq_source_tensor(
+                        name,
+                        arch_id,
+                        raw,
+                        src_qt,
+                        shape,
+                        HfqInputFormat::OqPlusCompactG128,
+                    );
+                }
                 return Ok((quantize_q8f16(&f32_data), QuantType::Q8F16, 32, "Q8_F16"));
             }
             let m_dim = shape[0] as usize;
@@ -5036,7 +5302,15 @@ fn quantize_hfq_source_tensor(
             // `oqplus_compact_ldlq_pack` emits 256-element blocks, so tiered LDLQ
             // has no G=128 form yet. Refuse rather than silently writing blocks
             // of the wrong group.
-            if OQ4_LDLQ_HESSIAN.get().is_some() {
+            // Refuse only when THIS tensor would actually draw a Hessian. The
+            // flag being set just means `--hessian` was passed run-wide, and
+            // under `oq4.25++` it always is -- so the coarse check turned every
+            // ragged-K tensor into a hard build failure even though routed
+            // experts take the imatrix path and never had a Hessian to pack.
+            if OQ4_LDLQ_HESSIAN
+                .get()
+                .is_some_and(|idx| ldlq_has_hessian(idx, name, k))
+            {
                 return Err(format!(
                     "{name}: --ldlq is not supported at group 128 (oq*g128); \
                      oqplus_compact_ldlq_pack emits 256-element blocks. Use a \
@@ -5304,7 +5578,12 @@ fn qtip_greedy_encode_gpu(
 #[cfg(feature = "gpu")]
 struct QtipEncodeScratch {
     chunk: usize,
-    backptr: hipfire_rdna::GpuTensor,
+    /// OWNED, not a bare `GpuTensor`. `GpuTensor`'s drop is a no-op, so a
+    /// scratch cell that goes out of scope used to strand its half-gigabyte
+    /// buffer for the life of the process — see `gpu_encode_symbols`, which
+    /// mints a fresh cell per tensor. Owned means the drop enqueues the buffer
+    /// for reclaim, and the next tensor's identically-sized request reuses it.
+    backptr: hipfire_rdna::OwnedTensor,
 }
 
 #[cfg(feature = "gpu")]
@@ -5315,7 +5594,21 @@ fn gpu_encode_symbols(
     bits: u32,
 ) -> Result<Vec<u8>, String> {
     let mut own: Option<QtipEncodeScratch> = None;
-    gpu_encode_symbols_scratch(gpu, rotated, n_groups, bits, &mut own)
+    let out = gpu_encode_symbols_scratch(gpu, rotated, n_groups, bits, &mut own);
+    // This wrapper is called once per TENSOR (the unconditioned `--format qtip3`
+    // path), so the scratch cell it owns is born and dies per tensor. Dropping an
+    // `OwnedTensor` only enqueues the buffer; it reaches the pool at an explicit
+    // reclaim. Without these two lines the backptr was stranded per tensor —
+    // ~512 MB × every quantized tensor, which is ~95 GB on a 2B model and is what
+    // drove halo into a global OOM on 2026-09-04 (measured: system memory climbed
+    // 5.6 → 106.3 GB on a 2B qtip3 build, monotonically, while the process cgroup
+    // stayed flat at 7.36 GB because KFD buffers are charged to no memcg).
+    //
+    // Reclaiming here bounds the whole run at ONE backptr: every allocation is
+    // the same capped size, so the pooled buffer is reused by the next tensor.
+    drop(own);
+    gpu.reclaim_pending();
+    out
 }
 
 /// As [`gpu_encode_symbols`], but reuses `scratch` across calls. Pass the same
@@ -5346,7 +5639,7 @@ fn gpu_encode_symbols_scratch(
         // `cn` entries so an oversized scratch costs nothing per call.
         let mut chunk = 1024usize;
         let backptr = loop {
-            match gpu.alloc_tensor(&[chunk * 256 * 256 * 2], DType::F32) {
+            match gpu.alloc_owned(&[chunk * 256 * 256 * 2], DType::F32) {
                 Ok(b) => break b,
                 Err(_) if chunk > 64 => chunk /= 2,
                 Err(e) => return Err(format!("backptr alloc (chunk={chunk}): {e}")),
@@ -5458,6 +5751,117 @@ fn qtip_trellis_lm_head_enabled() -> bool {
     hipfire_env::QTIP_LM_HEAD.flag()
 }
 
+/// `--norm-patch <file.json>`: fold recovered RMSNorm weights (`{"<tensor
+/// name>": [f32, ...]}`) into the staged tensors.
+///
+/// Light QAT (`hipfire qat`, the `hipfire-qat` binary) tunes γ for norms that
+/// are NOT quantized — they pass through at source precision — so this only
+/// substitutes their values. It has to happen during the BUILD rather than by
+/// rewriting a finished `.hfq`: once bf16 tensors carry a lossless recoding
+/// (`Bf16Huff`) the tuned values compress to a different byte length, and the
+/// container is written by exactly one writer.
+///
+/// Values are in the STORED convention — for a `(1+w)` family the recovery tool
+/// subtracts 1 before writing the file, so a gemma-style bake has already
+/// happened and is not applied twice.
+///
+/// Called from BOTH pipelines. The safetensors/`.hfa` ingest and
+/// `run_hfq_source_pipeline` are parallel implementations, and a flag wired into
+/// only one of them is silently inert on the other container — the exact shape of
+/// the `--embed-precision hfq4` bug this session already hit.
+fn apply_norm_patch(args: &[String], hfq_tensors: &mut [HfqTensor]) {
+    let Some(patch_path) = arg_value(args, "--norm-patch") else {
+        return;
+    };
+
+    let raw = match std::fs::read_to_string(patch_path) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("--norm-patch: {patch_path}: {e}");
+            std::process::exit(2);
+        }
+    };
+    let patch: std::collections::HashMap<String, Vec<f32>> = match serde_json::from_str(&raw) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("--norm-patch: {patch_path}: {e}");
+            std::process::exit(2);
+        }
+    };
+    let mut applied = 0usize;
+    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for t in hfq_tensors.iter_mut() {
+        let Some(vals) = patch.get(&t.name) else {
+            continue;
+        };
+        seen.insert(t.name.clone());
+        // A norm is a 1-D unquantized vector. Refuse anything else rather
+        // than overwrite a quantized weight's code bytes with raw floats.
+        if !t.name.ends_with("norm.weight") {
+            eprintln!("--norm-patch: FATAL {} is not a norm tensor", t.name);
+            std::process::exit(2);
+        }
+        if t.spilled_len > 0 {
+            eprintln!(
+                "--norm-patch: FATAL norm {} was spilled to disk before the patch",
+                t.name
+            );
+            std::process::exit(2);
+        }
+        // The `.hfq` pipeline pre-compresses bf16 as it stages, so a norm can
+        // already be a lossless recoding by the time we get here. Substitute the
+        // logical values and recode, rather than refusing.
+        let recoded = t.quant_type.is_lossless_recoding();
+        if recoded {
+            t.quant_type = QuantType::BF16;
+        }
+        match t.quant_type {
+            QuantType::F32 | QuantType::F16 | QuantType::BF16 => {}
+            other => {
+                eprintln!(
+                    "--norm-patch: FATAL norm {} has quant_type {} (expected F32/F16/BF16)",
+                    t.name, other as u8
+                );
+                std::process::exit(2);
+            }
+        };
+        let n: usize = t.shape.iter().map(|&d| d as usize).product();
+        if n != vals.len() {
+            eprintln!(
+                "--norm-patch: FATAL {} has {n} elements, patch has {}",
+                t.name,
+                vals.len()
+            );
+            std::process::exit(2);
+        }
+        t.data = match t.quant_type {
+            QuantType::F32 => vals.iter().flat_map(|v| v.to_le_bytes()).collect(),
+            QuantType::F16 => f32_slice_to_f16_bytes(vals),
+            QuantType::BF16 => f32_slice_to_bf16_bytes(vals),
+            _ => unreachable!(),
+        };
+        if recoded {
+            let mut stats = Bf16CompressStats::default();
+            compress_bf16_tensor(t, bf16_codec(), &mut stats);
+        }
+        applied += 1;
+    }
+    // A patch entry that matches nothing is the failure mode this area keeps
+    // repeating: the flag parses, the run succeeds, and the recovery silently
+    // did not ship. Name every miss and refuse.
+    let missed: Vec<&String> = patch.keys().filter(|k| !seen.contains(*k)).collect();
+    if !missed.is_empty() {
+        eprintln!(
+            "--norm-patch: FATAL {} patch entries match no tensor in this artifact \
+             (first: {}); the recovery would ship silently unapplied",
+            missed.len(),
+            missed[0]
+        );
+        std::process::exit(2);
+    }
+    eprintln!("--norm-patch: folded {applied} recovered norm tensors from {patch_path}");
+}
+
 fn pack_qtip_real_tensors(
     tensors: &mut Vec<HfqTensor>,
     qtip_cb: &[f32],
@@ -5534,6 +5938,7 @@ fn pack_qtip_real_tensors(
     let is_embed_table = |n: &str| n.contains("embed");
     let is_untied_head = |n: &str| n.contains("lm_head") || n.ends_with("output.weight");
     let mut n_q8 = 0usize;
+    let mut n_embed_override = 0usize;
     for t in tensors.iter_mut() {
         let force_q8 = is_embed_table(&t.name) || (is_untied_head(&t.name) && !trellis_lm_head);
         if !(matches!(t.quant_type, QuantType::BF16) && t.shape.len() == 2 && force_q8) {
@@ -5544,6 +5949,38 @@ fn pack_qtip_real_tensors(
             .chunks_exact(2)
             .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
             .collect();
+        // An EXPLICIT `--embed-precision` outranks the Q8 default for the embed
+        // TABLE. Q8 stays the default (it is a deliberate gather-friendliness
+        // choice, see above) and the untied head is unaffected — but silently
+        // discarding a width the operator asked for made "mixed body + 4-bit
+        // embed" inexpressible: `--tensor-format` only exists on the .hfq path,
+        // and this pass overrode `--embed-precision` on exactly that path while
+        // logging the flag as accepted.
+        if is_embed_table(&t.name) {
+            match embed_precision_code() {
+                // hfq4: 4-bit gather table, served by embedding_lookup_hfq4g256.
+                4 => {
+                    t.data = quantize_hfq4g256(&wf);
+                    t.quant_type = QuantType::HFQ4G256;
+                    t.group_size = 256;
+                    n_embed_override += 1;
+                    continue;
+                }
+                // bf16: already staged as BF16 — leave it.
+                1 => {
+                    n_embed_override += 1;
+                    continue;
+                }
+                2 => {
+                    t.data = f32_slice_to_f16_bytes(&wf);
+                    t.quant_type = QuantType::F16;
+                    t.group_size = 0;
+                    n_embed_override += 1;
+                    continue;
+                }
+                _ => {}
+            }
+        }
         t.data = quantize_q8f16(&wf);
         t.quant_type = QuantType::Q8F16;
         t.group_size = 32;
@@ -5551,6 +5988,11 @@ fn pack_qtip_real_tensors(
     }
     if n_q8 > 0 {
         eprintln!("  qtip{bits} (real): embed/lm_head → Q8F16 ({n_q8} tensors, gather-friendly)");
+    }
+    if n_embed_override > 0 {
+        eprintln!(
+            "  qtip{bits} (real): embed kept at --embed-precision ({n_embed_override} tensors)"
+        );
     }
     let (mut n_packed, mut max_err) = (0usize, 0.0f32);
     // Coarse per-phase wall-time (rotate / encode / pack), accumulated across tensors.
@@ -6492,6 +6934,15 @@ fn run_hfq_source_pipeline(
         }
     }
 
+    // `run_hfq_source_pipeline` is a parallel implementation of the
+    // safetensors/`.hfa` ingest, not a wrapper over it — a flag wired into only
+    // one of them is silently inert on the other container. That is exactly how
+    // `--embed-precision hfq4` came to depend on the input container.
+    {
+        let argv: Vec<String> = std::env::args().collect();
+        apply_norm_patch(&argv, &mut hfq_tensors);
+    }
+
     // Real QTIP-3 is a post-pass over the BF16-staged 2D weights, shared with
     // the HF/GGUF dispatch so a bf16 `.hfq` requantized to qtip3 is byte-
     // identical to quantizing the original safetensors with `--format qtip3`.
@@ -7345,6 +7796,32 @@ fn awq_eligible(name: &str) -> bool {
     f1_match || f2_match
 }
 
+/// Source-precision bytes for a tensor that `--rotate` has an override for.
+///
+/// The raw-byte fast paths below are byte-preserving, which is exactly wrong
+/// under `--rotate`: the override is the fold+rotated weight and lives only in
+/// the f32 domain, so copying raw source bytes ships the tensor UNROTATED while
+/// every reader has been rotated to expect the new frame. On a tied embedding
+/// that seeds the whole residual stream in the wrong basis.
+///
+/// It is silent, and it hides from an identity-rotation test: at `R1 = I` the
+/// rotated and raw bytes agree, so the no-op check passes while any real
+/// rotation destroys the model. Measured on Qwen3.5-0.8B oq8++ (embed at the
+/// `source` default): kld 0.000656 at `R1 = I` versus 7.78 with a Hadamard.
+fn rotated_source_override(name: &str, dtype: &str) -> Option<(Vec<u8>, QuantType, &'static str)> {
+    let rot = ROTATION_OVERRIDE.get()?.get(name)?;
+    Some(match dtype {
+        "BF16" => (f32_slice_to_bf16_bytes(rot), QuantType::BF16, "BF16"),
+        "F16" => (f32_slice_to_f16_bytes(rot), QuantType::F16, "F16"),
+        "F32" => (
+            rot.iter().flat_map(|&v| v.to_le_bytes()).collect(),
+            QuantType::F32,
+            "F32",
+        ),
+        _ => return None,
+    })
+}
+
 fn source_precision_tensor_bytes(
     raw_data: &[u8],
     dtype: &str,
@@ -7387,21 +7864,190 @@ fn is_embedding_table_name(name: &str) -> bool {
         || name.ends_with("embedding.weight")
 }
 
+/// Does this model store RMSNorm weights in the GemmaRMSNorm convention — raw
+/// `w`, with `(1 + w)` applied at runtime — rather than the effective scale?
+///
+/// Mirrors `hipfire_train::loader::uses_unit_offset_norm`, and reads
+/// `text_config.model_type` too because a VL wrapper nests it. Getting this wrong
+/// is silent (shapes match, the model just degrades), which is why it is a named,
+/// tested predicate rather than an inline condition.
+fn config_uses_unit_offset_norm(config: &serde_json::Value) -> bool {
+    config
+        .get("model_type")
+        .or_else(|| {
+            config
+                .get("text_config")
+                .and_then(|tc| tc.get("model_type"))
+        })
+        .and_then(|v| v.as_str())
+        .is_some_and(|mt| mt.starts_with("qwen3_5") || mt.starts_with("qwen3_next"))
+}
+
+/// `--embed-precision <P>` to the code [`embed_precision_override`] dispatches
+/// on. `None` for an unrecognised value (the caller reports and exits).
+///
+/// **0 is not in this table on purpose.** Code 0 means "unconfigured" — a
+/// library or unit-test caller that never ran `main` — and makes the override
+/// return `None` so the format's own embed handling stands. An explicit
+/// `--embed-precision q8` is a different request and gets its own code, because
+/// "keep the caller's default" is only Q8 on formats whose default embed arm is
+/// Q8. On every bf16-staging format (bf16, qtip3, roughquant) that arm is
+/// source-precision bf16, so mapping explicit q8 to 0 made the flag a silent
+/// no-op there.
+fn embed_precision_code_for(name: &str) -> Option<u8> {
+    Some(match name {
+        "source" | "auto" => 3,
+        "bf16" => 1,
+        "f16" => 2,
+        "hfq4" | "q4" => 4,
+        "q8" => 5,
+        "oq8" => 6,
+        _ => return None,
+    })
+}
+
 /// Embed-table storage override for `--embed-precision`. Returns
 /// `Some((bytes, quant_type, group, label))` when the flag keeps the embed above
 /// Q8, so callers replace their default Q8 embed emission with a source-precision
 /// gather table; returns `None` only for `q8` (code 0 — the caller keeps its Q8
 /// path, which is also what unconfigured library callers get). Group size is 0
-/// (ungrouped source precision). The runtime gathers these via the raw bf16/f16
-/// embedding kernels (f32 in-kernel, portable across RDNA2/3/4).
+/// (ungrouped source precision) except for `hfq4`, which is 256-grouped. The
+/// runtime gathers these via the raw bf16/f16 embedding kernels (f32 in-kernel,
+/// portable across RDNA2/3/4), or `embedding_lookup_hfq4g256` for `hfq4`.
+/// `--embed-sim <codec>`: which candidate codec to round-trip the embed through.
+/// Experiment-only; the artifact stores bf16 either way, so this measures a
+/// candidate's QUALITY without anyone writing a gather kernel for it first.
+fn embed_sim_codec() -> Option<&'static str> {
+    static C: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    C.get_or_init(|| {
+        let args: Vec<String> = std::env::args().collect();
+        arg_value(&args, "--embed-sim").map(|s| s.to_string())
+    })
+    .as_deref()
+}
+
+/// Host dequant for Q8F16 (34 B per 32: f16 scale + 32 int8), plain affine.
+fn dequant_q8f16_host(data: &[u8], n: usize) -> Vec<f32> {
+    const G: usize = 32;
+    const BLK: usize = 34;
+    let mut out = vec![0.0f32; n];
+    for b in 0..n.div_ceil(G) {
+        let off = b * BLK;
+        if off + BLK > data.len() {
+            break;
+        }
+        let scale =
+            hipfire_primitives::conv::f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
+        for j in 0..G {
+            let idx = b * G + j;
+            if idx < n {
+                out[idx] = (data[off + 2 + j] as i8) as f32 * scale;
+            }
+        }
+    }
+    out
+}
+
+/// Host dequant for HFQ4G256 (136 B per 256: f32 scale + f32 min + 128 nibbles).
+fn dequant_hfq4g256_host(data: &[u8], n: usize) -> Vec<f32> {
+    const G: usize = 256;
+    const BLK: usize = 136;
+    let mut out = vec![0.0f32; n];
+    for b in 0..n.div_ceil(G) {
+        let off = b * BLK;
+        if off + BLK > data.len() {
+            break;
+        }
+        let rd = |o: usize| f32::from_le_bytes([data[o], data[o + 1], data[o + 2], data[o + 3]]);
+        let (scale, min_val) = (rd(off), rd(off + 4));
+        for i in 0..128 {
+            let byte = data[off + 8 + i];
+            for (half_i, q) in [(0usize, byte & 0x0f), (1usize, byte >> 4)] {
+                let idx = b * G + 2 * i + half_i;
+                if idx < n {
+                    out[idx] = min_val + q as f32 * scale;
+                }
+            }
+        }
+    }
+    out
+}
+
 fn embed_precision_override(
+    name: &str,
     raw_data: &[u8],
     dtype: &str,
     f32_data: &[f32],
 ) -> Option<(Vec<u8>, QuantType, u32, &'static str)> {
+    // `--rotate` wins over every width below: the rotated embed must reach the
+    // artifact whatever storage width was asked for. bf16/f16/hfq4/q8 all
+    // re-encode from f32 already; only the `source` arm copied raw bytes.
+    if ROTATION_OVERRIDE
+        .get()
+        .is_some_and(|m| m.contains_key(name))
+    {
+        if let Some((bytes, qt, label)) = rotated_source_override(name, dtype) {
+            if embed_precision_code() == 3 {
+                return Some((bytes, qt, 0, label));
+            }
+        }
+    }
+    // `--embed-sim <codec>`: quantize the embedding table through a candidate
+    // codec, immediately DEQUANTIZE it, and store the result at bf16.
+    //
+    // The artifact is then bf16-sized but carries the exact reconstruction error
+    // of that codec, so a KLD score measures the codec's QUALITY end-to-end with
+    // no gather kernel written. Size is computed analytically from the block
+    // layout. This is how a candidate embed format earns a kernel before anyone
+    // writes one — see docs/todo/2026-09-03-the-embed-is-the-one-untreated-tensor.md.
+    if let Some(sim) = embed_sim_codec() {
+        let s1 = gen_fwht_signs(42, 256);
+        let s2 = gen_fwht_signs(1042, 256);
+        let n = f32_data.len();
+        let rt: Vec<f32> = match sim {
+            // Current default for Opus bodies: plain affine int8, group 32.
+            "q8f16" => dequant_q8f16_host(&quantize_q8f16(f32_data), n),
+            // Current 4-bit option: plain affine int4, group 256, UNROTATED.
+            "hfq4" => dequant_hfq4g256_host(&quantize_hfq4g256(f32_data), n),
+            // The rotated twin of hfq4 — identical 136 B/256 layout, FWHT applied.
+            "mq4" => dequant_mq4g256(&quantize_mq4g256(f32_data, &s1, &s2), n, &s1, &s2),
+            // Rotated symmetric int4, 130 B/256 (narrower than mq4).
+            "oq4" => dequant_oq4g256(&quantize_oq4g256(f32_data, &s1, &s2), n, &s1, &s2),
+            // Rotated symmetric int8 / int6 / int3, for the width sweep.
+            "oq8" => dequant_oq8g256(&quantize_oq8g256(f32_data, &s1, &s2), n, &s1, &s2),
+            "oq6" => dequant_oq6g256(&quantize_oq6g256(f32_data, &s1, &s2), n, &s1, &s2),
+            "oq3" => dequant_oq3g256(&quantize_oq3g256(f32_data, &s1, &s2), n, &s1, &s2),
+            other => {
+                eprintln!("--embed-sim: unknown codec {other:?} (q8f16|hfq4|mq4|oq4|oq6|oq8|oq3)");
+                std::process::exit(2);
+            }
+        };
+        let sq = |v: f64| v * v;
+        let err: f64 = f32_data
+            .iter()
+            .zip(&rt)
+            .map(|(a, b)| sq((*a - *b) as f64))
+            .sum::<f64>()
+            / n.max(1) as f64;
+        let energy: f64 = f32_data.iter().map(|a| sq(*a as f64)).sum::<f64>() / n.max(1) as f64;
+        eprintln!(
+            "  --embed-sim {sim}: {name} round-tripped, rel MSE {:.4e} (stored bf16)",
+            err / energy.max(1e-30)
+        );
+        return Some((
+            f32_slice_to_bf16_bytes(&rt),
+            QuantType::BF16,
+            0,
+            "EMBED_SIM",
+        ));
+    }
     match embed_precision_code() {
-        // q8 (and unconfigured library callers): keep the caller's Q8 default.
+        // Unconfigured (library / unit-test callers that never run main): keep
+        // whatever the caller would have done. NOT the same as an explicit
+        // `--embed-precision q8`, which is code 5 below.
         0 => None,
+        // q8 (explicit): emit Q8 whatever the format's own embed arm would be.
+        5 => Some((quantize_q8f16(f32_data), QuantType::Q8F16, 32, "Q8_F16")),
         // bf16 (force): store the table as bf16 regardless of source width. bf16
         // source round-trips losslessly through f32; f16/f32 sources are re-encoded.
         1 => Some((
@@ -7412,6 +8058,43 @@ fn embed_precision_override(
         )),
         // f16 (force): always store as f16 (readers without a bf16 gather path).
         2 => Some((f32_slice_to_f16_bytes(f32_data), QuantType::F16, 0, "F16")),
+        // oq8 (force): the Opus W8A8 gather table (Oq8G256, 258 B/256 = 8.06
+        // stored bits/weight). This is the measured replacement for the Q8F16
+        // default: on Qwen3.5-0.8B with the body held at oq4.25++, round-tripping
+        // the embed through each codec gave KLD 0.044724 for oq8 against 0.044742
+        // for q8f16 — the same quality at 0.44 fewer bits per weight, because
+        // Oq8 is symmetric with one f16 scale per 256 where Q8F16 spends one per
+        // 32. Served by `embedding_lookup_oq8g256`, which rotates back per group.
+        //
+        // It also unifies the tied lm_head with the body's own W8A8 format, so a
+        // model no longer carries a second 8-bit encoding just for the gather.
+        6 => {
+            let s1 = gen_fwht_signs(42, 256);
+            let s2 = gen_fwht_signs(1042, 256);
+            Some((
+                quantize_oq8g256(f32_data, &s1, &s2),
+                QuantType::Oq8G256,
+                256,
+                "OQ8G256",
+            ))
+        }
+        // hfq4 (force): 4-bit affine gather table (HFQ4G256, 136 B/256 =
+        // 4.25 stored bits/weight). The ONE arm here that goes BELOW the Q8
+        // default, and the reason it exists: on a tied-embedding model the embed
+        // table is also the lm_head, and at a 248k vocab it dominates both the
+        // artifact and the decode bandwidth. `embedding_lookup_hfq4g256` gathers
+        // it and `load_weight_tensor_raw` qt 6 serves the tied head from the same
+        // bytes, so nothing new is needed on the runtime side.
+        //
+        // Quant error on the embed is the largest per-tensor KLD cost in a
+        // low-bit model — it seeds the residual UNNORMALIZED — so this is an
+        // explicit opt-in, never a default. Measure before shipping it.
+        4 => Some((
+            quantize_hfq4g256(f32_data),
+            QuantType::HFQ4G256,
+            256,
+            "HFQ4G256",
+        )),
         // source (CLI default): keep the table at its source float precision
         // (bf16 -> bf16, f16 -> f16, f32 -> f32). If the source is ALREADY quantized
         // (e.g. a GGUF / re-quant .hfq with a Q8 embed), keep the caller's default
@@ -7491,14 +8174,31 @@ OPTIONS:
     --beam <N>                 QTIP trellis beam-search width (default 128, near-Viterbi); lower =
                                much faster encode on big models, slight quality loss (env HIPFIRE_QTIP_BEAM)
     --arch-id <U32>            override the auto-detected arch id stamped in the .hfq header
-    --embed-precision <P>      embedding-table storage: source (default) | q8 | bf16 | f16.
+    --embed-precision <P>      embedding-table storage: source (default) | q8 | oq8 | bf16 | f16 | hfq4.
                                Default `source` keeps the gather table at the model's source
                                precision (bf16->bf16, f16->f16, f32->f32); `q8` drops it to the
                                ~500 MB-smaller Q8 table; bf16/f16 force a width. The embed seeds
                                the residual stream unnormalized, so its quant error is the largest
                                per-tensor KLD cost in an otherwise low-bit model — hence keeping it
                                at source by default. Raw bf16/f16 gather converts to f32 in-kernel
-                               (portable RDNA2/3/4).
+                               (portable RDNA2/3/4). `hfq4` is the one setting BELOW q8 (4-bit
+                               HFQ4-G256, 4.25 stored bits/weight): on a tied-embedding model at a
+                               large vocab the table dominates the artifact, and this is the only
+                               way to get an average under 4 bits/weight. Opt-in, measure first.
+    --embed-sim <codec>        EXPERIMENT: round-trip the embed through a candidate codec
+                               (q8f16|hfq4|mq4|oq4|oq6|oq8|oq3) and store the result at bf16.
+                               Measures a candidate gather format's quality end-to-end
+                               without writing a gather kernel for it first.
+    --norm-patch <file.json>   fold recovered RMSNorm weights in, a JSON object mapping
+                               tensor name -> f32 array, as written by `hipfire qat`
+                               (light QAT:
+                               block-local norm recovery against the served artifact's own
+                               dequantized weights). Norms are not quantized, so this only
+                               substitutes their values -- but it must happen HERE rather than by
+                               patching a finished .hfq, because a lossless bf16 recoding
+                               (Bf16Huff) makes the tuned values a different byte length. Values
+                               are in the STORED convention: a (1+w) family expects w, not 1+w.
+                               An entry matching no tensor is fatal, not skipped.
 
   MoE / K-map:
     --kmap-dense               enable K-map promotion on dense models (default: MoE-only)
@@ -7907,16 +8607,13 @@ pub fn main() {
     }
 
     let embed_precision = arg_value(&args, "--embed-precision").unwrap_or("source");
-    let embed_precision_code = match embed_precision {
-        "source" | "auto" => 3u8,
-        "q8" => 0u8,
-        "bf16" => 1u8,
-        "f16" => 2u8,
-        other => {
-            eprintln!("error: --embed-precision must be one of source|q8|bf16|f16 (got '{other}')");
-            std::process::exit(1);
-        }
-    };
+    let embed_precision_code = embed_precision_code_for(embed_precision).unwrap_or_else(|| {
+        eprintln!(
+            "error: --embed-precision must be one of source|q8|bf16|f16|hfq4 \
+             (got '{embed_precision}')"
+        );
+        std::process::exit(1);
+    });
     let _ = EMBED_PRECISION.set(embed_precision_code);
     eprintln!("Embed precision: {embed_precision}");
 
@@ -8890,6 +9587,20 @@ pub fn main() {
     {
         let raw_input = Path::new(input_dir);
         if is_hfq_input(raw_input) {
+            // The SpinQuant pre-pass folds and rotates from the SAFETENSORS tensor
+            // set (it needs `st_files`), so this pipeline never consults it and
+            // `--rotate` here did nothing at all -- no warning, no rotate lines,
+            // an output byte-identical to the unrotated build. Refuse instead:
+            // a flag that is accepted and silently ignored is the failure mode
+            // this file has already produced four times.
+            if arg_value(&args, "--rotate").is_some() {
+                eprintln!(
+                    "error: --rotate is not supported with a .hfq input -- the R1 \
+                     pre-pass reads the safetensors tensor set.\n\
+                     \x20      Quantize from the HF/.hfa source to use it."
+                );
+                std::process::exit(2);
+            }
             let hfq_format = HfqInputFormat::from_flag(format).unwrap_or_else(|| {
                 eprintln!(
                     "HFQ input: --format '{format}' not recognized. \
@@ -9623,8 +10334,16 @@ pub fn main() {
     // after the main tensor loop.
     let mut rotate_lm_head: Option<Vec<f32>> = None;
     if let Some(rotate_path) = arg_value(&args, "--rotate") {
-        if arch_id != 0 && arch_id != 1 {
-            eprintln!("error: --rotate is dense-llama only (arch_id 0/1); got arch_id {arch_id}");
+        // 0/1 dense llama-shaped, 5 qwen3.5 dense (a Gated-DeltaNet/full-attention
+        // hybrid, and a VL wrapper whose decoder lives under
+        // `model.language_model.`). The name table covers both; a layer that
+        // matches no residual reader or writer is a hard error rather than a
+        // partial rotation, so an unlisted arch fails loudly if forced here.
+        if !matches!(arch_id, 0 | 1 | ARCH_ID_QWEN35_DENSE) {
+            eprintln!(
+                "error: --rotate supports arch_id 0/1 (dense llama) and \
+                 {ARCH_ID_QWEN35_DENSE} (qwen3.5 dense); got arch_id {arch_id}"
+            );
             std::process::exit(2);
         }
         match build_rotation_overrides(rotate_path, &config, n_layers, &st_files, &fp8_scale_for) {
@@ -10059,7 +10778,15 @@ pub fn main() {
         // because no forward path consumed them. deepseek4-q8-mtp is the first format
         // that ingests the MTP layer; v3 spec-decode requires it. For other
         // formats we still skip to avoid bloating the HFQ with unused tensors.
-        if name.starts_with("mtp.") && !use_deepseek4_source_precision {
+        // ...unless the caller ASKED for them by prefix. `--include-prefix mtp.`
+        // is documented as the way to build an MTP sidecar, and this skip —
+        // keyed to the deepseek4 FORMATS rather than to intent — silently ate
+        // every tensor it selected. The run then reported `Total params: 0`,
+        // wrote a 14 MB artifact with no weights, and exited 0.
+        let mtp_requested = include_prefix
+            .as_deref()
+            .is_some_and(|p| p.starts_with("mtp."));
+        if name.starts_with("mtp.") && !use_deepseek4_source_precision && !mtp_requested {
             let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
             let n: usize = meta.shape.iter().product();
             skipped_params += n as u64;
@@ -11110,20 +11837,28 @@ pub fn main() {
                     .or(opus_expert_group)
                     .unwrap_or(256),
             );
-            // oq8/oq8+ have no G128 input format yet, so they still need 256. Say so
-            // rather than dropping them silently, which is the defect being fixed.
-            let oq_needs_g256 = use_oq8 || use_oq8_plus;
-            let opus_admits = match opus_expert_group {
-                Some(256) => true,
-                Some(_) => !oq_needs_g256,
-                None => false,
-            };
+            // Every Opus group a K admits is now producible: 256 natively, and
+            // 128 through `Oq4`/`OqPlusCompactG128` or `Oq8G128`. Only a K that
+            // divides by NEITHER has no Opus home.
+            let opus_admits = matches!(opus_expert_group, Some(256) | Some(128));
             if stacked_oq_format.is_some() && !opus_admits {
-                quant_log!(
-                    "  ⚠️  {base_name}: K={inner_k} admits no Opus group for this format \
-                     (oq8/oq8+ need K % 256 == 0); falling back OUT of Opus, which also \
-                     drops calibration for this tensor"
-                );
+                quant_progress.warn(format!(
+                    "  ⚠️  {base_name}: K={inner_k} admits no Opus group (needs K % 128 == 0); \
+                     falling back OUT of Opus, which also drops calibration for this tensor"
+                ));
+            }
+            // A G128 Opus home exists, but not a calibrated one: there is no
+            // 128-point AWQ rotation kernel (`RotationVariant::PlainG128` refuses
+            // the sidecar outright, because AWQ weights ship pre-scaled) and
+            // `oq8_ldlq_pack` asserts K % 256 == 0. Under `oq8+`/`oq8++` the
+            // tensor is therefore quantised plain. Say so: the operator asked
+            // for calibration and this tensor will not get it.
+            if opus_admits && opus_expert_group == Some(128) && use_oq8_plus {
+                quant_progress.warn(format!(
+                    "  ⚠️  {base_name}: K={inner_k} is Opus G128, which has no AWQ rotation \
+                     kernel and no LDLQ pack; quantising PLAIN Oq8G128 (8-bit, uncalibrated) \
+                     rather than the 4-bit HFQ4G128 this used to fall back to"
+                ));
             }
             // Undercovered experts go to W8 rather than source precision, but
             // only where an OQ expert target is actually in play — under a
@@ -11675,13 +12410,13 @@ pub fn main() {
                 let mut awq_sidecar_scales: Option<Vec<f32>> = None;
 
                 let (quantized, qt, gs, label) = if let Some(ov) = is_embed
-                    .then(|| embed_precision_override(&raw_data, &meta.dtype, &f32_data))
+                    .then(|| embed_precision_override(name, &raw_data, &meta.dtype, &f32_data))
                     .flatten()
                 {
-                    // --embed-precision bf16|f16: keep the gather table at source
-                    // precision instead of dropping it to Q8. No-op (None) under
-                    // the default q8, so every format's Q8 embed arm below is
-                    // unchanged then.
+                    // --embed-precision: the operator's explicit choice for the
+                    // gather table wins over this format's own embed arm below.
+                    // None only when UNCONFIGURED, so every format's default embed
+                    // handling is unchanged when the flag is absent.
                     ov
                 } else if use_bf16 {
                     let (data, qt, label) =
@@ -12733,8 +13468,15 @@ pub fn main() {
                 data: quantized,
                 spilled_len: 0,
             });
-        } else if (use_bf16 || (is_vision && vision_quant == "bf16")) && meta.dtype == "BF16" {
+        } else if (use_bf16 || (is_vision && vision_quant == "bf16"))
+            && meta.dtype == "BF16"
+            && !ROTATION_OVERRIDE
+                .get()
+                .is_some_and(|m| m.contains_key(*name))
+        {
             // Store original BF16 bytes losslessly in source-precision containers.
+            // Skipped when `--rotate` has an override: raw bytes are the UNROTATED
+            // weight, and the later override arm re-encodes the rotated f32.
             quantized_params += n_elements as u64;
             let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
             let scope = if is_vision && vision_quant == "bf16" {
@@ -12871,8 +13613,14 @@ pub fn main() {
     // per-format weight-codec branch. The runtime prefers an explicit lm_head.weight
     // over the tied embedding (see hfq.rs loader), so this deploys the rotated head.
     if let Some(lm) = rotate_lm_head.take() {
+        // Same text_config fallback the pre-pass uses: a VL wrapper nests it.
         let h = config
             .get("hidden_size")
+            .or_else(|| {
+                config
+                    .get("text_config")
+                    .and_then(|tc| tc.get("hidden_size"))
+            })
             .and_then(|v| v.as_u64())
             .expect("hidden_size (validated in --rotate pre-pass)") as usize;
         let vocab = lm.len() / h;
@@ -12910,6 +13658,26 @@ pub fn main() {
     } else {
         0.0
     };
+
+    // An artifact with no weights is never what anyone asked for, and it is
+    // indistinguishable from success at the shell: `--include-prefix mtp.` used
+    // to select every MTP tensor, hand them to a skip rule keyed on the
+    // deepseek4 formats, and report "Total params: 0 ... Done: 14.3 MB written"
+    // with exit 0. Refuse instead, and name the selection that emptied the run.
+    if total_params == 0 {
+        eprintln!("\n=== Quantization Summary ===");
+        eprintln!("  Skipped params:   {skipped_params}");
+        eprintln!("  Total params:     0");
+        let selector = match include_prefix.as_deref() {
+            Some(p) => format!("--include-prefix {p}"),
+            None => "the current format/skip rules".to_string(),
+        };
+        eprintln!(
+            "\nERROR: no tensor survived selection ({selector}), so the artifact \
+             would contain no weights. Nothing was written."
+        );
+        std::process::exit(2);
+    }
 
     eprintln!("\n=== Quantization Summary ===");
     if skipped_params > 0 {
@@ -14101,6 +14869,8 @@ pub fn main() {
             "gemma3: baked +1.0 into {n_baked} RMSNorm weight tensors (zero-centered (1+w) convention)"
         );
     }
+
+    apply_norm_patch(&args, &mut hfq_tensors);
 
     // qtip3 (real) post-pass: pack every eligible 2D BF16 weight into
     // QuantType::Qtip3G256 records (rotated-frame 3-bit trellis symbols + scale,
@@ -18063,6 +18833,168 @@ mod codec_golden {
         h("hfq2g128", &quantize_hfq2g128(&x));
         h("hfp4g32_2d", &quantize_hfp4g32_2d(&x, m, k));
         out
+    }
+
+    /// `--rotate` folds RMSNorm into its readers, so it must know whether the
+    /// stored weight IS the scale (llama) or whether the runtime adds 1 first
+    /// (Qwen3.5 / Qwen3-Next, per qwen35/loading.rs:4530). Guessing wrong is
+    /// silent: measured on Qwen3.5-0.8B, oq8++ scored kld 0.000676 unrotated and
+    /// 20.43 rotated while this predicate was missing.
+    #[test]
+    fn unit_offset_norm_families() {
+        let j = |v: serde_json::Value| config_uses_unit_offset_norm(&v);
+        // Qwen3.5 and Qwen3-Next store raw w.
+        assert!(j(serde_json::json!({"model_type": "qwen3_5"})));
+        assert!(j(serde_json::json!({"model_type": "qwen3_5_text"})));
+        assert!(j(serde_json::json!({"model_type": "qwen3_next"})));
+        // A VL wrapper nests the text config; the top level says "qwen3_5" here
+        // but the nested form must be found on its own too.
+        assert!(j(
+            serde_json::json!({"text_config": {"model_type": "qwen3_5_text"}})
+        ));
+        // Llama-shaped models store the effective scale — must stay false, or
+        // --rotate would start double-counting a +1 on arch 0/1.
+        assert!(!j(serde_json::json!({"model_type": "llama"})));
+        assert!(!j(serde_json::json!({"model_type": "qwen2"})));
+        assert!(!j(serde_json::json!({"model_type": "qwen3"})));
+        assert!(!j(serde_json::json!({})));
+    }
+
+    /// `H → R1 H R1ᵀ` must be a congruence by an ORTHOGONAL matrix: symmetry and
+    /// trace are preserved, `R1 = I` is the identity, and it agrees with the naive
+    /// triple loop. Worth pinning because the fast path is two separate blocked
+    /// passes (`R1·H` then `·R1ᵀ`) and a transposed index in either one still
+    /// produces a plausible symmetric matrix — it just optimizes in the wrong
+    /// basis, which is exactly the failure this transform exists to fix.
+    #[test]
+    fn hessian_congruence_is_orthogonal_and_matches_naive() {
+        let k = 8usize;
+        // A symmetric PSD H (H = AᵀA), and an orthogonal R1 (a 8-point FWHT block).
+        let a: Vec<f32> = (0..k * k)
+            .map(|i| ((i * 37 % 19) as f32 - 9.0) / 5.0)
+            .collect();
+        let mut h = vec![0.0f32; k * k];
+        for i in 0..k {
+            for j in 0..k {
+                h[i * k + j] = (0..k).map(|t| a[t * k + i] * a[t * k + j]).sum();
+            }
+        }
+        let mut r = vec![0.0f32; k * k];
+        for i in 0..k {
+            for j in 0..k {
+                let par = (i & j).count_ones() % 2;
+                r[i * k + j] = if par == 0 { 1.0 } else { -1.0 } / (k as f32).sqrt();
+            }
+        }
+        let out = rotate_hessian_congruence(&h, &r, k);
+
+        // naive reference: out[i,j] = Σ_a Σ_b R[i,a] H[a,b] R[j,b]
+        let mut want = vec![0.0f32; k * k];
+        for i in 0..k {
+            for j in 0..k {
+                let mut acc = 0.0f32;
+                for x in 0..k {
+                    for y in 0..k {
+                        acc += r[i * k + x] * h[x * k + y] * r[j * k + y];
+                    }
+                }
+                want[i * k + j] = acc;
+            }
+        }
+        for (o, w) in out.iter().zip(want.iter()) {
+            assert!((o - w).abs() < 1e-3, "fast path != naive: {o} vs {w}");
+        }
+        // symmetry
+        for i in 0..k {
+            for j in 0..k {
+                assert!(
+                    (out[i * k + j] - out[j * k + i]).abs() < 1e-3,
+                    "congruence must stay symmetric"
+                );
+            }
+        }
+        // trace is invariant under an orthogonal congruence
+        let tr_in: f32 = (0..k).map(|i| h[i * k + i]).sum();
+        let tr_out: f32 = (0..k).map(|i| out[i * k + i]).sum();
+        assert!(
+            (tr_in - tr_out).abs() / tr_in.abs().max(1.0) < 1e-3,
+            "trace must be preserved: {tr_in} vs {tr_out}"
+        );
+        // R1 = I is the identity transform
+        let mut eye = vec![0.0f32; k * k];
+        for i in 0..k {
+            eye[i * k + i] = 1.0;
+        }
+        let same = rotate_hessian_congruence(&h, &eye, k);
+        for (o, w) in same.iter().zip(h.iter()) {
+            assert!((o - w).abs() < 1e-4, "R1=I must leave H unchanged");
+        }
+    }
+
+    /// Every `--embed-precision` value maps to a DISTINCT non-zero code.
+    ///
+    /// Regression: `q8` used to map to 0, the same code an unconfigured library
+    /// caller gets, which makes `embed_precision_override` return `None` ("keep
+    /// the caller's default"). On oq4/oq8 that default happens to be Q8 so the
+    /// flag appeared to work; on every bf16-staging format (bf16, qtip3,
+    /// roughquant) the default is source-precision bf16, so an explicit
+    /// `--embed-precision q8` silently produced a bf16 embed. Measured on
+    /// Qwen3.5-0.8B: `--format qtip3` with `--embed-precision q8` and with
+    /// `bf16` emitted byte-identical 479,622,157-byte artifacts.
+    #[test]
+    fn embed_precision_codes_are_distinct_and_nonzero() {
+        let names = ["source", "auto", "q8", "bf16", "f16", "hfq4", "q4"];
+        let mut seen = std::collections::HashMap::new();
+        for n in names {
+            let c = embed_precision_code_for(n)
+                .unwrap_or_else(|| panic!("--embed-precision {n} must be accepted"));
+            assert_ne!(c, 0, "{n} must not reuse the unconfigured code 0");
+            seen.insert(n, c);
+        }
+        // Aliases agree; distinct requests differ.
+        assert_eq!(seen["source"], seen["auto"]);
+        assert_eq!(seen["hfq4"], seen["q4"]);
+        for (a, b) in [
+            ("q8", "bf16"),
+            ("q8", "source"),
+            ("q8", "hfq4"),
+            ("bf16", "f16"),
+            ("bf16", "hfq4"),
+            ("source", "hfq4"),
+        ] {
+            assert_ne!(seen[a], seen[b], "{a} and {b} must be distinguishable");
+        }
+        assert_eq!(embed_precision_code_for("nonsense"), None);
+    }
+
+    /// `--embed-precision hfq4` emits bytes the qwen35 loader's qt-6 arm can
+    /// actually serve. The arm is only correct if all three agree: the codec's
+    /// output length, `QuantType::HFQ4G256`'s declared block size, and the qt
+    /// code the loader keys on. A mismatch here is a model that quantizes fine
+    /// and then fails (or worse, silently mis-reads) at load.
+    #[test]
+    fn embed_precision_hfq4_matches_loader_contract() {
+        // The tied-embedding case this exists for: a vocab-shaped gather table.
+        let (rows, dim) = (512usize, 1024usize);
+        let x: Vec<f32> = (0..rows * dim)
+            .map(|i| ((i % 97) as f32 - 48.0) / 48.0)
+            .collect();
+        let packed = quantize_hfq4g256(&x);
+
+        // 136 B per 256-weight group == 4.25 stored bits/weight.
+        assert_eq!(QuantType::HFQ4G256.block_bytes(), Some(136));
+        assert_eq!(packed.len(), (rows * dim / 256) * 136);
+        assert_eq!(
+            QuantType::HFQ4G256.tensor_bytes(rows * dim),
+            Some(packed.len())
+        );
+        // qt 6 is what `load_weight_tensor_raw` and `EmbeddingFormat::HFQ4G256`
+        // both key on; the override arm hands back this QuantType by name, so
+        // pin the code the runtime actually sees.
+        assert_eq!(QuantType::HFQ4G256.code(), 6);
+        // 4.25 bits/weight, the number the sub-4-bit budget is built on.
+        let bits = (packed.len() * 8) as f64 / (rows * dim) as f64;
+        assert!((bits - 4.25).abs() < 1e-9, "stored bits/weight = {bits}");
     }
 
     #[test]

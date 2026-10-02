@@ -828,6 +828,49 @@ impl ContinuousWorkScheduler {
         self.active.remove(&lease_id)
     }
 
+    /// Remove up to `limit` queued workloads a RUNNING batch can absorb: same
+    /// `class` and `microbatch_key`, priority at least as urgent as the batch's
+    /// (`priority <= max_priority`), never exclusive. Most urgent bucket first,
+    /// FIFO within a bucket. No lease is granted — the running batch's lease
+    /// already holds the GPU turn — so callers must only take work whose
+    /// resources the running batch covers (text workloads carry none).
+    ///
+    /// This is mid-cycle admission: without it a batch admits nobody until every
+    /// request in it finishes, so a same-priority request arriving a moment after
+    /// a long generation started waits for all of it.
+    /// ponytail: FIFO within a bucket, not the owner round-robin `next_batch`
+    /// uses; matters only when one owner floods a bucket mid-cycle.
+    pub fn take_microbatch_compatible(
+        &mut self,
+        class: WorkloadClass,
+        microbatch_key: &str,
+        max_priority: u8,
+        limit: usize,
+    ) -> Vec<WorkloadSpec> {
+        let mut taken = Vec::new();
+        for bucket in self.buckets.iter_mut().take(max_priority as usize + 1) {
+            let mut index = 0;
+            while index < bucket.len() && taken.len() < limit {
+                let w = &bucket[index];
+                if !w.exclusive
+                    && w.class == class
+                    && w.microbatch_key.as_deref() == Some(microbatch_key)
+                {
+                    taken.push(bucket.remove(index));
+                } else {
+                    index += 1;
+                }
+            }
+            if taken.len() >= limit {
+                break;
+            }
+        }
+        for w in &taken {
+            self.queued_ids.remove(&w.id);
+        }
+        taken
+    }
+
     /// The priority bucket the next `next_batch` call would draw from (honouring
     /// aging), without removing anything. Lower = served sooner. A running batch
     /// polls this to decide whether a higher-priority workload is waiting: if the
@@ -1934,6 +1977,49 @@ impl PriorityPrefillScheduler {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_running_batch_takes_only_compatible_work_at_its_priority_or_better() {
+        let mut s = ContinuousWorkScheduler::new(continuous_capacity(), 32, 0);
+        let text = |id: &str, pri: u8, key: &str| {
+            WorkloadSpec::microbatchable(
+                id,
+                WorkloadClass::TokenPrefill,
+                pri,
+                0,
+                WorkloadResources::default(),
+                key,
+                16,
+            )
+        };
+        s.enqueue(text("late-urgent", 10, "w1")).unwrap();
+        s.enqueue(text("same-1", 64, "w1")).unwrap();
+        s.enqueue(text("other-model", 64, "w2")).unwrap();
+        s.enqueue(text("same-2", 64, "w1")).unwrap();
+        s.enqueue(text("background", 128, "w1")).unwrap();
+        let taken: Vec<String> = s
+            .take_microbatch_compatible(WorkloadClass::TokenPrefill, "w1", 64, 8)
+            .into_iter()
+            .map(|w| w.id)
+            .collect();
+        // Most urgent first, FIFO within a priority; the other worker's request
+        // and the less urgent one stay queued.
+        assert_eq!(taken, vec!["late-urgent", "same-1", "same-2"]);
+        let rest: Vec<String> = std::iter::from_fn(|| s.next_batch(0))
+            .flat_map(|lease| lease.workloads.into_iter().map(|w| w.id))
+            .collect();
+        assert_eq!(rest.len(), 2);
+        assert!(rest.contains(&"other-model".to_string()));
+        assert!(rest.contains(&"background".to_string()));
+        // The limit is honoured.
+        s.enqueue(text("a", 64, "w1")).unwrap();
+        s.enqueue(text("b", 64, "w1")).unwrap();
+        assert_eq!(
+            s.take_microbatch_compatible(WorkloadClass::TokenPrefill, "w1", 64, 1)
+                .len(),
+            1
+        );
+    }
 
     // Force-links the arch `-spec` crates so their `register_arch!`
     // registrations survive rlib pruning and `ArchRegistry` is populated —

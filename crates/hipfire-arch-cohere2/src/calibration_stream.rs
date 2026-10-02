@@ -1622,6 +1622,10 @@ pub(crate) fn forward_resident_token(
     }
     let hip = |error: hip_bridge::HipError| CalibError::Runtime(error.to_string());
     match weights.embedding_format {
+        EmbeddingFormat::Oq8G256 => panic!(
+            "Oq8G256 embedding gather is wired for qwen3.5 only; this arch has no \
+             oq8 gather path. Rebuild the artifact with --embed-precision q8."
+        ),
         EmbeddingFormat::HFQ4G256 => gpu.embedding_lookup_hfq4g256(
             &weights.token_embedding,
             &state.embedding,

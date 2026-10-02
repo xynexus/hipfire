@@ -402,6 +402,7 @@ fn load_lm_head(
             EmbeddingFormat::HFQ4G256 => DType::HFQ4G256,
             EmbeddingFormat::HFQ4G128 => DType::HFQ4G128,
             EmbeddingFormat::Q8_0 => DType::Q8_0,
+            EmbeddingFormat::Oq8G256 => DType::Oq8G256,
             // BF16/F16 gather tables are kept raw for the embedding lookup, but the
             // tied lm_head matmul consumes an F32-decoded copy (info.quant_type
             // 16/1 -> decode_direct_f32 below), matching the pre-existing direct
@@ -1050,6 +1051,9 @@ fn embed_token_into_x(
         }
         EmbeddingFormat::Q8_0 => {
             gpu.embedding_lookup_q8(&weights.token_embd, &state.x, token, dim)?
+        }
+        EmbeddingFormat::Oq8G256 => {
+            gpu.embedding_lookup_oq8g256(&weights.token_embd, &state.x, token, dim)?
         }
         EmbeddingFormat::BF16 => {
             gpu.embedding_lookup_bf16(&weights.token_embd, &state.x, token, dim)?

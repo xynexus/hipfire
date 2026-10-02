@@ -1801,6 +1801,7 @@ version = "0.3.0"
 dependencies = [
  "hipfire-arch-api",
  "hipfire-arch-qwen4exp-spec",
+ "hipfire-model",
  "hipfire-quant-format",
  "hipfire-rdna",
  "hipfire-runtime",

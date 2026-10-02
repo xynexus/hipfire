@@ -453,6 +453,17 @@ pub struct GenerateBatchPrefillSession {
     /// last unrelated `generate` left behind.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub raw: Option<bool>,
+    /// Tokens the caller may generate after this prefill. With it a new session's
+    /// KV is sized to `prompt + max_tokens` instead of the model's full context;
+    /// `None` keeps the full size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_tokens: Option<usize>,
+    /// Absolute prompt positions (chat-turn boundaries) to checkpoint in
+    /// addition to the default ones. An attached session otherwise checkpoints
+    /// only its last boundary, which is its own; the server asks for the deepest
+    /// boundary it shares with a sibling, so the siblings can attach it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub checkpoint_at: Vec<usize>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize, Eq, PartialEq)]
@@ -653,6 +664,20 @@ pub struct Qwen35DecodeTokenOutcome {
     pub token: u32,
     pub text: String,
     pub stop: bool,
+    /// The stop is the token budget running out, not the model ending its turn.
+    /// `stop` alone cannot say which, so a truncated reply was reported as done.
+    pub by_length: bool,
+}
+
+impl Qwen35DecodeTokenOutcome {
+    /// OpenAI-style reason for a stopped session; `None` while still decoding.
+    pub fn finish_reason(&self) -> Option<&'static str> {
+        match (self.stop, self.by_length) {
+            (false, _) => None,
+            (true, true) => Some("length"),
+            (true, false) => Some("stop"),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -895,10 +920,29 @@ pub fn validate_generate_batch_prefill(
         // optional `"raw"`. Absent → None → auto, which is the behaviour a batch
         // prefill should have had all along instead of inheriting a thread-local.
         let raw = session.get("raw").and_then(|v| v.as_bool());
+        let max_tokens = session
+            .get("params")
+            .and_then(|p| p.get("max_tokens"))
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+
+        let checkpoint_at = session
+            .get("params")
+            .and_then(|p| p.get("checkpoint_at"))
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .collect()
+            })
+            .unwrap_or_default();
 
         parsed_sessions.push(GenerateBatchPrefillSession {
             id: session_id.to_string(),
             raw,
+            max_tokens,
+            checkpoint_at,
             prompt: session
                 .get("prompt")
                 .and_then(|v| v.as_str())
@@ -1196,8 +1240,10 @@ pub fn qwen35_generate_batch_prefill_session_done_json(
                 serde_json::json!({
                     "checkpoint_id": checkpoint_id,
                     "checkpoint_runtime_state": "attachable",
-                    "logical_position": checkpoint.prefix_len,
-                    "cached_prefix_tokens": checkpoint.prefix_len,
+                    // Absolute: `checkpoint.prefix_len` is relative to the tokens
+                    // prefilled, which start after any prefix the session attached.
+                    "logical_position": checkpoint.hash.prefix_len,
+                    "cached_prefix_tokens": checkpoint.hash.prefix_len,
                     "prefix_hash": generate_prefix_hash_json(&checkpoint.hash),
                     "prefix_len": checkpoint.hash.prefix_len,
                     "boundary": checkpoint.boundary,
@@ -1664,10 +1710,25 @@ mod tests {
     use super::*;
     use hipfire_model::{ARCH_ID_QWEN35_DENSE, ARCH_ID_QWEN35_MOE};
 
+    #[test]
+    fn a_budget_stop_is_reported_as_length_not_stop() {
+        let outcome = |stop, by_length| Qwen35DecodeTokenOutcome {
+            token: 0,
+            text: String::new(),
+            stop,
+            by_length,
+        };
+        assert_eq!(outcome(false, false).finish_reason(), None);
+        assert_eq!(outcome(true, false).finish_reason(), Some("stop"));
+        assert_eq!(outcome(true, true).finish_reason(), Some("length"));
+    }
+
     fn prefill_session(id: &str) -> GenerateBatchPrefillSession {
         GenerateBatchPrefillSession {
             id: id.to_string(),
             raw: None,
+            max_tokens: None,
+            checkpoint_at: Vec::new(),
             prompt: Some("hello".to_string()),
             suffix_tokens: None,
             system_prompt: None,

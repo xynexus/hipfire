@@ -175,6 +175,44 @@ pub fn parse_hfq(bytes: &[u8]) -> Result<(Vec<HfqEntry>, String), String> {
 }
 
 /// Is this tensor one of the RMSNorm weights recovery tunes?
+/// The metadata a caller actually wants, following the `tail_metadata` pointer
+/// when the container has one.
+///
+/// `parse_hfq` returns the HEADER metadata JSON, which on a modern artifact
+/// carries provenance (`architecture`, hashes, parameter counts) but NOT the
+/// model config — that moved into a tail block, alongside the tokenizer, at
+/// `tail_metadata.{offset,size}`. A consumer reading `hidden_size` from the
+/// header silently gets nothing and computes with zeros, so resolve the pointer
+/// here and hand back the tail's inner `metadata` object when it is present.
+///
+/// Falls back to `header` unchanged for older containers, an absent or
+/// malformed pointer, or an out-of-range slice.
+pub fn effective_metadata(bytes: &[u8], header: &str) -> String {
+    let Ok(hj) = serde_json::from_str::<serde_json::Value>(header) else {
+        return header.to_string();
+    };
+    let Some(tail) = hj.get("tail_metadata") else {
+        return header.to_string();
+    };
+    let (Some(off), Some(size)) = (
+        tail.get("offset").and_then(|v| v.as_u64()),
+        tail.get("size").and_then(|v| v.as_u64()),
+    ) else {
+        return header.to_string();
+    };
+    let (off, size) = (off as usize, size as usize);
+    if off.saturating_add(size) > bytes.len() {
+        return header.to_string();
+    }
+    match serde_json::from_slice::<serde_json::Value>(&bytes[off..off + size]) {
+        Ok(t) => t
+            .get("metadata")
+            .map(|m| m.to_string())
+            .unwrap_or_else(|| header.to_string()),
+        Err(_) => header.to_string(),
+    }
+}
+
 pub fn is_norm(name: &str) -> bool {
     name.ends_with(".input_layernorm.weight")
         || name.ends_with(".post_attention_layernorm.weight")

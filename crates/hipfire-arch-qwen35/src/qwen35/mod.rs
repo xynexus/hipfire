@@ -1180,6 +1180,15 @@ fn is_batchable_la(dt: DType, arch: &str, allow_compact: bool) -> bool {
         // models unaffected because no production checkpoint sets
         // wqkv.gpu_dtype = ParoQ4G128 outside the shisa-PARO codepath.
         | DType::ParoQ4G128 | DType::F32 | DType::F16
+        // Qtip3G256: batched arms exist (gemm_qtip3g256 + the FA QKV arm in
+        // prefill_lowered). Without this line those arms are unreachable — this
+        // predicate is the FOURTH admission list a dtype must appear in
+        // (is_batchable_la -> pbs_eligible -> the rotation list -> the branch
+        // chain), and being absent from any one of them is silent. Measured
+        // before it: a qtip3 body prefilled at 234 tok/s against 2128 for an
+        // oq4.25++ body of the same model, with the correctly-wired arms below
+        // never called. See docs/todo/2026-09-02-prefill-lowered-dispatch-table.md.
+        | DType::Qtip3G256
         // BF16 was excluded on gfx1151 by the BUG-001 guard: the batched
         // FullAttention BF16 q/k/v projection was reported to inflate `fa_q`
         // ~9x there, so BF16 prefill was routed through the per-token
@@ -2924,6 +2933,32 @@ fn run_plain_gemm_key(
              fallthrough with no compact arm; it would be decoded as another \
              format on an unrotated activation. Unset HIPFIRE_OQ_COMPACT_RESIDENT \
              for this model, or wire the compact arm at the call site.",
+        ));
+    }
+    // Qtip3G256 has exactly the same exposure and no arm here either: its 100 B
+    // trellis blocks would be decoded as HFQ4/Q8 by the fallthrough key, and a
+    // dtype absent from a call site's chain is also absent from that site's
+    // rotation-admission list, so the activation arrives unrotated too. Today it
+    // is routed away from the lowered prefill entirely (which is why a qtip3
+    // body prefills per-token at ~233 tok/s but scores correctly), so this is
+    // latent rather than live -- and it is precisely the trap waiting for the
+    // next person who wires the lowered path halfway.
+    if w_dtype == DType::Qtip3G256
+        && !matches!(
+            key,
+            hipfire_dispatch::types::KernelKey::GemmQtip3G256
+                | hipfire_dispatch::types::KernelKey::GemmQtip3G256Residual
+        )
+    {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "Qtip3G256 reached a KernelKey GEMM fallthrough with no qtip3 arm \
+                 (key={key:?} m={m} k={k} n={n}); its trellis blocks would be \
+                 decoded as another format on an unrotated activation. Wire the \
+                 qtip3 arm at the call site (the batched kernel is \
+                 gemm_qtip3g256) rather than relying on the fallthrough key."
+            ),
         ));
     }
 
@@ -5144,6 +5179,12 @@ mod tests {
         validate_dense_prefill_session_batch_state_signatures(&[q8, q8])
             .expect("matching signatures are batchable");
 
+        // Sessions sized to their own prompt + max_tokens still batch together.
+        let mut different_cap = q8;
+        different_cap.kv_physical_cap = 1152;
+        validate_dense_prefill_session_batch_state_signatures(&[q8, different_cap])
+            .expect("capacity is per session, not a batch property");
+
         let mut different_compact_offset = q8;
         different_compact_offset.kv_compact_offset = 16;
         let err =
@@ -5400,16 +5441,9 @@ mod tests {
         assert_eq!(plan.total_rows, 6);
         assert_eq!(plan.max_rows_per_round, 3);
         assert_eq!(plan.multi_state_rounds, 2);
-        assert_eq!(plan.multi_state_prefix_rounds, 2);
-        assert_eq!(plan.multi_state_prefix_rows, 5);
-        assert_eq!(
-            plan.singleton_tail,
-            Some(DensePrefillSessionBatchSingletonTail {
-                start_round: 2,
-                session_index: 0,
-                rows: 1,
-            })
-        );
+        // The ragged tail (round 2: session 0 alone) runs fused with the rest.
+        assert_eq!(plan.multi_state_prefix_rounds, 3);
+        assert_eq!(plan.multi_state_prefix_rows, 6);
         assert_eq!(plan.rounds.len(), 3);
         assert_eq!(plan.rounds[0].rows.len(), 3);
         assert_eq!(plan.rounds[1].rows.len(), 2);
@@ -5450,7 +5484,6 @@ mod tests {
         assert_eq!(plan.multi_state_rounds, 2);
         assert_eq!(plan.multi_state_prefix_rounds, 2);
         assert_eq!(plan.multi_state_prefix_rows, 4);
-        assert_eq!(plan.singleton_tail, None);
         assert_eq!(
             plan.state_routes,
             vec![
@@ -5477,7 +5510,6 @@ mod tests {
         assert_eq!(single.total_rows, 2);
         assert_eq!(single.multi_state_prefix_rounds, 2);
         assert_eq!(single.multi_state_prefix_rows, 2);
-        assert_eq!(single.singleton_tail, None);
 
         let ragged = build_calibration_session_batch_execution_plan(
             &[
@@ -5500,7 +5532,6 @@ mod tests {
         assert_eq!(ragged.total_rows, 6);
         assert_eq!(ragged.multi_state_prefix_rounds, 3);
         assert_eq!(ragged.multi_state_prefix_rows, 6);
-        assert_eq!(ragged.singleton_tail, None);
         let route_shape = DensePrefillSessionStateRouteShape {
             kv_k_layers: 1,
             kv_v_layers: 1,
@@ -5864,8 +5895,8 @@ mod tests {
             dense_prefill_session_batch_pointer_table_shape(&plan, route_shape, 3, 0),
             DensePrefillSessionBatchPointerTableShape {
                 sessions: 3,
-                multi_state_prefix_rounds: 2,
-                multi_state_prefix_rows: 5,
+                multi_state_prefix_rounds: 3,
+                multi_state_prefix_rows: 6,
                 max_rows_per_round: 3,
                 kv_k_ptrs: 12,
                 kv_v_ptrs: 12,
@@ -5875,9 +5906,9 @@ mod tests {
                 dn_conv_ptrs: 6,
                 logits_ptrs: 3,
                 session_last_row_indices: 3,
-                row_session_indices: 5,
-                row_tokens: 5,
-                row_positions: 5,
+                row_session_indices: 6,
+                row_tokens: 6,
+                row_positions: 6,
             }
         );
     }
@@ -5971,13 +6002,23 @@ mod tests {
                     token: 31,
                     position: 3,
                 },
+                // The ragged tail: session 0 alone in round 2.
+                DensePrefillSessionBatchPrefixRowSlot {
+                    round_index: 2,
+                    round_row_index: 0,
+                    session_index: 0,
+                    token_index: 2,
+                    token: 12,
+                    position: 6,
+                },
             ]
         );
-        assert_eq!(tables.session_last_row_indices, vec![3, 1, 4]);
+        // Session 0 ends on its tail row (5), not on token 11 (3).
+        assert_eq!(tables.session_last_row_indices, vec![5, 1, 4]);
         let (tokens, positions) =
             dense_prefill_session_batch_prefix_tokens_positions(&tables).unwrap();
-        assert_eq!(tokens, vec![10, 20, 30, 11, 31]);
-        assert_eq!(positions, vec![4, 9, 2, 5, 3]);
+        assert_eq!(tokens, vec![10, 20, 30, 11, 31, 12]);
+        assert_eq!(positions, vec![4, 9, 2, 5, 3, 6]);
     }
 
     #[test]
@@ -6122,10 +6163,13 @@ mod tests {
         assert_eq!(tables.dn_scale_ptrs, vec![0x4000, 0x4001, 0xA000, 0xA001]);
         assert_eq!(tables.dn_conv_ptrs, vec![0x5000, 0x5001, 0xB000, 0xB001]);
         assert_eq!(tables.logits_ptrs, vec![0x6000, 0xC000]);
-        assert_eq!(tables.session_last_row_indices, vec![0, 1]);
-        assert_eq!(tables.row_session_indices, vec![0, 1]);
-        assert_eq!(tables.row_tokens, vec![10, 20]);
-        assert_eq!(tables.row_positions, vec![4, 9]);
+        // Session 0's ragged tail (token 11) is a row too, and its logits come
+        // from it — the old plan dropped the row and read session 0's logits
+        // off its FIRST prompt token (last-row index 0).
+        assert_eq!(tables.session_last_row_indices, vec![2, 1]);
+        assert_eq!(tables.row_session_indices, vec![0, 1, 0]);
+        assert_eq!(tables.row_tokens, vec![10, 20, 11]);
+        assert_eq!(tables.row_positions, vec![4, 9, 5]);
     }
 
     #[test]

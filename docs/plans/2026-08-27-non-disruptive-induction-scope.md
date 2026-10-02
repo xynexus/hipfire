@@ -82,13 +82,26 @@ so it is co-resident-ready now.
 `quantize_oq4g256` codec as a differentiable fp32→fp32 round-trip, with
 `oq3_simquant`/`oq8_simquant` siblings and `a4_quant.rs` for the activation side.
 But **every caller lives in `examples/`** — `qat_w3_kvarn.rs`,
-`w3_codec_compare.rs`, `qwen35_mlp_norm_recovery.rs`. Nothing in `block.rs`,
+`w3_codec_compare.rs`, `qwen35_mlp_norm_recovery.rs` (since renamed
+`qwen35_norm_recovery.rs`; see the SUPERSEDED note at the end of this section). Nothing in `block.rs`,
 `train_loop.rs`, or `model.rs` calls them, and unlike `kv_noise` there is **no
 env gate**. `examples/qat_w3_kvarn.rs` is the closest thing to the target
 harness — frozen Oq3-fake-quantized weights, trainable LoRA(q/v)+RMSNorm,
 KL-distilled against a clean fp32 teacher, scored in-sample *and* held-out — but
 it is a standalone GPU binary that wants `hipfire lock acquire`, which deadlocks
 against a serving daemon.
+
+> **SUPERSEDED (2026-09-03).** "Not reachable" was right about *weight* QAT and
+> wrong about the reachable form. Norms are not quantized, so there is nothing to
+> requantize: block-local RMSNorm recovery ships through
+> `hipfire-quantize --norm-patch`, and `qwen35_mlp_norm_recovery.rs` is now
+> `qwen35_norm_recovery.rs` — student weights dequantized from the served
+> artifact, both norms per layer, and a build-time fold. Measured on
+> Qwen3.5-0.8B-e4--qtip3g: mean KLD flat, perplexity ~0.6% better, reproduced
+> across two captures. Recovering the FINAL norm measures far better locally and
+> deploys worse, so it is off by default. Full numbers in
+> `docs/plans/2026-09-02-qwen35-0.8b-sub4bit-induction-RESULT.md` and the "Light
+> QAT" section of `docs/QUANTIZE.md`.
 
 ---
 

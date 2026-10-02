@@ -618,9 +618,15 @@ fn accumulate_gamma_dense_mlp(
 pub fn gamma_by_layer(table: &HashMap<String, f32>) -> Vec<(usize, Vec<(String, f32)>)> {
     let mut by: HashMap<usize, Vec<(String, f32)>> = HashMap::new();
     for (k, &v) in table {
+        // Match ANY `...layers.<N>.` prefix. Hardcoding `model.layers.` silently
+        // dropped every tensor on a wrapped decoder (Qwen3.5-VL names them
+        // `model.language_model.layers.N.`), so the per-layer report came back
+        // empty while the gamma table itself was full -- precisely the
+        // "silently produced nothing looks like a pass" failure this report
+        // exists to catch.
         let layer = k
-            .strip_prefix("model.layers.")
-            .and_then(|r| r.split('.').next())
+            .rsplit_once("layers.")
+            .and_then(|(_, r)| r.split('.').next())
             .and_then(|n| n.parse::<usize>().ok());
         if let Some(l) = layer {
             by.entry(l).or_default().push((k.clone(), v));

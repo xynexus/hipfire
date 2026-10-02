@@ -221,21 +221,36 @@ gpu_held_by_local_daemon() {
     [ -r "$lock" ] || return 1
     local line
     line=$(cat "$lock" 2>/dev/null) || return 1
-    # `daemon resource=hip-gpu-0 pid=<pid> host=<host> acquired_epoch=<ms>`;
-    # the `daemon` label is written only by acquire_resource_lease_or_exit.
+    # Two writers, two shapes, and the LABEL leads in one of them — so matching
+    # on a prefix is wrong for everything but the daemon:
+    #   daemon:        `daemon resource=hip-gpu-0 pid=<pid> host=<h> acquired_epoch=<ms>`
+    #   hipfire lock run: `<label> host=<h> acquired_epoch=<ms> holder=<pid> pgid=<g> mode=run`
+    # Both are long-lived by construction — the daemon for its process lifetime,
+    # a `lock run` for a whole offline job — so both must short-circuit. A
+    # transient holder (a bench, an eval, another gate) still finishes, so
+    # waiting on those stays correct and is deliberately left alone.
     case "$line" in
         "daemon "*) ;;
+        *" mode=run"*) ;;
         *) return 1 ;;
     esac
     local host=${line##*host=}; host=${host%% *}
     [ "$host" = "$(hostname)" ] || return 1
-    local pid=${line##*pid=}; pid=${pid%% *}
+    # `holder=` is the CLI's pid field, `pid=` the daemon's. Prefer `holder=`:
+    # `lock run` writes BOTH in the acquire form, and `holder=` is the process
+    # actually on the GPU.
+    local pid
+    case "$line" in
+        *holder=*) pid=${line##*holder=} ;;
+        *)         pid=${line##*pid=} ;;
+    esac
+    pid=${pid%% *}
     case "$pid" in ''|*[!0-9]*) return 1 ;; esac
     # The holder LINE is file contents, not kernel state, so it outlives its
-    # writer (AGENTS.md). A dead or recycled pid must not read as a live
-    # daemon and silence the gates, so confirm the process really is one.
+    # writer (AGENTS.md). A dead or recycled pid must not read as a live holder
+    # and silence the gates, so confirm the process really is one of ours.
     kill -0 "$pid" 2>/dev/null || return 1
-    tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q 'hipfire.*daemon'
+    tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | grep -q 'hipfire'
 }
 
 GPU_GATES=1
@@ -243,19 +258,24 @@ GPU_HOLDER_PID=""
 if gpu_held_by_local_daemon; then
     GPU_GATES=0
     GPU_HOLDER_PID=$(cat "${HIPFIRE_RESOURCE_LOCK_DIR:-$HOME/.hipfire/locks}/hip-gpu-0.lock" 2>/dev/null)
-    GPU_HOLDER_PID=${GPU_HOLDER_PID##*pid=}; GPU_HOLDER_PID=${GPU_HOLDER_PID%% *}
+    case "$GPU_HOLDER_PID" in
+        *holder=*) GPU_HOLDER_PID=${GPU_HOLDER_PID##*holder=} ;;
+        *)         GPU_HOLDER_PID=${GPU_HOLDER_PID##*pid=} ;;
+    esac
+    GPU_HOLDER_PID=${GPU_HOLDER_PID%% *}
     echo "========================================================================"
-    echo "GPU GATES SKIPPED: hip-gpu-0 is held by your own hipfire daemon"
-    echo "                   (pid $GPU_HOLDER_PID)."
+    echo "GPU GATES SKIPPED: hip-gpu-0 is held by another local hipfire"
+    echo "                   process (pid $GPU_HOLDER_PID)."
     echo "========================================================================"
     echo
-    echo "A serving daemon holds the GPU until it stops, so these gates cannot"
+    echo "It holds the GPU until it stops, so these gates cannot"
     echo "run and would only block the commit while they timed out:"
     echo "  tiny-affected tripwire · coherence battery · agentic gate"
     echo "  multi-GPU pp gate      · MQ4 speed gate"
     echo
     echo "This commit therefore carries NO GPU regression cover. To get it:"
-    echo "  hipfire stop && git commit ...    # gates run, then \`hipfire start\`"
+    echo "  hipfire stop && git commit ...    # if it is the daemon"
+    echo "  wait for the job, then commit     # if it is an offline GPU job"
     echo "  ./tests/tiny-affected-gate.sh --require-coverage   # or run one by hand"
     echo
 fi

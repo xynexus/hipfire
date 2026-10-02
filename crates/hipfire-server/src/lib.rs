@@ -540,6 +540,38 @@ fn apply_resource_list_env(key: &str, values: &[String], auto_removes: bool) {
     }
 }
 
+/// Give the GPU up so an offline tool can have it, returning whether a daemon
+/// was actually running (and therefore needs bringing back).
+///
+/// Stopping the daemon rather than asking it to drop its flock is deliberate: it
+/// takes the `hip-gpu-0` lease before HIP init and holds it for the process
+/// lifetime, and an offline quantize needs the resident model's VRAM as much as
+/// it needs the lock. Handing over one without the other would trade a lock
+/// timeout for an OOM.
+pub(crate) async fn release_gpu_for_offline_job(state: &SharedState) -> bool {
+    let Some(mut engine) = state.engine.lock().await.take() else {
+        return false;
+    };
+    // Best-effort clean unload first; the drop below kills the child either way
+    // (`kill_on_drop`), and the kernel releases the flock when its fds close.
+    if let Err(e) = engine.unload().await {
+        tracing::warn!("daemon unload before offline GPU job failed: {e}");
+    }
+    drop(engine);
+    clear_loaded_model_state(state).await;
+    tracing::info!("daemon stopped; GPU handed to an offline job");
+    true
+}
+
+/// Bring serving back after [`release_gpu_for_offline_job`]. Models reload on
+/// the next request — the state cleared above is what makes that happen.
+pub(crate) async fn reclaim_gpu_after_offline_job(state: &SharedState) {
+    match spawn_daemon_for_serving(state).await {
+        Ok(()) => tracing::info!("daemon restarted after offline GPU job"),
+        Err(e) => tracing::error!("daemon restart after offline GPU job failed: {e}"),
+    }
+}
+
 async fn clear_loaded_model_state(state: &SharedState) {
     state.loaded_models.lock().await.clear();
     *state.loaded_model_path.lock().await = None;
@@ -657,7 +689,7 @@ async fn prewarm_model(state: &SharedState, target: &PrewarmTarget) {
     };
     match routes::chat::ensure_model_loaded(state, model, required_max_seq).await {
         Ok(loaded) => {
-            let mut engine_guard = state.engine.lock().await;
+            let mut engine_guard = state.lock_engine().await;
             let Some(engine) = engine_guard.as_mut() else {
                 tracing::warn!("pre-warm loaded model but daemon engine is unavailable");
                 return;

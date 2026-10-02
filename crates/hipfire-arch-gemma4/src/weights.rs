@@ -408,6 +408,7 @@ pub fn load_dense_weights(
         let embed_per_layer_dtype = match embed_per_layer_format {
             EmbeddingFormat::F32 => DType::F32,
             EmbeddingFormat::Q8_0 => DType::Q8_0,
+            EmbeddingFormat::Oq8G256 => DType::Oq8G256,
             EmbeddingFormat::HFQ4G256 => DType::HFQ4G256,
             EmbeddingFormat::HFQ4G128 => DType::HFQ4G128,
             EmbeddingFormat::Q4K => DType::Q4K,

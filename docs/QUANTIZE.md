@@ -33,6 +33,54 @@ Qwen3.5-9B--mq4l.hfq
 Qwen3.5-9B--mq4+.gfx1103.hfq
 ```
 
+## Embedding Tables: Usually the Biggest Win
+
+**Check `--embed-precision` before tuning anything else on a large-vocab model.**
+On a tied-embedding model the embed table is *also* the lm_head, and at a large
+vocab it dominates both the artifact and the decode bandwidth. The default is
+`source`, which keeps it at the checkpoint's float width.
+
+Measured on Qwen3.5-0.8B (248320 x 1024 tied embed = 254.3M of 752.4M text params,
+**29%**), same `oq4.25++` body, only the embed varying. KLD is against a bf16
+reference on a held-out slice:
+
+| `--embed-precision` | artifact | bpw | KLD | decode tok/s |
+|---|---|---|---|---|
+| `source` (bf16, the default) | 647.3 MB | 6.88 | 0.0446 | 156.0 |
+| `q8` | 550.2 MB | 5.85 | 0.0449 | — |
+| `hfq4` | 415.1 MB | **4.41** | 0.0755 | **194.1** |
+
+Three things follow:
+
+- **`q8` is free here.** +0.0002 KLD is noise, for −1.03 bpw and −97 MB. The
+  `source` default was spending a whole bit per weight, model-wide, for nothing
+  measurable.
+- **`hfq4` is cheap and *faster*.** +0.031 KLD buys another −1.44 bpw, and decode
+  goes up **24%** because the tied lm_head GEMV reads 135 MB instead of 367 MB.
+  It is a throughput lever, not just a size one.
+- **A float embed can make a sub-4-bit target arithmetically impossible.** A bf16
+  embed on this model costs 4068 Mbit on its own, against the 3092 Mbit a 4.0 bpw
+  budget allows for the *entire* model.
+
+`hfq4` is opt-in and should stay that way: the embed seeds the residual
+*unnormalized*, so at 4 bits and below its error is the largest per-tensor KLD cost
+in an otherwise low-bit model. The standing advice to keep embeddings wide holds
+**at 4 bits and below** — it does not justify the gap between `q8` and `bf16`.
+
+Scale matters: this is a 248k vocab on a 0.8B model. On a 30B model with the same
+vocab the embed is a few percent of the weights and none of this is worth the risk.
+
+### Related knobs
+
+- `--no-coarse-lmhead` disables the two-pass coarse lm_head tier. That tier makes
+  decode's output projection ~4x cheaper but costs **+1.36 bpw** at a 248320-row
+  vocab, which can decide whether a build lands under 4 bits/weight. It is emitted
+  only on the `.hfq`-source path, not the `.hfa`/safetensors path.
+- The `qtip3` path force-quantizes the embed to `Q8F16` on its own; only an
+  explicit `--embed-precision hfq4` overrides it.
+- Tag the embed width in the artifact name so it is recoverable later:
+  `Qwen3.5-0.8B-e4--oq4.25++.hfq` (precedent: `Llama-3.2-1B-Instruct-e16--oq4++.hfq`).
+
 ## Quant Token Taxonomy
 
 Quant tokens describe weight encoding only:
@@ -695,6 +743,226 @@ they rotate the activation and multiply directly against dequantized signed
 weights (`W4A16` or `W8A16`). This reuses the same stored weights while avoiding
 the A4/A8 activation error and extra activation-quantization launch.
 
+## Going Below 4 Bits
+
+On-disk bits and resident bits are not the same number, and only one of them
+decides decode speed.
+
+| body format | on-disk | resident | batched GEMM? |
+|---|---|---|---|
+| `oq4.25++` (`OqPlusCompact`) | 4.31 b | **8 b** (widens to `Oq8G256` at load) | yes |
+| `oq3++` (`Oq3G256`) | 3.06 b | **8 b** (sign-extends to int8 at load) | yes |
+| `qtip3` (`Qtip3G256`) | 3.13 b | 3.13 b (native `gemv_qtip3g256`) | yes (`gemm_qtip3g256`) |
+
+`qtip3` is the only genuinely low-bit-resident body here — and on gfx1151 that did
+not pay: decode is bandwidth-bound on a body this small either way (174.5 tok/s for
+qtip3 at 3.78 bpw vs 194 for `oq4.25++` at 4.41), so the halved weight bytes buy
+nothing back.
+
+Batched prefill for `qtip3` used to be a 9× penalty (233 tok/s vs 2128) because
+`Qtip3G256` was missing from every batched-prefill admission list and fell through to
+the per-token layer path — one full weight sweep per token. `gemm_qtip3g256` closed
+that to 1588 tok/s. Adding a dtype to this path means **five** things, and missing any
+one of them is silent: the kernel + `KernelKey` + registry row + family arm + wrapper;
+membership in `is_batchable_la`; membership in each chain's `*_is_mq` rotation-admission
+list; an arm in all eight per-chain branch chains; and an exemption in the
+refuse-don't-fall-through guard. See
+`docs/todo/2026-09-02-prefill-lowered-dispatch-table.md` — this is why that selector
+should be a table that rejects unknown dtypes rather than a chain that falls through.
+
+### Body-only cost, embed excluded
+
+Comparing whole-artifact bpw across formats is misleading when a tied embed is 29%
+of the parameters: the embed choice swamps the format difference. These are
+**body-only** figures — 498,113,344 params (752.4M text minus the 254.3M tied
+embed) — with every artifact built at `--embed-precision q8`, so the embed is a
+constant 270.17 MB across all rows and cancels out of the comparison.
+
+| body format | body MB | **body bpw** | artifact @e8 | evalA KLD | evalB KLD |
+|---|---|---|---|---|---|
+| bf16 (reference) | 680.2 | 10.924 | 950.3 | 0 | 0 |
+| `oq8++` | 517.2 | 8.306 | 787.3 | 0.000715 | 0.000586 |
+| `oq4.25++` | 280.0 | **4.496** | 550.2 | 0.044853 | 0.036061 |
+| `qtip3` + greedy OBS | 209.4 | **3.363** | 479.6 | 0.213695 | 0.174532 |
+| `oq3++` | 206.1 | **3.310** | 476.3 | 0.302466 | 0.245296 |
+
+Two things this framing exposes that whole-model bpw hides:
+
+- **The bf16 body is 10.92 bpw, not 16.** The lossless bf16 codec
+  (`Bf16Huff`/`Bf16Lut3`) compresses it ~1.46x, so the honest baseline for "what
+  did quantization buy" is 10.9. `oq4.25++` is a 2.4x reduction on the body, not
+  the 3.6x that comparing against nominal bf16 would suggest.
+- **Every format carries ~0.2–0.25 bpw of overhead** above its nominal block rate
+  (oq8 8.06→8.31, oq4.25 4.31→4.50, qtip3 3.13→3.36, oq3 3.06→3.31) — norms, AWQ
+  sidecars and HFQ container. Budget for it when targeting a bpw number.
+
+The sub-4 formats are also closer together than their names suggest: `oq3++` is
+the *smaller* body (3.310 vs 3.363) while scoring meaningfully worse (0.302 vs
+0.214). Per bit, `qtip3` with conditioning is the better 3-bit body — but see the
+prefill numbers below before choosing it.
+
+- **There is no `gemm_qtip3`.** `Qtip3G256` does not appear in `tables/gemm_table.rs`,
+  so every batched consumer (prefill, KLD scoring) degenerates to a per-token GEMV
+  loop — hence the 9x prefill gap and the 117.8 ms TTFT.
+- **3-bit residency did not buy decode speed.** `qtip3` decoded *slower* than an
+  8-bit-resident body: the trellis decode cost exceeds the DRAM bytes it saves.
+  Do not assume "fewer weight bytes ⇒ linear tok/s" for trellis formats.
+- Between the two ~3.6 bpw options, `qtip3` wins quality (+27%) and decode (+16%);
+  `oq3++` wins prefill and TTFT by ~8x. Neither dominates.
+
+### If you protect tensors, protect CHANNELS — and rank by gamma, not covariance
+
+Three protection strategies were measured on the same qtip3 body, against the line you
+get by simply interpolating qtip3 → `oq4.25++` (i.e. "would those bits have been better
+spent uniformly?"):
+
+| protection | est. body bpw | uniform line predicts | measured | |
+|---|---|---|---|---|
+| none (qtip3) | 3.364 | — | 0.2137 | |
+| **tensor**-level, covariance-ranked | 3.744 | 0.1570 | 0.2076 | **below** the line |
+| **channel**-level (`roughquant4-sim`) | 3.515 | 0.1912 | **0.1651** | **above** by 13.7% |
+
+Granularity is the whole story. An outlier lives in a **channel**; promoting the entire
+tensor that contains it pays for 1024 channels to fix one. `roughquant4-sim` ranks
+residual channels by activation energy once and keeps the top set exact in the *columns*
+of every residual reader **and** the *rows* of every residual writer, so a hot channel is
+exact where it is written and where it is read. At `protect_frac=0.03` that was 31/1024
+channels for −22.7% KLD.
+
+**Rank with gamma, not with `HIPFIRE_MIXED_BPW_RANK` density.** The density ranking
+(`err_oq4 / numel`) is input-covariance only, which implicitly sets the output side to
+the identity. On Qwen3.5-0.8B its top entries were all `linear_attn.in_proj_a` — [16,1024]
+tensors that are 0.158% of the body, so protecting them is free *and worthless*. The
+gamma table for the same model ranks **output projections** first (`out_proj`,
+`down_proj`, `o_proj` occupy the entire top 8), matching `calib_gamma`'s own note that
+covariance ranking "ranks `o_proj` 79th-113th of 113 while it is the single largest
+promotion win". Produce gamma with `gamma_hybrid` (it accepts a safetensors dir or an
+`.hfq`, and handles the VL `text_config` wrap) and feed it via `HIPFIRE_MIXED_BPW_GAMMA`.
+
+Caveat: `roughquant4` is a **sim** format — it emits bf16, so it measures the error a
+packed implementation would incur but is not itself shippable. Feed a quantized `.hfq`
+to `gamma_hybrid` and it fails on `Bf16Lut3` (qt 49); use the safetensors source, which
+is what its docs recommend anyway.
+
+**Set `HIPFIRE_QTIP_COND=greedy` if you use `qtip3` at all.** It enables output-aware
+OBS conditioning (GPU exact Viterbi + a device-resident residual) and was worth 26%
+on its own — KLD 0.3335 to 0.2469 — at no size cost. It is off by default.
+
+Whether sub-4 is worth it is a size question. On a 0.8B model there is little
+redundancy to spend and 3-bit weights cost roughly 3x the KLD of a 4-bit body for
+0.75 bpw. Larger models tolerate it far better.
+
+## Light QAT: recovering the norms
+
+Norms are the one thing in a quantized artifact that is **not** quantized — they
+pass through at source precision. That makes them the cheapest possible
+post-quantization correction: tune γ so the quantized block reproduces the bf16
+block, and fold the tuned values in at build time. No codes change, no
+requantization, no format work.
+
+    # 1. capture the bf16 teacher's residual stream (keep the prompt under one
+    #    2048-token prefill chunk — see the caveat below)
+    rm -f /tmp/residcap/qwen35.*
+    HIPFIRE_FORWARD_LOWERED=0 HIPFIRE_DUMP_HIDDEN=/tmp/residcap/qwen35 \
+    HIPFIRE_DUMP_HIDDEN_ALL=1 HIPFIRE_DUMP_HIDDEN_ALLLAYERS=1 HIPFIRE_MAX_GEN=4 \
+      ./target/release/examples/infer_qwen35 model--bf16.hfq --guards off "<corpus text>"
+
+    # 2. recover both norms per layer against the ARTIFACT's own weights
+    #    (--detach queues it as a service job instead; `hipfire jobs watch <id>`)
+    hipfire qat model-e4--qtip3g.hfq model--bf16.hfq /tmp/tuned.json
+
+    # 3. rebuild with the tuned norms folded in
+    hipfire-quantize --input model--bf16.hfq --output model-qat.hfq \
+      --format qtip3 ... --norm-patch /tmp/tuned.json
+
+Two things make this a tool rather than a probe. The student weights are
+**dequantized from the target artifact**, not re-simulated — γ compensates a
+specific quantization error, so a simulated error of a different format
+recovers the wrong correction. And `input_layernorm` is recovered as well as
+`post_attention_layernorm`, by training against the q/k/v (or `in_proj_qkv`)
+projections rather than the block output, so the non-differentiable
+DeltaNet/attention mixer is never run. A block's input is the previous block's
+`pertoken` capture, so no new capture tag is needed; layer 0 is skipped.
+
+### What it is worth
+
+Measured on `Qwen3.5-0.8B-e4--qtip3g` (3.78 bpw) against a control rebuilt by
+the same recipe. Three independent captures, all scored on the post-GDN-fix
+runtime (`origin/master` 63deba175 — see the retraction below):
+
+| | evalA kld | evalA ppl | evalB kld | evalB ppl | evalB p99 |
+|---|---|---|---|---|---|
+| control | 0.189130 | 17.9110 | 0.164674 | 15.6014 | 0.290186 |
+| capture 1 (2805 tok) | 0.189180 | **17.8043** | 0.164581 | **15.4936** | **0.283919** |
+| capture 2 (1596 tok) | 0.189115 | **17.8192** | 0.164621 | **15.4959** | **0.284335** |
+| capture 3 (post-fix) | 0.189151 | **17.7954** | 0.164525 | **15.4873** | **0.285312** |
+
+Block-local MSE recovers 11.6% (MLP norms) and 5.5% (attention norms), and it
+generalises — re-measured on a capture the recovery never trained on, the
+patched artifact beats the control on 15 blocks out of 15, by 1.0% to 10.1%.
+
+End to end that converts to: **mean KLD flat**, perplexity ~0.6% better, evalB's
+p99 KLD ~2% better. The two captures agree to three decimals, so the perplexity
+gain is a real effect rather than capture noise — it is just small.
+
+Verdict: real, cheap, and **not a lever on its own**. γ has `dim` free
+parameters against a `dim × inter` weight error; that is the ceiling of a
+per-channel input scale. The earlier Supra-50M probe's "52% recovered" came
+mostly from LoRA on q/v, not from norms. What is delivered here is the plumbing
+— artifact-accurate student weights, both norms, and a build-time fold — which
+a LoRA variant reuses directly.
+
+Recovery is converged, not under-trained: identical block-local MSE at lr
+1e-3 / 3e-3 / 1e-2 / 3e-2 over 300 steps, with `|Δγ|max` scaling exactly 100×
+with lr.
+
+### The final norm measures best and deploys worst
+
+The final norm is the only one whose error reaches the logits with no mixer in
+between, so its loss can be the **KL that is actually scored** rather than a
+block-local proxy. It posts the best local numbers of anything here, and both
+ways of training it make the artifact worse. `HIPFIRE_RECOVER_HEAD` is off by
+default.
+
+| | evalA kld | evalA ppl |
+|---|---|---|
+| control | 0.189131 | 17.9114 |
+| + final norm, teacher's hidden state | 0.194610 | 17.9895 |
+| final norm only, model's own hidden state | 0.262497 | 19.4805 |
+
+Fed the **teacher's** clean hidden state, local KL drops 59.4% and the artifact
+gets 2.9% worse: the correction is fitted for an input the deployed model never
+sees. Fed the **model's own** hidden state — which by the last layer has drifted
+to cos 0.9599 of the teacher's — the honest local KL is 5.07e-1, not 3.98e-2, so
+that is the error deployment actually has; recovery cuts it 67.9% and the
+artifact gets 39% worse, because γ has `dim` parameters and is being asked to
+absorb 24 layers of accumulated error. It fits the calibration rows and does not
+generalise.
+
+Two failures, same lesson from opposite sides, and the most useful thing this
+exercise produced: **a block-local win does not imply a deployed win, and here
+the variant that measured best locally was the worst deployed.** Score the
+artifact, every time.
+
+### Two traps
+
+
+**The patch must be folded at BUILD time, not into a finished `.hfq`.** Once
+bf16 tensors carry a lossless recoding (`Bf16Huff`, the default), tuned values
+compress to a different byte length, so there is no in-place patch. This is why
+`--norm-patch` lives in the quantizer.
+
+**The residual capture used to be non-finite past the first prefill chunk —
+and the obvious explanation was the wrong one.** Rows 0..2047 were clean; from
+~2048 to the end of a 2805-token prefill essentially every row was non-finite on
+both tags for full-attention layers. Since the same run generated coherent text,
+this was first written up as a dump bug. It was not: it was the **FP16 DeltaNet
+recurrence**, which was not chunk-invariant, diverging in the second prefill
+chunk (`docs/bugs/2026-09-02-fp16-deltanet-recurrence-is-not-chunk-invariant.md`,
+fixed in `origin/master` 63deba175). Re-measured on the identical prompt after
+that fix: **0 bad rows out of 2809**, every layer, both tags. Capture length is
+no longer constrained. The recovery tool keeps the filter as a cheap guard.
+
 ## Implementation Notes
 
 - MQ and OQ 256-group formats require `K % 256 == 0`. Ragged tensors fall back
@@ -707,6 +975,19 @@ the A4/A8 activation error and extra activation-quantization launch.
   KLD/PPL/coherence gates before promoting an artifact.
 - Older plan docs may mention `OQ+`, `Opus Plus`, `op4`, or `op8`; these are
   historical spellings and are not accepted by the current quantizer.
+- `--mixed-bpw` **cannot** serve a sub-4 target. Its floor is Oq4 by construction
+  ("only the oq4 -> oq8 step is available"): it promotes toward a higher average
+  and never demotes.
+- `HIPFIRE_LOWRANK_R` (LQER low-rank residual) writes `<base>.lr_u`/`.lr_v`
+  sidecars that are consumed **only by `hipfire-arch-minimax`**. On any other
+  architecture it is a silent no-op that still costs the bytes — on Qwen3.5-0.8B,
+  `r=32` added 84.2 MB (+0.90 bpw) and scored *identically to six decimals*.
+- `HIPFIRE_QTIP_CODEBOOK=3inst` tags its output `Qtip3G256I3` (qt 51). Confirm the
+  target architecture's loader has a qt-51 arm before using it; qwen35 does not.
+- Quantizing successfully is not evidence a model loads. Formats can be emitted
+  that the target architecture's loader rejects — `oq3` artifacts built cleanly and
+  then failed with "unsupported quant_type 38" until the qwen35 loader learned that
+  code. Always load the artifact once before trusting a build.
 
 ## Useful Flags
 
@@ -718,10 +999,31 @@ the A4/A8 activation error and extra activation-quantization launch.
 | `--awq` / `--awq-alpha <f>` | Enable the first `+`: activation-aware weight pre-scaling. Requires imatrix data or a Hessian-derived imatrix. |
 | `--ldlq` | Enable the second `+`: full-Hessian error-feedback packing. Requires `--hessian`. |
 | `--arch-id <id>` | Override the architecture id stamped in the `.hfq` header. |
+| `--embed-precision <p>` | `source` (default) / `q8` / `bf16` / `f16` / `hfq4`. See [Embedding Tables](#embedding-tables-usually-the-biggest-win) — usually the largest single lever on a large-vocab model. |
+| `--no-coarse-lmhead` | Drop the two-pass coarse lm_head tier (+1.36 bpw at a 248k vocab, but ~4x cheaper decode output projection). |
+| `--rotate <M.r1>` | SpinQuant R1 deploy pre-pass (arch 0/1 dense llama, arch 5 qwen3.5). See the validation notes below — the no-op test is `M = F`, not `M = I`. |
 
-After producing a portable OQ4 artifact, use `hipfire optimize` to pre-pack it
-for a specific GPU architecture (the `repack` alias is still accepted):
+`--rotate` applies `FᵀM` and relies on the *codec's* per-256-group FWHT to cancel
+the `Fᵀ`. Three things about validating it, each of which cost a wrong conclusion:
 
-```bash
-hipfire optimize ~/.hipfire/models/Qwen3.5-9B--oq4++.hfq --arch gfx1103
-```
+- **It cannot be validated with `--format bf16`.** That path is a raw byte copy with
+  no FWHT, so the `Fᵀ` is never cancelled and the model is broken by construction.
+  Gate it with a format whose codec does the FWHT — `oq8++` is near-lossless
+  unrotated, which makes it a sharp control.
+- **The no-op rotation is `M = F`, not `M = I`.** Since `R1 = FᵀM`, feeding an
+  identity `M` leaves `R1 = Fᵀ`, which is emphatically not a no-op. Feed `M = F` and
+  `R1 = FᵀF = I`, which *must* reproduce the unrotated result exactly — that is the
+  correctness test. (`F` is orthogonal but **not** an involution: the two sign
+  vectors mean `FF ≠ I`. `gen_fwht_signs` is a plain LCG and `signed_fwht` is
+  sign-flip → butterfly → `1/sqrt(n)` → sign-flip, so `F` is easy to reconstruct
+  exactly outside the codec.)
+- **A non-trivial rotation legitimately costs some quality**, because readers come
+  out unchanged (`F·R1·w = M·w`) while *writers* are quantized in the rotated output
+  frame with nothing to cancel them. An arbitrary Hadamard has no reason to be a
+  better basis than the original — finding a `M` that is better is the entire point
+  of learning it. Measured on a tiny llama fixture at oq8: `R1 = I` reproduces the
+  unrotated KLD to the digit (0.000006), while a Hadamard costs 0.058.
+
+A worked correctness loop lives in the run notes for
+`docs/plans/2026-09-02-qwen35-0.8b-sub4bit-induction-RESULT.md`:
+`--emit-fixture llama` plus an oq8 rotated/unrotated pair is a ~1 minute cycle.

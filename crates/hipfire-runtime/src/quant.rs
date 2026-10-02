@@ -76,6 +76,42 @@ pub fn dequant_oq8g256(data: &[u8], n: usize) -> Vec<f32> {
     out
 }
 
+/// Dequantize on-disk `Oq8G128` (qt 54) blocks to plain, unrotated f32.
+///
+/// The G128 sibling of [`dequant_oq8g256`], for a K divisible by 128 but not
+/// 256 — every routed `down_proj` in Qwen3.8-Flash-Next (K=640), and the
+/// qwen3_5_moe / gemma4_moe fixtures (K=128).
+///
+/// ⚠️ **Seeds 43/1043 at 128, not 42/1042 at 256.** The group IS the FWHT
+/// length. Using the 256 pair here un-rotates by a transform the weights were
+/// never rotated by, which produces plausible-looking numbers rather than an
+/// error — the same trap `quantize_oq8g128` asserts against on the way in.
+pub fn dequant_oq8g128(data: &[u8], n: usize) -> Vec<f32> {
+    use hipfire_primitives::fwht::{gen_fwht_signs, signed_fwht};
+    const GROUP: usize = 128;
+    const BLOCK: usize = 130; // 2 (f16 scale) + 128 int8
+    let s1 = gen_fwht_signs(43, GROUP);
+    let s2 = gen_fwht_signs(1043, GROUP);
+    let nblocks = n / GROUP; // K%128==0 ⇒ whole groups
+    let mut out = vec![0.0f32; n];
+
+    for b in 0..nblocks {
+        let off = b * BLOCK;
+        if off + BLOCK > data.len() {
+            break;
+        }
+        let scale = f16_to_f32(u16::from_le_bytes([data[off], data[off + 1]]));
+        let mut grp = [0.0f32; GROUP];
+        for j in 0..GROUP {
+            grp[j] = (data[off + 2 + j] as i8) as f32 * scale;
+        }
+        // Inverse rotation: forward transform with the sign tables swapped.
+        signed_fwht(&mut grp, &s2, &s1);
+        out[b * GROUP..b * GROUP + GROUP].copy_from_slice(&grp);
+    }
+    out
+}
+
 /// Dequantize canonical on-disk Oq4G256 blocks to plain, unrotated f32.
 pub fn dequant_oq4g256(data: &[u8], n: usize) -> Vec<f32> {
     use hipfire_primitives::fwht::{cpu_fwht_256, gen_fwht_signs};
@@ -343,6 +379,54 @@ mod tests {
         assert_eq!(
             oq_gpu_dtype_for_quant_type(QuantType::Oq8G256RowPadded.code()),
             None
+        );
+    }
+
+    #[test]
+    fn dequant_oq8g128_inverts_the_fwht_rotation_at_its_own_seeds() {
+        use hipfire_primitives::fwht::signed_fwht;
+        // The G128 sibling, and the trap it exists to avoid: the group IS the
+        // FWHT length, so G128 weights are rotated with seeds 43/1043 at 128.
+        // Un-rotating with the 256 pair produces plausible numbers rather than
+        // an error, so the check is a COSINE against the original plus a
+        // negative control proving a wrong-seed dequant would be caught.
+        let s1 = gen_fwht_signs(43, 128);
+        let s2 = gen_fwht_signs(1043, 128);
+        let orig: Vec<f32> = (0..128).map(|i| ((i as f32) * 0.031 - 1.5).cos()).collect();
+        let mut rot = orig.clone();
+        signed_fwht(&mut rot, &s1, &s2); // rotate, as quantize_oq8g128 does
+        let scale = rot.iter().fold(0.0f32, |m, &v| m.max(v.abs())) / 127.0;
+        let mut block = vec![0u8; 130];
+        let sf16 = f32_to_f16(scale);
+        block[0] = (sf16 & 0xff) as u8;
+        block[1] = (sf16 >> 8) as u8;
+        for i in 0..128 {
+            block[2 + i] = ((rot[i] / scale).round().clamp(-127.0, 127.0) as i8) as u8;
+        }
+        let cosine = |a: &[f32], b: &[f32]| -> f32 {
+            let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+            let na: f32 = a.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let nb: f32 = b.iter().map(|y| y * y).sum::<f32>().sqrt();
+            dot / (na * nb)
+        };
+        let deq = dequant_oq8g128(&block, 128);
+        let cos = cosine(&deq, &orig);
+        assert!(cos > 0.999, "dequant_oq8g128 not un-rotating: cosine={cos}");
+
+        // Negative control: un-rotating with the WRONG seeds must NOT recover
+        // it. Without this the test would pass on a dequant that skipped the
+        // rotation entirely for a near-symmetric input.
+        let w1 = gen_fwht_signs(42, 128);
+        let w2 = gen_fwht_signs(1042, 128);
+        let mut wrong = vec![0.0f32; 128];
+        for j in 0..128 {
+            wrong[j] = (block[2 + j] as i8) as f32 * scale;
+        }
+        signed_fwht(&mut wrong, &w2, &w1);
+        let bad = cosine(&wrong, &orig);
+        assert!(
+            bad < 0.9,
+            "wrong-seed dequant should not recover it: cosine={bad}"
         );
     }
 

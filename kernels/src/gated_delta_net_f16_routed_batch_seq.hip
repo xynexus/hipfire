@@ -112,8 +112,20 @@ __global__ void gated_delta_net_f16_routed_batch_seq(
         S_tile[i] = (float)S_global[i];
     }
 
-    for (int b = 0; b < batch_rows; b++) {
-        if (row_session_indices[b] != session_idx) continue;
+    // FIND THIS SESSION'S ROWS 32 AT A TIME. The scan used to read
+    // `row_session_indices[b]` one dependent load per row in every one of the
+    // n_heads x 32 x n_sessions waves, though a decode step gives a session ONE
+    // row: at 64 sessions that was 64 serial loads per wave to find it, and the
+    // kernel ran ~4x past its state traffic (4.2 ms/layer, ~half the step). The
+    // lanes now load 32 indices at once and a ballot names the matches. Same
+    // rows, same ascending order, same step body — bit-identical.
+    for (int b0 = 0; b0 < batch_rows; b0 += 32) {
+    const int bl = b0 + tid;
+    unsigned long long mine =
+        __ballot(bl < batch_rows && row_session_indices[bl] == session_idx);
+    while (mine) {
+        const int b = b0 + (__ffsll((long long)mine) - 1);
+        mine &= mine - 1;
 
         const float* q_t = q + b * stride + h * HD;
         const float* k_t = k + b * stride + h * HD;
@@ -194,6 +206,7 @@ __global__ void gated_delta_net_f16_routed_batch_seq(
         if (l == 0)
             output[b * stride + h * HD + row] = out_v;
         // --- end identical step ---
+    }
     }
 
     // Dither index UNIFIED with gated_delta_net_f16.hip and _f16_tree.hip:

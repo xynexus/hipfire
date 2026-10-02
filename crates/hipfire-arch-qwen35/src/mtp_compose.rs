@@ -236,6 +236,9 @@ pub fn spec_step_dflash_mtp(
             weights::EmbeddingFormat::Q8_0 => {
                 gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
             }
+            weights::EmbeddingFormat::Oq8G256 => {
+                gpu.embedding_lookup_oq8g256(&target.weights.token_embd, &dst, tok, h)?
+            }
             weights::EmbeddingFormat::BF16 => {
                 gpu.embedding_lookup_bf16(&target.weights.token_embd, &dst, tok, h)?
             }
@@ -838,6 +841,9 @@ pub fn spec_step_dflash_mtp_tree(
             }
             weights::EmbeddingFormat::Q8_0 => {
                 gpu.embedding_lookup_q8(&target.weights.token_embd, &dst, tok, h)?
+            }
+            weights::EmbeddingFormat::Oq8G256 => {
+                gpu.embedding_lookup_oq8g256(&target.weights.token_embd, &dst, tok, h)?
             }
             weights::EmbeddingFormat::BF16 => {
                 gpu.embedding_lookup_bf16(&target.weights.token_embd, &dst, tok, h)?
