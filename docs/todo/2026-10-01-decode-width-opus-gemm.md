@@ -137,6 +137,13 @@ BM=32 and BM=64/WARPS_M=1 variants of BN=32 too: within a few % either way.)
 Remaining gap for Corrode-sized swarms (3-15 sessions): the wide multicol is
 bandwidth-bound to 8 rows but turns VALU-bound past that -- cold, gate/up
 0.226 ms at 8 rows, 0.271 at 12, 0.326 at 16, against a ~0.21 ms floor.
+A BN=16 w64 tile does not close it (quiet host, cold, route; multicol vs
+the best BN=16 tile, WARPS 1x1): gate/up 0.267 vs 0.321 ms at 12 rows, 0.325
+vs 0.319 at 16; down 0.281 vs 0.304 / 0.316 vs 0.323; qkv 0.112 vs 0.122 /
+0.144 vs 0.117 (WMt=2). Only qkv-sized M (6144) prefers a tile at 14-16 rows,
+worth ~1% of a 16-session step -- not routed. The tile is not WMMA-bound
+here either (BN=16 runs 1088 tiny workgroups); closing the 9..16 gap needs a
+different decode-width kernel, not another tile shape.
 
 ## Tried: split-K for the B<=64 tile (2026-10-02, reverted)
 
