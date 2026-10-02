@@ -304,12 +304,26 @@ impl Qwen35RequestSessionState {
         gpu: &mut hipfire_rdna::Gpu,
         source: &Qwen35RequestSessionState,
     ) -> Result<Self, String> {
+        Self::fork_from_capped(gpu, source, None)
+    }
+
+    /// [`Self::fork_from`] mapping only `cap` positions (paged sources; at least
+    /// what is sealed) instead of the source's whole capacity.
+    pub fn fork_from_capped(
+        gpu: &mut hipfire_rdna::Gpu,
+        source: &Qwen35RequestSessionState,
+        cap: Option<usize>,
+    ) -> Result<Self, String> {
         let src_kv = source.kv_cache();
         // A paged source shares the pages behind what it has already written; the
         // rest is copied. Pooled caches are deep-copied as before.
         let kv = if src_kv.pages.is_some() {
             src_kv
-                .fork_paged(gpu, source.cursor.seq_pos, src_kv.physical_cap)
+                .fork_paged(
+                    gpu,
+                    source.cursor.seq_pos,
+                    cap.unwrap_or(src_kv.physical_cap),
+                )
                 .map_err(|e| format!("fork paged KV: {e}"))?
         } else {
             Self::clone_kv_cache(gpu, src_kv)?
@@ -2283,6 +2297,19 @@ pub fn qwen35_fork_session_state(
     gpu: &mut hipfire_rdna::Gpu,
     request: SequenceStateForkRequest<'_>,
 ) -> Result<(), String> {
+    qwen35_fork_session_state_impl(m, gpu, request, false)
+}
+
+/// `as_checkpoint`: the fork is a prefix checkpoint -- nothing is ever decoded
+/// into it, it is only forked FROM -- so it maps just its sealed prefix, not the
+/// source's capacity (prompt + that request's max_tokens). Mapping the source's
+/// capacity gave every checkpoint up to 8K positions of never-written KV pages.
+fn qwen35_fork_session_state_impl(
+    m: &mut LoadedModel,
+    gpu: &mut hipfire_rdna::Gpu,
+    request: SequenceStateForkRequest<'_>,
+    as_checkpoint: bool,
+) -> Result<(), String> {
     if request.source_session_id == request.dest_session_id {
         return Ok(());
     }
@@ -2311,16 +2338,25 @@ pub fn qwen35_fork_session_state(
         .sessions
         .get(request.source_session_id)
         .expect("source residency was validated");
-    let mut forked = Qwen35RequestSessionState::fork_from(gpu, source)?;
+    let group = hipfire_runtime::kv::KvCache::KVARN_GROUP;
+    let checkpoint_cap =
+        as_checkpoint.then(|| (source.cursor.seq_pos.max(1)).div_ceil(group) * group);
+    let source_is_checkpoint = request.source_session_id.starts_with("qwen35-checkpoint:");
+    let mut forked = Qwen35RequestSessionState::fork_from_capped(gpu, source, checkpoint_cap)?;
     // Being forked from is a use. Eviction is oldest-first by this epoch, so without
     // the touch a prefix every request attaches to — minted first, hence oldest — was
     // the first thing evicted, and each request then re-prefilled it in full.
     if let Some(source) = m.q35_registry.sessions.get_mut(request.source_session_id) {
         source.allocation_epoch = next_qwen35_state_allocation_epoch();
     }
-    // A checkpoint carries the capacity of the request it was taken from; the
-    // request attaching to it may need more room than that.
-    if let Some(cap) = m.q35_registry.kv_caps.remove(request.dest_session_id) {
+    // A checkpoint maps only its prefix; the request attaching to it needs room to
+    // decode: its own capacity (the batch prefill sets it), else the full one.
+    let dest_cap = m
+        .q35_registry
+        .kv_caps
+        .remove(request.dest_session_id)
+        .or_else(|| source_is_checkpoint.then_some(m.physical_cap));
+    if let Some(cap) = dest_cap {
         let config = m
             .q35_config
             .as_ref()
@@ -2373,7 +2409,7 @@ pub fn qwen35_checkpoint_session_state(
             source.prefix_hash = Some(prefix_hash.clone());
         }
     }
-    qwen35_fork_session_state(
+    qwen35_fork_session_state_impl(
         m,
         gpu,
         SequenceStateForkRequest {
@@ -2381,6 +2417,7 @@ pub fn qwen35_checkpoint_session_state(
             dest_session_id: request.dest_session_id,
             requested_prefix_hash: request.requested_prefix_hash,
         },
+        true,
     )
 }
 

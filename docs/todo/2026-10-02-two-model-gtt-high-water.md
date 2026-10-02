@@ -54,3 +54,34 @@ proxy), then sum live allocations by call site at idle.
 The memory watchdog kills the daemon below 16 GB MemAvailable. At the 94 GiB
 plateau the host keeps ~28 GB. Lower `HIPFIRE_SERVER_PREFIX_CACHE_MAX` (per model
 now) if running heavier than this.
+
+## Measured (2026-10-02, morning)
+
+- `rocprofv3 --memory-allocation-trace` over the same two-model replay: live
+  allocations (allocate minus free, by address, incl. VMEM) are **35.5 GiB** once
+  both models are loaded and **~42 GiB** at idle after the replay -- while GTT
+  reads 40.8 and **95.0 GiB**. So ~53 GiB of GTT is NOT held by any allocation
+  the runtime reports as live: it is memory hipfire freed that the system did not
+  get back (or allocations outside the traced APIs).
+- Not the paged KV's free path: `probe_vmm_free` maps 256 MiB of 128 KiB VMM
+  pages and frees the region (one range unmap) -- GTT returns exactly, `Ok(())`.
+- Not paged KV at all: with `HIPFIRE_KV_PAGED=0` the same replay climbed to
+  105 GiB and the memory watchdog killed the daemon at 15 GB free. Paging uses
+  LESS memory.
+- Leads now: the HIP/ROCr runtime keeping freed hipMalloc memory (sub-allocator
+  or pool caching; try a `hipDeviceGraphMemTrim`/mempool trim or the ROCclr
+  memory-pool env knobs and watch GTT after a release), host/pinned allocations
+  outside the trace, and fragmentation of many differently sized KV allocations.
+- `probe_hipmalloc_free`: ~4 GiB as 170 buffers of 1..48 MiB, freed -- GTT returns
+  exactly, three rounds. Plain hipFree is not caching either.
+- DRM fdinfo of the daemon at the 94 GiB plateau: `drm-resident-gtt: 95786316 KiB`
+  on its own fd -- the memory is the DAEMON's, but the HIP allocation trace only
+  accounts for ~42 GiB of it (paged KV ~2 GiB: ~17K live 128 KiB pages). So ~53 GiB
+  is held through something that trace does not see. Next: `rocprofv3
+  --scratch-memory-trace` (per-queue scratch for spilling kernels is allocated by
+  the runtime on demand and kept), and the runtime's internal heaps for small
+  allocations (40K live allocations under 1 MiB).
+- Checkpoints now map only their sealed prefix (`qwen35_checkpoint_session_state`):
+  no measurable change on this replay (93.6 vs 94-95 GiB) because it caps outputs
+  at 256 tokens; real Corrode requests carry up to 8K tokens of headroom, so it
+  should matter there -- not yet measured.
