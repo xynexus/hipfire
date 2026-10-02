@@ -60,6 +60,23 @@ serving up to 24 rows (`395fe0a66`), small-B overlay correction `_trs`
   from K-major XT inside the fold): gate/up B=33 **0.59 -> 1.10 ms**. 96 byte
   gathers per thread per group stall the WMMA pipeline far worse than a separate
   pass costs. Reverted; do not retry in that form.
+- **Fusing the overlay from LDS, not global** (2026-10-02, `OQ_FUSE_OVERLAY`
+  per strip, before the fold): entries loaded once per group into registers
+  (`OV_SLOTS`=3), x[idx] rebuilt from the interleaved strip already in LDS,
+  `val*x` added to the group's i32 `accl`. Correct (fused vs separate pass
+  max_rel 1.6e-4..3.8e-4, vs an overlay term ~1e3 rel) and same occupancy (3
+  waves/SIMD on `_n64`, no spills), but **40-50% slower on every shape**:
+  gate/up B=64 0.65 -> 0.93 ms, down 0.66 -> 0.83, qkv B=512 1.34 -> 2.01. Why:
+  on RDNA3.5 WMMA executes on the SIMD's own VALU, and this GEMM is
+  WMMA-throughput-bound at decode widths (~22 int8 TOPS), so every VALU op the
+  overlay adds is taken straight from the matmul. The output-stationary lane
+  map makes it worse (a wave's 4 row-groups diverge: ~64 body runs per group
+  each with 8 LDS byte loads + ~24 VALU, for 96 real MACs). A row-uniform remap
+  (scalar-loaded entries, lane = column, a side f32 accumulator merged through
+  LDS at the end) cuts that ~5x on paper, which still estimates at 20-40% of
+  the GEMM vs ~24% for the separate pass -- break-even at best. **Conclusion:
+  candidate 1 below is not available on this hardware in any VALU form**; the
+  overlay stays a separate pass unless it can ride the WMMA itself.
 - **`_trs` correction past 64 rows**: 2-6x worse than `_tr` (side-plane re-reads
   per 16-column block). Keep the B<=64 threshold.
 
