@@ -124,6 +124,22 @@ line (no gain). Bench note: without `HIPFIRE_BENCH_COLD=1`, shapes that fit
 the 32 MB MALL (qkv, wo) are timed warm and mislead -- wo is 0.155 ms warm,
 0.33 cold at B<=64 (~32 GB/s; its K<5120 wave32 path is the next suspect).
 
+## Tried: split-K for the B<=64 tile (2026-10-02, reverted)
+
+Wave-scheduling rounds are real on this kernel (cold, GEMM only, B=64, K=5120:
+120 workgroups 0.184 ms, 240 -> 0.334, 256 -> 0.427, 360 -> 0.477), and down
+(M=5120 -> 80 workgroups, K=17408) under-fills: 102 GB/s vs 114-131 for fuller
+grids. Built split-K with a deterministic last-arriving-slice reduction (each
+K-slice writes its partial; the tile's last slice sums them in slice order and
+resets a per-tile counter -- bit-identical run to run, <=2.1e-4 rel vs unsplit).
+Swept: down best at 3 slices (GEMM B=33 0.502 -> 0.393 ms, B=64 0.529 ->
+0.462); qkv (20 groups) and gate/up lose at any split. Route, down only: -8% at
+B=25, -2.5% at B=64. **End to end at 64 sessions: 154.5 / 153.9 vs 154.6 tok/s
+off -- nothing**, since down at B=64 is a quarter of the GEMM time and gained
+2.5%. Corrode's own swarms (3-15 sessions) decode at B<=24, the multicol path,
+so it does not reach them either. Not worth a counter buffer, a partial plane
+and a second epilogue; revisit only if B=25..48 becomes the serving regime.
+
 ## Scope of the redesign
 
 Goal: B in 17..128 at >=60% of weight bandwidth with the overlay included —
