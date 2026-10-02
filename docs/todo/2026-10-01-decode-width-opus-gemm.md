@@ -68,16 +68,35 @@ serving up to 24 rows (`395fe0a66`), small-B overlay correction `_trs`
   waves/SIMD on `_n64`, no spills), but **40-50% slower on every shape**:
   gate/up B=64 0.65 -> 0.93 ms, down 0.66 -> 0.83, qkv B=512 1.34 -> 2.01. Why:
   on RDNA3.5 WMMA executes on the SIMD's own VALU, so every VALU op the overlay
-  adds sits in the same issue stream as the matmul. (Not because the GEMM is
+  adds sits in the same issue stream as the matmul -- and this version also did
+  its control work (table decode, strip match, divergent branch) per lane on
+  the VALU, which the scalar unit could have taken (next entry). (Not because the GEMM is
   WMMA-bound -- it runs ~37% of WMMA peak at B=64; see the memory finding
   below.) The output-stationary lane
   map makes it worse (a wave's 4 row-groups diverge: ~64 body runs per group
   each with 8 LDS byte loads + ~24 VALU, for 96 real MACs). A row-uniform remap
   (scalar-loaded entries, lane = column, a side f32 accumulator merged through
   LDS at the end) cuts that ~5x on paper, which still estimates at 20-40% of
-  the GEMM vs ~24% for the separate pass -- break-even at best. **Conclusion:
-  candidate 1 below is not available on this hardware in any VALU form**; the
-  overlay stays a separate pass unless it can ride the WMMA itself.
+  the GEMM vs ~24% for the separate pass -- break-even at best.
+- **Overlay driven from the scalar unit** (2026-10-02, the row-uniform remap
+  above, built): the SALU is separate silicon from the VALU the WMMA uses, so
+  the loop walked one weight row at a time across the wave (lane = column) --
+  side entry as a wave-uniform `s_load_b64`, idx/val decode, strip match and
+  branch all on the SALU (`s_cvt_f32_f16`, `s_mul_f32` on gfx1151), only the
+  per-column multiply-add on the VALU, a per-row f32 accumulator merged into
+  facc through LDS. Correct (vs separate pass <=4.3e-4 rel), occupancy kept at
+  3 with `amdgpu_waves_per_eu(3)` (240 VGPRs, no spills), row loop unrolled
+  (32 batched s_loads, no M0 indexing). **2.3x SLOWER** (cold, B=64: gate/up
+  0.59 -> 1.37 ms, down 0.61 -> 1.35, qkv 0.22 -> 0.46). Ablation: with the LDS
+  reads and nibble math removed -- scalar loop only -- still 1.21 ms. Why: a
+  wave issues in order, so the ~96 entry checks + 32 s_loads it walks per strip
+  are cycles it is not issuing WMMAs, and every wave on the SIMD carries the
+  same load; the scalar side is the bottleneck, not the VALU. And the VALU/LDS
+  remainder (1.37 - 1.21 = ~0.16 ms) alone is about what the whole separate
+  pass costs (~0.15), so even a free scalar side breaks even. The only form
+  left would pre-bucket the overlay by strip at weight-load time (a new side
+  plane) to cut the scalar walk ~4x -- and its VALU part still only breaks
+  even. **The overlay stays a separate pass.**
 - **`_trs` correction past 64 rows**: 2-6x worse than `_tr` (side-plane re-reads
   per 16-column block). Keep the B<=64 threshold.
 
