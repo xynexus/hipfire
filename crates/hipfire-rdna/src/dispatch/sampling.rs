@@ -213,9 +213,12 @@ impl Gpu {
             .flat_map(|t| (t.buf.as_ptr() as usize as u64).to_le_bytes())
             .collect();
         let count = data.len();
-        let ptr_buf = self.hip.malloc(ptrs.len())?;
-        let result_buf = self.hip.malloc(count * 4)?;
-        let launched = self.hip.memcpy_htod(&ptr_buf, &ptrs).and_then(|()| {
+        // Pooled, not hipMalloc/hipFree: this runs every decode step, and hipFree
+        // synchronises the device.
+        let ptr_t = self.alloc_tensor(&[count * 2], crate::DType::F32)?;
+        let result_t = self.alloc_tensor(&[count], crate::DType::F32)?;
+        let (ptr_buf, result_buf) = (&ptr_t.buf, &result_t.buf);
+        let launched = self.hip.memcpy_htod(ptr_buf, &ptrs).and_then(|()| {
             let (pp, rp, nn) = (ptr_buf.as_ptr(), result_buf.as_ptr(), n as i32);
             self.launch_kernargs(
                 "argmax_f32_ptrs",
@@ -229,10 +232,10 @@ impl Gpu {
         let read = launched.and_then(|()| {
             let bytes: &mut [u8] =
                 unsafe { std::slice::from_raw_parts_mut(out.as_mut_ptr() as *mut u8, count * 4) };
-            self.hip.memcpy_dtoh(bytes, &result_buf)
+            self.hip.memcpy_dtoh(bytes, result_buf)
         });
-        let _ = self.hip.free(ptr_buf);
-        let _ = self.hip.free(result_buf);
+        let _ = self.free_tensor(ptr_t);
+        let _ = self.free_tensor(result_t);
         read?;
         Ok(out.into_iter().map(|v| v as u32).collect())
     }

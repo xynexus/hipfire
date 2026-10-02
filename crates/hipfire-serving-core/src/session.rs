@@ -205,23 +205,28 @@ impl Qwen35RequestSessionState {
         let buffer_size = tensor.buf.size();
         gpu.bind_thread()
             .map_err(|e| format!("clone qwen35 checkpoint {label} bind gpu: {e:?}"))?;
-        let buf = gpu.hip.malloc(buffer_size).map_err(|e| {
-            // Include shape/dtype: a byte count alone cannot say whether an
-            // oversized clone is a geometry bug (wrong head count, wrong
-            // max_seq) or genuine pressure.
-            format!(
-                "clone qwen35 checkpoint {label} alloc: {e:?} (shape={:?} dtype={:?} bytes={})",
-                tensor.shape, tensor.dtype, buffer_size
-            )
-        })?;
+        // From the POOL, not hip.malloc: every request that attaches to a checkpoint
+        // clones its state through here, and with ROCr's fragment allocator off a
+        // direct buffer's release is a real hipFree (~10 ms, it synchronises the
+        // device). Released sessions are freed mid-decode now, so 64-session decode
+        // lost ~6% to those frees.
+        let mut cloned = gpu
+            .alloc_tensor(&[buffer_size], hipfire_rdna::DType::Raw)
+            .map_err(|e| {
+                // Include shape/dtype: a byte count alone cannot say whether an
+                // oversized clone is a geometry bug (wrong head count, wrong
+                // max_seq) or genuine pressure.
+                format!(
+                    "clone qwen35 checkpoint {label} alloc: {e:?} (shape={:?} dtype={:?} bytes={})",
+                    tensor.shape, tensor.dtype, buffer_size
+                )
+            })?;
         gpu.hip
-            .memcpy_dtod_at(&buf, 0, &tensor.buf, 0, buffer_size)
+            .memcpy_dtod_at(&cloned.buf, 0, &tensor.buf, 0, buffer_size)
             .map_err(|e| format!("clone qwen35 checkpoint {label} copy: {e:?}"))?;
-        Ok(hipfire_rdna::GpuTensor {
-            buf,
-            shape: tensor.shape.clone(),
-            dtype: tensor.dtype,
-        })
+        cloned.shape = tensor.shape.clone();
+        cloned.dtype = tensor.dtype;
+        Ok(cloned)
     }
 
     /// [`clone_gpu_tensor`] over a slice of tensors (e.g. the per-layer KV
