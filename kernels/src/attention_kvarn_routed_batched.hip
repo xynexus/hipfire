@@ -228,11 +228,21 @@ __device__ __forceinline__ void kvarn_routed_gqa_impl(
     int window_f16,
     int bits,
     int row_offset,
-    int chunk
+    int chunk,
+    float* __restrict__ partials,
+    int split_len
 ) {
     const int kv_h = blockIdx.x;
     const int b = blockIdx.y + row_offset;
     if (kv_h >= n_kv_heads) return;
+    // Split-K over the context (flash decoding): gridDim.z workgroups per (row,
+    // KV head), each walking `split_len` positions and writing its partial
+    // (m, l, acc) per query head; attention_kvarn_split_reduce combines them.
+    // One workgroup per (row, KV head) left the GPU idle at long context -- 3
+    // sessions at 25K positions were 12 workgroups on 40 CUs and attention was 71%
+    // of each decode step.
+    const int n_splits = gridDim.z;
+    const int split = blockIdx.z;
 
     const int session_idx = row_session_indices[b];
     const size_t slot = (size_t)session_idx * ptr_layer_stride + layer_index;
@@ -243,6 +253,10 @@ __device__ __forceinline__ void kvarn_routed_gqa_impl(
     const int seq_len = positions[b] + 1;
     const int win_base = (seq_len / group) * group;
     extern __shared__ float sdata[];
+    const int c_begin = (n_splits > 1) ? split * split_len : 0;
+    const int c_end = (n_splits > 1) ? min(seq_len, c_begin + split_len) : seq_len;
+    const size_t part_base =
+        (((size_t)blockIdx.y * n_kv_heads + kv_h) * n_splits + split) * G * (2 + head_dim);
 
     const int h0 = kv_h * G;
     const int tid = threadIdx.x;
@@ -279,8 +293,8 @@ __device__ __forceinline__ void kvarn_routed_gqa_impl(
         for (int k = 0; k < KVARN_GQA_MAX_D; k++) acc[g][k] = 0.0f;
     }
 
-    for (int c0 = 0; c0 < seq_len; c0 += chunk) {
-        const int n = min(chunk, seq_len - c0);
+    for (int c0 = c_begin; c0 < c_end; c0 += chunk) {
+        const int n = min(chunk, c_end - c0);
 
         float local_max[G];
         for (int g = 0; g < G; g++) local_max[g] = -INFINITY;
@@ -380,11 +394,60 @@ __device__ __forceinline__ void kvarn_routed_gqa_impl(
         __syncthreads();
     }
 
+    if (n_splits > 1) {
+        // Partial for the reduce. A split past the row's context leaves m = -inf,
+        // l = 0, acc = 0, which the reduce weights by exp(-inf) = 0.
+        int k = 0;
+        for (int d = tid; d < head_dim && k < KVARN_GQA_MAX_D; d += nthreads, k++) {
+            for (int g = 0; g < G; g++)
+                partials[part_base + (size_t)g * (2 + head_dim) + 2 + d] = acc[g][k];
+        }
+        if (tid == 0) {
+            for (int g = 0; g < G; g++) {
+                partials[part_base + (size_t)g * (2 + head_dim)] = m[g];
+                partials[part_base + (size_t)g * (2 + head_dim) + 1] = l[g];
+            }
+        }
+        return;
+    }
     int k = 0;
     for (int d = tid; d < head_dim && k < KVARN_GQA_MAX_D; d += nthreads, k++) {
         for (int g = 0; g < G; g++) {
             out[(long long)b * q_stride + (h0 + g) * head_dim + d] = acc[g][k] / l[g];
         }
+    }
+}
+
+// Combine the split-K partials of attention_kvarn_routed_batched_gqa<G> (launched
+// with gridDim.z = n_splits). Grid [n_heads, rows], block [256]. Splits are summed
+// in order, so a row whose context fits one split reproduces the unsplit kernel
+// bit for bit (its weight is exp(0) = 1; empty splits add exact zeros).
+extern "C" __global__ void attention_kvarn_split_reduce(
+    const float* __restrict__ partials, float* __restrict__ out,
+    int n_heads, int n_kv_heads, int head_dim, int n_splits, int row_offset
+) {
+    const int h = blockIdx.x;
+    const int row = blockIdx.y;
+    const int G = n_heads / n_kv_heads;
+    const int kv_h = h / G;
+    const int g = h - kv_h * G;
+    const size_t stride = 2 + head_dim;
+    const size_t base = ((size_t)row * n_kv_heads + kv_h) * n_splits * G;
+    float M = -INFINITY;
+    for (int s = 0; s < n_splits; s++) M = fmaxf(M, partials[((base + (size_t)s * G) + g) * stride]);
+    float L = 0.0f;
+    for (int s = 0; s < n_splits; s++) {
+        const float* p = partials + ((base + (size_t)s * G) + g) * stride;
+        L += p[1] * expf(p[0] - M);
+    }
+    const int q_stride = n_heads * head_dim;
+    for (int d = threadIdx.x; d < head_dim; d += blockDim.x) {
+        float a = 0.0f;
+        for (int s = 0; s < n_splits; s++) {
+            const float* p = partials + ((base + (size_t)s * G) + g) * stride;
+            a += p[2 + d] * expf(p[0] - M);
+        }
+        out[(long long)(row + row_offset) * q_stride + h * head_dim + d] = a / L;
     }
 }
 
@@ -396,11 +459,12 @@ __device__ __forceinline__ void kvarn_routed_gqa_impl(
     float* __restrict__ out, const int* __restrict__ row_session_indices, \
     const int* __restrict__ positions, int ptr_layer_stride, int layer_index, int n_heads, \
     int n_kv_heads, int head_dim, int max_seq, float scale_attn, int rec_bytes, int group, \
-    int window_f16, int bits, int row_offset, int chunk
+    int window_f16, int bits, int row_offset, int chunk, float* __restrict__ partials, \
+    int split_len
 #define KVARN_GQA_PASS \
     q, rec_ptrs, win_ptrs, v_ptrs, out, row_session_indices, positions, ptr_layer_stride, \
     layer_index, n_heads, n_kv_heads, head_dim, max_seq, scale_attn, rec_bytes, group, \
-    window_f16, bits, row_offset, chunk
+    window_f16, bits, row_offset, chunk, partials, split_len
 #define KVARN_GQA_KERNEL(NG) \
     extern "C" __global__ void attention_kvarn_routed_batched_gqa##NG(KVARN_GQA_ARGS) { \
         kvarn_routed_gqa_impl<NG>(KVARN_GQA_PASS); \

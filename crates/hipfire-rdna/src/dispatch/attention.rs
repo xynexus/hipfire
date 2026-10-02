@@ -1329,22 +1329,85 @@ impl Gpu {
             row_offset as i32,
             chunk as i32,
         );
-        self.launch_kernargs(
+        if !gqa {
+            return self.launch_kernargs(
+                func,
+                [n_heads as u32, batch_size as u32, 1],
+                [block_size, 1, 1],
+                shared_mem,
+                &kernargs![
+                    ptr q_ptr, ptr rec_ptrs_ptr, ptr win_ptrs_ptr, ptr v_ptrs_ptr,
+                    ptr out_ptr, ptr rsi_ptr, ptr pos_ptr,
+                    i32 ptr_stride, i32 layer, i32 nh, i32 nkv, i32 hd, i32 ms, f32 sc, i32 rb, i32 gp,
+                    i32 win_f16_i, i32 bits_i, i32 row_offset_i, i32 chunk_i
+                ],
+            );
+        }
+        // Split-K over the context: one workgroup per (row, KV head) left the GPU
+        // idle at long context (3 sessions at 25K positions: 12 workgroups, attention
+        // 71% of a decode step). Splits past a row's context exit at once.
+        // Only as many splits as it takes to fill the GPU: 64 sessions x 4 KV heads
+        // are already 256 workgroups, and splitting them anyway (empty workgroups
+        // past short contexts, plus the reduce) cost ~5% of 64-session decode.
+        const TARGET_WORKGROUPS: usize = 256;
+        let split_len = kvarn_decode_split_len(chunk);
+        let n_splits = if split_len == 0 {
+            1
+        } else {
+            let base = (batch_size * n_kv_heads).max(1);
+            TARGET_WORKGROUPS
+                .div_ceil(base)
+                .clamp(1, max_seq.div_ceil(split_len).max(1))
+        };
+        let partials = if n_splits > 1 {
+            Some(self.alloc_tensor(
+                &[batch_size * n_kv_heads * n_splits * g * (2 + head_dim)],
+                DType::F32,
+            )?)
+        } else {
+            None
+        };
+        let part_ptr = partials
+            .as_ref()
+            .map_or(std::ptr::null_mut(), |t| t.buf.as_ptr());
+        let split_i = split_len as i32;
+        let launched = self.launch_kernargs(
             func,
-            [
-                if gqa { n_kv_heads } else { n_heads } as u32,
-                batch_size as u32,
-                1,
-            ],
+            [n_kv_heads as u32, batch_size as u32, n_splits as u32],
             [block_size, 1, 1],
             shared_mem,
             &kernargs![
                 ptr q_ptr, ptr rec_ptrs_ptr, ptr win_ptrs_ptr, ptr v_ptrs_ptr,
                 ptr out_ptr, ptr rsi_ptr, ptr pos_ptr,
                 i32 ptr_stride, i32 layer, i32 nh, i32 nkv, i32 hd, i32 ms, f32 sc, i32 rb, i32 gp,
-                i32 win_f16_i, i32 bits_i, i32 row_offset_i, i32 chunk_i
+                i32 win_f16_i, i32 bits_i, i32 row_offset_i, i32 chunk_i,
+                ptr part_ptr, i32 split_i
             ],
-        )
+        );
+        let reduced = match (&launched, &partials) {
+            (Ok(()), Some(_)) => {
+                self.ensure_kernel(
+                    "attention_kvarn_routed_batched",
+                    kernels::ATTENTION_KVARN_ROUTED_BATCHED_SRC,
+                    "attention_kvarn_split_reduce",
+                )?;
+                let ns = n_splits as i32;
+                self.launch_kernargs(
+                    "attention_kvarn_split_reduce",
+                    [n_heads as u32, batch_size as u32, 1],
+                    [256, 1, 1],
+                    0,
+                    &kernargs![
+                        ptr part_ptr, ptr out_ptr, i32 nh, i32 nkv, i32 hd, i32 ns, i32 row_offset_i
+                    ],
+                )
+            }
+            _ => Ok(()),
+        };
+        if let Some(t) = partials {
+            let _ = self.free_tensor(t);
+        }
+        launched.and(reduced)
     }
     /// FP32 causal attention specialized for GQA groups where four query heads
     /// share one KV head. This is a full-precision KLD prefill fast path: it
@@ -6010,4 +6073,18 @@ fn kvarn_prefill_wmma_enabled() -> bool {
         std::env::var("HIPFIRE_KVARN_PREFILL_WMMA").as_deref(),
         Ok("0" | "off" | "false")
     )
+}
+
+/// Positions each split-K workgroup of the routed KVarN decode attention walks,
+/// `HIPFIRE_KVARN_DECODE_SPLIT` (default 2048; 0 = no split). Rounded to `chunk`.
+fn kvarn_decode_split_len(chunk: usize) -> usize {
+    let v = std::env::var("HIPFIRE_KVARN_DECODE_SPLIT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(2048);
+    if v == 0 {
+        0
+    } else {
+        v.div_ceil(chunk.max(1)) * chunk.max(1)
+    }
 }
