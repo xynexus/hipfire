@@ -112,7 +112,7 @@ fn main() {
         })
     }
     let mut w: HashMap<String, Vec<f32>> = HashMap::new();
-    let mut put = |w: &mut HashMap<String, Vec<f32>>, name: String, len: usize| {
+    let put = |w: &mut HashMap<String, Vec<f32>>, name: String, len: usize| {
         let sd = name_seed(&name);
         w.insert(name, seeded(len, sd));
     };

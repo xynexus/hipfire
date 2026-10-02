@@ -270,7 +270,7 @@ fn run_case(gpu: &mut Gpu, n_full_blocks: usize, tail_len: usize, rows: usize) -
     let partials = gpu
         .zeros(&[rows * n_heads * max_tiles * (2 + head_dim)], DType::F32)
         .unwrap();
-    let mut run = |gpu: &mut Gpu, wmma: bool| {
+    let run = |gpu: &mut Gpu, wmma: bool| {
         std::env::set_var("HIPFIRE_KVARN_PREFILL_WMMA", if wmma { "1" } else { "0" });
         let out = gpu.zeros(&[rows * q_dim], DType::F32).unwrap();
         gpu.attention_flash_kvarn_batched_masked(

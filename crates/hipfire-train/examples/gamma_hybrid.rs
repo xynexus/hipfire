@@ -316,8 +316,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // HIPFIRE_MIXED_BPW_GAMMA (a flat {tensor: gamma} map), and without it the
     // pass reports a summary and throws the numbers away.
     if let Ok(js) = serde_json::to_string(&table) {
-        let out = std::env::var("HIPFIRE_GAMMA_OUT")
-            .unwrap_or_else(|_| "gamma.json".to_string());
+        let out = std::env::var("HIPFIRE_GAMMA_OUT").unwrap_or_else(|_| "gamma.json".to_string());
         match std::fs::write(&out, js) {
             Ok(()) => println!("  wrote {} gamma entries -> {out}", table.len()),
             Err(e) => eprintln!("  WARN could not write {out}: {e}"),

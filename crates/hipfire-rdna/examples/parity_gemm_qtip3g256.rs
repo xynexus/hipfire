@@ -19,7 +19,6 @@ use hipfire_rdna::Gpu;
 const BLK: usize = 100; // [f32 scale | 96 B of 3-bit symbols]
 const NT: usize = 32; // activation columns per pass (matches the kernel)
 
-
 fn lcg_u8(seed: u32, n: usize) -> Vec<u8> {
     let mut s = seed.max(1);
     (0..n)
@@ -86,7 +85,9 @@ fn main() {
     let mut yref = vec![0.0f32; n * m];
     let yv = gpu.upload_raw(&vec![0u8; m * 4], &[1, m]).unwrap();
     for c in 0..n {
-        let xc = gpu.upload_raw(&f32_bytes(&x[c * k..(c + 1) * k]), &[1, k]).unwrap();
+        let xc = gpu
+            .upload_raw(&f32_bytes(&x[c * k..(c + 1) * k]), &[1, k])
+            .unwrap();
         gpu.gemv_qtip3g256(&ad, &xc, &yv, m, k).unwrap();
         gpu.device_synchronize().unwrap();
         yref[c * m..(c + 1) * m].copy_from_slice(&gpu.download_f32(&yv).unwrap());
@@ -104,7 +105,11 @@ fn main() {
         max_abs = max_abs.max((yg[i] - yref[i]).abs());
         max_mag = max_mag.max(yref[i].abs());
     }
-    let rel = if max_mag > 0.0 { max_abs / max_mag } else { 0.0 };
+    let rel = if max_mag > 0.0 {
+        max_abs / max_mag
+    } else {
+        0.0
+    };
     println!("gemm_qtip3g256 vs gemv_qtip3g256  M={m} K={k} N={n} (tiles of {NT})");
     println!("  max |Δ| {max_abs:.3e}   max |ref| {max_mag:.3e}   rel {rel:.3e}");
     // Same decode, same order of the 8 per-lane products, same wave reduction —

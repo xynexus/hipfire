@@ -200,7 +200,6 @@ impl ExpertStack {
                 )
             })?;
         let t_views = page_timing::enabled().then(std::time::Instant::now);
-        let t_views = page_timing::enabled().then(std::time::Instant::now);
         let views = pager.resident_expert_views(key).ok_or_else(|| {
             HipError::new(
                 0,

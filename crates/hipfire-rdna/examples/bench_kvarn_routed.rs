@@ -71,7 +71,7 @@ fn main() {
         .flat_map(|r| ((ctx - rows + r) as i32).to_le_bytes())
         .collect();
     let posd = gpu.upload_raw(&pos, &[rows]).unwrap();
-    let mut run = |gpu: &mut Gpu| {
+    let run = |gpu: &mut Gpu| {
         if mode == 0 {
             gpu.attention_kvarn_routed_batched(
                 false, &q, &recp, &winp, &vp, &out, &rsi, &posd, 1, 0, NH, NKV, HD, ctx, ctx, rows,

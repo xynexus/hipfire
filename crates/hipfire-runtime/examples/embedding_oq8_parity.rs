@@ -53,16 +53,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     // Encode row-major, one row at a time: a gather addresses whole rows.
     let mut packed: Vec<u8> = Vec::with_capacity(rows * groups * 258);
     for r in 0..rows {
-        packed.extend_from_slice(&quantize_oq8g256(
-            &table[r * dim..(r + 1) * dim],
-            &s1,
-            &s2,
-        ));
+        packed.extend_from_slice(&quantize_oq8g256(&table[r * dim..(r + 1) * dim], &s1, &s2));
     }
     assert_eq!(packed.len(), rows * groups * 258, "unexpected packed size");
 
     let mut gpu = Gpu::init().expect("Gpu::init failed");
-    println!("arch: {}  rows={rows} dim={dim}  packed={} B/row", gpu.arch, groups * 258);
+    println!(
+        "arch: {}  rows={rows} dim={dim}  packed={} B/row",
+        gpu.arch,
+        groups * 258
+    );
 
     // Upload the PLANAR form the kernel reads (and the tied head's GEMV shares).
     let combined = hipfire_runtime::oq8_arch::oq8_combined(&packed, rows, dim);
