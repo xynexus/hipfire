@@ -583,12 +583,15 @@ impl Gpu {
         // so it is the right kernel for a tree the same way it is for a block.
         //
         // Batched serving (`oq_batch_serving`) takes the WIDE multicol, and only
-        // up to 24 rows: measured on the 27B shapes (gfx1151, with the overlay
-        // correction the tiled path adds), wide multicol vs the narrow-N tile
-        // below — gate/up 0.45 vs 0.68 ms at 20 rows, 0.54 vs 0.69 at 24, 0.76
-        // vs 0.69 at 32 — where the narrow multicol was 2.95 ms at 32 rows.
+        // up to 21 rows. Re-measured after the narrow tile stopped over-fetching
+        // (group-line staging), cold weights, route incl. the overlay pass,
+        // multicol vs tile: gate/up 0.435 vs 0.485 ms at 20 rows, 0.488 vs 0.490
+        // at 22, 0.515 vs 0.489 at 24; down 0.450 vs 0.441 / 0.507 vs 0.442 /
+        // 0.529 vs 0.445; qkv 0.170 vs 0.186 / 0.195 vs 0.188 / 0.204 vs 0.190.
+        // (Before it, warm: 24 rows, gate/up 0.54 vs 0.69.) Narrow multicol
+        // was 2.95 ms at 32 rows.
         let serving_wide = self.oq_batch_serving && (k / 256) % 4 == 0;
-        let small_n = if serving_wide { 24 } else { 32 };
+        let small_n = if serving_wide { 21 } else { 32 };
         if n <= small_n
             && group == 256
             && std::env::var("HIPFIRE_OQ_COMPACT_SMALL_N").as_deref() != Ok("0")

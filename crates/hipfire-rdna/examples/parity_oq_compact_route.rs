@@ -2,7 +2,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 //! Parity of the batched-serving routes of `gemm_oq_compact_act_batched` —
-//! the wide multicol (<= 24 rows) and the BN=64 wave64 tile (25..=64 rows) —
+//! the wide multicol (<= 21 rows) and the BN=64 wave64 tile (22..=64 rows) —
 //! against the default BN=128 tile, which the same rows padded to B=300 take.
 //! The narrow tile must match bit for bit (same per-element K order); the
 //! multicol sums in a different order, so it gets a rounding tolerance.
@@ -141,7 +141,7 @@ fn main() {
             let _ = gpu.free_tensor(xs);
             let _ = gpu.free_tensor(y);
         }
-        for &b in &[1usize, 8, 20, 24, 25, 33, 40, 64] {
+        for &b in &[1usize, 8, 20, 21, 22, 24, 33, 40, 64] {
             let xs = gpu.upload_f32(&x[..b * k], &[b * k]).expect("x");
             let y = gpu.alloc_tensor(&[b * m], DType::F32).expect("y");
             gpu.gemm_oq_compact_act_batched(&wb, &xs, &y, m, k, b, stride)
@@ -153,7 +153,7 @@ fn main() {
                 exact &= g.to_bits() == r.to_bits();
                 max_rel = max_rel.max((g - r).abs() / r.abs().max(1.0));
             }
-            let tiled = b > 24;
+            let tiled = b > 21;
             let pass = if tiled { exact } else { max_rel < 1e-3 };
             fail |= !pass;
             println!(
