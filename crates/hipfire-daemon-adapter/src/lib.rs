@@ -194,10 +194,20 @@ impl StdioTransport {
         // Ensure the worker emits a backtrace on panic; an operator-provided
         // value (e.g. `full`) wins so deeper traces can be requested.
         let backtrace = std::env::var("RUST_BACKTRACE").unwrap_or_else(|_| "1".to_string());
+        // ROCr's fragment allocator carves small allocations out of 2 MiB blocks
+        // and keeps a block while any piece of it lives; per-request KV and state
+        // scatter small long-lived pieces across thousands of blocks. Measured on
+        // gfx1151 replaying a two-model Corrode swarm turn: 24,407 retained 2 MiB
+        // blocks, idle GTT 94 GiB; with it disabled, 42.8 GiB (and the loaded
+        // weights 36.2 instead of 40.8 GiB: no 2 MiB rounding), same throughput.
+        // An operator-provided value (`=0` to keep the allocator) wins.
+        let no_fragments =
+            std::env::var("HSA_DISABLE_FRAGMENT_ALLOCATOR").unwrap_or_else(|_| "1".to_string());
         let mut child = Command::new(bin)
             .args(daemon_argv(bin))
             .args(extra)
             .env("RUST_BACKTRACE", backtrace)
+            .env("HSA_DISABLE_FRAGMENT_ALLOCATOR", no_fragments)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             // Piped (not inherited) so we can parse per-layer load progress; the

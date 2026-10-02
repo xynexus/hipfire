@@ -1,6 +1,7 @@
 # TODO: ~53 GiB of GTT above the weights with two models serving a swarm
 
-Status: TODO (bounded, not explained). Date: 2026-10-02.
+Status: RESOLVED (2026-10-02) -- ROCr's fragment allocator; see "Resolution".
+Date: 2026-10-02.
 Models: Qwen3.8-27B--oq4.25++ + Qwen3.6-35B-A3B--oq4.25++ co-resident, gfx1151
 (APU: GTT is host RAM, 116 GiB cap of 125 GiB).
 
@@ -94,3 +95,25 @@ now) if running heavier than this.
   /sys/kernel/debug/dri/1/amdgpu_gem_info` lists every buffer object per process
   with its size -- group the daemon's by size and compare against the trace's live
   set to see which BOs nothing in HIP still references.
+
+## Resolution
+
+`sudo cat /sys/kernel/debug/dri/1/amdgpu_vm_info` (amdgpu_gem_info does not list
+KFD buffers) at the plateau, against the same right after loading both models:
+the daemon's VM held 92.0 GiB of BOs, and the extra over baseline was **24,407 BOs
+of exactly 2 MiB (47.7 GiB)** plus 9,774 x 128 KiB live KV pages (1.2 GiB). The
+2 MiB blocks are ROCr's fragment allocator: small hipMalloc requests are carved
+from 2 MiB blocks, and a block stays allocated while any piece of it lives --
+per-request KV/state pieces scattered across blocks pin them all. It is invisible
+to the HIP allocation trace (which sees the freed pieces as freed).
+
+`HSA_DISABLE_FRAGMENT_ALLOCATOR=1`, same replay:
+
+| | loaded (both models) | idle after replay | peak |
+|---|---|---|---|
+| default (fragment allocator on) | 40.8 GiB | 94.2 GiB | 94.3 GiB |
+| fragment allocator off | **36.2 GiB** | **42.8 GiB** | **43.6 GiB** |
+
+No errors, same throughput (same requests left at 600 s), cold 8.3K prefill
+30.5 s vs 30.2 s. The daemon is now spawned with it set by default
+(hipfire-daemon-adapter; an operator value, `=0` included, wins).
