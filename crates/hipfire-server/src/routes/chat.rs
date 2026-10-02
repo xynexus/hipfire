@@ -1288,7 +1288,13 @@ fn daemon_tool_calls_to_openai(calls: Vec<hipfire_generate::ToolCall>, req_id: &
         .collect()
 }
 
-fn parse_inline_tool_calls(text: &str, req_id: &str) -> (String, Vec<Value>) {
+/// `tools` is the request's tool declarations: a parameter's declared type decides
+/// whether its value is taken as text or JSON-parsed (see [`coerce_inline_tool_param`]).
+fn parse_inline_tool_calls(
+    text: &str,
+    req_id: &str,
+    tools: Option<&Value>,
+) -> (String, Vec<Value>) {
     let mut tool_calls = Vec::new();
     let mut search_from = 0usize;
     while let Some(rel_open) = text[search_from..].find("<tool_call>") {
@@ -1308,7 +1314,7 @@ fn parse_inline_tool_calls(text: &str, req_id: &str) -> (String, Vec<Value>) {
                 raw = before_close.trim();
             }
         }
-        if let Some((name, arguments)) = parse_one_inline_tool_call(raw) {
+        if let Some((name, arguments)) = parse_one_inline_tool_call(raw, tools) {
             let idx = tool_calls.len();
             tool_calls.push(json!({
                 "id": format!("call_{req_id}_{idx}"),
@@ -1366,7 +1372,7 @@ fn strip_chat_specials(text: &str) -> String {
         .replace("<|im_sep|>", "")
 }
 
-fn parse_one_inline_tool_call(raw: &str) -> Option<(String, Value)> {
+fn parse_one_inline_tool_call(raw: &str, tools: Option<&Value>) -> Option<(String, Value)> {
     let cleaned = strip_chat_specials(raw);
     let raw = cleaned.trim();
     if let Ok(value) = serde_json::from_str::<Value>(raw) {
@@ -1409,7 +1415,10 @@ fn parse_one_inline_tool_call(raw: &str) -> Option<(String, Value)> {
             let value_end = value_start + value_end_rel;
             args.insert(
                 key.to_string(),
-                coerce_inline_tool_param(body[value_start..value_end].trim()),
+                coerce_inline_tool_param(
+                    &body[value_start..value_end],
+                    declared_param_type(tools, name.trim(), key),
+                ),
             );
             body = &body[value_end + "</parameter>".len()..];
         }
@@ -1427,11 +1436,40 @@ fn parse_one_inline_tool_call(raw: &str) -> Option<(String, Value)> {
     None
 }
 
-fn coerce_inline_tool_param(s: &str) -> Value {
+/// A `<parameter=…>` value. Qwen's template puts one newline after the opening tag
+/// and one before the closing tag; only those are markup. A parameter declared
+/// `string` keeps everything else exactly -- trimming stripped every written file's
+/// trailing newline and first-line indentation, and JSON-parsing turned a file whose
+/// contents parse as JSON into an object (and unquoted a JSON string literal). Other
+/// or undeclared types are trimmed and JSON-parsed, falling back to text.
+fn coerce_inline_tool_param(raw: &str, declared: Option<&str>) -> Value {
+    if declared == Some("string") {
+        let s = raw.strip_prefix('\n').unwrap_or(raw);
+        let s = s.strip_suffix('\n').unwrap_or(s);
+        return Value::String(s.to_string());
+    }
+    let s = raw.trim();
     if s.is_empty() {
         return Value::String(String::new());
     }
     serde_json::from_str::<Value>(s).unwrap_or_else(|_| Value::String(s.to_string()))
+}
+
+/// The JSON-Schema `type` the request declared for `tool`'s parameter `param`, from
+/// either tool shape: OpenAI-nested (`{type: function, function: {name, parameters}}`)
+/// or flat (`{name, parameters}`).
+fn declared_param_type<'a>(tools: Option<&'a Value>, tool: &str, param: &str) -> Option<&'a str> {
+    tools?.as_array()?.iter().find_map(|t| {
+        let f = t.get("function").unwrap_or(t);
+        if f.get("name")?.as_str()? != tool {
+            return None;
+        }
+        f.get("parameters")?
+            .get("properties")?
+            .get(param)?
+            .get("type")?
+            .as_str()
+    })
 }
 
 fn inline_xml_tool_name_and_tail(raw: &str) -> Option<(String, &str)> {
@@ -2183,7 +2221,8 @@ where
         let final_text = strip_visible_thinking(text, preserve_thinking, true);
         // The daemon's batch decode returns text only, so parse calls the way the
         // legacy path does when the daemon hands it none.
-        let (final_text, tool_calls) = parse_inline_tool_calls(&final_text, &req_id);
+        let (final_text, tool_calls) =
+            parse_inline_tool_calls(&final_text, &req_id, body.tools.as_ref());
         let done = hipfire_generate::DoneEvent {
             id: req_id.clone(),
             tokens: token_count,
@@ -2247,7 +2286,7 @@ where
                 Some(request_max_tokens),
             ),
             loaded.worker_key_id,
-            body.tools,
+            body.tools.clone(),
             body.system,
             stop,
             image_base64,
@@ -2302,7 +2341,8 @@ where
             let mut text = strip_visible_thinking(raw_text, preserve_thinking, true);
             let mut tool_calls = daemon_tool_calls_to_openai(raw_tool_calls, &req_id);
             if tool_calls.is_empty() {
-                let (content, parsed) = parse_inline_tool_calls(&text, &req_id);
+                let (content, parsed) =
+                    parse_inline_tool_calls(&text, &req_id, body.tools.as_ref());
                 text = content;
                 tool_calls = parsed;
             } else if let Some((before, _)) = text.split_once("<tool_call>") {
@@ -2604,7 +2644,7 @@ async fn stream_chat(
                     Some(request_max_tokens),
                 ),
                 loaded.worker_key_id,
-                body.tools,
+                body.tools.clone(),
                 body.system,
                 stop,
                 image_base64,
@@ -2726,7 +2766,8 @@ async fn stream_chat(
                     if !structured_tool_calls_emitted {
                         let stripped =
                             strip_visible_thinking(accumulated_tool_text, preserve_thinking, true);
-                        let (content, tool_calls) = parse_inline_tool_calls(&stripped, &req_id);
+                        let (content, tool_calls) =
+                            parse_inline_tool_calls(&stripped, &req_id, body.tools.as_ref());
                         maybe_log_debug_chat_reply(
                             &req_id,
                             &model_arg,
@@ -3201,6 +3242,7 @@ mod tests {
         let (content, tool_calls) = parse_inline_tool_calls(
             "Before\n<tool_call>{\"name\":\"lookup\",\"arguments\":{\"q\":\"hipfire\"}}</tool_call>",
             "req",
+            None,
         );
 
         assert_eq!(content, "Before");
@@ -3208,25 +3250,28 @@ mod tests {
         let (stray, calls) = parse_inline_tool_calls(
             "<|im_start|><tool_call>{\"name\":\"lookup\",\"arguments\":{}}</tool_call>",
             "req",
+            None,
         );
         assert_eq!(
             (stray.as_str(), calls.len()),
             ("", 1),
             "a stray special token is not content"
         );
-        let (kept, _) = parse_inline_tool_calls("<|im_start|>assistant\n\n\n# Summary\n- a", "req");
+        let (kept, _) =
+            parse_inline_tool_calls("<|im_start|>assistant\n\n\n# Summary\n- a", "req", None);
         assert_eq!(
             kept, "# Summary\n- a",
             "a header in front of a real answer is dropped, the answer kept"
         );
-        let (gone, _) = parse_inline_tool_calls("<|im_start|>user", "req");
+        let (gone, _) = parse_inline_tool_calls("<|im_start|>user", "req", None);
         assert_eq!(
             gone, "",
             "a reply that only opens someone else's turn is empty"
         );
-        let (cut, _) = parse_inline_tool_calls("Done.<|im_end|>\n<|im_start|>user\nthanks", "req");
+        let (cut, _) =
+            parse_inline_tool_calls("Done.<|im_end|>\n<|im_start|>user\nthanks", "req", None);
         assert_eq!(cut, "Done.\n", "a hallucinated next turn is cut off");
-        let (plain, _) = parse_inline_tool_calls("No markup here.", "req");
+        let (plain, _) = parse_inline_tool_calls("No markup here.", "req", None);
         assert_eq!(plain, "No markup here.");
         assert_eq!(tool_calls[0]["type"], "function");
         assert_eq!(tool_calls[0]["function"]["name"], "lookup");
@@ -3241,6 +3286,7 @@ mod tests {
         let (_, tool_calls) = parse_inline_tool_calls(
             "<tool_call><function=write><parameter=path>README.md</parameter><parameter=overwrite>true</parameter></function></tool_call>",
             "req",
+            None,
         );
 
         assert_eq!(tool_calls.len(), 1);
@@ -3250,11 +3296,41 @@ mod tests {
         assert_eq!(args, json!({"path": "README.md", "overwrite": true}));
     }
 
+    // A parameter declared `string` is taken exactly: only the template's newline after
+    // the opening tag and before the closing one is markup. Trimming stripped a written
+    // file's trailing newline and first-line indentation, and JSON-parsing turned
+    // contents that parse as JSON into an object.
+    #[test]
+    fn string_params_are_taken_exactly_by_declared_type() {
+        let tools = json!([{"type": "function", "function": {"name": "write_file", "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "contents": {"type": "string"},
+                           "overwrite": {"type": "boolean"}}}}}]);
+        let text = "<tool_call>\n<function=write_file>\n<parameter=path>\na.json\n</parameter>\n\
+                    <parameter=contents>\n  {\"k\": 1}\n\n</parameter>\n\
+                    <parameter=overwrite>\ntrue\n</parameter>\n</function>\n</tool_call>";
+        let (_, calls) = parse_inline_tool_calls(text, "req", Some(&tools));
+        let args: Value =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["path"], "a.json");
+        assert_eq!(
+            args["contents"], "  {\"k\": 1}\n",
+            "indentation and trailing newline kept, not parsed"
+        );
+        assert_eq!(args["overwrite"], true, "a non-string type is still parsed");
+        // Without declarations the old behaviour stands (trim, then JSON if it parses).
+        let (_, calls) = parse_inline_tool_calls(text, "req", None);
+        let args: Value =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["contents"], json!({"k": 1}));
+    }
+
     #[test]
     fn malformed_tool_call_shapes_match_bun_recovery() {
         let (_, flat_calls) = parse_inline_tool_calls(
             "<tool_call>{\"name\":\"write\",\"path\":\"README.md\",\"content\":\"hi\"}</tool_call>",
             "req",
+            None,
         );
         let flat_args: Value =
             serde_json::from_str(flat_calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
@@ -3263,12 +3339,14 @@ mod tests {
         let (_, xml_calls) = parse_inline_tool_calls(
             "<tool_call><plain>write</param> {\"path\":\"README.md\"}</tool_call>",
             "req",
+            None,
         );
         assert_eq!(xml_calls[0]["function"]["name"], "write");
 
         let (_, fallback_calls) = parse_inline_tool_calls(
             "<tool_call><|im_start|>name\": \"lookup\", \"arguments\": {\"q\":\"hipfire\"}}</tool_call>",
             "req",
+            None,
         );
         assert_eq!(fallback_calls[0]["function"]["name"], "lookup");
         let fallback_args: Value =
