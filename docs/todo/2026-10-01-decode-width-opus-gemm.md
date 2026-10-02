@@ -124,6 +124,20 @@ line (no gain). Bench note: without `HIPFIRE_BENCH_COLD=1`, shapes that fit
 the 32 MB MALL (qkv, wo) are timed warm and mislead -- wo is 0.155 ms warm,
 0.33 cold at B<=64 (~32 GB/s; its K<5120 wave32 path is the next suspect).
 
+## Landed: a BN=32 tile for 17..32 rows (2026-10-03)
+
+The BN=64 tile does 64 columns of WMMA work for any B. A BN=32 variant
+(WARPS 2x1, WMt 2, WNt 2, group-line staging; still one N-block) wins from 17
+rows. Cold route, at 24 rows: gate/up 0.488 -> 0.407 ms, down 0.479 -> 0.384,
+qkv 0.190 -> 0.147. Serving routing is now: wide multicol <= 16, BN=32 tile
+17..32, BN=64 tile 33..64, default tile above. End to end, 27B: 20 sessions
+101.1 -> 108.5 tok/s, 24 -> 107.3 -> 122.0, 32 -> 125.4 -> 141.6. (Swept
+BM=32 and BM=64/WARPS_M=1 variants of BN=32 too: within a few % either way.)
+
+Remaining gap for Corrode-sized swarms (3-15 sessions): the wide multicol is
+bandwidth-bound to 8 rows but turns VALU-bound past that -- cold, gate/up
+0.226 ms at 8 rows, 0.271 at 12, 0.326 at 16, against a ~0.21 ms floor.
+
 ## Tried: split-K for the B<=64 tile (2026-10-02, reverted)
 
 Wave-scheduling rounds are real on this kernel (cold, GEMM only, B=64, K=5120:
