@@ -94,6 +94,8 @@ each row's whole group line once, non-temporally, into registers and slice it
 into LDS per strip. EA traffic now 48.8 / 49.0 / 17.1 MB (gate/up / down /
 qkv, ~ideal). Bit-exact. Route, `HIPFIRE_BENCH_COLD=1` (weights not MALL-warm,
 as in serving), B=25..64: gate/up -12..16%, down -9..12%, qkv -5..7%.
+End to end, 27B at 64 sessions (committed / decode_ms, same binary with and
+without the define): **143.9 -> 154.0 / 155.3 tok/s (+7-8%)**.
 
 Not for multi-N-block grids (B > 64): other workgroups reuse those lines, and
 non-temporal reads evict them (m128 at B=512: 97 -> 230 MB, slower). Also
