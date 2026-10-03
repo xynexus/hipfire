@@ -765,10 +765,9 @@ async fn stream_responses(
                             response_id = %response_id, error = %e,
                             "responses stream cancel/drain failed; dropping daemon"
                         );
-                        *state.loaded_model_path.lock().await = None;
-                        *state.loaded_model_cache_capable.lock().await = None;
-                        *state.loaded_model_max_seq.lock().await = None;
                         *engine_guard = None;
+                        crate::routes::chat::clear_loaded_model_state_for_failed_daemon(&state)
+                            .await;
                     }
                 }
             }

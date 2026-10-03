@@ -519,6 +519,20 @@ pub(crate) async fn ensure_model_loaded(
     // high-priority request meant to preempt a running low-priority one — would
     // otherwise see None here and wrongly try to spawn a second daemon. A
     // concurrent request only needs the loaded-model metadata to enqueue.
+    //
+    // It trusts `loaded_models`, so first make sure the daemon behind them is alive: a
+    // worker that died while idle (panic, OOM, the host's memory watchdog) otherwise
+    // took every request into a batch cycle against a dead engine. `try_lock` keeps
+    // the fast path off the engine mutex: a slot that is busy or checked out is
+    // checked when the batch runner returns it.
+    if let Ok(mut slot) = state.engine.try_lock() {
+        if slot.as_mut().is_some_and(|e| !e.worker_alive()) {
+            tracing::error!("inference daemon is gone; respawning it for this request");
+            *slot = None;
+            drop(slot);
+            clear_loaded_model_state_for_failed_daemon(state).await;
+        }
+    }
     if let Some(loaded) = state.loaded_models.lock().await.get(&model_str).cloned() {
         if loaded.max_seq >= params.max_seq {
             return Ok(LoadedModelContext {
@@ -905,7 +919,11 @@ async fn set_loaded_model_state(state: &SharedState, model_path: String, loaded:
     *state.loaded_model_max_seq.lock().await = Some(loaded.max_seq);
 }
 
-async fn clear_loaded_model_state_for_failed_daemon(state: &SharedState) {
+/// Forget every loaded model after the daemon is gone. Load-bearing for recovery:
+/// `ensure_model_loaded` trusts `loaded_models` on its fast path and `lock_engine`
+/// waits on an empty slot while it is non-empty, so a dead daemon that leaves its
+/// models listed is never respawned -- every later request fails or waits forever.
+pub(crate) async fn clear_loaded_model_state_for_failed_daemon(state: &SharedState) {
     state.loaded_models.lock().await.clear();
     *state.loaded_model_path.lock().await = None;
     *state.loaded_model_cache_capable.lock().await = None;
@@ -2354,10 +2372,8 @@ where
                 }
                 Err(e) => {
                     tracing::warn!(request_id = %req_id, error = %e, "non-stream cancel/drain failed; dropping daemon");
-                    *state.loaded_model_path.lock().await = None;
-                    *state.loaded_model_cache_capable.lock().await = None;
-                    *state.loaded_model_max_seq.lock().await = None;
                     *engine_guard = None;
+                    clear_loaded_model_state_for_failed_daemon(&state).await;
                 }
             }
             Ok(None)
@@ -2853,10 +2869,8 @@ async fn stream_chat(
                     }
                     Err(e) => {
                         tracing::warn!(request_id = %req_id, error = %e, "stream cancel/drain failed; dropping daemon");
-                        *state.loaded_model_path.lock().await = None;
-                        *state.loaded_model_cache_capable.lock().await = None;
-                        *state.loaded_model_max_seq.lock().await = None;
                         drop(engine);
+                        clear_loaded_model_state_for_failed_daemon(&state).await;
                     }
                 }
                 return;

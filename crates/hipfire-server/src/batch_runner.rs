@@ -1297,7 +1297,21 @@ async fn batch_runner_loop(state: SharedState) {
                     &mut prefix_index,
                 )
                 .await;
-                *state.engine.lock().await = Some(engine);
+                // A worker that died during the cycle (panic, OOM, killed) must not go
+                // back in the slot: requests take `ensure_model_loaded`'s fast path,
+                // which trusts `loaded_models` and never pings, so every later request
+                // -- to either resident model -- failed against the dead engine for the
+                // rest of the run. Drop it and forget the models; the next request
+                // respawns the daemon.
+                if engine.worker_alive() {
+                    *state.engine.lock().await = Some(engine);
+                } else {
+                    tracing::error!(
+                        "inference daemon died during a batch cycle; next request respawns it"
+                    );
+                    drop(engine);
+                    crate::routes::chat::clear_loaded_model_state_for_failed_daemon(&state).await;
+                }
                 if let Some(id) = lease_id {
                     state.work_scheduler.lock().await.complete(id);
                 }
