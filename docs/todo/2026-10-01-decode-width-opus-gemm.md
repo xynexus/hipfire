@@ -60,8 +60,106 @@ serving up to 24 rows (`395fe0a66`), small-B overlay correction `_trs`
   from K-major XT inside the fold): gate/up B=33 **0.59 -> 1.10 ms**. 96 byte
   gathers per thread per group stall the WMMA pipeline far worse than a separate
   pass costs. Reverted; do not retry in that form.
+- **Fusing the overlay from LDS, not global** (2026-10-02, `OQ_FUSE_OVERLAY`
+  per strip, before the fold): entries loaded once per group into registers
+  (`OV_SLOTS`=3), x[idx] rebuilt from the interleaved strip already in LDS,
+  `val*x` added to the group's i32 `accl`. Correct (fused vs separate pass
+  max_rel 1.6e-4..3.8e-4, vs an overlay term ~1e3 rel) and same occupancy (3
+  waves/SIMD on `_n64`, no spills), but **40-50% slower on every shape**:
+  gate/up B=64 0.65 -> 0.93 ms, down 0.66 -> 0.83, qkv B=512 1.34 -> 2.01. Why:
+  on RDNA3.5 WMMA executes on the SIMD's own VALU, so every VALU op the overlay
+  adds sits in the same issue stream as the matmul -- and this version also did
+  its control work (table decode, strip match, divergent branch) per lane on
+  the VALU, which the scalar unit could have taken (next entry). (Not because the GEMM is
+  WMMA-bound -- it runs ~37% of WMMA peak at B=64; see the memory finding
+  below.) The output-stationary lane
+  map makes it worse (a wave's 4 row-groups diverge: ~64 body runs per group
+  each with 8 LDS byte loads + ~24 VALU, for 96 real MACs). A row-uniform remap
+  (scalar-loaded entries, lane = column, a side f32 accumulator merged through
+  LDS at the end) cuts that ~5x on paper, which still estimates at 20-40% of
+  the GEMM vs ~24% for the separate pass -- break-even at best.
+- **Overlay driven from the scalar unit** (2026-10-02, the row-uniform remap
+  above, built): the SALU is separate silicon from the VALU the WMMA uses, so
+  the loop walked one weight row at a time across the wave (lane = column) --
+  side entry as a wave-uniform `s_load_b64`, idx/val decode, strip match and
+  branch all on the SALU (`s_cvt_f32_f16`, `s_mul_f32` on gfx1151), only the
+  per-column multiply-add on the VALU, a per-row f32 accumulator merged into
+  facc through LDS. Correct (vs separate pass <=4.3e-4 rel), occupancy kept at
+  3 with `amdgpu_waves_per_eu(3)` (240 VGPRs, no spills), row loop unrolled
+  (32 batched s_loads, no M0 indexing). **2.3x SLOWER** (cold, B=64: gate/up
+  0.59 -> 1.37 ms, down 0.61 -> 1.35, qkv 0.22 -> 0.46). Ablation: with the LDS
+  reads and nibble math removed -- scalar loop only -- still 1.21 ms. Why: a
+  wave issues in order, so the ~96 entry checks + 32 s_loads it walks per strip
+  are cycles it is not issuing WMMAs, and every wave on the SIMD carries the
+  same load; the scalar side is the bottleneck, not the VALU. And the VALU/LDS
+  remainder (1.37 - 1.21 = ~0.16 ms) alone is about what the whole separate
+  pass costs (~0.15), so even a free scalar side breaks even. The only form
+  left would pre-bucket the overlay by strip at weight-load time (a new side
+  plane) to cut the scalar walk ~4x -- and its VALU part still only breaks
+  even. **The overlay stays a separate pass.**
 - **`_trs` correction past 64 rows**: 2-6x worse than `_tr` (side-plane re-reads
   per 16-column block). Keep the B<=64 threshold.
+
+## Landed: the B<=64 tile was bandwidth-bound on over-fetch (2026-10-02)
+
+`GL2C_EA_RDREQ_*` counters (rocprofv3 `--pmc`) on the BN=64 tile at B=64
+showed it pulling **~2.1x its weight bytes** from memory: gate/up 99.5 MB for
+47.7 MB of nibbles+scales, i.e. ~200 GB/s -- at the DRAM limit, on waste. Two
+sources: (1) each strip read 32 B per weight row and relied on L2 holding the
+128-byte line for the next three strips; (2) the weight stream evicted the
+side table between group folds (ablating the scale reads dropped 18 MB: a
+6.5x over-fetch of a 2.8 MB plane). Fix (`A_GROUP_LINE`, `_n64` only): read
+each row's whole group line once, non-temporally, into registers and slice it
+into LDS per strip. EA traffic now 48.8 / 49.0 / 17.1 MB (gate/up / down /
+qkv, ~ideal). Bit-exact. Route, `HIPFIRE_BENCH_COLD=1` (weights not MALL-warm,
+as in serving), B=25..64: gate/up -12..16%, down -9..12%, qkv -5..7%.
+End to end, 27B at 64 sessions (committed / decode_ms, same binary with and
+without the define): **143.9 -> 154.0 / 155.3 tok/s (+7-8%)**.
+
+Not for multi-N-block grids (B > 64): other workgroups reuse those lines, and
+non-temporal reads evict them (m128 at B=512: 97 -> 230 MB, slower). Also
+tried and neutral: padding the A tile in LDS (halved the 38% bank-conflict
+rate, no time change -- LDS is not the limiter), double-buffering the group
+line (no gain). Bench note: without `HIPFIRE_BENCH_COLD=1`, shapes that fit
+the 32 MB MALL (qkv, wo) are timed warm and mislead -- wo is 0.155 ms warm,
+0.33 cold at B<=64 (~32 GB/s; its K<5120 wave32 path is the next suspect).
+
+## Landed: a BN=32 tile for 17..32 rows (2026-10-03)
+
+The BN=64 tile does 64 columns of WMMA work for any B. A BN=32 variant
+(WARPS 2x1, WMt 2, WNt 2, group-line staging; still one N-block) wins from 17
+rows. Cold route, at 24 rows: gate/up 0.488 -> 0.407 ms, down 0.479 -> 0.384,
+qkv 0.190 -> 0.147. Serving routing is now: wide multicol <= 16, BN=32 tile
+17..32, BN=64 tile 33..64, default tile above. End to end, 27B: 20 sessions
+101.1 -> 108.5 tok/s, 24 -> 107.3 -> 122.0, 32 -> 125.4 -> 141.6. (Swept
+BM=32 and BM=64/WARPS_M=1 variants of BN=32 too: within a few % either way.)
+
+Remaining gap for Corrode-sized swarms (3-15 sessions): the wide multicol is
+bandwidth-bound to 8 rows but turns VALU-bound past that -- cold, gate/up
+0.226 ms at 8 rows, 0.271 at 12, 0.326 at 16, against a ~0.21 ms floor.
+A BN=16 w64 tile does not close it (quiet host, cold, route; multicol vs
+the best BN=16 tile, WARPS 1x1): gate/up 0.267 vs 0.321 ms at 12 rows, 0.325
+vs 0.319 at 16; down 0.281 vs 0.304 / 0.316 vs 0.323; qkv 0.112 vs 0.122 /
+0.144 vs 0.117 (WMt=2). Only qkv-sized M (6144) prefers a tile at 14-16 rows,
+worth ~1% of a 16-session step -- not routed. The tile is not WMMA-bound
+here either (BN=16 runs 1088 tiny workgroups); closing the 9..16 gap needs a
+different decode-width kernel, not another tile shape.
+
+## Tried: split-K for the B<=64 tile (2026-10-02, reverted)
+
+Wave-scheduling rounds are real on this kernel (cold, GEMM only, B=64, K=5120:
+120 workgroups 0.184 ms, 240 -> 0.334, 256 -> 0.427, 360 -> 0.477), and down
+(M=5120 -> 80 workgroups, K=17408) under-fills: 102 GB/s vs 114-131 for fuller
+grids. Built split-K with a deterministic last-arriving-slice reduction (each
+K-slice writes its partial; the tile's last slice sums them in slice order and
+resets a per-tile counter -- bit-identical run to run, <=2.1e-4 rel vs unsplit).
+Swept: down best at 3 slices (GEMM B=33 0.502 -> 0.393 ms, B=64 0.529 ->
+0.462); qkv (20 groups) and gate/up lose at any split. Route, down only: -8% at
+B=25, -2.5% at B=64. **End to end at 64 sessions: 154.5 / 153.9 vs 154.6 tok/s
+off -- nothing**, since down at B=64 is a quarter of the GEMM time and gained
+2.5%. Corrode's own swarms (3-15 sessions) decode at B<=24, the multicol path,
+so it does not reach them either. Not worth a counter buffer, a partial plane
+and a second epilogue; revisit only if B=25..48 becomes the serving regime.
 
 ## Scope of the redesign
 

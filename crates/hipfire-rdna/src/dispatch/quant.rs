@@ -583,12 +583,13 @@ impl Gpu {
         // so it is the right kernel for a tree the same way it is for a block.
         //
         // Batched serving (`oq_batch_serving`) takes the WIDE multicol, and only
-        // up to 24 rows: measured on the 27B shapes (gfx1151, with the overlay
-        // correction the tiled path adds), wide multicol vs the narrow-N tile
-        // below — gate/up 0.45 vs 0.68 ms at 20 rows, 0.54 vs 0.69 at 24, 0.76
-        // vs 0.69 at 32 — where the narrow multicol was 2.95 ms at 32 rows.
+        // up to 16 rows; past that the BN=32 w64 tile wins. Cold weights, route
+        // incl. the overlay pass, multicol vs BN=32 tile: gate/up 0.317 vs 0.368
+        // ms at 16 rows, 0.408 vs 0.396 at 18, 0.443 vs 0.401 at 20; down 0.316
+        // vs 0.349 / 0.428 vs 0.370 / 0.448 vs 0.373; qkv 0.143 vs 0.134 / 0.162
+        // vs 0.147 / 0.174 vs 0.147. Narrow multicol was 2.95 ms at 32 rows.
         let serving_wide = self.oq_batch_serving && (k / 256) % 4 == 0;
-        let small_n = if serving_wide { 24 } else { 32 };
+        let small_n = if serving_wide { 16 } else { 32 };
         if n <= small_n
             && group == 256
             && std::env::var("HIPFIRE_OQ_COMPACT_SMALL_N").as_deref() != Ok("0")
@@ -1788,7 +1789,22 @@ impl Gpu {
         // `HIPFIRE_OQ_W64_WIDE=0` keeps the default tile.
         let wide_m =
             batch_size >= 384 && std::env::var("HIPFIRE_OQ_W64_WIDE").as_deref() != Ok("0");
-        let (func_name, warps_m, warps_n, w_mt, w_nt) = if narrow_n {
+        // B <= 32 halves the tile again (BN=32, WNt=2): the BN=64 tile does 64
+        // columns of WMMA work for any B, and at these widths that padding is
+        // what it spends. Cold, route incl. the overlay pass, BN=32 vs BN=64 at
+        // 24 rows: gate/up 0.407 vs 0.488 ms, down 0.384 vs 0.479, qkv 0.147 vs
+        // 0.190; at 32: 0.417 vs 0.495 / 0.387 vs 0.481 / 0.155 vs 0.192.
+        // Still one N-block, so A_GROUP_LINE's single read of each weight holds.
+        let narrow32 = batch_size <= 32;
+        let (func_name, warps_m, warps_n, w_mt, w_nt) = if narrow32 {
+            (
+                "gemm_oq_compact_iu4x2_w64_n32",
+                2usize,
+                1usize,
+                2usize,
+                2usize,
+            )
+        } else if narrow_n {
             (
                 "gemm_oq_compact_iu4x2_w64_n64",
                 2usize,
@@ -1801,11 +1817,23 @@ impl Gpu {
         } else {
             ("gemm_oq_compact_iu4x2_w64", 2, 2, 2, 4)
         };
-        if narrow_n {
+        if narrow32 {
             static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
             let src = SRC.get_or_init(|| {
                 format!(
-                    "#define WARPS_M 2\n#define WARPS_N 1\n#define WMt 2\n#define WNt 4\n{}",
+                    "#define A_GROUP_LINE 1\n#define WARPS_M 2\n#define WARPS_N 1\n#define WMt 2\n#define WNt 2\n{}",
+                    kernels::GEMM_OQ_COMPACT_IU4X2_W64_SRC.replace(
+                        "void gemm_oq_compact_iu4x2_w64(",
+                        "void gemm_oq_compact_iu4x2_w64_n32("
+                    )
+                )
+            });
+            self.ensure_kernel(func_name, src, func_name)?;
+        } else if narrow_n {
+            static SRC: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+            let src = SRC.get_or_init(|| {
+                format!(
+                    "#define A_GROUP_LINE 1\n#define WARPS_M 2\n#define WARPS_N 1\n#define WMt 2\n#define WNt 4\n{}",
                     kernels::GEMM_OQ_COMPACT_IU4X2_W64_SRC.replace(
                         "void gemm_oq_compact_iu4x2_w64(",
                         "void gemm_oq_compact_iu4x2_w64_n64("

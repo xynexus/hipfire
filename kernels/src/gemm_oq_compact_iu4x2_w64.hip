@@ -101,8 +101,6 @@ __launch_bounds__(BLOCK) extern "C" __global__ void gemm_oq_compact_iu4x2_w64(
     const int n_groups = K / 256;
     const int side_stride = block_stride - 128;
     const long long side_base = (long long)M * n_groups * 128LL;
-    const int UA = (BK / 2) / 8;   // 8-byte A chunks per row-strip
-    const int NA = BM * UA / BLOCK;
     // X staging in 16-byte chunks: BK/16 chunks per row, BN rows. Expressing it
     // this way (rather than a fixed 32 B per thread) keeps the mapping valid for
     // any BLOCK, which is what lets WARPS_M change without touching the macros.
@@ -143,28 +141,56 @@ __launch_bounds__(BLOCK) extern "C" __global__ void gemm_oq_compact_iu4x2_w64(
         sxp[j] = Xs + (long long)cs * n_groups;
     }
 
+#ifdef A_GROUP_LINE
+    // Single-N-block launches (the BN=64 tile, B <= 64) read every weight exactly
+    // once, so stage them a whole GROUP at a time: each row's 128-byte nibble line
+    // in one non-temporal read into registers, sliced into LDS one 32-byte strip
+    // per iteration. The per-strip 32 B reads relied on L2 holding the line for
+    // the next three strips, and the weight stream also evicted the side table
+    // (re-read every group fold): measured at B=64, gate/up pulled 99.5 MB for
+    // 47.7 MB of weights+scales (~200 GB/s, bandwidth-bound on waste), down 62.7
+    // for 47.7. This path pulls 48.8 / 49.0. Not for multi-N-block grids: there
+    // other workgroups reuse the lines and non-temporal reads evict them (m128
+    // at B=512: 97 -> 230 MB). Chunk ci = threadIdx.x + l*BLOCK is (row = ci % BM,
+    // 16-byte chunk q = ci / BM), so a register slot serves one strip pair.
+    static_assert((BM * 8) % BLOCK == 0, "A_GROUP_LINE needs BM*8 % BLOCK == 0");
+    const int NG = BM * 8 / BLOCK;
+    i32x4 rA[NG];
+#define LOADA(ks) \
+    if ((ks) % STRIPS_PER_GROUP == 0) { _Pragma("unroll") for (int l = 0; l < NG; l++) { int ci = threadIdx.x + l * BLOCK, row = ci % BM, q = ci / BM; int r = bm + row < M ? bm + row : M - 1; rA[l] = __builtin_nontemporal_load((const i32x4*)(W + (long long)r * st + (ks) / STRIPS_PER_GROUP * 128 + q * 16)); } }
+#define STSA(bf, ks) \
+    _Pragma("unroll") for (int l = 0; l < NG; l++) { int ci = threadIdx.x + l * BLOCK, row = ci % BM, q = ci / BM; \
+        if ((q >> 1) == (ks) % STRIPS_PER_GROUP) *(i32x4*)(As[bf] + row * (BK / 2) + (q & 1) * 16) = rA[l]; }
+#else
+    const int UA = (BK / 2) / 8;   // 8-byte A chunks per row-strip
+    const int NA = BM * UA / BLOCK;
     i32x2 rA[NA];
+#define LOADA(ks) \
+    _Pragma("unroll") for (int l = 0; l < NA; l++) { int idx = threadIdx.x + l * BLOCK, row = idx / UA, c = idx % UA; int r = bm + row < M ? bm + row : M - 1; rA[l] = *(const i32x2*)(W + (long long)r * st + (ks) * (BK / 2) + c * 8); }
+#define STSA(bf, ks) \
+    _Pragma("unroll") for (int l = 0; l < NA; l++) { int idx = threadIdx.x + l * BLOCK; ((i32x2*)As[bf])[idx] = rA[l]; }
+#endif
     i32x4 rX[NXv];
-#define LOADG(kk) \
-    _Pragma("unroll") for (int l = 0; l < NA; l++) { int idx = threadIdx.x + l * BLOCK, row = idx / UA, c = idx % UA; int r = bm + row < M ? bm + row : M - 1; rA[l] = *(const i32x2*)(W + (long long)r * st + (kk) / 2 + c * 8); } \
+#define LOADG(ks) \
+    LOADA(ks) \
     /* X is pre-interleaved in DRAM: a strip is BK bytes per row, copied verbatim.
        Two i32x4 per thread covers 32 of the 64 strip bytes. */ \
     _Pragma("unroll") for (int l = 0; l < NXv; l++) { \
         int q = threadIdx.x + l * BLOCK, row = q / XCPR, ch = q % XCPR; \
         int r = bn + row < B ? bn + row : B - 1; \
-        rX[l] = *(const i32x4*)((const uint8_t*)X + (long long)r * xst + (kk) + ch * 16); }
-#define STS(bf) \
-    _Pragma("unroll") for (int l = 0; l < NA; l++) { int idx = threadIdx.x + l * BLOCK; ((i32x2*)As[bf])[idx] = rA[l]; } \
+        rX[l] = *(const i32x4*)((const uint8_t*)X + (long long)r * xst + (ks) * BK + ch * 16); }
+#define STS(ks) \
+    STSA((ks) & 1, ks) \
     _Pragma("unroll") for (int l = 0; l < NXv; l++) { int q = threadIdx.x + l * BLOCK; \
         int row = q / XCPR, ch = q % XCPR; \
-        *(i32x4*)(Xi[bf] + row * (BK + XPAD) + ch * 16) = rX[l]; }
+        *(i32x4*)(Xi[(ks) & 1] + row * (BK + XPAD) + ch * 16) = rX[l]; }
 
     { LOADG(0); STS(0); }
     __syncthreads();
     for (int k = 0; k < nstrip; k++) {
         int buf = k & 1;
         const bool seed = (k % STRIPS_PER_GROUP) == 0;
-        if (k + 1 < nstrip) { LOADG((k + 1) * BK); }
+        if (k + 1 < nstrip) { LOADG(k + 1); }
 #pragma unroll
         // Every LDS read below is 128-bit at the ISA, both operands. X gets there
         // by construction (the interleave packs hi+lo of one 16-K step into 16 B);
@@ -227,10 +253,12 @@ __launch_bounds__(BLOCK) extern "C" __global__ void gemm_oq_compact_iu4x2_w64(
                 }
             }
         }
-        if (k + 1 < nstrip) { STS((k + 1) & 1); }
+        if (k + 1 < nstrip) { STS(k + 1); }
         __syncthreads();
     }
 #undef LOADG
+#undef LOADA
+#undef STSA
 #undef STS
 #pragma unroll
     for (int i = 0; i < WMt; i++)
