@@ -175,6 +175,7 @@ fn main() {
         build_session(&mut gpu, 11, 1, 20), // pos 147
         build_session(&mut gpu, 31, 0, 70), // pos 69
         build_session(&mut gpu, 53, 2, 5),  // pos 260
+        build_session(&mut gpu, 71, 5, 60), // pos 699: past 512, see split-K below
     ];
 
     // Reference: single-session fused flash per session (one query at its pos).
@@ -235,7 +236,7 @@ fn main() {
     }
 
     // Routed batch: rows in SHUFFLED session order.
-    let row_sessions: Vec<i32> = vec![2, 0, 1];
+    let row_sessions: Vec<i32> = vec![2, 0, 3, 1];
     let n_rows = row_sessions.len();
     let mut q_batch = vec![0.0f32; n_rows * N_HEADS * HEAD_DIM];
     let mut pos_batch = vec![0i32; n_rows];
@@ -354,6 +355,63 @@ fn main() {
         "parity_kvarn_routed gqa(64): max-abs-err={max_abs_g:.2e} bit-identical-to-chunked={same}"
     );
     max_abs = max_abs.max(max_abs_g);
+
+    // Split-K at 256-position splits over the 768-position capacity. Few rows:
+    // the split count is capped by the capacity (3 splits of 256). 64 rows x 2
+    // KV heads: the GPU-occupancy target caps it at 2, so each split must
+    // stretch to 384 positions -- fixed 256-position splits covered only [0,
+    // 512) and session 3 (pos 699) silently lost its newest 188 positions.
+    std::env::set_var("HIPFIRE_KVARN_DECODE_SPLIT", "256");
+    for n in [row_sessions.len(), 64] {
+        let rows: Vec<i32> = (0..n)
+            .map(|r| row_sessions[r % row_sessions.len()])
+            .collect();
+        let up_f32 = |gpu: &mut Gpu, v: &[f32]| {
+            gpu.upload_raw(
+                &v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>(),
+                &[v.len()],
+            )
+            .unwrap()
+        };
+        let up_i32 = |gpu: &mut Gpu, v: &[i32]| {
+            gpu.upload_raw(
+                &v.iter().flat_map(|x| x.to_le_bytes()).collect::<Vec<_>>(),
+                &[v.len()],
+            )
+            .unwrap()
+        };
+        let q: Vec<f32> = rows
+            .iter()
+            .flat_map(|&s| q_all[s as usize].iter().copied())
+            .collect();
+        let pos: Vec<i32> = rows
+            .iter()
+            .map(|&s| sessions[s as usize].pos as i32)
+            .collect();
+        let (qn, posn, rsn) = (
+            up_f32(&mut gpu, &q),
+            up_i32(&mut gpu, &pos),
+            up_i32(&mut gpu, &rows),
+        );
+        let out_n = up_f32(&mut gpu, &vec![0.0; n * N_HEADS * HEAD_DIM]);
+        gpu.attention_kvarn_routed_batched(
+            false, &qn, &recp, &winp, &vp, &out_n, &rsn, &posn, 1, 0, N_HEADS, N_KV_HEADS,
+            HEAD_DIM, MAX_SEQ, max_ctx, n, 4, 0,
+        )
+        .unwrap();
+        gpu.device_synchronize().unwrap();
+        let got_n = gpu.download_f32(&out_n).unwrap();
+        let mut e = 0.0f32;
+        for (r, &sess) in rows.iter().enumerate() {
+            let rr = &got_n[r * N_HEADS * HEAD_DIM..(r + 1) * N_HEADS * HEAD_DIM];
+            for (a, b) in rr.iter().zip(&ref_out[sess as usize]) {
+                e = e.max((a - b).abs());
+            }
+        }
+        println!("parity_kvarn_routed split-K(256) rows={n}: max-abs-err={e:.2e}");
+        max_abs = max_abs.max(e);
+    }
+    std::env::remove_var("HIPFIRE_KVARN_DECODE_SPLIT");
     let pass = max_abs < 2e-3;
     println!("parity_kvarn_routed on {}: routed-vs-single-session max-abs-err={max_abs:.2e} (rows->sessions {row_sessions:?}) -> {}",
         gpu.arch, if pass { "PASS" } else { "FAIL" });
