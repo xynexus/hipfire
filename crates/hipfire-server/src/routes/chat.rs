@@ -2070,7 +2070,7 @@ where
 
     let loaded = match ensure_model_loaded(&state, &model_arg, required_max_seq).await {
         Ok(loaded) => loaded,
-        Err(e) => return Err(json!({"error": {"message": e, "type": "server_error"}})),
+        Err(e) => return Err(crate::routes::responses::load_error_body(&e)),
     };
 
     // Continuous-batching path: hand the request to the batch runner (which owns
@@ -2205,8 +2205,8 @@ where
                     done_json = done;
                     break;
                 }
-                Some(crate::batch_runner::BatchEvent::Error(e)) => {
-                    return Err(json!({"error": {"message": e, "type": "server_error"}}));
+                Some(crate::batch_runner::BatchEvent::Error(kind, e)) => {
+                    return Err(crate::routes::responses::fail_body(kind, &e));
                 }
                 None => break,
             }
@@ -2405,10 +2405,14 @@ fn blocking_chat_response_json(result: Result<BlockingChatResult, Value>) -> Val
 const BLOCKING_CHAT_HEARTBEAT: Duration = Duration::from_secs(10);
 
 fn blocking_chat_body(status: StatusCode, bytes: Vec<u8>) -> Response {
-    Response::builder()
+    let mut builder = Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "application/json")
-        .header(header::CACHE_CONTROL, "no-cache")
+        .header(header::CACHE_CONTROL, "no-cache");
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        builder = builder.header(header::RETRY_AFTER, crate::routes::responses::RETRY_AFTER_S);
+    }
+    builder
         .body(Body::from(bytes))
         .unwrap_or_else(|_| Response::new(Body::from("{}")))
 }
@@ -2536,7 +2540,7 @@ async fn blocking_chat_buffered_for_tests(state: SharedState, body: ChatRequest)
             result.request_max_tokens,
         ))
         .into_response(),
-        Err(e) => (crate::routes::responses::error_status(&e), Json(e)).into_response(),
+        Err(e) => crate::routes::responses::error_response(e),
     }
 }
 

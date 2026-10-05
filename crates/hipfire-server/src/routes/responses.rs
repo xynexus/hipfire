@@ -177,20 +177,62 @@ pub async fn post_responses(
             }
             Json(body).into_response()
         }
-        Err(error) => (error_status(&error), Json(error)).into_response(),
+        Err(error) => error_response(error),
     }
 }
 
+/// Seconds a client is told to wait before retrying a 503: about what a
+/// respawned worker takes to come back with its model.
+pub(crate) const RETRY_AFTER_S: &str = "10";
+
+/// The HTTP status an error body maps to. Typed by `type` and `code`, so a
+/// client can tell a request that can never succeed (400, 404) from a server
+/// that is coming back (503) from a failure (500) -- every one of them used to be
+/// a 500, which clients retried blindly.
 pub(crate) fn error_status(error: &Value) -> StatusCode {
-    if error
-        .get("error")
-        .and_then(|inner| inner.get("type"))
-        .and_then(Value::as_str)
-        == Some("invalid_request_error")
-    {
-        StatusCode::BAD_REQUEST
+    let inner = error.get("error");
+    let field = |k: &str| inner.and_then(|e| e.get(k)).and_then(Value::as_str);
+    match (field("type"), field("code")) {
+        (_, Some("model_not_found")) => StatusCode::NOT_FOUND,
+        (Some("invalid_request_error"), _) => StatusCode::BAD_REQUEST,
+        (Some("service_unavailable"), _) => StatusCode::SERVICE_UNAVAILABLE,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
+    }
+}
+
+/// An error body as a response, with `Retry-After` on a 503.
+pub(crate) fn error_response(error: Value) -> axum::response::Response {
+    let status = error_status(&error);
+    let mut response = (status, Json(error)).into_response();
+    if status == StatusCode::SERVICE_UNAVAILABLE {
+        response.headers_mut().insert(
+            axum::http::header::RETRY_AFTER,
+            axum::http::HeaderValue::from_static(RETRY_AFTER_S),
+        );
+    }
+    response
+}
+
+/// The error body for a request the batch runner failed, by kind.
+pub(crate) fn fail_body(kind: crate::batch_runner::FailKind, message: &str) -> Value {
+    use crate::batch_runner::FailKind;
+    match kind {
+        FailKind::ContextLength => json!({"error": {
+            "message": message, "type": "invalid_request_error", "code": "context_length_exceeded"}}),
+        FailKind::Unavailable => json!({"error": {
+            "message": message, "type": "service_unavailable", "code": "worker_unavailable"}}),
+        FailKind::Server => json!({"error": {"message": message, "type": "server_error"}}),
+    }
+}
+
+/// The error body for a failed `ensure_model_loaded`: a model that does not
+/// exist is the caller's mistake (404); a load that failed -- the worker would not
+/// start, ran out of memory, died -- is worth retrying (503).
+pub(crate) fn load_error_body(message: &str) -> Value {
+    if message.starts_with("model not found") {
+        json!({"error": {"message": message, "type": "invalid_request_error", "code": "model_not_found"}})
     } else {
-        StatusCode::INTERNAL_SERVER_ERROR
+        json!({"error": {"message": message, "type": "service_unavailable", "code": "model_load_failed"}})
     }
 }
 
@@ -1451,6 +1493,44 @@ mod tests {
 
         let error = json!({"error": {"message": "bad", "type": "server_error"}});
         assert_eq!(error_status(&error), StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    // Each failure kind maps to the status a client acts on: never retry a 400 or
+    // 404, retry a 503 after Retry-After, and a 500 is a real fault.
+    #[test]
+    fn failures_map_to_typed_statuses() {
+        use crate::batch_runner::FailKind;
+        let status = |v: &Value| error_status(v);
+        assert_eq!(
+            status(&fail_body(FailKind::ContextLength, "x")),
+            StatusCode::BAD_REQUEST
+        );
+        assert_eq!(
+            fail_body(FailKind::ContextLength, "x")["error"]["code"],
+            "context_length_exceeded"
+        );
+        assert_eq!(
+            status(&fail_body(FailKind::Unavailable, "x")),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            status(&fail_body(FailKind::Server, "x")),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            status(&load_error_body("model not found: nope")),
+            StatusCode::NOT_FOUND
+        );
+        assert_eq!(
+            status(&load_error_body("hipMalloc failed")),
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+
+        let r = error_response(fail_body(FailKind::Unavailable, "respawning"));
+        assert_eq!(r.status(), StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(r.headers()[axum::http::header::RETRY_AFTER], RETRY_AFTER_S);
+        let r = error_response(fail_body(FailKind::ContextLength, "too long"));
+        assert!(r.headers().get(axum::http::header::RETRY_AFTER).is_none());
     }
 
     #[test]

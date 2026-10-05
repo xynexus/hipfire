@@ -188,6 +188,31 @@ struct StdioTransport {
     /// Set once the worker's exit status has been logged, so a dead worker is
     /// reported exactly once rather than on every liveness probe.
     exit_logged: bool,
+    /// The pipe to the worker failed (EOF, or a read/write error). The worker is
+    /// gone or unusable even if `try_wait` has not caught up: a dying process's
+    /// pipes close before the kernel reports it exited, so a liveness probe right
+    /// after "stdout closed" still read it alive.
+    pipe_broken: bool,
+}
+
+impl StdioTransport {
+    /// Remember a failed pipe operation before passing its error on.
+    fn note<T>(&mut self, r: std::io::Result<T>) -> anyhow::Result<T> {
+        r.map_err(|e| {
+            self.pipe_broken = true;
+            e.into()
+        })
+    }
+
+    async fn write_line(&mut self, line: &str) -> anyhow::Result<()> {
+        debug!("> {line}");
+        let r = self.stdin.write_all(line.as_bytes()).await;
+        self.note(r)?;
+        let r = self.stdin.write_all(b"\n").await;
+        self.note(r)?;
+        let r = self.stdin.flush().await;
+        self.note(r)
+    }
 }
 
 impl StdioTransport {
@@ -235,6 +260,7 @@ impl StdioTransport {
             stdin,
             stdout,
             exit_logged: false,
+            pipe_broken: false,
         })
     }
 }
@@ -248,11 +274,7 @@ impl DaemonTransport for StdioTransport {
     fn send_json<'a>(&'a mut self, req: &'a DaemonRequest) -> BoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async move {
             let line = serde_json::to_string(req)?;
-            debug!("> {line}");
-            self.stdin.write_all(line.as_bytes()).await?;
-            self.stdin.write_all(b"\n").await?;
-            self.stdin.flush().await?;
-            Ok(())
+            self.write_line(&line).await
         })
     }
 
@@ -262,19 +284,17 @@ impl DaemonTransport for StdioTransport {
     ) -> BoxFuture<'a, anyhow::Result<()>> {
         Box::pin(async move {
             let line = serde_json::to_string(value)?;
-            debug!("> {line}");
-            self.stdin.write_all(line.as_bytes()).await?;
-            self.stdin.write_all(b"\n").await?;
-            self.stdin.flush().await?;
-            Ok(())
+            self.write_line(&line).await
         })
     }
 
     fn recv_response<'a>(&'a mut self) -> BoxFuture<'a, anyhow::Result<DaemonResponse>> {
         Box::pin(async move {
             let mut line = String::new();
-            self.stdout.read_line(&mut line).await?;
+            let r = self.stdout.read_line(&mut line).await;
+            self.note(r)?;
             if line.is_empty() {
+                self.pipe_broken = true;
                 anyhow::bail!("daemon stdout closed unexpectedly");
             }
             let line = line.trim_end();
@@ -296,7 +316,8 @@ impl DaemonTransport for StdioTransport {
 
     fn is_worker_alive(&mut self) -> bool {
         match self.child.try_wait() {
-            Ok(None) => true, // still running
+            Ok(None) if self.pipe_broken => false, // exiting, or unreachable
+            Ok(None) => true,                      // still running
             Ok(Some(status)) => {
                 if !self.exit_logged {
                     self.exit_logged = true;
