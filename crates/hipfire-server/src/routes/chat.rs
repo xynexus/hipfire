@@ -922,6 +922,34 @@ async fn set_loaded_model_state(state: &SharedState, model_path: String, loaded:
     *state.loaded_model_max_seq.lock().await = Some(loaded.max_seq);
 }
 
+/// What in `body` the batched decode path would drop, if anything. That path
+/// decodes greedily (argmax) and its session spec carries no sampling, penalty,
+/// stop or image fields, so a request asking for one of them got a different
+/// generation than it asked for, with no sign of it. Only what the CLIENT set
+/// counts: config defaults were never honoured there either, and rerouting on them
+/// would move every request off the batched path.
+fn batch_unhonoured(body: &ChatRequest, has_stop: bool, has_image: bool) -> Option<&'static str> {
+    let sampling = body.temperature.is_some_and(|t| t > 0.0);
+    if sampling {
+        return Some("temperature > 0 (sampling)");
+    }
+    if body.repeat_penalty.is_some_and(|p| p != 1.0) {
+        return Some("repeat_penalty");
+    }
+    if body.presence_penalty.is_some_and(|p| p != 0.0)
+        || body.frequency_penalty.is_some_and(|p| p != 0.0)
+    {
+        return Some("presence/frequency penalty");
+    }
+    if has_stop {
+        return Some("stop sequences");
+    }
+    if has_image {
+        return Some("an image input");
+    }
+    None
+}
+
 /// Forget every loaded model after the daemon is gone. Load-bearing for recovery:
 /// `ensure_model_loaded` trusts `loaded_models` on its fast path and `lock_engine`
 /// waits on an empty slot while it is non-empty, so a dead daemon that leaves its
@@ -2114,7 +2142,14 @@ where
             }
         );
     }
-    if __bt_enabled && __bt_elig && !__bt_spec {
+    // The batched path decodes greedily and carries none of these; a request that
+    // asks for one goes to the legacy path rather than having it silently ignored.
+    let has_stop = stop.as_ref().is_some_and(|s| !s.is_empty());
+    let __bt_unhonoured = batch_unhonoured(&body, has_stop, image_base64.is_some());
+    if let Some(reason) = __bt_unhonoured.filter(|_| __bt_enabled && __bt_elig && !__bt_spec) {
+        tracing::info!(request_id = %req_id, "taking the legacy path: the batched path cannot honour {reason}");
+    }
+    if __bt_enabled && __bt_elig && !__bt_spec && __bt_unhonoured.is_none() {
         let controls = {
             let cfg = state.config.lock().await;
             let resolved = cfg.resolve_for_model(&model_arg);
@@ -3625,6 +3660,34 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("model not found"));
+    }
+
+    // Requests asking for what the batched path drops are routed away from it;
+    // plain greedy requests (everything Corrode sends) stay batched.
+    #[test]
+    fn requests_the_batch_path_cannot_honour_are_identified() {
+        let base: ChatRequest = serde_json::from_value(json!({"messages": []})).unwrap();
+        assert_eq!(batch_unhonoured(&base, false, false), None);
+        let with = |v: Value| -> ChatRequest {
+            let mut j = json!({"messages": []});
+            j.as_object_mut()
+                .unwrap()
+                .extend(v.as_object().unwrap().clone());
+            serde_json::from_value(j).unwrap()
+        };
+        assert_eq!(
+            batch_unhonoured(&with(json!({"temperature": 0.0})), false, false),
+            None
+        );
+        assert!(batch_unhonoured(&with(json!({"temperature": 0.7})), false, false).is_some());
+        assert!(batch_unhonoured(&with(json!({"repeat_penalty": 1.1})), false, false).is_some());
+        assert_eq!(
+            batch_unhonoured(&with(json!({"repeat_penalty": 1.0})), false, false),
+            None
+        );
+        assert!(batch_unhonoured(&with(json!({"frequency_penalty": 0.5})), false, false).is_some());
+        assert!(batch_unhonoured(&base, true, false).is_some(), "stop");
+        assert!(batch_unhonoured(&base, false, true).is_some(), "image");
     }
 
     #[test]
