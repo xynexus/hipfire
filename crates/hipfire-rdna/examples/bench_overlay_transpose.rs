@@ -106,8 +106,11 @@ fn main() {
         let y0 = gpu.upload_f32(&zeros0, &[b * m]).expect("y0");
         let y1 = gpu.upload_f32(&zeros0, &[b * m]).expect("y1");
         // k-major staging
-        let xt = gpu.alloc_tensor(&[k * b], DType::Raw).expect("xt");
-        let xst = gpu.alloc_tensor(&[ng * b], DType::F32).expect("xst");
+        let slack = hipfire_rdna::OQ_OVERLAY_SLACK;
+        let xt = gpu.alloc_tensor(&[k * b + slack], DType::Raw).expect("xt");
+        let xst = gpu
+            .alloc_tensor(&[ng * b + slack], DType::F32)
+            .expect("xst");
 
         let iters = 10usize;
 

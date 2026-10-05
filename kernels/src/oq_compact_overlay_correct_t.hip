@@ -22,6 +22,8 @@
 //
 //   XT : [K, B] int8, one sign-extended value per byte (not packed)
 //   XsT: [n_groups, B] f32
+//   Both need 3 elements of slack past the end (OQ_OVERLAY_SLACK): a lane gathers
+//   4 consecutive b, so at B % 4 != 0 the last one reads up to 3 past B.
 //   W  : compact SPLIT-PLANE blocks
 //   Y  : [B, M] f32, ACCUMULATED IN PLACE
 #include <hip/hip_runtime.h>
@@ -104,8 +106,9 @@ __launch_bounds__(256) extern "C" __global__ void oq_compact_overlay_correct_t(
     //      Giving each lane FOUR CONSECUTIVE b makes it a dword gather: 32 lanes
     //      x 4 B = 128 contiguous bytes, two full lines, nothing wasted.
     //
-    // XT rows are B-aligned and the block base is a multiple of 4, so the dword
-    // load is always aligned.
+    // The dword load is aligned when B % 4 == 0 (XT rows are B long, b0 is a
+    // multiple of 4) and unaligned otherwise, which the hardware takes. Past B it
+    // reads the slack XT carries; those b are never stored.
     // MAXQ dword blocks per lane x 128 b per block = 512 b per launch. `nblk`
     // MUST be clamped to MAXQ: it indexes the acc[]/isum[] REGISTER arrays, and
     // letting it run to (B+127)>>7 on a B > 512 batch indexes them out of bounds
@@ -173,7 +176,7 @@ __launch_bounds__(256) extern "C" __global__ void oq_compact_overlay_correct_t(
         if (q >= nblk || b0 >= B) continue;
         #pragma unroll
         for (int t = 0; t < 4; ++t)
-            Y[(long long)(b0 + t) * M + row] += acc[q][t];
+            if (b0 + t < B) Y[(long long)(b0 + t) * M + row] += acc[q][t];
     }
 }
 

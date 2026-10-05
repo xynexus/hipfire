@@ -1038,6 +1038,7 @@ impl Gpu {
         block_stride: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        overlay_inputs_check(xt, xst, k, batch_size, group)?;
         // Row-coalesced write variant. The `_t` kernel's store is 67% of its
         // runtime (ablation in the kernel header): Y is [B, M], a wave owns one
         // row and 128 b, so 128 stores hit 128 lines at 4 bytes each. `_tr`
@@ -1112,6 +1113,7 @@ impl Gpu {
         block_stride: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        overlay_inputs_check(xt, xst, k, batch_size, group)?;
         self.ensure_kernel(
             "oq_compact_overlay_correct_tr",
             kernels::OQ_COMPACT_OVERLAY_CORRECT_T_SRC,
@@ -3045,4 +3047,29 @@ fn w64_tile_override() -> Option<(usize, usize, usize, usize)> {
     let v = std::env::var("HIPFIRE_OQ_W64_TILE").ok()?;
     let p: Vec<usize> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
     (p.len() == 4).then(|| (p[0], p[1], p[2], p[3]))
+}
+
+/// Refuse XT/XsT that do not cover the overlay kernels' 4-wide gather (see
+/// [`super::OQ_OVERLAY_SLACK`]): an error fails this forward, an over-read faults
+/// the GPU and kills every session on it.
+fn overlay_inputs_check(
+    xt: &GpuTensor,
+    xst: &GpuTensor,
+    k: usize,
+    b: usize,
+    group: usize,
+) -> HipResult<()> {
+    if super::oq_overlay_inputs_fit(xt.buf.size(), xst.buf.size() / 4, k, b, group) {
+        return Ok(());
+    }
+    Err(hip_bridge::HipError::new(
+        0,
+        &format!(
+            "overlay correction: XT {} B / XsT {} B do not cover K={k} B={b} group={group} \
+             plus {} elements of gather slack",
+            xt.buf.size(),
+            xst.buf.size(),
+            super::OQ_OVERLAY_SLACK
+        ),
+    ))
 }
