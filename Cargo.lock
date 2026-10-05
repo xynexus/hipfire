@@ -2713,6 +2713,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "hip-bridge",
+ "hipfire-config",
  "hipfire-daemon-adapter",
  "hipfire-daemon-protocol",
  "hipfire-generate",

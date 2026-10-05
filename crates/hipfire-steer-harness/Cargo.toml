@@ -16,6 +16,7 @@ name = "hipfire-hneurons-probe"
 path = "src/bin/hipfire-hneurons-probe.rs"
 
 [dependencies]
+hipfire-config = { path = "../hipfire-config" }
 hipfire-steer = { path = "../hipfire-steer" }
 hipfire-hneurons = { path = "../hipfire-hneurons" }
 hipfire-daemon-adapter = { path = "../hipfire-daemon-adapter" }
