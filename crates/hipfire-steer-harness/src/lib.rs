@@ -382,10 +382,16 @@ impl HttpHarness {
     /// and non-2xx statuses into the trait's error channel.
     fn post(&self, path: &str, body: serde_json::Value) -> HipResult<serde_json::Value> {
         let url = format!("{}{path}", self.base_url);
-        let resp = self
-            .client
-            .post(&url)
-            .json(&body)
+        let mut req = self.client.post(&url).json(&body);
+        // /steer/* is admin-gated: present the local admin secret there, as `hipfire
+        // bench` and `hipfire admin` do -- and only there, since the API gate rejects
+        // it as an API key on /v1/*.
+        if path.starts_with("/steer/") {
+            if let Some(secret) = hipfire_config::read_admin_secret() {
+                req = req.bearer_auth(secret);
+            }
+        }
+        let resp = req
             .send()
             .map_err(|e| HipError::new(0, &format!("POST {path}: {e}")))?;
         let status = resp.status();

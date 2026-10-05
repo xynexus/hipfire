@@ -145,6 +145,14 @@ pub fn build_router(state: SharedState, cors_allowed_origins: &[String]) -> Rout
             "/admin/training/runs/{id}/events",
             get(routes::training::get_training_run_events),
         )
+        // Steering rewrites every later generation and training writes files the
+        // server can reach: admin-gated like the rest of this block, not API-gated
+        // (they were on the public router with no authentication at all).
+        .route("/steer/capture", post(routes::steer::post_steer_capture))
+        .route("/steer/apply", post(routes::steer::post_steer_apply))
+        .route("/steer/clear", post(routes::steer::post_steer_clear))
+        .route("/train/drafter", post(routes::train::post_train_drafter))
+        .route("/train/lora", post(routes::train::post_train_lora))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::admin_gate,
@@ -196,11 +204,6 @@ pub fn build_router(state: SharedState, cors_allowed_origins: &[String]) -> Rout
         )
         .route("/v1/embeddings", post(routes::embeddings::post_embeddings))
         .route("/v1/rerank", post(routes::embeddings::post_rerank))
-        .route("/steer/capture", post(routes::steer::post_steer_capture))
-        .route("/steer/apply", post(routes::steer::post_steer_apply))
-        .route("/steer/clear", post(routes::steer::post_steer_clear))
-        .route("/train/drafter", post(routes::train::post_train_drafter))
-        .route("/train/lora", post(routes::train::post_train_lora))
         .route("/v1/responses", post(routes::responses::post_responses))
         .route("/sdapi/v1/txt2img", post(routes::sdapi::post_txt2img))
         .route("/sdapi/v1/img2img", post(routes::sdapi::post_img2img))

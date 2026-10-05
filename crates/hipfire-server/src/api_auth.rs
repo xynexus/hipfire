@@ -62,7 +62,11 @@ pub async fn api_gate(
     request: Request<Body>,
     next: Next,
 ) -> Response {
-    if !is_api_path(request.uri().path()) {
+    // Deny by default: only the public pages and the admin-gated routes skip API
+    // auth. A route nobody classified used to skip it too -- that is how
+    // /steer and /train ended up reachable with no credential at all.
+    let path = request.uri().path();
+    if is_public_path(path) || is_admin_gated_path(path) {
         return next.run(request).await;
     }
 
@@ -358,8 +362,33 @@ fn workload_class(method: &Method, path: &str) -> WorkloadClass {
     WorkloadClass::Other
 }
 
-fn is_api_path(path: &str) -> bool {
-    path == "/v1" || path.starts_with("/v1/") || path == "/sdapi" || path.starts_with("/sdapi/")
+/// Pages anyone may load: the chat UI, health, and the admin shell plus its
+/// login/logout (the admin DATA routes are gated, see `is_admin_gated_path`).
+pub(crate) fn is_public_path(path: &str) -> bool {
+    matches!(
+        path,
+        "/" | "/chat"
+            | "/chat/"
+            | "/health"
+            | "/load-progress"
+            | "/admin"
+            | "/admin/"
+            | "/admin/login"
+            | "/admin/logout"
+            | "/admin/ui"
+            | "/admin/ui/"
+    ) || path.starts_with("/chat/")
+        || path.starts_with("/admin/ui/")
+}
+
+/// Routes `auth::admin_gate` guards instead of the API gate (the admin data
+/// routes, steering, training). They must all be registered in the admin-gated
+/// router; `lib.rs`'s route test holds that.
+pub(crate) fn is_admin_gated_path(path: &str) -> bool {
+    !is_public_path(path)
+        && (path.starts_with("/admin/")
+            || path.starts_with("/steer/")
+            || path.starts_with("/train/"))
 }
 
 fn required_scope(path: &str) -> Option<Scope> {
@@ -521,6 +550,47 @@ fn now_secs_f64() -> f64 {
 mod tests {
     use super::*;
     use std::collections::BTreeSet;
+
+    /// Every route `build_router` registers sits behind exactly one gate. A route in
+    /// the admin block must classify admin-gated, or the API gate turns it away
+    /// first; a route outside it must not, or it skips the API gate with no admin
+    /// gate behind it -- which is how /steer and /train were reachable with no
+    /// credential at all.
+    #[test]
+    fn every_registered_route_is_behind_one_gate() {
+        let src = include_str!("lib.rs");
+        let body = &src[src.find("pub fn build_router").unwrap()..];
+        let body = &body[..body.find("\npub async fn serve").unwrap()];
+        // The admin block ends where its gate is layered on (the comment above it
+        // names the gate too, hence the call-site form).
+        let admin_end = body.find("            auth::admin_gate,").unwrap();
+        let mut routes = 0;
+        let mut at = 0;
+        while let Some(i) = body[at..].find(".route(") {
+            let pos = at + i;
+            at = pos + ".route(".len();
+            let path = body[at..]
+                .trim_start()
+                .strip_prefix('"')
+                .and_then(|p| p.split('"').next())
+                .expect("a route registered with a literal path");
+            // `{id}` / `{*path}` segments classify as any concrete segment would.
+            let concrete = path
+                .split('/')
+                .map(|s| if s.starts_with('{') { "x" } else { s })
+                .collect::<Vec<_>>()
+                .join("/");
+            let admin_block = pos < admin_end;
+            assert_eq!(
+                is_admin_gated_path(&concrete),
+                admin_block,
+                "{path} is registered {} the admin-gated block but classified otherwise",
+                if admin_block { "inside" } else { "outside" }
+            );
+            routes += 1;
+        }
+        assert!(routes > 50, "found only {routes} routes: the parse broke");
+    }
 
     use axum::{body::Body, http::Request};
     use hipfire_auth::{NewToken, NewUser, RatePolicyOverride};
