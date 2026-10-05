@@ -197,6 +197,18 @@ env_vars! {
          reported `pp512 t/s` from a per-token warm-pass for five arches.";
 
     // ── DeltaNet state (hipfire-arch-qwen35) ────────────────────────────────
+    DAEMON_REPLY_DEADLINE_S = "HIPFIRE_DAEMON_REPLY_DEADLINE_S", User,
+        "Seconds `hipfire serve` lets its inference worker go without replying to a \
+         model load, prefill or generate before it treats the worker as wedged, kills \
+         it, and respawns it on the next request. Default 1800: a fused prefill says \
+         nothing until it finishes. 0 waits forever.";
+
+    DAEMON_STEP_DEADLINE_S = "HIPFIRE_DAEMON_STEP_DEADLINE_S", User,
+        "Seconds `hipfire serve` lets one batched decode step go without a reply \
+         before it treats the inference worker as wedged, kills it, and respawns it \
+         on the next request. Default 60; a healthy step answers in well under a \
+         second. 0 falls back to HIPFIRE_DAEMON_REPLY_DEADLINE_S.";
+
     DN_STATE_FP16 = "HIPFIRE_DN_STATE_FP16", Developer,
         "Store DeltaNet recurrent state as FP16, halving per-sequence state. \
          Storage only; arithmetic stays FP32. OPT-IN: unset means FP32, which \

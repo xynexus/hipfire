@@ -66,8 +66,15 @@ async fn assemble_health_json(state: &SharedState) -> Value {
         let mut engine = state.engine.lock().await;
         engine.as_mut().map(|e| e.worker_alive())
     };
+    // A worker killed as wedged leaves no engine and no loaded model until the
+    // next request respawns it; say so rather than `ok`. (Mid-cycle the engine is
+    // also checked out, but the models are still listed then.)
+    let last_wedge_ms = hipfire_daemon_adapter::last_wedge_ms();
+    let recovering_from_wedge =
+        worker_alive.is_none() && last_wedge_ms > 0 && state.loaded_models.lock().await.is_empty();
     let status = match worker_alive {
         Some(false) => "degraded",
+        _ if recovering_from_wedge => "wedged",
         _ => "ok",
     };
     let diffusion = diffusion_health_payload(&state).await;
@@ -149,6 +156,8 @@ async fn assemble_health_json(state: &SharedState) -> Value {
     json!({
         "status": status,
         "worker_alive": worker_alive,
+        "worker_wedge_kills": hipfire_daemon_adapter::wedge_kills(),
+        "last_worker_wedge_unix_ms": last_wedge_ms,
         "version": hipfire_build_info::VERSION,
         "bind": bind,
         "api_auth": api_auth,

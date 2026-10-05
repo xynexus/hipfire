@@ -174,6 +174,11 @@ trait DaemonTransport: Send {
     fn worker_pid(&self) -> Option<u32> {
         None
     }
+    /// Kill the worker this transport owns, and wait for it to go. A no-op for
+    /// transports that own no process (a socket to a shared daemon, mocks).
+    fn kill_worker<'a>(&'a mut self) -> BoxFuture<'a, ()> {
+        Box::pin(async {})
+    }
 }
 
 struct StdioTransport {
@@ -280,6 +285,13 @@ impl DaemonTransport for StdioTransport {
 
     fn worker_pid(&self) -> Option<u32> {
         self.child.id()
+    }
+
+    fn kill_worker<'a>(&'a mut self) -> BoxFuture<'a, ()> {
+        // SIGKILL reaches a stopped (SIGSTOP) or spinning process alike.
+        Box::pin(async move {
+            let _ = self.child.kill().await;
+        })
     }
 
     fn is_worker_alive(&mut self) -> bool {
@@ -435,6 +447,28 @@ pub struct DaemonEngine {
     /// run exercises whatever build is resident, which need not be the one the
     /// caller just compiled.
     attached: bool,
+    /// Longest silence tolerated from the worker before it is treated as wedged
+    /// and killed (see [`Self::with_serving_deadlines`]). `None` waits forever,
+    /// which is right for CLI tools whose calls (eval, training) run for hours.
+    reply_deadline: Option<Duration>,
+    /// The same, for one batched decode step: a healthy step answers in well
+    /// under a second, so a wedge shows up here fastest.
+    step_deadline: Option<Duration>,
+}
+
+/// Unix-ms time of the last wedged-worker kill (0 = never) and how many there
+/// have been, for `/health`.
+static LAST_WEDGE_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static WEDGE_KILLS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// When an inference worker was last killed as wedged (unix ms; 0 = never).
+pub fn last_wedge_ms() -> u64 {
+    LAST_WEDGE_MS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// How many inference workers this process has killed as wedged.
+pub fn wedge_kills() -> u64 {
+    WEDGE_KILLS.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub struct GenerateCollected {
@@ -469,6 +503,8 @@ impl DaemonEngine {
             transport: Box::new(transport),
             worker_key_id: None,
             attached: false,
+            reply_deadline: None,
+            step_deadline: None,
         })
     }
 
@@ -488,6 +524,8 @@ impl DaemonEngine {
             transport: Box::new(transport),
             worker_key_id: None,
             attached: false,
+            reply_deadline: None,
+            step_deadline: None,
         })
     }
 
@@ -534,6 +572,8 @@ impl DaemonEngine {
             transport: Box::new(transport),
             worker_key_id: None,
             attached: true,
+            reply_deadline: None,
+            step_deadline: None,
         })
     }
 
@@ -588,7 +628,58 @@ impl DaemonEngine {
     }
 
     async fn recv(&mut self) -> anyhow::Result<DaemonResponse> {
-        self.transport.recv_response().await
+        self.recv_within(self.reply_deadline).await
+    }
+
+    /// Bound this engine's waits on the worker, for a long-lived server. A worker
+    /// that is alive but hung (a stuck kernel, a deadlock, SIGSTOP) otherwise
+    /// blocks every request behind it forever: liveness checks see a running
+    /// process. Past the deadline the worker is killed, so the server's
+    /// dead-worker path respawns it on the next request.
+    ///
+    /// Two bounds, because a healthy worker's silences differ by orders of
+    /// magnitude: a batched decode step answers in well under a second, while a
+    /// fused prefill or a model load can say nothing for minutes.
+    /// `HIPFIRE_DAEMON_STEP_DEADLINE_S` (default 60) and
+    /// `HIPFIRE_DAEMON_REPLY_DEADLINE_S` (default 1800); 0 disables either.
+    pub fn with_serving_deadlines(mut self) -> Self {
+        let secs = |v: &hipfire_env::EnvVar, default: u64| {
+            Some(v.parse_or(default))
+                .filter(|&s| s > 0)
+                .map(Duration::from_secs)
+        };
+        self.step_deadline = secs(&hipfire_env::DAEMON_STEP_DEADLINE_S, 60);
+        self.reply_deadline = secs(&hipfire_env::DAEMON_REPLY_DEADLINE_S, 1800);
+        self
+    }
+
+    /// The next reply, or -- if `deadline` passes first -- kill the worker and
+    /// fail. A killed worker reads as dead to `worker_alive`, which is what the
+    /// server's recovery keys on.
+    async fn recv_within(&mut self, deadline: Option<Duration>) -> anyhow::Result<DaemonResponse> {
+        let Some(deadline) = deadline else {
+            return self.transport.recv_response().await;
+        };
+        match tokio::time::timeout(deadline, self.transport.recv_response()).await {
+            Ok(reply) => reply,
+            Err(_) => {
+                tracing::error!(
+                    "inference worker sent nothing for {}s; treating it as wedged and killing it",
+                    deadline.as_secs()
+                );
+                self.transport.kill_worker().await;
+                let now = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_millis() as u64)
+                    .unwrap_or(1);
+                LAST_WEDGE_MS.store(now, std::sync::atomic::Ordering::Relaxed);
+                WEDGE_KILLS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                anyhow::bail!(
+                    "inference worker wedged: no reply in {}s; it was killed and is respawned on the next request",
+                    deadline.as_secs()
+                )
+            }
+        }
     }
 
     /// Ask the daemon to abort a running request.
@@ -878,8 +969,9 @@ impl DaemonEngine {
         require_extended_request_type(&request, "generate_batch_decode_step")?;
         self.send_value(&request).await?;
         let mut events = Vec::new();
+        let deadline = self.step_deadline.or(self.reply_deadline);
         loop {
-            match self.recv().await? {
+            match self.recv_within(deadline).await? {
                 DaemonResponse::GenerateBatchDecodeStepSessionDone { payload } => events.push(
                     tagged_extended_event("generate_batch_decode_step_session_done", payload),
                 ),
@@ -2083,6 +2175,84 @@ mod tests {
         }
     }
 
+    /// A worker that takes requests and never answers: alive, hung.
+    struct StalledTransport {
+        killed: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl DaemonTransport for StalledTransport {
+        fn as_any(&self) -> &dyn std::any::Any {
+            self
+        }
+        fn send_json<'a>(&'a mut self, _: &'a DaemonRequest) -> BoxFuture<'a, anyhow::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn send_value<'a>(
+            &'a mut self,
+            _: &'a serde_json::Value,
+        ) -> BoxFuture<'a, anyhow::Result<()>> {
+            Box::pin(async { Ok(()) })
+        }
+        fn recv_response<'a>(&'a mut self) -> BoxFuture<'a, anyhow::Result<DaemonResponse>> {
+            Box::pin(std::future::pending())
+        }
+        fn is_worker_alive(&mut self) -> bool {
+            !self.killed.load(std::sync::atomic::Ordering::SeqCst)
+        }
+        fn kill_worker<'a>(&'a mut self) -> BoxFuture<'a, ()> {
+            self.killed.store(true, std::sync::atomic::Ordering::SeqCst);
+            Box::pin(async {})
+        }
+    }
+
+    // A hung worker used to block the call forever: process liveness still read
+    // "alive". With serving deadlines, a decode step past its deadline kills the
+    // worker and fails, so the server's dead-worker path respawns it; without
+    // them (CLI tools), the call keeps waiting.
+    #[tokio::test]
+    async fn a_hung_worker_is_killed_at_the_step_deadline() {
+        let killed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let mut engine = DaemonEngine {
+            transport: Box::new(StalledTransport {
+                killed: killed.clone(),
+            }),
+            worker_key_id: None,
+            attached: false,
+            reply_deadline: None,
+            step_deadline: Some(Duration::from_millis(50)),
+        };
+        let before = wedge_kills();
+        let step = serde_json::json!({"type": "generate_batch_decode_step"});
+        let t0 = std::time::Instant::now();
+        let err = tokio::time::timeout(
+            Duration::from_secs(5),
+            engine.generate_batch_decode_step(step.clone()),
+        )
+        .await
+        .expect("the deadline, not the test timeout, ends the call")
+        .unwrap_err();
+        assert!(t0.elapsed() < Duration::from_secs(2));
+        assert!(err.to_string().contains("wedged"), "{err}");
+        assert!(
+            killed.load(std::sync::atomic::Ordering::SeqCst),
+            "the worker was killed"
+        );
+        assert!(
+            !engine.worker_alive(),
+            "so the server sees it dead and respawns"
+        );
+        assert!(wedge_kills() > before && last_wedge_ms() > 0);
+
+        // No deadline configured (CLI tools): the call still waits.
+        engine.step_deadline = None;
+        let waited = tokio::time::timeout(
+            Duration::from_millis(200),
+            engine.generate_batch_decode_step(step),
+        )
+        .await;
+        assert!(waited.is_err(), "unbounded without serving deadlines");
+    }
+
     fn mock_engine(responses: Vec<DaemonResponse>) -> DaemonEngine {
         DaemonEngine {
             transport: Box::new(MockTransport {
@@ -2092,6 +2262,8 @@ mod tests {
             worker_key_id: None,
             // A mock owns no daemon, shared or otherwise.
             attached: false,
+            reply_deadline: None,
+            step_deadline: None,
         }
     }
 

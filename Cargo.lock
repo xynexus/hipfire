@@ -2100,6 +2100,7 @@ dependencies = [
  "dirs",
  "futures",
  "hipfire-daemon-protocol",
+ "hipfire-env",
  "hipfire-generate",
  "hipfire-lock",
  "hipfire-model",

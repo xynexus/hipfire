@@ -1067,8 +1067,24 @@ pub fn spawn_batch_runner(state: SharedState) {
     state
         .batch_runner_active
         .store(true, std::sync::atomic::Ordering::Relaxed);
+    // Supervised: the runner is the only thing draining the batch inbox, so a
+    // panic in it used to leave every later request queued forever. Restart it,
+    // and if the panic took the checked-out engine with it, forget the loaded
+    // models so the next request respawns a worker instead of waiting on an
+    // empty slot.
     tokio::spawn(async move {
-        batch_runner_loop(state).await;
+        loop {
+            match tokio::spawn(batch_runner_loop(state.clone())).await {
+                Ok(()) => break,
+                Err(e) => {
+                    tracing::error!("batch runner died ({e}); restarting it");
+                    if state.engine.lock().await.is_none() {
+                        crate::routes::chat::clear_loaded_model_state_for_failed_daemon(&state)
+                            .await;
+                    }
+                }
+            }
+        }
     });
 }
 
