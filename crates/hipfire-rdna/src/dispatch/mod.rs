@@ -834,6 +834,28 @@ pub fn oq8_batched_xs_len(n: usize, k: usize, group: usize) -> usize {
     n * (k / group.max(1))
 }
 
+/// Elements the k-major overlay inputs (XT bytes, XsT floats) need past their
+/// K*B / ng*B. The overlay kernels gather 4 consecutive b per lane, so at
+/// B % 4 != 0 the last lane reads up to 3 past the end. Allocated exactly, that
+/// faulted the GPU whenever the buffer ended on a page boundary -- B=78 at
+/// K=6144 is 117 pages, six coalesced 27B prompts -- and took the daemon with it.
+/// Slack in the buffer, not a guard in the gather: a per-gather bound check cost
+/// the kernel 10-15% at full quads and 2x at B=30.
+pub const OQ_OVERLAY_SLACK: usize = 3;
+
+/// Whether XT / XsT buffers of these lengths (bytes, floats) cover what the
+/// overlay kernels read at this K, B and group.
+pub fn oq_overlay_inputs_fit(
+    xt_len: usize,
+    xst_len: usize,
+    k: usize,
+    b: usize,
+    group: usize,
+) -> bool {
+    xt_len >= k * b + OQ_OVERLAY_SLACK
+        && xst_len >= oq8_batched_xs_len(b, k, group) + OQ_OVERLAY_SLACK
+}
+
 impl Gpu {
     /// Returns the active stream ref for kernel launches (None = null stream).
     fn stream_ref(&self) -> Option<&hip_bridge::Stream> {
@@ -2820,8 +2842,9 @@ impl Gpu {
         // K-major twins for the iu4x2 overlay pass. Same sizes as xq/xs, just
         // transposed; allocated here so the GEMM never mallocs in the hot path
         // (doing so per call cost prefill 195.0 -> 132.2 tok/s on the 27B).
-        if grow(&self.oq_xt_batch, need_xq) {
-            self.oq_xt_batch = Some(self.alloc_tensor(&[need_xq], DType::Raw)?);
+        let (need_xt, need_xst) = (need_xq + OQ_OVERLAY_SLACK, need_xs + OQ_OVERLAY_SLACK);
+        if grow(&self.oq_xt_batch, need_xt) {
+            self.oq_xt_batch = Some(self.alloc_tensor(&[need_xt], DType::Raw)?);
         }
         if grow(&self.oq4_xq_batch, need_xq / 2) {
             self.oq4_xq_batch = Some(self.alloc_tensor(&[need_xq / 2], DType::Raw)?);
@@ -2829,8 +2852,8 @@ impl Gpu {
         if grow(&self.oq4_xs_batch, need_xs) {
             self.oq4_xs_batch = Some(self.alloc_tensor(&[need_xs], DType::F32)?);
         }
-        if grow(&self.oq_xst_batch, need_xs) {
-            self.oq_xst_batch = Some(self.alloc_tensor(&[need_xs], DType::F32)?);
+        if grow(&self.oq_xst_batch, need_xst) {
+            self.oq_xst_batch = Some(self.alloc_tensor(&[need_xst], DType::F32)?);
         }
         // Same size as the int8 activation: interleaving is a permutation, not a
         // widening (K/2 hi + K/2 lo == K).
@@ -5502,5 +5525,33 @@ mod oq8_batched_scratch_tests {
     #[test]
     fn a_zero_group_does_not_divide_by_zero() {
         assert_eq!(oq8_batched_xs_len(4, 256, 0), 4 * 256);
+    }
+
+    /// The served shape that faulted: exactly-sized XT/XsT do not cover the last
+    /// lane's 4-wide gather at B % 4 != 0; the slack the scratch carries does.
+    #[test]
+    fn overlay_inputs_need_slack_past_a_partial_quad() {
+        use super::{oq_overlay_inputs_fit, OQ_OVERLAY_SLACK};
+        let (k, b, g) = (6144usize, 78usize, 256usize);
+        let xs = oq8_batched_xs_len(b, k, g);
+        assert!(!oq_overlay_inputs_fit(k * b, xs, k, b, g));
+        assert!(!oq_overlay_inputs_fit(
+            k * b + OQ_OVERLAY_SLACK,
+            xs,
+            k,
+            b,
+            g
+        ));
+        assert!(oq_overlay_inputs_fit(
+            k * b + OQ_OVERLAY_SLACK,
+            xs + OQ_OVERLAY_SLACK,
+            k,
+            b,
+            g
+        ));
+        assert!(
+            OQ_OVERLAY_SLACK >= 3,
+            "a lane reads b0..b0+3, so up to 3 past B"
+        );
     }
 }

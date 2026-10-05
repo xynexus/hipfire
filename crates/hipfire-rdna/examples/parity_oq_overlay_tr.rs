@@ -5,22 +5,38 @@
 //! overlay sum, at batch widths past the small-B (`_trs`, B <= 64) routing and row
 //! counts that leave a partial row block. The host differs only by FMA contraction,
 //! so the gate is error relative to the output scale; the printed hash of the GPU
-//! output is for comparing two kernel versions bit for bit.
+//! output is for comparing two kernel versions bit for bit. Then again through the
+//! b-tiled `_t` kernel (HIPFIRE_OQ_OVERLAY_ROWC=0).
+//!
+//! B % 4 != 0 with K*B a whole number of pages is the served-shape fault: a lane
+//! gathers 4 b at once, so the last one read past XT -- into an unmapped page when
+//! the exactly-sized buffer ended on one (B=78 at K=6144 is 117 pages; six
+//! coalesced 27B prompts) -- and `_t` also stored up to 3 rows past Y. So inputs
+//! carry OQ_OVERLAY_SLACK and exactly-sized ones must be refused, and rows past B
+//! are a sentinel band that must come back untouched.
 //!
 //!   cargo run --release -p hipfire-rdna --example parity_oq_overlay_tr
 
-use hipfire_rdna::{DType, Gpu};
+use hipfire_rdna::{DType, Gpu, OQ_OVERLAY_SLACK};
 
 fn main() {
     let mut gpu = Gpu::init().unwrap();
     let mut ok = true;
-    for &(m, k, b) in &[
-        (200usize, 1024usize, 65usize),
-        (128, 2048, 100),
-        (77, 1024, 257),
-        (300, 512, 513),
-    ] {
-        ok &= case(&mut gpu, m, k, b);
+    for pass in ["tr", "t"] {
+        if pass == "t" {
+            std::env::set_var("HIPFIRE_OQ_OVERLAY_ROWC", "0");
+        }
+        println!("-- {pass}");
+        for &(m, k, b) in &[
+            (200usize, 1024usize, 65usize),
+            (128, 2048, 100),
+            (77, 1024, 257),
+            (300, 512, 513),
+            (5120, 6144, 78),
+            (6144, 6144, 30),
+        ] {
+            ok &= case(&mut gpu, m, k, b);
+        }
     }
     if !ok {
         std::process::exit(1);
@@ -67,13 +83,16 @@ fn case(gpu: &mut Gpu, m: usize, k: usize, b: usize) -> bool {
             ov[i * n_ov + e] = (idx, val);
         }
     }
-    let xt: Vec<i8> = (0..k * b)
+    let xt: Vec<i8> = (0..k * b + OQ_OVERLAY_SLACK)
         .map(|_| ((rnd() % 255) as i32 - 127) as i8)
         .collect();
-    let xst: Vec<f32> = (0..n_groups * b)
+    let xst: Vec<f32> = (0..n_groups * b + OQ_OVERLAY_SLACK)
         .map(|_| 0.01 + (rnd() % 1000) as f32 * 1e-4)
         .collect();
-    let y0: Vec<f32> = (0..b * m).map(|_| (rnd() % 1000) as f32 * 1e-3).collect();
+    const SENTINEL_ROWS: usize = 4;
+    let y0: Vec<f32> = (0..(b + SENTINEL_ROWS) * m)
+        .map(|_| (rnd() % 1000) as f32 * 1e-3)
+        .collect();
 
     // Host: Y[b][row] += sum_g (isum * sw) * xs, groups in order.
     let mut want = y0.clone();
@@ -112,7 +131,11 @@ fn case(gpu: &mut Gpu, m: usize, k: usize, b: usize) -> bool {
         )
         .unwrap();
     let _ = DType::F32;
-    gpu.oq_compact_overlay_correct_tr(&wd, &xtd, &xsd, &yd, m, k, b, group, block_stride)
+    let exact = gpu.upload_raw(&vec![0u8; k * b], &[k * b]).unwrap();
+    let refused = gpu
+        .oq_compact_overlay_correct_t(&wd, &exact, &xsd, &yd, m, k, b, group, block_stride)
+        .is_err();
+    gpu.oq_compact_overlay_correct_t(&wd, &xtd, &xsd, &yd, m, k, b, group, block_stride)
         .unwrap();
     gpu.device_synchronize().unwrap();
     let got = gpu.download_f32(&yd).unwrap();
@@ -124,10 +147,13 @@ fn case(gpu: &mut Gpu, m: usize, k: usize, b: usize) -> bool {
     let hash = got.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, v| {
         (h ^ v.to_bits() as u64).wrapping_mul(0x100_0000_01b3)
     });
-    let pass = max_err <= scale * 1e-6;
+    let clobbered = got[b * m..] != y0[b * m..];
+    let pass = max_err <= scale * 1e-6 && !clobbered && refused;
     println!(
-        "M={m} K={k} B={b}: max_err/scale={:.2e} gpu_hash={hash:016x} -> {}",
+        "M={m} K={k} B={b}: max_err/scale={:.2e} gpu_hash={hash:016x}{}{} -> {}",
         max_err / scale,
+        if clobbered { " WROTE PAST B" } else { "" },
+        if refused { "" } else { " TOOK AN UNPADDED XT" },
         if pass { "PASS" } else { "FAIL" }
     );
     pass
