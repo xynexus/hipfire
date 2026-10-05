@@ -622,7 +622,10 @@ pub(crate) async fn ensure_model_loaded(
     // DFlash n-gram override) and takes effect only through the spawned child's
     // environment. An attached daemon would ignore it entirely.
     daemon_spawn_env.apply();
-    let mut engine = DaemonEngine::spawn(&bin).await.map_err(|e| e.to_string())?;
+    let mut engine = DaemonEngine::spawn(&bin)
+        .await
+        .map_err(|e| e.to_string())?
+        .with_serving_deadlines();
     apply_residency_evictions(state, &mut engine, &residency_plan).await?;
     let loaded = engine
         .load_with_worker_key_id(

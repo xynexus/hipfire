@@ -486,7 +486,9 @@ async fn spawn_daemon_for_serving(state: &SharedState) -> anyhow::Result<()> {
     // Listening as well as piped: this is the machine's shared daemon, so
     // `hipfire chat/bench/eval` can attach to it instead of failing on the
     // `daemon.pid` flock. The stdio half stays the server's own transport.
-    let mut engine = hipfire_daemon_adapter::DaemonEngine::spawn_listening(&bin).await?;
+    let mut engine = hipfire_daemon_adapter::DaemonEngine::spawn_listening(&bin)
+        .await?
+        .with_serving_deadlines();
     engine.ping().await?;
     *state.engine.lock().await = Some(engine);
     Ok(())
