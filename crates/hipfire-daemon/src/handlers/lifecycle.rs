@@ -696,6 +696,12 @@ pub(crate) fn load(
         let _ = daemon_state.out.sink.flush();
         return;
     }
+    let free_before_load = daemon_state
+        .gpu
+        .hip
+        .get_vram_info()
+        .ok()
+        .map(|(free, _)| free);
     let load_result = load_model(
         path,
         max_seq,
@@ -1206,6 +1212,12 @@ pub(crate) fn load(
             daemon_state.model = Some(m);
         }
         Err(e) => {
+            // Measured before the placeholders go back, against what was free just
+            // before the load, with the pool's parked buffers handed back first.
+            daemon_state.gpu.drain_pool();
+            let stranded = free_before_load
+                .zip(daemon_state.gpu.hip.get_vram_info().ok())
+                .and_then(|(before, (after, _))| stranded_by_failed_load(before, after));
             if let Err(err) = daemon_state
                 .resource_reservations
                 .reacquire_placeholders(&mut daemon_state.gpu)
@@ -1221,13 +1233,52 @@ pub(crate) fn load(
                 &mut daemon_state.out.sink,
                 "",
                 &format!(
-                    "load failed: {e}. GPU: {} ({free_mb} MB free / {total_mb} MB total)",
-                    daemon_state.gpu.arch
+                    "load failed: {e}. GPU: {} ({free_mb} MB free / {total_mb} MB total){}",
+                    daemon_state.gpu.arch,
+                    stranded.map_or(String::new(), |b| format!(
+                        "; the failed load stranded {:.1} GiB, so this worker is exiting \
+                         to give it back (the server respawns it)",
+                        b as f64 / (1u64 << 30) as f64
+                    )),
                 ),
             );
+            if stranded.is_some() {
+                let _ = daemon_state.out.sink.flush();
+                std::process::exit(STRANDED_EXIT_CODE);
+            }
         }
     }
     let _ = daemon_state.out.sink.flush();
+}
+
+/// Past this much memory left behind by a failed load, the worker exits rather
+/// than keep it. Weights, KV and scratch have no `Drop` (it cannot reach `&mut
+/// Gpu`); every success path frees them by hand, and a load that fails halfway
+/// drops them unfreed -- tens of GiB pinned, which then makes the load-headroom
+/// check refuse every retry. The process is the one boundary that reclaims all of
+/// it; the server respawns a worker that dies.
+const STRANDED_LOAD_LIMIT: usize = 1 << 30;
+const STRANDED_EXIT_CODE: i32 = 75; // EX_TEMPFAIL
+
+fn stranded_by_failed_load(free_before: usize, free_after: usize) -> Option<usize> {
+    let lost = free_before.saturating_sub(free_after);
+    (lost >= STRANDED_LOAD_LIMIT).then_some(lost)
+}
+
+#[cfg(test)]
+mod stranded_load_tests {
+    use super::*;
+
+    // A failed load that gave everything back (or freed more) keeps the worker; one
+    // that stranded a GiB or more ends it.
+    #[test]
+    fn a_failed_load_that_strands_memory_ends_the_worker() {
+        const GIB: usize = 1 << 30;
+        assert_eq!(stranded_by_failed_load(40 * GIB, 40 * GIB), None);
+        assert_eq!(stranded_by_failed_load(40 * GIB, 41 * GIB), None);
+        assert_eq!(stranded_by_failed_load(40 * GIB, 40 * GIB - GIB / 2), None);
+        assert_eq!(stranded_by_failed_load(40 * GIB, 12 * GIB), Some(28 * GIB));
+    }
 }
 
 pub(crate) fn reset(daemon_state: &mut DaemonState, msg: &serde_json::Value) {

@@ -483,6 +483,16 @@ impl PrefixIndex {
     pub fn forget(&mut self, checkpoint_id: &str) {
         self.entries.retain(|e| e.checkpoint_id != checkpoint_id);
     }
+
+    /// Drop every checkpoint held for `worker`, returning the ids to release: on a
+    /// device OOM they are the memory this runner can give back.
+    pub fn drain(&mut self, worker: &str) -> Vec<String> {
+        let (gone, kept): (Vec<_>, Vec<_>) = std::mem::take(&mut self.entries)
+            .into_iter()
+            .partition(|e| e.worker == worker);
+        self.entries = kept;
+        gone.into_iter().map(|e| e.checkpoint_id).collect()
+    }
 }
 
 /// One session of a `generate_batch_prefill` or `prefix_hash_preflight`. Both
@@ -821,6 +831,12 @@ async fn prefill_budgeted(
             Err(e) => e,
         };
         let message = e.to_string();
+        // Out of memory is not the attaches' fault, and prefilling their prefixes in
+        // full needs more memory, not less: hand it to the cycle, which releases the
+        // cached checkpoints and splits the batch.
+        if is_device_oom(&message) {
+            return Err(e);
+        }
         let attached: Vec<String> = group
             .iter()
             .filter_map(|s| match reuse.get(&s.id) {
@@ -849,7 +865,13 @@ async fn prefill_budgeted(
                 }
             }
         }
-        let handles: Vec<String> = group.iter().map(|s| s.id.clone()).collect();
+        // The dropped checkpoints too: forgetting one the daemon still holds left it
+        // resident with nothing able to name it again. An unknown id is a no-op.
+        let handles: Vec<String> = group
+            .iter()
+            .map(|s| s.id.clone())
+            .chain(dropping.iter().cloned())
+            .collect();
         let _ = engine
             .release_sessions(build_release_request(worker, &handles))
             .await;
@@ -1431,6 +1453,11 @@ async fn batch_runner_loop(state: SharedState) {
                     CycleOutcome::Parked(remaining) => {
                         parked.push((remaining, running_priority, now_ms()))
                     }
+                    CycleOutcome::OutOfMemory(batch) if batch.len() == 1 => {
+                        // Retried once on the memory its released checkpoints freed;
+                        // with none left to release, a second OOM fails it.
+                        parked.push((batch, running_priority, now_ms()));
+                    }
                     CycleOutcome::OutOfMemory(mut batch) => {
                         let half = batch.len() / 2;
                         fit_cap = half;
@@ -1967,9 +1994,24 @@ async fn run_batch_cycle(
                 let _ = engine
                     .release_sessions(build_release_request(&worker, &handles))
                     .await;
-                // A lone request that does not fit cannot be split any further.
-                if !resuming && batch.len() > 1 && is_device_oom(&e.to_string()) {
-                    return CycleOutcome::OutOfMemory(batch);
+                if !resuming && is_device_oom(&e.to_string()) {
+                    // Cached prefix checkpoints are the one thing this runner holds
+                    // that it can give back: release them before splitting the batch,
+                    // or before failing a lone request that cannot be split.
+                    let held = prefix_index.drain(&worker);
+                    if !held.is_empty() {
+                        tracing::warn!(
+                            "out of device memory: releasing {} cached prefix checkpoint(s)",
+                            held.len()
+                        );
+                        let _ = engine
+                            .release_sessions(build_release_request(&worker, &held))
+                            .await;
+                    }
+                    // A lone request gets one retry, on what the release freed.
+                    if batch.len() > 1 || !held.is_empty() {
+                        return CycleOutcome::OutOfMemory(batch);
+                    }
                 }
                 let kind = cycle_failure_kind(engine);
                 fail_all(&txs, kind, &format!("batch prefill: {e}"));
@@ -2594,6 +2636,27 @@ mod tests {
                 index.insert(mk(format!("c{chain}-s{step}"), 1000 * (step + 1) + chain));
             }
         }
+    }
+
+    #[test]
+    fn drain_gives_back_only_that_workers_checkpoints() {
+        let mut index = PrefixIndex::default();
+        for (worker, id) in [("27b", "a"), ("35b", "b"), ("27b", "c")] {
+            index.insert(PrefixEntry {
+                worker: worker.into(),
+                prefix_hash: serde_json::json!({ "value": id }),
+                prefix_len: 10,
+                checkpoint_id: id.into(),
+                hits: 0,
+                batch: 1,
+                mint_at: None,
+            });
+        }
+        let mut gone = index.drain("27b");
+        gone.sort();
+        assert_eq!(gone, vec!["a", "c"]);
+        assert_eq!(index.drain("27b"), Vec::<String>::new());
+        assert_eq!(index.drain("35b"), vec!["b"]);
     }
 
     #[test]

@@ -686,24 +686,6 @@ pub fn resolve_tiny_model_state(
     q
 }
 
-/// `MemAvailable` from `/proc/meminfo`, in bytes.
-///
-/// `MemAvailable`, not `MemFree`: reclaimable page cache is genuinely available
-/// to a load, and on this box the cache is routinely tens of GiB. Reading
-/// `MemFree` would refuse loads that fit comfortably.
-fn mem_available_bytes() -> Option<u64> {
-    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
-    meminfo.lines().find_map(|line| {
-        let kb: u64 = line
-            .strip_prefix("MemAvailable:")?
-            .split_whitespace()
-            .next()?
-            .parse()
-            .ok()?;
-        Some(kb * 1024)
-    })
-}
-
 /// Decide whether a load of `need` bytes may proceed. Split out from
 /// [`check_load_headroom`] so the arithmetic is testable without `/proc`.
 fn load_headroom_verdict(need: u64, available: u64, reserve: u64) -> Result<(), String> {
@@ -761,7 +743,7 @@ fn check_load_headroom(path: &str) -> Result<(), String> {
     let Ok(meta) = std::fs::metadata(path) else {
         return Ok(());
     };
-    let Some(available) = mem_available_bytes() else {
+    let Some(available) = hipfire_rdna::pool::mem_available_bytes().map(|b| b as u64) else {
         return Ok(());
     };
     // Price the routed-expert modules at what they will actually occupy, and the
