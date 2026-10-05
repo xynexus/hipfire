@@ -871,6 +871,22 @@ impl ContinuousWorkScheduler {
         taken
     }
 
+    /// How long the longest-waiting queued workload matching `pred` has waited, in
+    /// ms (`None` if none matches). A running batch asks this to see whether work it
+    /// cannot admit -- another worker's, or a less urgent band -- is being starved.
+    pub fn longest_wait_ms(
+        &self,
+        now_ms: u64,
+        pred: impl Fn(&WorkloadSpec) -> bool,
+    ) -> Option<u64> {
+        self.buckets
+            .iter()
+            .flatten()
+            .filter(|w| pred(w))
+            .map(|w| now_ms.saturating_sub(w.enqueued_at_ms))
+            .max()
+    }
+
     /// The priority bucket the next `next_batch` call would draw from (honouring
     /// aging), without removing anything. Lower = served sooner. A running batch
     /// polls this to decide whether a higher-priority workload is waiting: if the
@@ -3095,6 +3111,46 @@ mod tests {
 
         assert_eq!(lease.class, WorkloadClass::ImageGeneration);
         assert_eq!(lease.workloads.len(), 2);
+    }
+
+    // A running batch asks how long work it cannot admit has waited: the longest
+    // wait among the matching queued workloads, by key and band.
+    #[test]
+    fn longest_wait_reports_the_oldest_matching_waiter() {
+        let mut scheduler = ContinuousWorkScheduler::new(continuous_capacity(), 32, 0);
+        let text = |id: &str, key: &str, priority: u8, at: u64| {
+            let mut w = WorkloadSpec::singleton(
+                id,
+                WorkloadClass::TokenPrefill,
+                priority,
+                at,
+                WorkloadResources::default(),
+            );
+            w.microbatch_key = Some(key.to_string());
+            w
+        };
+        scheduler
+            .enqueue(text("a1", "worker-a", 64, 1_000))
+            .unwrap();
+        scheduler
+            .enqueue(text("b1", "worker-b", 64, 2_000))
+            .unwrap();
+        scheduler.enqueue(text("b2", "worker-b", 255, 500)).unwrap();
+        let other = |w: &WorkloadSpec| w.microbatch_key.as_deref() != Some("worker-a");
+        assert_eq!(
+            scheduler.longest_wait_ms(10_000, |w| other(w) && w.priority <= 64),
+            Some(8_000)
+        );
+        assert_eq!(
+            scheduler.longest_wait_ms(10_000, other),
+            Some(9_500),
+            "any band"
+        );
+        assert_eq!(
+            scheduler.longest_wait_ms(10_000, |w| !other(w)),
+            Some(9_000)
+        );
+        assert_eq!(scheduler.longest_wait_ms(10_000, |w| w.priority == 0), None);
     }
 
     /// A holder that never calls `complete` must not wedge the scheduler

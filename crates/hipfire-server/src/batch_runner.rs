@@ -1197,8 +1197,9 @@ async fn batch_runner_loop(state: SharedState) {
     // strictly-higher-priority workload, so priorities decrease toward the top.
     // The daemon sessions for parked requests stay resident, so resume skips
     // prefill. Depth is bounded (each level pins resident VRAM) — see
-    // `preempt_max_depth`. `.1` is the priority the batch was running at.
-    let mut parked: Vec<(Vec<PendingRequest>, u8)> = Vec::new();
+    // `preempt_max_depth`. `.1` is the priority the batch was running at, `.2` when
+    // it was parked (it has left the scheduler's queue, so only this ages it).
+    let mut parked: Vec<(Vec<PendingRequest>, u8, u64)> = Vec::new();
     let max_depth = preempt_max_depth();
     // Largest fresh batch known to fit in device memory, learned from prefill OOMs.
     // ponytail: only ratchets down until restart; probe upward if memory is freed
@@ -1214,7 +1215,9 @@ async fn batch_runner_loop(state: SharedState) {
         };
         // Resume the top parked batch unless a strictly-higher-priority workload
         // is queued (waiter < top parked priority). Nothing queued resumes it.
-        let top_parked = parked.last().map(|(_, pri)| *pri);
+        let top_parked = parked
+            .last()
+            .map(|(_, pri, at)| effective_priority(*pri, now_ms().saturating_sub(*at), aging_ms()));
         let resume_parked = match top_parked {
             Some(pri) => waiter.map_or(true, |top| top >= pri),
             None => false,
@@ -1232,10 +1235,10 @@ async fn batch_runner_loop(state: SharedState) {
         // Select what to run this iteration: a resumed parked text batch (no
         // lease), or a fresh lease — which the runner dispatches by class.
         let dispatch: Dispatch = if resume_parked {
-            let (b, pri) = parked.pop().unwrap();
+            let (b, pri, at) = parked.pop().unwrap();
             Dispatch::Text {
                 batch: b,
-                running_priority: pri,
+                running_priority: effective_priority(pri, now_ms().saturating_sub(at), aging_ms()),
                 lease_id: None,
             }
         } else {
@@ -1270,11 +1273,22 @@ async fn batch_runner_loop(state: SharedState) {
                 state.work_scheduler.lock().await.complete(lease.lease_id);
                 continue;
             }
-            let pri = lease
+            let now = now_ms();
+            let waited = lease
                 .workloads
-                .first()
-                .map(|w| w.priority)
-                .unwrap_or(u8::MAX);
+                .iter()
+                .map(|w| now.saturating_sub(w.enqueued_at_ms))
+                .max()
+                .unwrap_or(0);
+            let pri = effective_priority(
+                lease
+                    .workloads
+                    .first()
+                    .map(|w| w.priority)
+                    .unwrap_or(u8::MAX),
+                waited,
+                aging_ms(),
+            );
             // A lease is single-class; classify by the first job's variant and
             // dispatch the whole (single-variant) set accordingly.
             match jobs.first() {
@@ -1360,7 +1374,7 @@ async fn batch_runner_loop(state: SharedState) {
                 // remainder waits on the parked stack as a fresh batch: it holds no
                 // resident state, so it pins nothing while it waits.
                 if batch.len() > fit_cap && batch[0].resume_position.is_none() {
-                    parked.push((batch.split_off(fit_cap), running_priority));
+                    parked.push((batch.split_off(fit_cap), running_priority, now_ms()));
                 }
                 // Let a caller blocked on the engine have it first (it polls every
                 // 20 ms; taking it straight back would starve it again).
@@ -1414,7 +1428,9 @@ async fn batch_runner_loop(state: SharedState) {
                 }
                 match outcome {
                     CycleOutcome::Completed => {}
-                    CycleOutcome::Parked(remaining) => parked.push((remaining, running_priority)),
+                    CycleOutcome::Parked(remaining) => {
+                        parked.push((remaining, running_priority, now_ms()))
+                    }
                     CycleOutcome::OutOfMemory(mut batch) => {
                         let half = batch.len() / 2;
                         fit_cap = half;
@@ -1425,8 +1441,8 @@ async fn batch_runner_loop(state: SharedState) {
                             batch.len() - half
                         );
                         // LIFO: push the second half first so the first runs next.
-                        parked.push((batch.split_off(half), running_priority));
-                        parked.push((batch, running_priority));
+                        parked.push((batch.split_off(half), running_priority, now_ms()));
+                        parked.push((batch, running_priority, now_ms()));
                     }
                 }
             }
@@ -1734,6 +1750,51 @@ fn fold_prefill_events(
     }
 }
 
+/// See `HIPFIRE_SERVER_AGING_MS`: also the scheduler's aging, so after a cycle
+/// the longest-waiting request past it is served next.
+pub(crate) fn aging_ms() -> u64 {
+    hipfire_env::SERVER_AGING_MS.parse_or(60_000)
+}
+
+/// The band a leased or resumed text batch runs at. Work that has waited past the
+/// aging threshold -- in the queue, or parked -- runs at the top band until its cycle
+/// ends: parking it for the next fresher, more urgent request undoes the aging. A cycle
+/// aging had seeded with a band-255 request was parked four steps in by a band-0
+/// stream, and stayed parked until the stream ended three minutes later.
+fn effective_priority(nominal: u8, waited_ms: u64, aging_ms: u64) -> u8 {
+    if aging_ms > 0 && waited_ms >= aging_ms {
+        0
+    } else {
+        nominal
+    }
+}
+
+/// See `HIPFIRE_SERVER_TIME_SLICE_MS`.
+fn time_slice_ms() -> u64 {
+    hipfire_env::SERVER_TIME_SLICE_MS.parse_or(20_000)
+}
+
+/// Whether a running cycle may keep admitting new requests for its own model.
+///
+/// A cycle used to admit for as long as its model had work, and it yielded only
+/// to strictly more urgent work, so the OTHER resident model's equal-band
+/// requests -- and any band-255 request -- waited until the stream dried up: a
+/// swarm's 27B architect/review chains held the GPU while its 35B coder calls
+/// queued for tens of minutes. Admission now closes once the cycle has had its
+/// time slice and work it cannot admit is waiting at its priority or better
+/// (`contending_wait_ms`), or once anything it cannot admit has waited past the
+/// aging threshold (`aged_other`). The cycle then finishes what it has and ends,
+/// and the scheduler -- aging on -- serves the longest waiter.
+fn admission_open(
+    cycle_ms: u64,
+    slice_ms: u64,
+    contending_wait_ms: Option<u64>,
+    aged_other: bool,
+) -> bool {
+    let sliced = slice_ms > 0 && cycle_ms >= slice_ms && contending_wait_ms.is_some();
+    !(sliced || aged_other)
+}
+
 /// Whether a running text cycle admits queued requests between decode steps.
 /// `HIPFIRE_SERVER_MIDCYCLE_ADMIT=0` restores cycle-granular batching.
 fn midcycle_admit_enabled() -> bool {
@@ -1961,6 +2022,8 @@ async fn run_batch_cycle(
     }
 
     let quantum = min_quantum();
+    let cycle_start_ms = now_ms();
+    let mut admission_closed = false;
     let mut last_backend: Option<String> = None;
     let mut last_chunk_count = 0u64;
     let mut last_chunk_size = 0u64;
@@ -2122,13 +2185,49 @@ async fn run_batch_cycle(
         // the next step instead of waiting for the whole batch to finish. Runs
         // before the preemption check: a more urgent request on this worker joins
         // rather than parking the batch.
-        if midcycle_admit_enabled() && !active.is_empty() && !state.engine_wanted() {
+        let (contending, aged_other, aged_own) = {
+            let now = now_ms();
+            let sched = state.work_scheduler.lock().await;
+            let own = |w: &hipfire_scheduler::WorkloadSpec| {
+                w.microbatch_key.as_deref() == Some(worker.as_str())
+            };
+            let aging = aging_ms();
+            let aged = |ms: Option<u64>| aging > 0 && ms.is_some_and(|ms| ms >= aging);
+            (
+                sched.longest_wait_ms(now, |w| !own(w) && w.priority <= running_priority),
+                aged(sched.longest_wait_ms(now, |w| !own(w))),
+                aged(sched.longest_wait_ms(now, own)),
+            )
+        };
+        if !admission_closed
+            && !admission_open(
+                now_ms().saturating_sub(cycle_start_ms),
+                time_slice_ms(),
+                contending,
+                aged_other,
+            )
+        {
+            admission_closed = true;
+            tracing::debug!(
+                "closing admission at step {steps}: other work is waiting \
+                 (contending {contending:?} ms, aged {aged_other}); finishing {} session(s)",
+                active.len()
+            );
+        }
+        if midcycle_admit_enabled()
+            && !admission_closed
+            && !active.is_empty()
+            && !state.engine_wanted()
+        {
+            // Own-model work that has waited past the aging threshold is admitted
+            // whatever its band: it cannot run until this cycle ends otherwise.
+            let admit_up_to = if aged_own { u8::MAX } else { running_priority };
             let admitted = admit_into_cycle(
                 engine,
                 state,
                 &worker,
                 &format!("{batch_id}-a{steps}"),
-                running_priority,
+                admit_up_to,
                 batch_max().saturating_sub(active.len()),
                 prefix_index,
             )
@@ -2254,6 +2353,31 @@ async fn run_batch_cycle(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Aged work, queued or parked, runs where nothing can park it; aging off or
+    // not yet aged keeps the band it asked for.
+    #[test]
+    fn aged_work_runs_at_the_top_band() {
+        assert_eq!(effective_priority(255, 60_000, 60_000), 0);
+        assert_eq!(effective_priority(64, 59_999, 60_000), 64);
+        assert_eq!(effective_priority(255, 600_000, 0), 255, "aging off");
+    }
+
+    // A cycle keeps admitting until it has had its slice AND other work it cannot
+    // admit is waiting at its priority, or until such work has aged out.
+    #[test]
+    fn admission_closes_for_contending_or_aged_work() {
+        // Alone: admits for as long as it likes.
+        assert!(admission_open(600_000, 20_000, None, false));
+        // Contended but still within its slice.
+        assert!(admission_open(5_000, 20_000, Some(5_000), false));
+        // Contended past its slice: closes.
+        assert!(!admission_open(20_000, 20_000, Some(1), false));
+        // Anything it cannot admit has aged: closes even within the slice.
+        assert!(!admission_open(1_000, 20_000, None, true));
+        // Slicing disabled (0): only aging closes it.
+        assert!(admission_open(600_000, 0, Some(600_000), false));
+    }
 
     // The form the daemon ACTUALLY sends. `lifecycle.rs` reports `loaded.family` for any
     // model with a registered backend — "qwen3.5", with a dot — and only falls back to a
