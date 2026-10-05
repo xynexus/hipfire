@@ -2554,6 +2554,7 @@ dependencies = [
  "hipfire-config",
  "hipfire-daemon-adapter",
  "hipfire-diffusion",
+ "hipfire-env",
  "hipfire-generate",
  "hipfire-lock",
  "hipfire-model",

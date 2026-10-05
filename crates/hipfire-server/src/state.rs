@@ -354,7 +354,7 @@ impl AppState {
                     cpu_threads: u32::MAX,
                 },
                 0,
-                0,
+                crate::batch_runner::aging_ms(),
             )),
             selected_prefill_requests: Mutex::new(HashSet::new()),
             prefill_dispatch: Mutex::new(()),

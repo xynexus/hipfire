@@ -41,6 +41,7 @@ hipfire-sysinfo = { path = "../hipfire-sysinfo" }
 hipfire-build-info = { path = "../hipfire-build-info" }
 hipfire-config = { path = "../hipfire-config" }
 hipfire-daemon-adapter = { path = "../hipfire-daemon-adapter" }
+hipfire-env = { path = "../hipfire-env" }
 hipfire-lock = { path = "../hipfire-lock" }
 hipfire-generate = { path = "../hipfire-generate" }
 hipfire-diffusion = { path = "../hipfire-diffusion" }

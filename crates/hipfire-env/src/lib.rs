@@ -196,7 +196,21 @@ env_vars! {
          because a measurement can name a path it never took: bench_prefill \
          reported `pp512 t/s` from a per-token warm-pass for five arches.";
 
-    // ── DeltaNet state (hipfire-arch-qwen35) ────────────────────────────────
+    // ── Serving (hipfire-server) ────────────────────────────────────────────
+    SERVER_AGING_MS = "HIPFIRE_SERVER_AGING_MS", User,
+        "Milliseconds after which a queued request is served ahead of fresher, more \
+         urgent ones, and a running batch stops admitting other work so it can be. \
+         Keeps low-priority work (a swarm's band-255 research) from waiting forever \
+         behind a steady stream of higher-priority requests. Default 60000; 0 \
+         restores strict priority order.";
+
+    SERVER_TIME_SLICE_MS = "HIPFIRE_SERVER_TIME_SLICE_MS", User,
+        "Milliseconds one model's running batch may keep admitting new requests \
+         while another resident model has requests of the same or higher priority \
+         waiting. Past it the batch stops admitting, finishes what it has, and the \
+         waiting model runs. Default 20000; 0 disables (a batch admits for as long \
+         as its own model has work).";
+
     DAEMON_REPLY_DEADLINE_S = "HIPFIRE_DAEMON_REPLY_DEADLINE_S", User,
         "Seconds `hipfire serve` lets its inference worker go without replying to a \
          model load, prefill or generate before it treats the worker as wedged, kills \
@@ -209,6 +223,7 @@ env_vars! {
          on the next request. Default 60; a healthy step answers in well under a \
          second. 0 falls back to HIPFIRE_DAEMON_REPLY_DEADLINE_S.";
 
+    // ── DeltaNet state (hipfire-arch-qwen35) ────────────────────────────────
     DN_STATE_FP16 = "HIPFIRE_DN_STATE_FP16", Developer,
         "Store DeltaNet recurrent state as FP16, halving per-sequence state. \
          Storage only; arithmetic stays FP32. OPT-IN: unset means FP32, which \
