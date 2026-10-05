@@ -103,8 +103,34 @@ pub enum BatchEvent {
     /// can build its response without this module depending on the generate
     /// crate's event types.
     Done(serde_json::Value),
-    /// Terminal error for this request.
-    Error(String),
+    /// Terminal error for this request, and what kind it is.
+    Error(FailKind, String),
+}
+
+/// Why a request failed: which status the route returns and whether a client
+/// should retry. Every failure used to be a 500, so a client could not tell a
+/// prompt that will never fit (retrying it only re-fails, and in lockstep with
+/// its batch-mates) from a worker that is being respawned (retrying works).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FailKind {
+    /// The inference worker is not running, died, or was killed as wedged. The
+    /// next request respawns it: retry shortly. HTTP 503 with Retry-After.
+    Unavailable,
+    /// The prompt alone fills the model's context. Never retry. HTTP 400
+    /// `context_length_exceeded`.
+    ContextLength,
+    /// Anything else. HTTP 500.
+    Server,
+}
+
+/// The kind of a failure that ended a cycle: a worker that is no longer alive
+/// (it crashed, or the deadline killed it as wedged) makes it `Unavailable`.
+fn cycle_failure_kind(engine: &mut DaemonEngine) -> FailKind {
+    if engine.worker_alive() {
+        FailKind::Server
+    } else {
+        FailKind::Unavailable
+    }
 }
 
 /// A request admitted to the batch path but not yet complete. The route builds
@@ -840,25 +866,46 @@ async fn prefill_budgeted(
 /// round 2 attaches them to what round 1 checkpointed — so a cold batch of N
 /// requests with a common system turn prefills it once, not N times. They still
 /// decode together; only prefill is split, by rounds and by the row budget.
+/// Sessions turned away before prefill because the prompt alone fills the model's
+/// context: `(request id, prompt tokens)`.
+type Overlong = Vec<(String, usize)>;
+
+/// Prefill `specs`, and refuse -- before any prefill -- each session whose prompt
+/// leaves no room in `max_seq` to generate. One such prompt used to fail the
+/// daemon's fused prefill for the whole batch, every co-batched request with it.
+/// The prompt lengths come from the reuse preflight, so the check costs nothing
+/// extra; with the prefix cache and row budget both off there is no preflight,
+/// and the daemon's own guard is all that applies.
 async fn prefill_with_prefix_reuse(
     engine: &mut DaemonEngine,
     batch_id: &str,
     worker: &str,
     specs: &[SessionSpec],
     index: &mut PrefixIndex,
-) -> anyhow::Result<Vec<serde_json::Value>> {
+    max_seq: Option<usize>,
+) -> anyhow::Result<(Vec<serde_json::Value>, Overlong)> {
     let use_cache = prefix_cache_enabled();
     let budget = prefill_row_budget();
     if !use_cache && budget == 0 {
         let request = build_batch_prefill_request(batch_id, worker, specs, &HashMap::new());
-        return engine.generate_batch_prefill(request).await;
+        return Ok((engine.generate_batch_prefill(request).await?, Vec::new()));
     }
     const MAX_ROUNDS: usize = 3;
     let mut events = Vec::new();
+    let mut overlong = Vec::new();
     let mut pending: Vec<SessionSpec> = specs.to_vec();
     for round in 0..MAX_ROUNDS {
         let (mut reuse, mut deferred, full) =
             plan_prefix_reuse(engine, worker, &pending, index, use_cache).await;
+        if let Some(cap) = max_seq {
+            pending.retain(|s| match full.get(&s.id) {
+                Some(&n) if n >= cap => {
+                    overlong.push((s.id.clone(), n));
+                    false
+                }
+                _ => true,
+            });
+        }
         if round + 1 == MAX_ROUNDS {
             deferred.clear();
         }
@@ -877,7 +924,39 @@ async fn prefill_with_prefix_reuse(
         }
         pending = later;
     }
-    Ok(events)
+    Ok((events, overlong))
+}
+
+/// Fail each overlong session with a context-length error and forget it, so the
+/// rest of the cycle never waits on it.
+fn reject_overlong(
+    overlong: &Overlong,
+    max_seq: Option<usize>,
+    txs: &mut HashMap<String, mpsc::UnboundedSender<BatchEvent>>,
+) {
+    for (id, n) in overlong {
+        if let Some(tx) = txs.remove(id) {
+            let _ = tx.send(BatchEvent::Error(
+                FailKind::ContextLength,
+                format!(
+                    "the prompt is {n} tokens, which leaves no room to generate in this \
+                     model's {}-token context",
+                    max_seq.unwrap_or(0)
+                ),
+            ));
+        }
+    }
+}
+
+/// The context (`max_seq`) the model on `worker` was loaded with.
+async fn loaded_max_seq(state: &SharedState, worker: &str) -> Option<usize> {
+    state
+        .loaded_models
+        .lock()
+        .await
+        .values()
+        .find(|m| m.worker_key_id.as_deref() == Some(worker))
+        .map(|m| m.max_seq as usize)
 }
 
 /// Index the checkpoints a prefill minted, releasing duplicates and evictions.
@@ -1292,8 +1371,10 @@ async fn batch_runner_loop(state: SharedState) {
                     Some(e) => e,
                     None => {
                         for p in &batch {
-                            let _ =
-                                p.tx.send(BatchEvent::Error("daemon not running".to_string()));
+                            let _ = p.tx.send(BatchEvent::Error(
+                                FailKind::Unavailable,
+                                "daemon not running".to_string(),
+                            ));
                         }
                         if let Some(id) = lease_id {
                             state.work_scheduler.lock().await.complete(id);
@@ -1607,9 +1688,9 @@ async fn run_embed_jobs(engine: &mut DaemonEngine, jobs: Vec<EmbedJob>) {
     }
 }
 
-fn fail_all(txs: &HashMap<String, mpsc::UnboundedSender<BatchEvent>>, msg: &str) {
+fn fail_all(txs: &HashMap<String, mpsc::UnboundedSender<BatchEvent>>, kind: FailKind, msg: &str) {
     for tx in txs.values() {
-        let _ = tx.send(BatchEvent::Error(msg.to_string()));
+        let _ = tx.send(BatchEvent::Error(kind, msg.to_string()));
     }
 }
 
@@ -1694,7 +1775,7 @@ async fn admit_into_cycle(
     if taken.is_empty() {
         return Vec::new();
     }
-    let newcomers: Vec<PendingRequest> = {
+    let mut newcomers: Vec<PendingRequest> = {
         let mut inbox = state.batch_inbox.lock().await;
         taken
             .iter()
@@ -1723,15 +1804,26 @@ async fn admit_into_cycle(
         .iter()
         .map(|s| (s.id.clone(), s.max_tokens.max(1)))
         .collect();
-    match prefill_with_prefix_reuse(engine, batch_id, worker, &specs, prefix_index).await {
-        Ok(events) => fold_prefill_events(&events, &mut positions, &mut remaining),
+    let max_seq = loaded_max_seq(state, worker).await;
+    match prefill_with_prefix_reuse(engine, batch_id, worker, &specs, prefix_index, max_seq).await {
+        Ok((events, overlong)) => {
+            let mut txs: HashMap<String, mpsc::UnboundedSender<BatchEvent>> = newcomers
+                .iter()
+                .map(|p| (p.spec.id.clone(), p.tx.clone()))
+                .collect();
+            reject_overlong(&overlong, max_seq, &mut txs);
+            newcomers.retain(|p| txs.contains_key(&p.spec.id));
+            fold_prefill_events(&events, &mut positions, &mut remaining)
+        }
         Err(e) => {
             let handles: Vec<String> = specs.iter().map(|s| s.id.clone()).collect();
             let _ = engine
                 .release_sessions(build_release_request(worker, &handles))
                 .await;
+            let kind = cycle_failure_kind(engine);
             for p in &newcomers {
-                let _ = p.tx.send(BatchEvent::Error(format!("batch prefill: {e}")));
+                let _ =
+                    p.tx.send(BatchEvent::Error(kind, format!("batch prefill: {e}")));
             }
             return Vec::new();
         }
@@ -1741,6 +1833,7 @@ async fn admit_into_cycle(
         .filter_map(|p| {
             let Some(&pos) = positions.get(&p.spec.id) else {
                 let _ = p.tx.send(BatchEvent::Error(
+                    FailKind::Server,
                     "batch prefill produced no session state".to_string(),
                 ));
                 return None;
@@ -1793,10 +1886,16 @@ async fn run_batch_cycle(
     if resuming {
         positions = resume_pos.clone();
     } else {
+        let max_seq = loaded_max_seq(state, &worker).await;
         let result =
-            prefill_with_prefix_reuse(engine, &batch_id, &worker, &specs, prefix_index).await;
+            prefill_with_prefix_reuse(engine, &batch_id, &worker, &specs, prefix_index, max_seq)
+                .await;
         let events = match result {
-            Ok(events) => events,
+            Ok((events, overlong)) => {
+                reject_overlong(&overlong, max_seq, &mut txs);
+                specs.retain(|s| txs.contains_key(&s.id));
+                events
+            }
             Err(e) => {
                 // The daemon's activation loop can run to completion for every
                 // session and THEN fail (suffix prefill, or the checkpoint step),
@@ -1811,7 +1910,8 @@ async fn run_batch_cycle(
                 if !resuming && batch.len() > 1 && is_device_oom(&e.to_string()) {
                     return CycleOutcome::OutOfMemory(batch);
                 }
-                fail_all(&txs, &format!("batch prefill: {e}"));
+                let kind = cycle_failure_kind(engine);
+                fail_all(&txs, kind, &format!("batch prefill: {e}"));
                 return CycleOutcome::Completed;
             }
         };
@@ -1853,6 +1953,7 @@ async fn run_batch_cycle(
         if !positions.contains_key(&s.id) {
             if let Some(tx) = txs.get(&s.id) {
                 let _ = tx.send(BatchEvent::Error(
+                    FailKind::Server,
                     "batch prefill produced no session state".to_string(),
                 ));
             }
@@ -1896,7 +1997,8 @@ async fn run_batch_cycle(
         let events = match engine.generate_batch_decode_step(decode_req).await {
             Ok(events) => events,
             Err(e) => {
-                fail_all(&txs, &format!("batch decode: {e}"));
+                let kind = cycle_failure_kind(engine);
+                fail_all(&txs, kind, &format!("batch decode: {e}"));
                 break;
             }
         };
