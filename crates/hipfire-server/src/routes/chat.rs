@@ -1459,7 +1459,7 @@ fn parse_inline_tool_calls(
 /// header in front of a real answer, kept — or `<|im_start|>user`, the start of a
 /// turn that is not theirs, cut there. See
 /// docs/todo/2026-10-02-stray-im-start-and-chat-template-check.md.
-fn clean_reply_text(text: &str) -> String {
+pub(crate) fn clean_reply_text(text: &str) -> String {
     let mut rest = text;
     if let Some(after) = rest.strip_prefix("<|im_start|>") {
         rest = after;
@@ -1854,6 +1854,19 @@ impl ThinkStreamFilter {
     /// templates open `<think>` in the generation prompt when thinking is enabled,
     /// so the model's first token is already reasoning and no opening marker will
     /// ever appear in the stream.
+    /// The filter for a reply generated under `controls`: inside a think block
+    /// from its first token when the template opened one, outside it when the
+    /// template closed it (`closed_think`: thinking off, effort `none`). Taking
+    /// either for every request sent a thinking-off reply out whole as
+    /// reasoning, or a thinking reply's reasoning out as the answer.
+    pub(crate) fn for_controls(controls: &RequestGenerationControls) -> Self {
+        if controls.assistant_prefix.as_deref() == Some("closed_think") {
+            Self::default()
+        } else {
+            Self::started_in_think()
+        }
+    }
+
     pub(crate) fn started_in_think() -> Self {
         Self {
             in_think: true,
@@ -2872,7 +2885,7 @@ async fn stream_chat(
             return;
         }
 
-        let gen_req = {
+        let (gen_req, think_filter) = {
             let cfg = state.config.lock().await;
             let resolved = cfg.resolve_for_model(&model_arg);
             let controls = request_generation_controls(
@@ -2883,26 +2896,30 @@ async fn stream_chat(
                 body.presence_penalty,
                 body.frequency_penalty,
             );
-            generate_request_from_chat(
-                req_id.clone(),
-                &body.messages,
-                GenerationSamplingPolicy::from_defaults(
-                    resolved.temperature,
-                    resolved.top_p,
-                    resolved.repeat_penalty,
-                    resolved.max_tokens,
-                    body.temperature,
-                    body.top_p,
-                    body.top_k,
-                    body.repeat_penalty,
-                    Some(request_max_tokens),
+            let think_filter = ThinkStreamFilter::for_controls(&controls);
+            (
+                generate_request_from_chat(
+                    req_id.clone(),
+                    &body.messages,
+                    GenerationSamplingPolicy::from_defaults(
+                        resolved.temperature,
+                        resolved.top_p,
+                        resolved.repeat_penalty,
+                        resolved.max_tokens,
+                        body.temperature,
+                        body.top_p,
+                        body.top_k,
+                        body.repeat_penalty,
+                        Some(request_max_tokens),
+                    ),
+                    loaded.worker_key_id,
+                    body.tools.clone(),
+                    body.system,
+                    stop,
+                    image_base64,
+                    controls,
                 ),
-                loaded.worker_key_id,
-                body.tools.clone(),
-                body.system,
-                stop,
-                image_base64,
-                controls,
+                think_filter,
             )
         };
 
@@ -2910,7 +2927,7 @@ async fn stream_chat(
         let created_cb = created;
         let model_cb = model_arg.clone();
         let tx_cb = tx.clone();
-        let mut think_filter = ThinkStreamFilter::default();
+        let mut think_filter = think_filter;
         let mut accumulated_tool_text = String::new();
         let mut debug_raw_text = String::new();
         let mut debug_structured_tool_calls = Vec::new();
@@ -3282,6 +3299,26 @@ mod tests {
 
         assert!(matches!(&deltas[0], AssistantDelta::Reasoning(s) if s == "\nwhy"));
         assert!(matches!(&deltas[1], AssistantDelta::Content(s) if s == "answer"));
+    }
+
+    // A stream starts inside a think block only when the template opened one: with
+    // thinking off (`closed_think`, effort none) the first text is the answer, and
+    // it used to go out whole as reasoning on the Responses stream.
+    #[test]
+    fn a_stream_starts_in_think_only_when_the_template_opened_one() {
+        let controls = |prefix: &str| RequestGenerationControls {
+            presence_penalty: None,
+            frequency_penalty: None,
+            reasoning_effort: None,
+            thinking_mode: None,
+            assistant_prefix: Some(prefix.to_string()),
+            max_think_tokens: None,
+        };
+        let closed =
+            ThinkStreamFilter::for_controls(&controls("closed_think")).observe("Hello", false);
+        assert!(matches!(closed.as_slice(), [AssistantDelta::Content(s)] if s == "Hello"));
+        let open = ThinkStreamFilter::for_controls(&controls("open_think")).observe("hmm", false);
+        assert!(matches!(open.as_slice(), [AssistantDelta::Reasoning(s)] if s == "hmm"));
     }
 
     #[test]
