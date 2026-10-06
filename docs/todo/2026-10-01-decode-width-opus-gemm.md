@@ -99,6 +99,30 @@ serving up to 24 rows (`395fe0a66`), small-B overlay correction `_trs`
   even. **The overlay stays a separate pass.**
 - **`_trs` correction past 64 rows**: 2-6x worse than `_tr` (side-plane re-reads
   per 16-column block). Keep the B<=64 threshold.
+- **Wide multicol at 4 lanes per group, 64 weights per lane** (2026-10-07,
+  9..16 rows). The idea: past 8 rows the kernel is VALU-bound, and each
+  (row, column) pays cvt + scale mul + fmac plus an overlay LDS gather for only 8
+  dot4. At 4 lanes per group the same epilogue covers 16 dot4, halving it per MAC
+  (ISA at B=16: 768 dot4 against the same 48 cvt/fma). A half-empty last round
+  (ng % 8 == 4: 20 and 68 groups) loaded a real group with its scale zeroed.
+  Parity passed, and it was slower on 3 of 4 shapes. Cold ms, master -> LPG=4
+  with RW=3:
+
+  | B | gate/up | down | qkv | wo |
+  |---|---|---|---|---|
+  | 9 | 0.233 -> 0.297 | 0.258 -> 0.282 | 0.095 -> 0.133 | 0.115 -> 0.110 |
+  | 12 | 0.265 -> 0.364 | 0.278 -> 0.333 | 0.114 -> 0.147 | 0.130 -> 0.107 |
+  | 16 | 0.321 -> 0.471 | 0.313 -> 0.412 | 0.144 -> 0.197 | 0.144 -> 0.129 |
+
+  - The activation tile is 8 groups x BC x 256 B: 32 KB at B=16, so 2
+    workgroups per WGP (4 waves/SIMD, against 8). VGPRs rose 191 -> 232.
+  - RW=2 cut VGPRs to 174 but was worse again (gate/up B=16 0.589): it loses
+    row reuse of the tile.
+  - Only `wo` (K=4096, no tail round) gained, about 1% of a step. That isn't
+    worth a second kernel set.
+  - What's left is the tile itself. The epilogue saving is real but smaller
+    than the occupancy it costs, so a version that pays has to stage fewer
+    bytes per MAC.
 
 ## Landed: the B<=64 tile was bandwidth-bound on over-fetch (2026-10-02)
 
