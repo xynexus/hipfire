@@ -2699,7 +2699,10 @@ fn moe_grouped_gemm_supported_for_dtype(dtype: DType, arch: &str) -> bool {
         // grouped GEMM against gemm_oq8_grouped_wmma on expanded blocks -- the
         // shape `parity_gemm_oq_compact` already uses for the dense twin -- before
         // flipping it on.
-        // ⚠️ STILL OPT-IN, and NOT because of the GEMM. See the note below.
+        // ON by default on gfx11 since 43653ea3d (+31.6% prefill, output identical);
+        // HIPFIRE_MOE_COMPACT_GROUPED=0 opts out. tests/serving-shape-gate.sh checks
+        // the grouped f32 GEMM at the 35B-A3B shapes on every change to its route.
+        // The notes below are the history of that decision.
         //
         // Path 2 was moved onto
         // `gemm_oq_compact_moe_grouped_f32`, which is BIT-EXACT against the
@@ -2735,7 +2738,7 @@ fn moe_grouped_gemm_supported_for_dtype(dtype: DType, arch: &str) -> bool {
         // remaining candidate is summation ORDER in the down combine, which is
         // a legitimate difference, not a bug.
         //
-        // It stays OPT-IN regardless, because "coherent and probably rounding"
+        // It stayed opt-in until then, because "coherent and probably rounding"
         // is not the bar for changing what every prefill computes, and no
         // quantitative gate covers this path today: `hipfire-eval --battery
         // perplexity` does not route through `forward_prefill_batch` at all

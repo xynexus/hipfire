@@ -280,6 +280,23 @@ if gpu_held_by_local_daemon; then
     echo
 fi
 
+# ── Serving-shape parity gate (runs beside a serving daemon) ─────────────
+# The routes the deployed models take -- K >= 5120, the multicol/BN=32/BN=64 tiles,
+# head_dim 256, the coder's compact grouped MoE -- are out of the tiny fixtures'
+# reach, and a daemon holding the GPU skips every model gate above. These parity
+# examples need a few hundred MiB, so they run either way, and a failure blocks the
+# commit. HIPFIRE_SKIP_SERVING_GATE=1 skips it.
+SERVING_ROUTE='^crates/hipfire-rdna/src/dispatch/(quant|attention|gemm_misc|moe|mod)\.rs$|^crates/hipfire-rdna/src/pool\.rs$|^kernels/src/.*(oq_compact|overlay|kvarn).*\.hip$'
+if echo "$CODE_CHANGED" | grep -qE "$SERVING_ROUTE" && [ "${HIPFIRE_SKIP_SERVING_GATE:-0}" != 1 ]; then
+    echo "=== Serving-shape parity gate ==="
+    if ! ./tests/serving-shape-gate.sh; then
+        echo
+        echo "COMMIT BLOCKED: a served route lost parity (HIPFIRE_SKIP_SERVING_GATE=1 overrides)."
+        exit 1
+    fi
+    echo
+fi
+
 # ── Tiny affected-model tripwire (git-diff selected front tier) ──────────
 # Use git's staged path list as the dependency/touched-file database. The
 # selector maps changed paths to the smallest covered tiny_quant family set
