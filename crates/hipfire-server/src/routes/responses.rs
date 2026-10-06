@@ -72,8 +72,11 @@ pub struct ResponsesRequest {
     pub tools: Option<Value>,
     /// Scheduler priority band, same top-level field the chat route reads.
     pub priority: Option<i64>,
-    /// Client metadata. Only `hipfire_priority` is read (see `request_priority`) —
-    /// Corrode carries the band here.
+    /// Run alone for a batch-independent answer (see `ChatRequest::deterministic`).
+    #[serde(default)]
+    pub deterministic: Option<bool>,
+    /// Client metadata. `hipfire_priority` and `hipfire_deterministic` are read (see
+    /// `request_priority`) -- Corrode carries them here.
     pub metadata: Option<Value>,
 }
 
@@ -84,6 +87,17 @@ pub struct ResponsesRequest {
 fn request_priority(body: &ResponsesRequest) -> Option<i64> {
     body.priority
         .or_else(|| body.metadata.as_ref()?.get("hipfire_priority")?.as_i64())
+}
+
+/// Whether to run alone: the top-level `deterministic` field, else
+/// `metadata.hipfire_deterministic`.
+fn request_deterministic(body: &ResponsesRequest) -> Option<bool> {
+    body.deterministic.or_else(|| {
+        body.metadata
+            .as_ref()?
+            .get("hipfire_deterministic")?
+            .as_bool()
+    })
 }
 
 /// Whether the client asked to keep reasoning inline in the visible text. Mirrors the
@@ -325,6 +339,7 @@ async fn execute_responses_owned(
         max_tokens: body.max_output_tokens.or(body.max_tokens),
         stop: body.stop.clone(),
         priority: request_priority(&body),
+        deterministic: request_deterministic(&body),
         tools: normalize_tools(body.tools.clone()),
         system: None,
         reasoning_effort: body.reasoning_effort.clone(),

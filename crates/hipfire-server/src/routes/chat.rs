@@ -53,6 +53,14 @@ pub struct ChatRequest {
     pub max_tokens: Option<u32>,
     pub stop: Option<Value>,
     pub priority: Option<i64>,
+    /// Run this request ALONE: prefilled and decoded with no other session in its
+    /// batch. Batch composition changes the numbers -- a single session takes the
+    /// serial prefill, several take the fused one -- and at a near-tie that changes
+    /// a temperature-0 answer: the same request alone and beside three others gave
+    /// two different answers. Set, the answer is the one a cold, idle server gives,
+    /// however busy this one is; the cost is that nothing batches with it.
+    #[serde(default)]
+    pub deterministic: Option<bool>,
     pub tools: Option<Value>,
     pub system: Option<String>,
     pub reasoning_effort: Option<String>,
@@ -2246,7 +2254,9 @@ where
             max_think_tokens,
             max_tokens: request_max_tokens as usize,
             tools: body.tools.clone(),
+            solo: body.deterministic.unwrap_or(false),
         };
+        let solo = spec.solo;
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
         let worker_key_id = loaded.worker_key_id.clone().unwrap_or_default();
         // Register the pending request first so the runner can always resolve a
@@ -2266,14 +2276,16 @@ where
         // Admit through the ContinuousWorkScheduler (the batch runner's front-end):
         // same worker key = microbatch-compatible, up to the batch max. On backpressure
         // or duplicate id, unregister and surface the error.
+        let (microbatch_key, microbatch_max) =
+            crate::batch_runner::text_microbatch(&worker_key_id, &req_id, solo);
         let workload = hipfire_scheduler::WorkloadSpec::microbatchable(
             req_id.clone(),
             hipfire_scheduler::WorkloadClass::TokenPrefill,
             hipfire_scheduler::clamp_scheduler_priority(body.priority.unwrap_or(64)),
             now_ms(),
             hipfire_scheduler::WorkloadResources::default(),
-            worker_key_id,
-            crate::batch_runner::batch_max(),
+            microbatch_key,
+            microbatch_max,
         )
         .with_owner(owner.clone());
         if let Err(e) = state.work_scheduler.lock().await.enqueue(workload) {
@@ -3722,6 +3734,7 @@ mod tests {
 
         let bad_stop = ChatRequest {
             request_id: None,
+            deterministic: None,
             model: Some("qwen3.5-0.8b-mq4".to_string()),
             messages: vec![ChatMessage {
                 role: "user".to_string(),
@@ -3739,6 +3752,7 @@ mod tests {
 
         let bad_image = ChatRequest {
             request_id: None,
+            deterministic: None,
             model: Some("qwen3.5-0.8b-mq4".to_string()),
             messages: vec![ChatMessage {
                 role: "user".to_string(),
@@ -3760,6 +3774,7 @@ mod tests {
 
         let missing_model = ChatRequest {
             request_id: None,
+            deterministic: None,
             model: Some("__definitely_missing_hipfire_model__".to_string()),
             messages: vec![ChatMessage {
                 role: "user".to_string(),
