@@ -463,6 +463,79 @@ impl<'a> ChatFrame<'a> {
         out
     }
 
+    /// Build a whole conversation -- every system, user, assistant and tool turn --
+    /// then the assistant prefix: what a request's `messages` carry, which is what
+    /// the Jinja path renders. The plain path used to read only `system` and the
+    /// last user turn, dropping the rest without a word: a [system, user] request
+    /// rendered as the user turn alone, and a tool conversation lost its calls and
+    /// results. Assistant tool calls render as `<tool_call>` JSON blocks and a run
+    /// of tool results as one user turn of `<tool_response>` blocks, as the Qwen
+    /// templates do. `raw` encodes the contents, one per line.
+    pub fn build_messages(&self, messages: &[Message]) -> Vec<u32> {
+        if self.raw {
+            let text: Vec<&str> = messages.iter().map(|m| m.content.as_str()).collect();
+            return self.tokenizer.encode(&text.join("\n"));
+        }
+        let scaffold = ChatScaffold::for_tokenizer(self.tokenizer);
+        let mut out: Vec<u32> = Vec::new();
+        let mut i = 0;
+        while i < messages.len() {
+            let m = &messages[i];
+            match m.role {
+                Role::System | Role::Developer => scaffold.append_system(&mut out, &m.content),
+                Role::User => scaffold.append_user_turn(&mut out, &m.content),
+                Role::Assistant => {
+                    let mut body = m.content.clone();
+                    for call in &m.tool_calls {
+                        if !body.is_empty() {
+                            body.push('\n');
+                        }
+                        let call =
+                            serde_json::json!({"name": call.name, "arguments": call.arguments});
+                        body.push_str(&format!("<tool_call>\n{call}\n</tool_call>"));
+                    }
+                    scaffold.append_assistant_turn(&mut out, &body);
+                }
+                Role::Tool => {
+                    let mut body = String::new();
+                    while let Some(t) = messages.get(i).filter(|t| t.role == Role::Tool) {
+                        if !body.is_empty() {
+                            body.push('\n');
+                        }
+                        body.push_str(&format!("<tool_response>\n{}\n</tool_response>", t.content));
+                        i += 1;
+                    }
+                    scaffold.append_user_turn(&mut out, &body);
+                    continue;
+                }
+            }
+            i += 1;
+        }
+        scaffold.append_assistant_prefix(&mut out, self.assistant_prefix);
+        out
+    }
+
+    /// [`Self::build`], or the whole conversation when the request carried one.
+    pub fn build_with_history(&self, history: Option<&[Message]>) -> Vec<u32> {
+        match history {
+            Some(h) if !h.is_empty() => self.build_messages(h),
+            _ => self.build(),
+        }
+    }
+
+    /// [`Self::build_with_user_tokens`], or the whole conversation when the request
+    /// carried one (the pre-tokenized user turn is then the history's last turn).
+    pub fn build_tokens_with_history(
+        &self,
+        user_tokens: &[u32],
+        history: Option<&[Message]>,
+    ) -> Vec<u32> {
+        match history {
+            Some(h) if !h.is_empty() => self.build_messages(h),
+            _ => self.build_with_user_tokens(user_tokens),
+        }
+    }
+
     /// Build the prompt token sequence for a multi-turn request.
     /// `history` is prior turns in chronological order (oldest first);
     /// the final turn is appended from `self.user` +
@@ -2037,6 +2110,67 @@ mod tests {
             serde_json::from_str::<serde_json::Value>(&fallback)
                 .expect("structured fallback prompt json"),
             serde_json::json!({"type": "text", "text": "second"})
+        );
+    }
+
+    // A conversation in `messages` renders whole on the plain path: [system, user]
+    // exactly as the separate `system` field + user turn, and the assistant's calls
+    // and the tool results reach the prompt instead of vanishing.
+    #[test]
+    fn plain_messages_keep_system_history_and_tool_turns() {
+        let t = make_tokenizer();
+        let frame = |system| ChatFrame {
+            tokenizer: &t,
+            system,
+            user: "hi",
+            assistant_prefix: AssistantPrefix::Plain,
+            raw: false,
+        };
+        let msg = |role, content: &str| Message {
+            role,
+            content: content.into(),
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+        };
+        let sys_user = [msg(Role::System, "be terse"), msg(Role::User, "hi")];
+        assert_eq!(
+            frame(None).build_with_history(Some(&sys_user)),
+            frame(Some("be terse")).build()
+        );
+        assert_eq!(
+            frame(Some("ignored")).build_with_history(None),
+            frame(Some("ignored")).build()
+        );
+
+        let mut call = msg(Role::Assistant, "");
+        call.tool_calls.push(ToolCall {
+            id: Some("c0".into()),
+            name: "read_file".into(),
+            arguments: serde_json::json!({"path": "a.txt"}),
+        });
+        let convo = [
+            msg(Role::System, "be terse"),
+            msg(Role::User, "read a.txt and b.txt"),
+            call,
+            msg(Role::Tool, "alpha"),
+            msg(Role::Tool, "beta"),
+        ];
+        let mut want = Vec::new();
+        let s = ChatScaffold::for_tokenizer(&t);
+        s.append_system(&mut want, "be terse");
+        s.append_user_turn(&mut want, "read a.txt and b.txt");
+        s.append_assistant_turn(
+            &mut want,
+            "<tool_call>\n{\"name\":\"read_file\",\"arguments\":{\"path\":\"a.txt\"}}\n</tool_call>",
+        );
+        s.append_user_turn(
+            &mut want,
+            "<tool_response>\nalpha\n</tool_response>\n<tool_response>\nbeta\n</tool_response>",
+        );
+        s.append_assistant_prefix(&mut want, AssistantPrefix::Plain);
+        assert_eq!(
+            frame(None).build_tokens_with_history(&[1, 2, 3], Some(&convo)),
+            want
         );
     }
 

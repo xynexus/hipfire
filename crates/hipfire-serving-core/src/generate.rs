@@ -149,7 +149,7 @@ pub fn generate_mtp(
                     assistant_prefix,
                     raw: effective_raw(m, raw_override),
                 }
-                .build()
+                .build_with_history(messages_history)
             }
         }
     } else {
@@ -160,7 +160,7 @@ pub fn generate_mtp(
             assistant_prefix,
             raw: effective_raw(m, raw_override),
         }
-        .build()
+        .build_with_history(messages_history)
     };
 
     let im_end = tokenizer.encode("<|im_end|>");
@@ -589,7 +589,7 @@ pub fn generate_dflash(
                     assistant_prefix,
                     raw: effective_raw(m, raw_override),
                 }
-                .build()
+                .build_with_history(messages_history)
             }
         }
     } else {
@@ -600,7 +600,7 @@ pub fn generate_dflash(
             assistant_prefix,
             raw: effective_raw(m, raw_override),
         }
-        .build()
+        .build_with_history(messages_history)
     };
 
     // `im_end_token` is still needed downstream for the EOS check.
@@ -1661,7 +1661,7 @@ pub fn generate_multi(
                     assistant_prefix,
                     raw: effective_raw(m, raw_override),
                 }
-                .build_with_user_tokens(&q_tokens)
+                .build_tokens_with_history(&q_tokens, messages_history)
             }
         }
     } else {
@@ -1676,7 +1676,7 @@ pub fn generate_multi(
             assistant_prefix,
             raw: effective_raw(m, raw_override),
         }
-        .build_with_user_tokens(&q_tokens)
+        .build_tokens_with_history(&q_tokens, messages_history)
     };
 
     let trailer = nl.len();
@@ -4565,7 +4565,7 @@ pub fn generate_start(
                     assistant_prefix,
                     raw: effective_raw(m, raw_override),
                 }
-                .build_with_user_tokens(&q_tokens)
+                .build_tokens_with_history(&q_tokens, messages_history)
             }
         }
     } else {
@@ -4580,7 +4580,10 @@ pub fn generate_start(
             assistant_prefix,
             raw: effective_raw(m, raw_override),
         }
-        .build_with_user_tokens(&q_tokens)
+        .build_tokens_with_history(
+            &q_tokens,
+            messages_history.filter(|_| seq_pos_for_prompt == 0),
+        )
     };
 
     // KV-budget guard. Without eviction the physical buffer is the hard cap;
