@@ -1393,27 +1393,18 @@ fn is_batchable_la(dt: DType, arch: &str, allow_compact: bool) -> bool {
         && matches!(arch, "gfx1200" | "gfx1201")
         && std::env::var("HIPFIRE_LLOYD_GFX12").ok().as_deref() == Some("1");
 
-    // Lloyd-MQ4 (MQ4G256Lloyd) on gfx11: shipped as part of issue #182.
-    // Uses the gemm_*_mq4g256_lloyd_wmma family; group stride differs
-    // (160 B Lloyd vs 136 B HFQ4) so dispatch routes through the
-    // Lloyd-specific arms in forward_prefill_chunk.
-    let lloyd_mq4_with_gfx11_wmma = matches!(dt, DType::MQ4G256Lloyd)
-        && matches!(
-            arch,
-            "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151"
-        );
-
-    // Lloyd-MQ4 on gfx12 (RDNA4): same opt-in gate as Lloyd-MQ3.
-    let lloyd_mq4_with_gfx12_wmma = matches!(dt, DType::MQ4G256Lloyd)
-        && matches!(arch, "gfx1200" | "gfx1201")
-        && std::env::var("HIPFIRE_LLOYD_GFX12").ok().as_deref() == Some("1");
+    // Lloyd-MQ4 (MQ4G256Lloyd) is NOT admitted. It was, on gfx11 (and gfx12 by
+    // opt-in), citing Lloyd-specific arms in forward_prefill_chunk -- but its
+    // kernels exist only in the per-token decode layers; the batched prefill has
+    // no MQ4-Lloyd arm, so an admitted layer fell into the HFQ4G256 kernels and
+    // read 160-byte Lloyd groups as 136-byte HFQ4 ones. Declined, it takes the
+    // per-token path, whose Lloyd arms are real. Admit it again together with a
+    // batched arm (the all-together rule, docs/plans/mq-lloyd-batched-prefill-followup.md).
 
     let batchable = mq3_uniform_with_wmma
         || mq3_uniform_with_gfx10_scalar
         || lloyd_mq3_with_gfx11_wmma
         || lloyd_mq3_with_gfx12_wmma
-        || lloyd_mq4_with_gfx11_wmma
-        || lloyd_mq4_with_gfx12_wmma
         || fp4_with_wmma
         || oq4_with_wmma
         || oq8_with_wmma;
@@ -4965,9 +4956,10 @@ mod tests {
                 is_batchable_la(DType::MQ3G256Lloyd, arch, false),
                 "MQ3G256Lloyd should batch on {arch}"
             );
+            // Lloyd MQ4 has no batched prefill arm: never admitted.
             assert!(
-                is_batchable_la(DType::MQ4G256Lloyd, arch, false),
-                "MQ4G256Lloyd should batch on {arch}"
+                !is_batchable_la(DType::MQ4G256Lloyd, arch, false),
+                "MQ4G256Lloyd must not batch on {arch}"
             );
         }
         // gfx1152 not in admit list
