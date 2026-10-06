@@ -1558,6 +1558,36 @@
     ]
   },
   {
+    "key": "reasoning_effort",
+    "type": {
+      "kind": "enum",
+      "values": [
+        "none",
+        "minimal",
+        "low",
+        "medium",
+        "high",
+        "xhigh"
+      ]
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": null,
+    "scopes": [
+      "global",
+      "model",
+      "request"
+    ],
+    "mutability": "request_only",
+    "owner": "hipfire-config",
+    "description": "Effort (and so the thinking budget) a request runs at when it names none and leaves thinking on. Unset: unbudgeted, and a template that reads `reasoning_effort` uses its own default -- Qwen3.8-27B's is `xhigh`. Set per model.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": []
+  },
+  {
     "key": "repeat_penalty",
     "type": {
       "kind": "f64"
