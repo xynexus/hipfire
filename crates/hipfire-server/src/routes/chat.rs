@@ -2411,13 +2411,16 @@ where
     let engine = match engine_guard.as_mut() {
         Some(e) => e,
         None => {
-            return Err(json!({"error": {"message": "daemon not running", "type": "server_error"}}))
+            return Err(crate::routes::responses::fail_body(
+                crate::batch_runner::FailKind::Unavailable,
+                "daemon not running",
+            ))
         }
     };
 
     if !loaded.cache_capable {
         if let Err(e) = engine.reset().await {
-            return Err(json!({"error": {"message": e.to_string(), "type": "server_error"}}));
+            return Err(legacy_failure(engine.worker_alive(), &e.to_string()));
         }
     }
 
@@ -2485,8 +2488,25 @@ where
             }
             Ok(None)
         }
-        Err(e) => Err(json!({"error": {"message": e.to_string(), "type": "server_error"}})),
+        Err(e) => Err(legacy_failure(engine.worker_alive(), &e.to_string())),
     }
+}
+
+/// The error body for a failure on the non-batched path, typed as the batch runner
+/// types its own (`fail_body`): a worker that is gone is 503 + Retry-After (it
+/// respawns: retry), a request that does not fit the loaded context is 400
+/// `context_length_exceeded` (never retry), anything else 500. This path answered
+/// 500 for all three, so a client could not tell "wait" from "give up".
+fn legacy_failure(worker_alive: bool, message: &str) -> Value {
+    use crate::batch_runner::FailKind;
+    let kind = if !worker_alive {
+        FailKind::Unavailable
+    } else if message.contains("exceeds loaded KV budget") {
+        FailKind::ContextLength
+    } else {
+        FailKind::Server
+    };
+    crate::routes::responses::fail_body(kind, message)
 }
 
 fn blocking_chat_response_json(result: Result<BlockingChatResult, Value>) -> Value {
@@ -4023,6 +4043,28 @@ mod tests {
         assert_eq!(params.cask_sidecar, None);
         assert_eq!(params.cask_budget, Some(2048));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    // The non-batched path types its failures like the batch runner: a dead worker
+    // is retryable (503), an overlong request is not (400), the rest is 500.
+    #[test]
+    fn legacy_failures_are_typed() {
+        let code = |v: Value| v["error"]["code"].as_str().unwrap_or("").to_string();
+        assert_eq!(
+            code(legacy_failure(false, "broken pipe")),
+            "worker_unavailable"
+        );
+        assert_eq!(
+            code(legacy_failure(
+                true,
+                "request exceeds loaded KV budget: seq_pos=0 + prefill=40000 + max_tokens=8 + trailer=2 > physical_cap=32768"
+            )),
+            "context_length_exceeded"
+        );
+        assert_eq!(
+            legacy_failure(true, "kernel fault")["error"]["type"],
+            "server_error"
+        );
     }
 
     #[test]
