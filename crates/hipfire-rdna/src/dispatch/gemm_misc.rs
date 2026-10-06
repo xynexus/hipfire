@@ -894,9 +894,27 @@ impl Gpu {
         if !use_legacy && self.arch_caps.is_rdna4() && k % 32 == 0 && n > 0 {
             return self.gemm_q8_0_wmma(a_raw, x, y, m, k, n);
         }
+        // RDNA3/3.5 at prefill widths: the scalar kernel below is one wave per
+        // output row re-reading all of X, launched per 64 rows -- 682 us a call
+        // and 3.5 s of a 4096-token Qwen3.6-35B-A3B prefill, for the MoE router
+        // (256x2048) and shared-expert gate (1x2048). The 64-aligned rows take the
+        // 16x64 WMMA tile instead (f16 inputs, as RDNA4's default Q8_0 path already
+        // is; parity_gemm_q8_0_x64), the remainder the scalar kernel. Decode and
+        // speculative-verify widths (< 256) are untouched. HIPFIRE_Q8_WMMA_X64=0
+        // keeps every width on the scalar kernel.
+        let mut off = 0;
+        if !use_legacy
+            && (self.arch_caps.is_rdna3() || self.arch_caps.is_rdna3p5())
+            && k % 32 == 0
+            && n >= 256
+            && std::env::var("HIPFIRE_Q8_WMMA_X64").as_deref() != Ok("0")
+        {
+            off = n / 64 * 64;
+            let (xa, ya) = (x.sub_offset(0, off * k), y.sub_offset(0, off * m));
+            self.gemm_q8_0_wmma_x64(a_raw, &xa, &ya, m, k, off)?;
+        }
 
         const MAX_BATCH: usize = 64;
-        let mut off = 0;
         while off < n {
             let take = (n - off).min(MAX_BATCH);
             let x_sub = x.sub_offset(off * k, take * k);

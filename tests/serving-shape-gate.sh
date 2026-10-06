@@ -24,6 +24,7 @@ CASES=(
     "hipfire-rdna parity_oq_compact_route"                            # dense compact routes, 27B K=5120/17408: multicol, BN=32/64, default, 128x64, chunked
     "hipfire-rdna parity_oq_overlay_tr"                               # overlay correction _tr/_trs/_t, B % 4 != 0 (the B=78 fault), nothing written past B
     "hipfire-rdna parity_kvarn_routed"                                # routed batched KVarN attention, head_dim 256, GQA
+    "hipfire-rdna parity_gemm_q8_0_x64"                               # Q8_0 batched at prefill widths (MoE router/shared gate): WMMA rows + scalar tail
     "hipfire-runtime parity_gemv_oq_compact_moe"                      # compact-resident indexed MoE GEMVs (coder decode)
     "hipfire-runtime parity_gemm_oq_compact_moe_grouped 1024 2048 16 64"  # 35B-A3B gate/up, grouped f32 at n >= 64 (prefill)
     "hipfire-runtime parity_gemm_oq_compact_moe_grouped 2048 512 16 128"  # 35B-A3B down
