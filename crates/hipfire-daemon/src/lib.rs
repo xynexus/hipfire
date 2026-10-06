@@ -833,6 +833,39 @@ fn reset_has_no_resident_model(
     dummy_model.is_none() && model.is_none() && resident_models.is_empty()
 }
 
+/// Request kinds a socket client may send without naming a worker: they only read.
+const READ_ONLY_KINDS: &[&str] = &[
+    "ping",
+    "inventory",
+    "model_registry",
+    "worker_status",
+    "resource_status",
+    "scheduler_status",
+    "executor_trace",
+    "lora_list",
+];
+
+/// Why a frame must be refused, if it must: on a daemon SHARED with `hipfire serve`
+/// (`owner` is serve's stdio connection), a socket client's request that names no
+/// worker or model would act on whichever model is active -- the swarm's. A CLI
+/// `bench` reset wiped the swarm's in-flight batch sessions; a CLI load cleared
+/// every steer and left a duplicate model resident. The daemon-socket CLI tools are
+/// deprecated (docs/todo/2026-10-06-cli-tools-to-http-api.md), so they get a refusal,
+/// not a fallback. The owner itself is never refused: serve sends a bare `reset` on
+/// its non-batched path.
+fn refuse_unscoped(owner: Option<u64>, conn: u64, msg: &serde_json::Value) -> Option<String> {
+    let kind = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
+    let refused = owner.is_some_and(|o| o != conn)
+        && !READ_ONLY_KINDS.contains(&kind)
+        && !hipfire_model::has_worker_or_model_identity(msg);
+    refused.then(|| {
+        format!(
+            "`{kind}` names no worker_key_id or model: this daemon is shared with hipfire serve \
+             and would act on its active model. Name the worker, or use the HTTP API"
+        )
+    })
+}
+
 fn reset_target_worker_id(msg: &serde_json::Value, active_worker_id: &str) -> String {
     if hipfire_model::has_worker_or_model_identity(msg) {
         message_worker_id(msg)
@@ -1132,6 +1165,39 @@ mod resource_reservation_tests {
             &model,
             &resident_models
         ));
+    }
+
+    // Shared with serve: a socket client's unscoped request is refused, its scoped
+    // or read-only ones pass, and serve (the owner) is never refused.
+    #[test]
+    fn a_shared_daemon_refuses_unscoped_requests_from_socket_clients() {
+        let (owner, client) = (Some(0), 7);
+        let reset = serde_json::json!({"type": "reset"});
+        assert!(refuse_unscoped(owner, client, &reset).is_some());
+        assert!(refuse_unscoped(
+            owner,
+            client,
+            &serde_json::json!({"type": "bench_prefill", "tokens": 512})
+        )
+        .is_some());
+        assert!(
+            refuse_unscoped(owner, client, &serde_json::json!({"type": "steer_clear"})).is_some()
+        );
+        assert!(refuse_unscoped(
+            owner,
+            client,
+            &serde_json::json!({"type": "reset", "worker_key_id": "w"})
+        )
+        .is_none());
+        assert!(refuse_unscoped(owner, client, &serde_json::json!({"type": "ping"})).is_none());
+        assert!(
+            refuse_unscoped(owner, 0, &reset).is_none(),
+            "serve's own bare reset"
+        );
+        assert!(
+            refuse_unscoped(None, client, &reset).is_none(),
+            "not shared: no owner"
+        );
     }
 
     #[test]
@@ -1795,12 +1861,12 @@ pub fn main() {
     // stdio is always served; `--listen` ADDS a socket rather than replacing it,
     // so a daemon spawned by `hipfire serve` keeps answering its parent over the
     // pipe while `chat`/`bench`/`eval` attach to the same daemon over the socket.
-    let inbound = match transport::spawn_readers(listen_path.as_deref()) {
-        Ok(inbound) => {
+    let (inbound, owner_conn) = match transport::spawn_readers(listen_path.as_deref()) {
+        Ok((inbound, owner_conn)) => {
             if let Some(path) = &listen_path {
                 tracing::info!("hipfire daemon listening on {}", path.display());
             }
-            inbound
+            (inbound, owner_conn)
         }
         // `fatal_startup_error` diverges — it emits a fatal frame and exits.
         Err(error) => hipfire_daemon_adapter::fatal_startup_error(
@@ -1884,7 +1950,7 @@ pub fn main() {
         let transport::Inbound {
             payload,
             reply,
-            conn: _,
+            conn,
             seq: _,
             priority: _,
         } = frame;
@@ -1945,6 +2011,10 @@ pub fn main() {
         };
 
         let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        if let Some(refusal) = refuse_unscoped(owner_conn, conn, &msg) {
+            daemon_state.out.error(refusal);
+            continue;
+        }
         let protocol_load = if msg_type == "load" {
             serde_json::from_value::<hipfire_model::ModelLoadRequest>(msg.clone()).ok()
         } else {
