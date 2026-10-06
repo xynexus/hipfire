@@ -532,7 +532,11 @@ impl<'a> Qwen35PrefillBindings<'a> {
                     n,
                 )?;
             }
-        } else if qkv_same_dtype {
+        } else if qkv_same_dtype && matches!(layer.wq.gpu_dtype, DType::MQ4G256 | DType::HFQ4G256) {
+            // These kernels read HFQ4G256 blocks (MQ4 shares the layout). Any other
+            // dtype that got this far takes the per-weight path below, which
+            // dispatches each weight on its own dtype or refuses it -- it used to
+            // be read as HFQ4 here, wrong numbers and no error.
             if fa_bridge_tape_active {
                 gpu.gemm_qkv_hfq4g256_exact(
                     &layer.wq.buf,
@@ -2873,10 +2877,7 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                 n,
             )?;
         } else if gdn_tape.is_some()
-            && !matches!(
-                layer.wqkv.gpu_dtype,
-                DType::OqCompactG256 | DType::OqCompactG128
-            )
+            && matches!(layer.wqkv.gpu_dtype, DType::MQ4G256 | DType::HFQ4G256)
         {
             // NB the compact exclusion. This arm hard-codes the HFQ4G256
             // "exact" qkvza, and it sits ABOVE the compact arm below, so
@@ -2938,7 +2939,7 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                 let bs = super::prefill_batch::oq_compact_block_stride(w)?;
                 gpu.gemm_oq_compact_grouped_prequant(&w.buf, y, w.m, w.k, n, bs)?;
             }
-        } else {
+        } else if matches!(layer.wqkv.gpu_dtype, DType::MQ4G256 | DType::HFQ4G256) {
             run_fused_qkvza_key(
                 gpu,
                 hipfire_dispatch::types::KernelKey::FusedQkvzaHfq4G256,
@@ -2958,6 +2959,19 @@ impl<'a> Qwen35PrefillDnBindings<'a> {
                 layer.wqkv.k,
                 n,
             )?;
+        } else {
+            // No batched LA in_proj arm for this dtype. It used to fall into the
+            // HFQ4G256 kernel above -- another layout read as HFQ4, wrong numbers and
+            // no error. `is_batchable_la` should never admit such a dtype; this is
+            // the backstop.
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "qwen35 batched prefill: no LA qkvza arm for {:?}; it must not be \
+                     admitted by is_batchable_la",
+                    layer.wqkv.gpu_dtype
+                ),
+            ));
         }
 
         if let Some(tape) = gdn_tape.as_ref() {
