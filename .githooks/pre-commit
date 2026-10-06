@@ -286,7 +286,7 @@ fi
 # reach, and a daemon holding the GPU skips every model gate above. These parity
 # examples need a few hundred MiB, so they run either way, and a failure blocks the
 # commit. HIPFIRE_SKIP_SERVING_GATE=1 skips it.
-SERVING_ROUTE='^crates/hipfire-rdna/src/dispatch/(quant|attention|gemm_misc|moe|mod)\.rs$|^crates/hipfire-rdna/src/pool\.rs$|^kernels/src/.*(oq_compact|overlay|kvarn).*\.hip$'
+SERVING_ROUTE='^crates/hipfire-rdna/src/dispatch/(quant|attention|gemm_misc|moe|mod)\.rs$|^crates/hipfire-rdna/src/pool\.rs$|^kernels/src/.*(oq_compact|overlay|kvarn|gemm_q8_0_wmma_x64|gemm_q8_0_batched).*\.hip$'
 if echo "$CODE_CHANGED" | grep -qE "$SERVING_ROUTE" && [ "${HIPFIRE_SKIP_SERVING_GATE:-0}" != 1 ]; then
     echo "=== Serving-shape parity gate ==="
     if ! ./tests/serving-shape-gate.sh; then
