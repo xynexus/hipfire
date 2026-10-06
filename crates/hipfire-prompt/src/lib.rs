@@ -1572,6 +1572,119 @@ mod tests {
         }
     }
 
+    /// The swarm's two models' own chat templates, rendered by minijinja over a
+    /// multi-step tool conversation (tools declared, two calls replayed, a trailing
+    /// tool result), must match Python jinja2 configured as HuggingFace's
+    /// apply_chat_template configures it, byte for byte, and end in the generation
+    /// prompt. Regenerate the expected files with `render_reference.py` beside them.
+    /// The point is the stray `<|im_start|>` in replies: if the prompt hipfire builds
+    /// is the one the model was trained on, a header the model writes is the model's.
+    #[test]
+    fn qwen_templates_render_like_the_reference() {
+        let conv: serde_json::Value = serde_json::from_str(include_str!(
+            "../tests/fixtures/qwen-templates/conversation.json"
+        ))
+        .unwrap();
+        let messages: Vec<Message> = conv["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|m| Message {
+                role: serde_json::from_value(m["role"].clone()).unwrap(),
+                content: m["content"].as_str().unwrap_or_default().to_string(),
+                tool_calls: m["tool_calls"]
+                    .as_array()
+                    .map(|calls| {
+                        calls
+                            .iter()
+                            .map(|c| ToolCall {
+                                id: None,
+                                name: c["function"]["name"].as_str().unwrap().to_string(),
+                                arguments: c["function"]["arguments"].clone(),
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                tool_call_id: None,
+            })
+            .collect();
+        let tools: Vec<serde_json::Value> = conv["tools"].as_array().unwrap().clone();
+        let t = make_tokenizer();
+        let cases: [(&str, &str, bool, Option<&'static str>, &str); 5] = [
+            (
+                "qwen3.8-27b",
+                include_str!("../tests/fixtures/qwen-templates/qwen3.8-27b.jinja"),
+                false,
+                None,
+                include_str!("../tests/fixtures/qwen-templates/expected-qwen3.8-27b-nothink.txt"),
+            ),
+            (
+                "qwen3.8-27b",
+                include_str!("../tests/fixtures/qwen-templates/qwen3.8-27b.jinja"),
+                true,
+                None,
+                include_str!("../tests/fixtures/qwen-templates/expected-qwen3.8-27b-think.txt"),
+            ),
+            (
+                "qwen3.8-27b",
+                include_str!("../tests/fixtures/qwen-templates/qwen3.8-27b.jinja"),
+                true,
+                Some("low"),
+                include_str!("../tests/fixtures/qwen-templates/expected-qwen3.8-27b-think-low.txt"),
+            ),
+            (
+                "qwen3.6-35b-a3b",
+                include_str!("../tests/fixtures/qwen-templates/qwen3.6-35b-a3b.jinja"),
+                false,
+                None,
+                include_str!(
+                    "../tests/fixtures/qwen-templates/expected-qwen3.6-35b-a3b-nothink.txt"
+                ),
+            ),
+            (
+                "qwen3.6-35b-a3b",
+                include_str!("../tests/fixtures/qwen-templates/qwen3.6-35b-a3b.jinja"),
+                true,
+                None,
+                include_str!("../tests/fixtures/qwen-templates/expected-qwen3.6-35b-a3b-think.txt"),
+            ),
+        ];
+        for (model, template, think, effort, expected) in cases {
+            let frame = JinjaChatFrame {
+                tokenizer: &t,
+                template,
+                system: None,
+                user: "",
+                enable_thinking: think,
+                bos_token: None,
+                reasoning_effort: effort,
+            };
+            let got = frame
+                .render_messages(&messages, Some(&tools), None)
+                .unwrap_or_else(|e| panic!("{model} think={think}: {e}"));
+            let at = got
+                .bytes()
+                .zip(expected.bytes())
+                .position(|(a, b)| a != b)
+                .unwrap_or(got.len().min(expected.len()));
+            assert!(
+                got == expected,
+                "{model} think={think} effort={effort:?}: diverges at byte {at}\n got: {:?}\nwant: {:?}",
+                &got[at.saturating_sub(40)..(at + 40).min(got.len())],
+                &expected[at.saturating_sub(40)..(at + 40).min(expected.len())],
+            );
+            let generation_prompt = if think {
+                "<|im_start|>assistant\n<think>\n"
+            } else {
+                "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+            };
+            assert!(
+                got.ends_with(generation_prompt),
+                "{model} think={think}: {got:?}"
+            );
+        }
+    }
+
     fn test_tokenizer_no_think() -> TestTokenizer {
         TestTokenizer {
             include_think: false,

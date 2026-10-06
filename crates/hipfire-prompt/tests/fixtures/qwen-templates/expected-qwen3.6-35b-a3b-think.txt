@@ -1,0 +1,80 @@
+<|im_start|>system
+# Tools
+
+You have access to the following functions:
+
+<tools>
+{"type": "function", "function": {"name": "read_file", "description": "Read a file in the repo", "parameters": {"type": "object", "properties": {"path": {"type": "string", "description": "Repo-relative path"}}, "required": ["path"]}}}
+{"type": "function", "function": {"name": "write_file", "description": "Write a file in the repo", "parameters": {"type": "object", "properties": {"path": {"type": "string"}, "contents": {"type": "string"}}, "required": ["path", "contents"]}}}
+</tools>
+
+If you choose to call a function ONLY reply in the following format with NO suffix:
+
+<tool_call>
+<function=example_function_name>
+<parameter=example_parameter_1>
+value_1
+</parameter>
+<parameter=example_parameter_2>
+This is the value for the second parameter
+that can span
+multiple lines
+</parameter>
+</function>
+</tool_call>
+
+<IMPORTANT>
+Reminder:
+- Function calls MUST follow the specified format: an inner <function=...></function> block must be nested within <tool_call></tool_call> XML tags
+- Required parameters MUST be specified
+- You may provide optional reasoning for your function call in natural language BEFORE the function call, but NOT after
+- If there is no function call available, answer the question like normal with your current knowledge and do not tell the user about function calls
+</IMPORTANT>
+
+You are a subagent in a coding swarm. Repo: a tiny Rust crate with src/lib.rs.<|im_end|>
+<|im_start|>user
+Add a gcd function to src/lib.rs and run the tests.<|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+<tool_call>
+<function=read_file>
+<parameter=path>
+src/lib.rs
+</parameter>
+</function>
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+pub fn add(a: i32, b: i32) -> i32 {
+    a + b
+}
+</tool_response><|im_end|>
+<|im_start|>assistant
+<think>
+
+</think>
+
+I will add gcd next to add.
+
+<tool_call>
+<function=write_file>
+<parameter=path>
+src/lib.rs
+</parameter>
+<parameter=contents>
+pub fn gcd(a: u64, b: u64) -> u64 {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
+</parameter>
+</function>
+</tool_call><|im_end|>
+<|im_start|>user
+<tool_response>
+wrote src/lib.rs (72 bytes)
+</tool_response><|im_end|>
+<|im_start|>assistant
+<think>
