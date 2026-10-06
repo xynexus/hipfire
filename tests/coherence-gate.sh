@@ -17,7 +17,8 @@
 # Exit codes:
 #   0  battery ran clean — open the report and inspect coherence
 #   1  a test hit a hard error (daemon panic / zero tokens / timeout)
-#   2  build or environment error
+#   2  build or environment error -- including a battery that could run no row
+#      (none of its models present): a gate that checked nothing has not passed
 #
 # Report destination: /tmp/coherence-<timestamp>.md (or $HIPFIRE_COHERENCE_OUT)
 #
@@ -46,36 +47,13 @@ MODELS_DIR="${HIPFIRE_MODELS_DIR:-${HIPFIRE_DIR:-$HOME/.hipfire}/models}"
 OUT="${HIPFIRE_COHERENCE_OUT:-/tmp/coherence-$(date +%Y%m%d-%H%M%S).md}"
 HIPFIRE_GPULOCK_BIN="${HIPFIRE_BIN:-$(command -v hipfire 2>/dev/null || echo ./target/release/hipfire)}"
 
-# ── Rebuild daemon if any relevant source is newer than the binary ────────
-rebuild=0
-if [ ! -x "$EXE" ]; then
-    rebuild=1
-else
-    for src in crates/hipfire-arch-qwen35/src/qwen35/*.rs crates/hipfire-runtime/src/llama.rs \
-               crates/hipfire-runtime/src/hfq.rs crates/hipfire-daemon/src/main.rs \
-               crates/hipfire-rdna/src/dispatch.rs \
-               crates/hipfire-dispatch/src/families/moe.rs \
-               crates/hipfire-dispatch/src/pipeline/mod.rs \
-               crates/hipfire-dispatch/src/pipeline/steps.rs \
-               crates/hipfire-dispatch/src/families/gemv.rs \
-               crates/hipfire-dispatch/src/families/attention.rs \
-               crates/hipfire-dispatch/src/families/fused_qkv.rs \
-               crates/hipfire-arch-deepseek4/src/arch.rs \
-               crates/hipfire-arch-deepseek4/src/deepseek4.rs \
-               crates/hipfire-arch-deepseek4/src/forward.rs \
-               crates/hipfire-arch-deepseek4/src/spec_decode.rs; do
-        if [ -f "$src" ] && [ "$src" -nt "$EXE" ]; then
-            rebuild=1
-            break
-        fi
-    done
-fi
-if [ "$rebuild" -eq 1 ]; then
-    echo "coherence-gate: rebuilding daemon..."
-    if ! cargo build --release -p hipfire-daemon --bin hipfire-daemon --features deltanet >&2; then
-        echo "coherence-gate: build failed" >&2
-        exit 2
-    fi
+# Build the daemon under test. Cargo decides what is stale: a hand-kept list of
+# "relevant sources" went stale itself (it named dispatch.rs after dispatch/
+# became a directory), so a kernel-dispatch change ran against the old binary.
+# A fresh tree makes this a no-op.
+if ! cargo build --release -p hipfire-daemon --bin hipfire-daemon --features deltanet >&2; then
+    echo "coherence-gate: build failed" >&2
+    exit 2
 fi
 binary_md5=$(md5sum "$EXE" | awk '{print $1}')
 
@@ -125,7 +103,10 @@ find_model_file() {
 # Non-daemon follow-up stages, such as pflash-gate.sh, acquire their own lock.
 
 # ── Test matrix ───────────────────────────────────────────────────────────
-# Format: "model_file|id|prompt|max_tokens[|system_prompt_file]"
+# Format: "model_file|id|prompt|max_tokens[|system_prompt_file[|expect]]"
+# The optional 6th field is an extended regex the model's ANSWER -- its text after
+# the think block -- must match, or the row is a hard error. The other checks only
+# catch a crash or silence; a kernel computing fluent garbage passes them all.
 # The optional 5th field names a file under benchmarks/prompts/ to be read
 # verbatim and passed as the daemon's `system` field. Used for tool-call
 # coverage (see #87 — auto-MMQ regression slipped through previous gates
@@ -134,6 +115,13 @@ find_model_file() {
 # + a tool-call shape (auto-MMQ regression detector for #87 redo).
 # Full battery (--full): adds A3B MoE tests (loads large models, ~2-3 min each).
 SHORT_TESTS=(
+    # The OpusQuant oq4.25++ builds this deployment serves -- the rows above them
+    # name MQ builds that a host may not have, and a battery whose every row skips
+    # used to pass. Each answer is checked (6th field).
+    "Qwen3.5-0.8B--oq4.25++.hfq|oq-cap-0.8b|What is the capital of France? Answer in one short sentence.|80||Paris"
+    "Qwen3.5-9B--oq4.25++.hfq|oq-reason-9b|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300||\\b9\\b"
+    "Qwen3.5-9B--oq4.25++.hfq|tool-call-oq-9b|What does the file /tmp/fibonacci.c contain?|180|tool_call_system.txt|<tool_call>"
+    "Qwen3.8-27B--oq4.25++.hfq|oq-cap-27b|What is the capital of France? Answer in one short sentence.|120||Paris"
     "qwen3.5-0.8b-mq4.hfq|cap|What is the capital of France? Answer in one short sentence.|80"
     "qwen3.5-4b-mq4.hfq|code|Write a one-line Python function named square that returns n*n.|180"
     "qwen3.5-9b-mq4.hfq|reason|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|300"
@@ -252,6 +240,7 @@ FULL_EXTRA=(
     "qwen3.6-35b-a3b-paro.hfq|paro-a3b-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|500"
 )
 FULL_EXTRA=(
+    "Qwen3.6-35B-A3B--oq4.25++.hfq|oq-moe36-cap|What is the capital of France? Answer in one short sentence.|300||Paris"
     "Qwen3.5-35B-A3B--mq4.hfq|moe-sheep|A farmer has 17 sheep. All but 9 die. How many are left? Show brief reasoning then state the final number.|500"
     # gfx12/RDNA4 Q8_0-wo MoE coverage — the gate gap that let a9e8dfda
     # corrupt RDNA4 MoE output for ~100 commits before ae13aa75 fixed it.
@@ -293,6 +282,7 @@ fi
 
 # ── Run ───────────────────────────────────────────────────────────────────
 hard_errors=0
+ran=0
 
 {
     echo "# Coherence battery"
@@ -309,7 +299,7 @@ hard_errors=0
 } > "$OUT"
 
 for entry in "${tests[@]}"; do
-    IFS='|' read -r model_file prompt_id prompt max_tok system_file <<< "$entry"
+    IFS='|' read -r model_file prompt_id prompt max_tok system_file expect <<< "$entry"
     model_path="$(find_model_file "$model_file" || true)"
     if [ -z "$model_path" ]; then
         echo "## $model_file — $prompt_id — SKIPPED (model not present)" >> "$OUT"
@@ -353,6 +343,7 @@ for entry in "${tests[@]}"; do
         fi
     fi
 
+    ran=$((ran + 1))
     echo "== $model_file / $prompt_id =="
     # JSONL input for daemon. Use python json.dumps for the user prompt so
     # special tokens / quotes / backslashes in the fixture survive intact
@@ -450,6 +441,19 @@ print("".join(json.loads(l).get("text","") for l in sys.stdin if "token" in l))'
             ;;
     esac
 
+    if [ -n "${expect:-}" ] && [[ "$status" == OK* ]]; then
+        answer=$(grep -a '"type":"token"' "$out_file" | python3 -c '
+import sys, json
+t = "".join(json.loads(l).get("text", "") for l in sys.stdin if "token" in l)
+# The answer is what follows the think block; a think block never closed means
+# the model never answered (a degenerate loop counts).
+print(t.split("</think>")[-1] if "</think>" in t else ("" if "<think>" in t else t))')
+        if ! printf '%s' "$answer" | grep -qE "$expect"; then
+            status="HARD_ERROR (answer check: no match for /$expect/ in the answer after the think block)"
+            hard_errors=$((hard_errors + 1))
+        fi
+    fi
+
     {
         echo "## $model_file — $prompt_id"
         echo
@@ -495,6 +499,10 @@ done
 
 echo
 echo "coherence report: $OUT"
+if [ "$ran" -eq 0 ]; then
+    echo "no row could run: none of the battery's models is under $MODELS_DIR -- gate FAILED (it checked nothing)"
+    exit 2
+fi
 if [ "$hard_errors" -gt 0 ]; then
     echo "$hard_errors test(s) hit hard errors — gate FAILED"
     exit 1

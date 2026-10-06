@@ -41,8 +41,13 @@
 #       stacked openers, or > 1/N cells soft-warned)
 #   2 - build / env / detector-self-check failure
 #
-# Skip semantics (CI-safe):
-#   - Both A3B models absent           -> exit 0 with SKIPPED message
+# Skip semantics:
+#   - Both A3B models absent           -> exit 2: a gate that checked nothing has
+#                                         not passed (skip deliberately with
+#                                         HIPFIRE_SKIP_AGENTIC_GATE=1). CI never
+#                                         runs this gate; the pre-commit hook does,
+#                                         on GPU hosts only.
+#   - Each A3B is looked up as its MQ4 build, then its oq4.25++ build
 #   - One model absent                 -> run the present one's cells, log skip
 #   - Model exceeds host VRAM          -> treat as absent (path-blank); skips
 #                                         silently otherwise → zero-token hard-fail
@@ -172,11 +177,22 @@ find_model_file() {
     return 1
 }
 
-A3B_35="$(find_model_file "Qwen3.5-35B-A3B--mq4.hfq" || true)"
+# The first build of each that is present: MQ4, then the OpusQuant oq4.25++ a
+# deployment may carry instead (this gate used to skip, reporting success, on a
+# host that had only those).
+first_present() {
+    local name
+    for name in "$@"; do
+        find_model_file "$name" && return 0
+    done
+    return 1
+}
+
+A3B_35="$(first_present "Qwen3.5-35B-A3B--mq4.hfq" "Qwen3.5-35B-A3B--oq4.25++.hfq" || true)"
 # Defaults to the Qwen3.6 A3B artifact. If the old zero-token issue recurs,
 # set HIPFIRE_AGENTIC_GATE_QWEN36_MODEL=qwen3.6-27b-mq4.hfq to force the dense
 # predicate-only fallback without changing the script.
-A3B_36="$(find_model_file "${HIPFIRE_AGENTIC_GATE_QWEN36_MODEL:-Qwen3.6-35B-A3B--mq4.hfq}" || true)"
+A3B_36="$(first_present "${HIPFIRE_AGENTIC_GATE_QWEN36_MODEL:-Qwen3.6-35B-A3B--mq4.hfq}" "Qwen3.6-35B-A3B--oq4.25++.hfq" || true)"
 PI_SYS="benchmarks/prompts/agentic_pi_system.txt"
 HERMES_SYS="benchmarks/prompts/agentic_hermes_system.txt"
 USER_READ="benchmarks/prompts/agentic_user_read.txt"
@@ -193,9 +209,9 @@ if [ ! -f "$A3B_35" ] && [ ! -f "$A3B_36" ]; then
     if [ "$A3B_35_VRAM_SKIP" = "1" ] || [ "$A3B_36_VRAM_SKIP" = "1" ]; then
         echo "agentic-gate: all A3B models absent or exceed host VRAM (${VRAM_GB} GB) - SKIPPED"
     else
-        echo "agentic-gate: A3B models absent ($MODELS_DIR/qwen3.{5,6}-35b-a3b.{mq4,mq4.hfq} or -mq4.hfq) - SKIPPED"
+        echo "agentic-gate: no A3B model under $MODELS_DIR (Qwen3.{5,6}-35B-A3B--{mq4,oq4.25++}.hfq) - FAILED: it checked nothing (HIPFIRE_SKIP_AGENTIC_GATE=1 skips deliberately)"
     fi
-    exit 0
+    exit 2
 fi
 
 # Required fixtures
@@ -206,25 +222,13 @@ for f in "$PI_SYS" "$HERMES_SYS" "$USER_READ"; do
     fi
 done
 
-# Rebuild daemon if any tracked source is newer than the binary.
-rebuild=0
-if [ ! -x "$EXE" ]; then
-    rebuild=1
-else
-    for src in crates/hipfire-arch-qwen35/src/qwen35/*.rs crates/hipfire-runtime/src/llama.rs \
-               crates/hipfire-runtime/src/hfq.rs crates/hipfire-daemon/src/main.rs \
-               crates/hipfire-rdna/src/dispatch.rs; do
-        if [ -f "$src" ] && [ "$src" -nt "$EXE" ]; then
-            rebuild=1; break
-        fi
-    done
-fi
-if [ "$rebuild" -eq 1 ]; then
-    echo "agentic-gate: rebuilding daemon..."
-    if ! cargo build --release -p hipfire-daemon --bin hipfire-daemon --features deltanet >&2; then
-        echo "agentic-gate: build failed" >&2
-        exit 2
-    fi
+# Build the daemon under test. Cargo decides what is stale: a hand-kept list of
+# "relevant sources" went stale itself (it named dispatch.rs after dispatch/
+# became a directory), so a kernel-dispatch change ran against the old binary.
+# A fresh tree makes this a no-op.
+if ! cargo build --release -p hipfire-daemon --bin hipfire-daemon --features deltanet >&2; then
+    echo "agentic-gate: build failed" >&2
+    exit 2
 fi
 
 # Concurrency policy: the gate uses the daemon's existing singleton flock
@@ -457,8 +461,11 @@ PY
     # will exit with "FATAL: hipfire daemon already running" and the
     # detector picks it up. No HOME override here — that bypasses the
     # singleton and risks two 35B daemons on one GPU.
-    env HIPFIRE_KV_MODE=asym3 \
-        HIPFIRE_GRAPH=1 \
+    # The served KV mode (kvarn, the default), not a forced one: this forced
+    # asym3 until asym3 was deprecated, after which every load failed and every
+    # cell emitted zero tokens -- unnoticed while the gate skipped for want of
+    # an MQ4 A3B.
+    env HIPFIRE_GRAPH=1 \
         "$EXE" < "$STDIN_FIFO" > "$OUTPUT_FILE" 2>&1 &
     DAEMON_PID=$!
 
