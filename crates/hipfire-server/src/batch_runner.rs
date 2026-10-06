@@ -1030,10 +1030,35 @@ fn prefix_cache_enabled() -> bool {
 }
 
 /// A request's terminal payload: why it stopped, and its usage in tokens.
+/// One worker's live state, for `/health`. The cycle-end telemetry is all `/health`
+/// had, and a cycle can last a whole swarm turn: mid-cycle it read zero sessions while
+/// a batch ran, so the precursors of starvation and memory pressure were invisible
+/// exactly while they happened.
+#[derive(Clone, Debug, Default, serde::Serialize)]
+pub struct WorkerGauges {
+    /// Sessions decoding in the running cycle (0 between cycles).
+    pub active: usize,
+    /// Decode steps the running cycle has taken.
+    pub steps: u64,
+    /// When the running cycle started (unix ms); `None` between cycles.
+    pub cycle_started_ms: Option<u64>,
+    /// Requests parked (preempted or split) and waiting to resume.
+    pub parked: usize,
+    /// Prefix checkpoints held for reuse.
+    pub checkpoints: usize,
+}
+
+fn gauges(state: &SharedState, worker: &str, f: impl FnOnce(&mut WorkerGauges)) {
+    if let Ok(mut g) = state.worker_gauges.lock() {
+        f(g.entry(worker.to_string()).or_default());
+    }
+}
+
 fn done_payload(
     finish_reason: &str,
     prompt_tokens: Option<&usize>,
     completion_tokens: usize,
+    cached_tokens: Option<&usize>,
 ) -> serde_json::Value {
     let mut done = serde_json::json!({
         "finish_reason": finish_reason,
@@ -1041,6 +1066,11 @@ fn done_payload(
     });
     if let Some(n) = prompt_tokens {
         done["prompt_tokens"] = serde_json::json!(n);
+    }
+    // How much of the prompt came from a cached prefix -- the measure of whether
+    // prefix reuse, the swarm's central performance assumption, is happening.
+    if let Some(n) = cached_tokens {
+        done["cached_tokens"] = serde_json::json!(n);
     }
     done
 }
@@ -1207,7 +1237,7 @@ fn batch_wait_ms() -> u64 {
         .unwrap_or(10)
 }
 
-fn now_ms() -> u64 {
+pub(crate) fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -1237,6 +1267,20 @@ async fn batch_runner_loop(state: SharedState) {
         };
         // Resume the top parked batch unless a strictly-higher-priority workload
         // is queued (waiter < top parked priority). Nothing queued resumes it.
+        if let Ok(mut g) = state.worker_gauges.lock() {
+            for v in g.values_mut() {
+                v.parked = 0;
+                v.checkpoints = 0;
+            }
+            for (b, _, _) in &parked {
+                if let Some(p) = b.first() {
+                    g.entry(p.worker_key_id.clone()).or_default().parked += b.len();
+                }
+            }
+            for e in &prefix_index.entries {
+                g.entry(e.worker.clone()).or_default().checkpoints += 1;
+            }
+        }
         let top_parked = parked
             .last()
             .map(|(_, pri, at)| effective_priority(*pri, now_ms().saturating_sub(*at), aging_ms()));
@@ -1421,6 +1465,7 @@ async fn batch_runner_loop(state: SharedState) {
                 // Park only while the stack has room (bounds resident VRAM from
                 // nested preemption); at the cap the batch runs to completion.
                 let can_park = parked.len() < max_depth;
+                let cycle_worker = batch.first().map(|p| p.worker_key_id.clone());
                 let outcome = run_batch_cycle(
                     &mut engine,
                     &state,
@@ -1430,6 +1475,12 @@ async fn batch_runner_loop(state: SharedState) {
                     &mut prefix_index,
                 )
                 .await;
+                if let Some(w) = &cycle_worker {
+                    gauges(&state, w, |g| {
+                        g.active = 0;
+                        g.cycle_started_ms = None;
+                    });
+                }
                 // A worker that died during the cycle (panic, OOM, killed) must not go
                 // back in the slot: requests take `ensure_model_loaded`'s fast path,
                 // which trusts `loaded_models` and never pings, so every later request
@@ -1745,6 +1796,7 @@ fn fold_prefill_events(
     events: &[serde_json::Value],
     positions: &mut HashMap<String, usize>,
     remaining: &mut HashMap<String, usize>,
+    cached: &mut HashMap<String, usize>,
 ) {
     for ev in events {
         if ev.get("type").and_then(|t| t.as_str()) == Some("generate_batch_prefill_session_done") {
@@ -1753,6 +1805,9 @@ fn fold_prefill_events(
                 ev.get("logical_position").and_then(|v| v.as_u64()),
             ) {
                 positions.insert(sid.to_string(), pos as usize);
+                if let Some(n) = ev.get("cached_prefix_tokens").and_then(|v| v.as_u64()) {
+                    cached.insert(sid.to_string(), n as usize);
+                }
                 // `/health` has no prefix-cache counters; this is where reuse shows.
                 tracing::debug!(
                     "session {sid}: prefilled {} token(s), {} reused from a cached prefix",
@@ -1846,7 +1901,7 @@ async fn admit_into_cycle(
     running_priority: u8,
     room: usize,
     prefix_index: &mut PrefixIndex,
-) -> Vec<(PendingRequest, usize, usize)> {
+) -> Vec<(PendingRequest, usize, usize, usize)> {
     if room == 0 {
         return Vec::new();
     }
@@ -1888,6 +1943,7 @@ async fn admit_into_cycle(
     );
     let specs: Vec<SessionSpec> = newcomers.iter().map(|p| p.spec.clone()).collect();
     let mut positions = HashMap::new();
+    let mut cached: HashMap<String, usize> = HashMap::new();
     let mut remaining: HashMap<String, usize> = specs
         .iter()
         .map(|s| (s.id.clone(), s.max_tokens.max(1)))
@@ -1901,7 +1957,7 @@ async fn admit_into_cycle(
                 .collect();
             reject_overlong(&overlong, max_seq, &mut txs);
             newcomers.retain(|p| txs.contains_key(&p.spec.id));
-            fold_prefill_events(&events, &mut positions, &mut remaining)
+            fold_prefill_events(&events, &mut positions, &mut remaining, &mut cached)
         }
         Err(e) => {
             let handles: Vec<String> = specs.iter().map(|s| s.id.clone()).collect();
@@ -1927,7 +1983,8 @@ async fn admit_into_cycle(
                 return None;
             };
             let rem = remaining[&p.spec.id];
-            Some((p, pos, rem))
+            let reused = cached.get(&p.spec.id).copied().unwrap_or(0);
+            Some((p, pos, rem, reused))
         })
         .collect()
 }
@@ -1971,6 +2028,7 @@ async fn run_batch_cycle(
     // Fresh batches prefill every session's KV in one daemon call. Resumed
     // batches skip prefill: the sessions are already resident at their cursor.
     let mut positions: HashMap<String, usize> = HashMap::new();
+    let mut cached: HashMap<String, usize> = HashMap::new();
     if resuming {
         positions = resume_pos.clone();
     } else {
@@ -2018,7 +2076,7 @@ async fn run_batch_cycle(
                 return CycleOutcome::Completed;
             }
         };
-        fold_prefill_events(&events, &mut positions, &mut remaining);
+        fold_prefill_events(&events, &mut positions, &mut remaining, &mut cached);
     }
     // Usage for each request's Done: its prompt length (the position prefill left
     // it at) and the tokens it committed. A resumed (parked) session's prompt
@@ -2047,6 +2105,7 @@ async fn run_batch_cycle(
                 "length",
                 prompt_len.get(id),
                 0,
+                cached.get(id),
             )));
         }
         false
@@ -2065,6 +2124,10 @@ async fn run_batch_cycle(
 
     let quantum = min_quantum();
     let cycle_start_ms = now_ms();
+    gauges(state, &worker, |g| {
+        g.cycle_started_ms = Some(cycle_start_ms);
+        g.steps = 0;
+    });
     let mut admission_closed = false;
     let mut last_backend: Option<String> = None;
     let mut last_chunk_count = 0u64;
@@ -2108,6 +2171,10 @@ async fn run_batch_cycle(
             }
         };
         steps += 1;
+        gauges(state, &worker, |g| {
+            g.steps = u64::from(steps);
+            g.active = active.len();
+        });
 
         let mut still_active = Vec::new();
         for id in &active {
@@ -2123,6 +2190,7 @@ async fn run_batch_cycle(
                         "stop",
                         prompt_len.get(id),
                         generated.get(id).copied().unwrap_or(0),
+                        cached.get(id),
                     )));
                 }
                 continue;
@@ -2165,6 +2233,7 @@ async fn run_batch_cycle(
                         finish_reason,
                         prompt_len.get(id),
                         generated.get(id).copied().unwrap_or(0),
+                        cached.get(id),
                     )));
                 }
             } else {
@@ -2274,8 +2343,9 @@ async fn run_batch_cycle(
                 prefix_index,
             )
             .await;
-            for (p, pos, rem) in admitted {
+            for (p, pos, rem, reused) in admitted {
                 let id = p.spec.id.clone();
+                cached.insert(id.clone(), reused);
                 txs.insert(id.clone(), p.tx.clone());
                 positions.insert(id.clone(), pos);
                 prompt_len.insert(id.clone(), pos);
@@ -2285,8 +2355,12 @@ async fn run_batch_cycle(
                 if rem > 0 {
                     active.push(id);
                 } else {
-                    let _ =
-                        p.tx.send(BatchEvent::Done(done_payload("length", Some(&pos), 0)));
+                    let _ = p.tx.send(BatchEvent::Done(done_payload(
+                        "length",
+                        Some(&pos),
+                        0,
+                        None,
+                    )));
                 }
             }
         }
@@ -2846,6 +2920,17 @@ mod tests {
             "no_such_model_type"
         )));
         assert!(!arch_supports_continuous_batching(None));
+    }
+
+    // The batch path reports how much of each prompt a cached prefix covered.
+    #[test]
+    fn done_payload_carries_cached_tokens() {
+        let d = done_payload("stop", Some(&900), 12, Some(&640));
+        assert_eq!(d["prompt_tokens"], 900);
+        assert_eq!(d["cached_tokens"], 640);
+        assert!(done_payload("stop", Some(&900), 12, None)
+            .get("cached_tokens")
+            .is_none());
     }
 
     #[test]

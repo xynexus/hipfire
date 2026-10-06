@@ -45,6 +45,10 @@ impl ResponsesOwner {
 
 #[derive(Debug, Deserialize)]
 pub struct ResponsesRequest {
+    /// The request's id (see `post_responses`), set by the handler, never read
+    /// from the body.
+    #[serde(skip)]
+    pub request_id: Option<String>,
     pub model: Option<String>,
     pub input: Value,
     pub previous_response_id: Option<String>,
@@ -157,7 +161,28 @@ pub async fn post_responses(
     State(state): State<SharedState>,
     principal: Option<Extension<RequestPrincipal>>,
     accounting: Option<Extension<crate::accounting::RequestAccounting>>,
-    Json(body): Json<ResponsesRequest>,
+    headers: axum::http::HeaderMap,
+    Json(mut body): Json<ResponsesRequest>,
+) -> Response {
+    // One id end to end: the caller's X-Request-Id (plus a unique suffix) names the
+    // daemon session, the batch runner's log lines and the response, and comes back
+    // in the response header.
+    let request_id = crate::routes::chat::request_id_or_new(
+        crate::routes::chat::caller_request_id(&headers).as_deref(),
+    );
+    body.request_id = Some(request_id.clone());
+    let mut response = post_responses_inner(state, principal, accounting, body).await;
+    if let Ok(v) = axum::http::HeaderValue::from_str(&request_id) {
+        response.headers_mut().insert("x-request-id", v);
+    }
+    response
+}
+
+async fn post_responses_inner(
+    state: SharedState,
+    principal: Option<Extension<RequestPrincipal>>,
+    accounting: Option<Extension<crate::accounting::RequestAccounting>>,
+    body: ResponsesRequest,
 ) -> Response {
     let accounting = accounting.map(|Extension(accounting)| accounting);
     let scheduler_owner = principal
@@ -279,7 +304,12 @@ async fn execute_responses_owned(
 ) -> Result<Value, Value> {
     let messages = prepare_response_messages(&state, &body, &owner).await?;
 
+    let req_id = body
+        .request_id
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     let mut chat_body = ChatRequest {
+        request_id: Some(req_id.clone()),
         model: body.model.clone(),
         messages: messages
             .iter()
@@ -332,7 +362,7 @@ async fn execute_responses_owned(
         visible.clone()
     };
 
-    let response_id = format!("resp_{}", Uuid::new_v4().simple());
+    let response_id = format!("resp_{req_id}");
     let mut stored = messages;
     // History carries the answer only — these models are trained not to re-see their
     // own prior reasoning (the templates drop it too).
@@ -486,6 +516,11 @@ fn response_json(
             "input_tokens": prompt_tokens,
             "output_tokens": completion_tokens,
             "total_tokens": prompt_tokens + completion_tokens,
+            // The part of the prompt a cached prefix covered: whether prefix reuse is
+            // actually happening, per request.
+            "input_tokens_details": {
+                "cached_tokens": done.extra.get("cached_tokens").and_then(Value::as_u64).unwrap_or(0),
+            },
         }
     });
     if truncated {
@@ -504,7 +539,12 @@ async fn stream_responses(
     let (tx, mut rx) = mpsc::channel::<Result<Event, Infallible>>(64);
 
     tokio::spawn(async move {
-        let response_id = format!("resp_{}", Uuid::new_v4().simple());
+        let response_id = format!(
+            "resp_{}",
+            body.request_id
+                .clone()
+                .unwrap_or_else(|| Uuid::new_v4().simple().to_string())
+        );
         let message_id = format!("msg_{response_id}");
         let req_id = response_id.clone();
 
@@ -1348,6 +1388,18 @@ mod tests {
             response_id: None,
             extra: Default::default(),
         }
+    }
+
+    // Responses usage says how much of the prompt a cached prefix covered.
+    #[test]
+    fn response_usage_reports_cached_tokens() {
+        let mut done = done_event();
+        done.extra
+            .insert("cached_tokens".into(), serde_json::json!(5));
+        let body = response_json("resp_1", "qwen", "hi", "", &done, &[]);
+        assert_eq!(body["usage"]["input_tokens_details"]["cached_tokens"], 5);
+        let body = response_json("resp_1", "qwen", "hi", "", &done_event(), &[]);
+        assert_eq!(body["usage"]["input_tokens_details"]["cached_tokens"], 0);
     }
 
     // only the split test needs this — the route itself no longer strips

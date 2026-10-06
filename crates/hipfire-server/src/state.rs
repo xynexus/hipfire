@@ -126,6 +126,9 @@ pub struct AppState {
     pub batch_runner_active: std::sync::atomic::AtomicBool,
     /// Live batch-runner telemetry surfaced by `/health`.
     pub batch_telemetry: Mutex<crate::batch_runner::BatchTelemetry>,
+    /// Per-worker gauges the runner keeps current while a cycle runs (see
+    /// `batch_runner::WorkerGauges`).
+    pub worker_gauges: std::sync::Mutex<HashMap<String, crate::batch_runner::WorkerGauges>>,
     /// What the listener actually bound to, recorded by `serve_loaded` once the
     /// socket is up. `/health` reports this so clients read the real bind
     /// instead of re-deriving it from their own (possibly newer) config. `None`
@@ -364,6 +367,7 @@ impl AppState {
             batch_runner_active: std::sync::atomic::AtomicBool::new(false),
             bind: StdMutex::new(None),
             batch_telemetry: Mutex::new(crate::batch_runner::BatchTelemetry::default()),
+            worker_gauges: Default::default(),
             responses_contexts: Mutex::new(HashMap::new()),
             responses_order: Mutex::new(VecDeque::new()),
             files: Mutex::new(HashMap::new()),
