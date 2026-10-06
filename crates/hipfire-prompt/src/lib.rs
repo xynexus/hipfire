@@ -337,6 +337,12 @@ pub trait PromptTokenizer {
         &[]
     }
     fn bos_token_text(&self) -> String;
+    /// `text` marked so that `encode` reads any special-token string in it as
+    /// text, not a control id. Message content is data: a file or tool result
+    /// quoting `<|im_end|>` or `<tool_call>` must not end a turn or open a call.
+    fn escape_literal<'t>(&self, text: &'t str) -> std::borrow::Cow<'t, str> {
+        std::borrow::Cow::Borrowed(text)
+    }
 }
 
 /// Chooses what goes after the assistant role-and-newline opener.
@@ -620,7 +626,9 @@ impl<'a> ChatScaffold<'a> {
     }
 
     fn append_system(&self, out: &mut Vec<u32>, content: &str) {
-        let body = self.tokenizer.encode(content);
+        let body = self
+            .tokenizer
+            .encode(&self.tokenizer.escape_literal(content));
         out.extend_from_slice(&self.im_start);
         out.extend_from_slice(&self.system_role);
         out.extend_from_slice(&self.nl);
@@ -630,7 +638,9 @@ impl<'a> ChatScaffold<'a> {
     }
 
     fn append_user_turn(&self, out: &mut Vec<u32>, content: &str) {
-        let body = self.tokenizer.encode(content);
+        let body = self
+            .tokenizer
+            .encode(&self.tokenizer.escape_literal(content));
         self.append_user_turn_tokens(out, &body);
     }
 
@@ -803,11 +813,44 @@ fn native_thought_content(text: &str) -> Option<&str> {
     Some(body[..end].trim_end_matches('\n'))
 }
 
-fn template_message_values(messages: &[Message]) -> Vec<serde_json::Value> {
+/// The messages as template values, their data marked literal (see
+/// [`PromptTokenizer::escape_literal`]): every turn's content but the
+/// assistant's, and every tool call's arguments. Assistant content stays as
+/// written, because the template parses structure out of it (`</think>`).
+fn template_message_values(
+    messages: &[Message],
+    tokenizer: &dyn PromptTokenizer,
+) -> Vec<serde_json::Value> {
+    fn escape_strings(value: &mut serde_json::Value, tokenizer: &dyn PromptTokenizer) {
+        match value {
+            serde_json::Value::String(s) => {
+                if let std::borrow::Cow::Owned(escaped) = tokenizer.escape_literal(s) {
+                    *s = escaped;
+                }
+            }
+            serde_json::Value::Array(items) => {
+                items.iter_mut().for_each(|v| escape_strings(v, tokenizer))
+            }
+            serde_json::Value::Object(map) => {
+                map.values_mut().for_each(|v| escape_strings(v, tokenizer))
+            }
+            _ => {}
+        }
+    }
     messages
         .iter()
         .map(|message| {
             let mut value = serde_json::to_value(message).expect("Message serialization");
+            if let Some(object) = value.as_object_mut() {
+                if message.role != Role::Assistant {
+                    if let Some(content) = object.get_mut("content") {
+                        escape_strings(content, tokenizer);
+                    }
+                }
+                if let Some(calls) = object.get_mut("tool_calls") {
+                    escape_strings(calls, tokenizer);
+                }
+            }
             if let (Some(reasoning), Some(object)) = (
                 native_thought_content(&message.content),
                 value.as_object_mut(),
@@ -1346,7 +1389,7 @@ impl<'a> JinjaChatFrame<'a> {
             Some(k) => Value::from_serialize(k),
             None => Value::from_serialize(&empty_map),
         };
-        let message_values = template_message_values(messages);
+        let message_values = template_message_values(messages, self.tokenizer);
         let ctx = minijinja::context! {
             messages => Value::from_serialize(&message_values),
             add_generation_prompt => add_generation_prompt,

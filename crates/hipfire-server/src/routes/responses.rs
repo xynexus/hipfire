@@ -116,7 +116,7 @@ fn preserve_thinking_kwarg(kwargs: Option<&Value>) -> bool {
 /// caller to choose between "gone" and "inline". `started_in_think` covers the usual
 /// case where the template opened `<think>` in the generation prompt, so the stream has
 /// a closing marker but no opening one.
-fn split_thinking(text: &str, started_in_think: bool) -> (String, String) {
+pub(crate) fn split_thinking(text: &str, started_in_think: bool) -> (String, String) {
     let mut content = text.to_string();
     if started_in_think && !content.contains("<think>") && content.contains("</think>") {
         content = format!("<think>{content}");
@@ -370,7 +370,11 @@ async fn execute_responses_owned(
             Ok(generated) => generated,
             Err(error) => return Err(error),
         };
-    let (reasoning, visible) = split_thinking(&generated.text, true);
+    // Split the marked text: a `</think>` the answer quotes is not the end of
+    // the reasoning. Then the marks come off.
+    let (reasoning, visible) = split_thinking(&generated.marked, true);
+    let unmark = |s: String| hipfire_model::tokenizer::unmark_literal(&s).into_owned();
+    let (reasoning, visible) = (unmark(reasoning), unmark(visible));
     let text = if client_preserve {
         generated.text.clone()
     } else {

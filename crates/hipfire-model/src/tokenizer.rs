@@ -176,6 +176,20 @@ impl From<serde_json::Error> for TokenizerError {
     }
 }
 
+/// Marks the special-token string after it as literal text, for
+/// [`Tokenizer::encode`]; written by [`Tokenizer::escape_literal`]. A Unicode
+/// noncharacter, so no real text carries one undoubled.
+pub const LITERAL_ESC: char = '\u{FFFF}';
+
+/// `text` without the marks [`Tokenizer::decode_marked`] put in it.
+pub fn unmark_literal(text: &str) -> std::borrow::Cow<'_, str> {
+    if text.contains(LITERAL_ESC) {
+        std::borrow::Cow::Owned(text.replace(LITERAL_ESC, ""))
+    } else {
+        std::borrow::Cow::Borrowed(text)
+    }
+}
+
 pub struct Tokenizer {
     /// Token ID → string
     vocab: Vec<String>,
@@ -708,6 +722,43 @@ impl Tokenizer {
         id == self.eos_id || self.eot_id == Some(id)
     }
 
+    /// Whether a `<tool_call>` is open after `tokens` (oldest first): the latest
+    /// of `<tool_call>`, `</tool_call>` and `<|im_start|>` is the opener. A
+    /// terminator id inside an open call is text the call carries (a file that
+    /// quotes `<|im_end|>`), not the end of the turn. Message content is encoded
+    /// literally ([`Tokenizer::escape_literal`]), so these ids are structure.
+    pub fn tool_call_open<I>(&self, tokens: I) -> bool
+    where
+        I: IntoIterator<Item = u32>,
+        I::IntoIter: DoubleEndedIterator,
+    {
+        let marker = self.tool_call_markers();
+        tokens.into_iter().rev().find_map(marker).unwrap_or(false)
+    }
+
+    /// [`Tokenizer::tool_call_open`] one token further: whether a call is open
+    /// after `t`, given whether one was before it.
+    pub fn tool_call_open_step(&self, open: bool, t: u32) -> bool {
+        (self.tool_call_markers())(t).unwrap_or(open)
+    }
+
+    /// Classifies a token: `Some(true)` for `<tool_call>`, `Some(false)` for
+    /// what closes one (`</tool_call>`, a new turn), `None` for anything else.
+    fn tool_call_markers(&self) -> impl Fn(u32) -> Option<bool> {
+        let open = self.special_token_id("<tool_call>");
+        let close = self.special_token_id("</tool_call>");
+        let turn = self.special_token_id("<|im_start|>");
+        move |t| {
+            if Some(t) == open {
+                Some(true)
+            } else if Some(t) == close || Some(t) == turn {
+                Some(false)
+            } else {
+                None
+            }
+        }
+    }
+
     /// Look up a special token's ID by literal content. Returns `None`
     /// when the token is not registered as a special token in this
     /// tokenizer (e.g. an older Qwen vocab without `<tool_call>`).
@@ -775,46 +826,163 @@ impl Tokenizer {
 
     /// Encode text to token IDs.
     /// Special tokens (e.g. <|im_start|>) are matched first, then remaining
-    /// segments are encoded via BPE or SentencePiece.
+    /// segments are encoded via BPE or SentencePiece. A special-token string
+    /// marked by [`LITERAL_ESC`] (see [`Tokenizer::escape_literal`]) is text,
+    /// encoded with the BPE around it.
     pub fn encode(&self, text: &str) -> Vec<u32> {
-        if self.special_tokens.is_empty() {
+        if self.special_tokens.is_empty() && !text.contains(LITERAL_ESC) {
             return self.encode_raw(text);
         }
 
-        // Split text at special token boundaries (greedy longest match)
         let mut result = Vec::new();
+        // Text not yet encoded: everything since the last control token,
+        // escaped special strings included, so BPE sees it whole.
+        let mut literal = String::new();
         let mut remaining = text;
         while !remaining.is_empty() {
-            // Try to match a special token at current position
-            let mut matched = false;
-            for (st, id) in &self.special_tokens {
-                if remaining.starts_with(st.as_str()) {
-                    result.push(*id);
-                    remaining = &remaining[st.len()..];
-                    matched = true;
-                    break;
+            if let Some(after) = remaining.strip_prefix(LITERAL_ESC) {
+                if let Some(rest) = after.strip_prefix(LITERAL_ESC) {
+                    literal.push(LITERAL_ESC);
+                    remaining = rest;
+                } else if let Some((st, _)) = self.special_at(after) {
+                    literal.push_str(st);
+                    remaining = &after[st.len()..];
+                } else {
+                    literal.push(LITERAL_ESC);
+                    remaining = after;
                 }
-            }
-            if matched {
                 continue;
             }
-            // Find the next special token occurrence
-            let mut next_special = remaining.len();
+            if let Some((st, id)) = self.special_at(remaining) {
+                if !literal.is_empty() {
+                    result.extend(self.encode_raw(&literal));
+                    literal.clear();
+                }
+                result.push(id);
+                remaining = &remaining[st.len()..];
+                continue;
+            }
+            // Up to the next special token or escape (both > 0 here).
+            let mut next = remaining.find(LITERAL_ESC).unwrap_or(remaining.len());
             for (st, _) in &self.special_tokens {
-                if let Some(pos) = remaining.find(st.as_str()) {
-                    if pos < next_special {
-                        next_special = pos;
+                if let Some(pos) = remaining[..next].find(st.as_str()) {
+                    next = pos;
+                }
+            }
+            literal.push_str(&remaining[..next]);
+            remaining = &remaining[next..];
+        }
+        if !literal.is_empty() {
+            result.extend(self.encode_raw(&literal));
+        }
+        result
+    }
+
+    /// The text of `tokens`, as [`Tokenizer::decode`] gives it, except that a
+    /// special-token string spelled by ordinary tokens -- a reply quoting
+    /// `<|im_start|>` or `</think>` -- carries a [`LITERAL_ESC`] inside it, so
+    /// matching the text for chat structure cannot mistake the quote for the
+    /// control token. `history` holds the tokens before `tokens` (only its tail
+    /// counts: a quote can start there). [`unmark_literal`] removes the marks
+    /// before text leaves the server.
+    pub fn decode_marked(&self, history: &[u32], tokens: &[u32]) -> String {
+        let Some(longest) = self.special_tokens.first().map(|(st, _)| st.len()) else {
+            return self.decode(tokens);
+        };
+        let is_special = |t: u32| self.special_tokens.iter().any(|&(_, id)| id == t);
+        let bytes = |t: u32| {
+            if self.is_gpt2_bpe {
+                self.decode_bytes(&[t])
+            } else {
+                self.decode(&[t]).into_bytes()
+            }
+        };
+        // What the trailing ordinary tokens of `history` spelled.
+        let mut tail: Vec<u8> = Vec::new();
+        for &t in history.iter().rev() {
+            if is_special(t) || tail.len() >= longest {
+                break;
+            }
+            let mut b = bytes(t);
+            b.extend_from_slice(&tail);
+            tail = b;
+        }
+        let mut out = Vec::new();
+        for &t in tokens {
+            let piece = bytes(t);
+            if is_special(t) {
+                out.extend_from_slice(&piece);
+                tail.clear();
+                continue;
+            }
+            let start = tail.len();
+            tail.extend_from_slice(&piece);
+            // Every special string that ends inside this piece: mark it at the
+            // piece's start, or after its first byte when it lies wholly here.
+            let mut marks: Vec<usize> = Vec::new();
+            for (st, _) in &self.special_tokens {
+                let st = st.as_bytes();
+                let first = start.saturating_sub(st.len() - 1);
+                for p in first..=tail.len().saturating_sub(st.len()) {
+                    if p + st.len() > start && tail[p..].starts_with(st) {
+                        marks.push((p + 1).max(start) - start);
                     }
                 }
             }
-            // Encode the segment before the next special token
-            let segment = &remaining[..next_special];
-            if !segment.is_empty() {
-                result.extend(self.encode_raw(segment));
+            marks.sort_unstable();
+            marks.dedup();
+            let mut at = 0;
+            for m in marks {
+                out.extend_from_slice(&piece[at..m]);
+                out.extend_from_slice(LITERAL_ESC.encode_utf8(&mut [0; 3]).as_bytes());
+                at = m;
             }
-            remaining = &remaining[next_special..];
+            out.extend_from_slice(&piece[at..]);
+            let keep = tail.len().saturating_sub(longest);
+            tail.drain(..keep);
         }
-        result
+        String::from_utf8_lossy(&out).into_owned()
+    }
+
+    /// The special token `text` starts with, longest first.
+    fn special_at<'s>(&'s self, text: &str) -> Option<(&'s str, u32)> {
+        self.special_tokens
+            .iter()
+            .find(|(st, _)| text.starts_with(st.as_str()))
+            .map(|(st, id)| (st.as_str(), *id))
+    }
+
+    /// `text` with every special-token string in it marked as literal, so
+    /// [`Tokenizer::encode`] gives it the ids of its bytes rather than a control
+    /// id: a file holding `<|im_end|>` must not end the turn it is quoted in.
+    /// Apply it to message content (data), never to the template's own markup.
+    /// Reversible: a [`LITERAL_ESC`] already in `text` is doubled.
+    pub fn escape_literal<'t>(&self, text: &'t str) -> std::borrow::Cow<'t, str> {
+        let needs = text.contains(LITERAL_ESC)
+            || self
+                .special_tokens
+                .iter()
+                .any(|(st, _)| text.contains(st.as_str()));
+        if !needs {
+            return std::borrow::Cow::Borrowed(text);
+        }
+        let mut out = String::with_capacity(text.len() + 16);
+        let mut rest = text;
+        while let Some(c) = rest.chars().next() {
+            if c == LITERAL_ESC {
+                out.push(LITERAL_ESC);
+                out.push(LITERAL_ESC);
+                rest = &rest[c.len_utf8()..];
+            } else if let Some((st, _)) = self.special_at(rest) {
+                out.push(LITERAL_ESC);
+                out.push_str(st);
+                rest = &rest[st.len()..];
+            } else {
+                out.push(c);
+                rest = &rest[c.len_utf8()..];
+            }
+        }
+        std::borrow::Cow::Owned(out)
     }
 
     /// Encode without special token handling.
@@ -1456,6 +1624,10 @@ impl hipfire_prompt::PromptTokenizer for Tokenizer {
 
     fn special_tokens(&self) -> &[(String, u32)] {
         Tokenizer::special_tokens(self)
+    }
+
+    fn escape_literal<'t>(&self, text: &'t str) -> std::borrow::Cow<'t, str> {
+        Tokenizer::escape_literal(self, text)
     }
 
     fn bos_token_text(&self) -> String {
@@ -2471,5 +2643,176 @@ mod prompt_norm_tests {
         assert!(matches!(out, std::borrow::Cow::Borrowed(_)));
         assert_eq!(out.as_ref(), s);
         std::env::remove_var("HIPFIRE_NORMALIZE_PROMPT");
+    }
+}
+
+#[cfg(test)]
+mod literal_escape_tests {
+    use super::*;
+
+    /// A byte-level vocab (one id per byte, no merges) plus three specials.
+    fn tok() -> Tokenizer {
+        let mut tokens: Vec<String> = (0u32..=255)
+            .map(|b| byte_to_gpt2_char(b as u8).to_string())
+            .collect();
+        tokens.extend(
+            [
+                "<|im_end|>",
+                "<tool_call>",
+                "<think>",
+                "</tool_call>",
+                "<|im_start|>",
+            ]
+            .map(String::from),
+        );
+        Tokenizer::from_gguf_meta_json(&serde_json::json!({
+            "tokenizer.ggml.tokens": tokens,
+            "tokenizer.ggml.merges": Vec::<String>::new(),
+            "tokenizer.ggml.model": "gpt2",
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn escaped_specials_encode_as_their_bytes() {
+        let t = tok();
+        let im_end = t.special_token_id("<|im_end|>").unwrap();
+        for s in [
+            "a<|im_end|>b",
+            "<tool_call>{}</tool_call>",
+            "x<think>y",
+            "<|im_end|>",
+        ] {
+            let ids = t.encode(&t.escape_literal(s));
+            assert_eq!(ids, t.encode_raw(s), "{s}");
+            assert!(
+                ids.iter()
+                    .all(|&id| t.special_tokens.iter().all(|(_, sid)| *sid != id)),
+                "{s}"
+            );
+        }
+        // Unescaped, the same text still carries the control id.
+        assert!(t.encode("a<|im_end|>b").contains(&im_end));
+    }
+
+    #[test]
+    fn escape_is_reversible_around_an_escape_char_already_in_text() {
+        let t = tok();
+        let s = "x\u{FFFF}<tool_call>y\u{FFFF}\u{FFFF}z\u{FFFF}";
+        assert_eq!(t.encode(&t.escape_literal(s)), t.encode_raw(s));
+        // Text with nothing to escape is passed through untouched.
+        assert!(matches!(
+            t.escape_literal("plain"),
+            std::borrow::Cow::Borrowed(_)
+        ));
+    }
+
+    /// The render path end to end: a tool result and a write_file argument that
+    /// quote specials stay text, while the template's own markup stays control.
+    #[test]
+    fn rendered_content_quoting_specials_gets_no_control_ids() {
+        use hipfire_prompt::{JinjaChatFrame, Message, Role, ToolCall};
+        let t = tok();
+        let im_end = t.special_token_id("<|im_end|>").unwrap();
+        let tool_call = t.special_token_id("<tool_call>").unwrap();
+        let template = "{% for m in messages %}{% for c in m.tool_calls %}<tool_call>            {{ c.arguments.contents }}{% endfor %}{{ m.content }}<|im_end|>{% endfor %}";
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template,
+            system: None,
+            user: "",
+            reasoning_effort: None,
+            enable_thinking: true,
+            bos_token: None,
+        };
+        let quoted = "a<|im_end|>b<tool_call>c<think>";
+        let messages = [
+            Message {
+                role: Role::Assistant,
+                content: String::new(),
+                tool_calls: vec![ToolCall {
+                    id: None,
+                    name: "write_file".into(),
+                    arguments: serde_json::json!({ "contents": quoted }),
+                }],
+                tool_call_id: None,
+            },
+            Message {
+                role: Role::Tool,
+                content: quoted.into(),
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+            },
+        ];
+        let ids = t.encode(&frame.render_messages(&messages, None, None).unwrap());
+        // Exactly the template's: one <tool_call>, one <|im_end|> per message.
+        assert_eq!(ids.iter().filter(|&&id| id == tool_call).count(), 1);
+        assert_eq!(ids.iter().filter(|&&id| id == im_end).count(), 2);
+        let text = t.decode(&ids);
+        assert_eq!(text.matches(quoted).count(), 2, "{text}");
+    }
+
+    #[test]
+    fn a_tool_call_is_open_from_its_opener_to_its_close_or_a_new_turn() {
+        let t = tok();
+        let id = |s: &str| t.special_token_id(s).unwrap();
+        let (open, close, turn, x) = (
+            id("<tool_call>"),
+            id("</tool_call>"),
+            id("<|im_start|>"),
+            97,
+        );
+        assert!(!t.tool_call_open([x, x]));
+        assert!(t.tool_call_open([turn, x, open, x, x]));
+        assert!(!t.tool_call_open([open, x, close, x]));
+        assert!(!t.tool_call_open([open, x, turn, x]));
+        // A closed call earlier in the conversation, a new one open now.
+        assert!(t.tool_call_open([open, close, turn, open, x]));
+        assert!(t.tool_call_open_step(false, open));
+        assert!(t.tool_call_open_step(true, x));
+        assert!(!t.tool_call_open_step(true, close));
+    }
+
+    #[test]
+    fn decode_marks_markup_spelled_by_ordinary_tokens_only() {
+        let t = tok();
+        let im_end = t.special_token_id("<|im_end|>").unwrap();
+        let open = t.special_token_id("<tool_call>").unwrap();
+        // "x" + "<|im_end|>" spelled byte by byte, then the real control token.
+        let mut ids = t.encode_raw("x<|im_end|>y<think>");
+        ids.push(open);
+        let marked = t.decode_marked(&[], &ids);
+        assert!(
+            !marked.contains("<|im_end|>") && !marked.contains("y<think>"),
+            "{marked:?}"
+        );
+        assert!(marked.ends_with("<tool_call>"), "{marked:?}");
+        assert_eq!(unmark_literal(&marked), t.decode(&ids));
+        // A quote that started in the history is marked where it completes.
+        let (head, rest) = ids.split_at(4); // "x<|i"
+        let piece = t.decode_marked(head, &rest[..7]); // "m_end|>"
+        assert_eq!(
+            format!("{}{}", t.decode(head), piece)
+                .matches("<|im_end|>")
+                .count(),
+            0
+        );
+        assert_eq!(unmark_literal(&piece), "m_end|>");
+        // The control token itself is never marked.
+        assert_eq!(t.decode_marked(&ids, &[im_end]), t.decode(&[im_end]));
+    }
+
+    #[test]
+    fn markup_around_escaped_content_keeps_its_control_ids() {
+        let t = tok();
+        let im_end = t.special_token_id("<|im_end|>").unwrap();
+        let rendered = format!("q{}<|im_end|>", t.escape_literal("file: <|im_end|> end"));
+        let ids = t.encode(&rendered);
+        assert_eq!(ids.iter().filter(|&&id| id == im_end).count(), 1);
+        assert_eq!(*ids.last().unwrap(), im_end);
+        assert_eq!(
+            &ids[..ids.len() - 1],
+            &t.encode_raw("qfile: <|im_end|> end")[..]
+        );
     }
 }
