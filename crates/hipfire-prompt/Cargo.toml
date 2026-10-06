@@ -7,7 +7,10 @@ description = "Prompt framing and chat-template rendering for hipfire"
 
 [dependencies]
 serde.workspace = true
-serde_json = "1"
+# preserve_order: tool definitions must reach the template in the order the client
+# wrote them, as HF apply_chat_template renders them. The served binary got this
+# only by feature unification from hipfire-runtime; the renderer declares it itself.
+serde_json = { version = "1", features = ["preserve_order"] }
 regex.workspace = true
-minijinja = { version = "2", features = ["loop_controls", "json"] }
+minijinja = { version = "2", features = ["loop_controls", "json", "preserve_order"] }
 minijinja-contrib = { version = "2", features = ["pycompat"] }

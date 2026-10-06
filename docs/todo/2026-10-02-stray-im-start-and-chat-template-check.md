@@ -1,7 +1,8 @@
 # TODO: stray `<|im_start|>` in replies; verify the chat template for both swarm models
 
-Status: PARTLY DONE (2026-10-02) — templates checked, symptom handled; a per-model
-render-vs-reference test is still open (see "Still open").
+Status: PARTLY DONE (2026-10-02; render test 2026-10-06) — templates checked, symptom
+handled, per-model render-vs-reference test in place; streamed-reply cleaning still open
+(see "Still open").
 Date: 2026-10-02
 Models: Qwen3.8-27B--oq4.25++ (reasoning roles), Qwen3.6-35B-A3B--oq4.25++ (coder),
 both with `jinja_chat: "on"`, `max_seq: 32768` in `~/.hipfire/config.json`.
@@ -91,6 +92,15 @@ only; message replies (no tool call) still carry it, and Corrode replays them.
 ## Still open
 
 - Streamed replies (`stream: true`) are not cleaned — deltas go out as generated.
-- The byte-for-byte render test per model against a reference Jinja render.
+- ~~The byte-for-byte render test per model against a reference Jinja render.~~ Done
+  (2026-10-06): `qwen_templates_render_like_the_reference` (hipfire-prompt) renders both
+  models' own templates over a multi-step tool conversation -- tools declared, two calls
+  replayed, a trailing tool result; thinking off and on, and the 27B at effort `low` --
+  and matches Python jinja2 (configured as HF's apply_chat_template) byte for byte,
+  ending in the generation prompt. Fixtures and `render_reference.py` under
+  `crates/hipfire-prompt/tests/fixtures/qwen-templates/`. It found one gap: the
+  renderer crate did not declare serde_json/minijinja `preserve_order`, so on its own it
+  rendered tool definitions with keys sorted (the served binary had the feature only by
+  unification from hipfire-runtime). Declared now.
 - Suppressing `<|im_start|>` at the logits (argmax kernels) instead of after the
   fact, if a cleaned-but-empty reply (`<|im_start|>user` -> "") shows up often.
