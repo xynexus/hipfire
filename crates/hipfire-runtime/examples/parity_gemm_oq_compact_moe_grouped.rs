@@ -27,15 +27,17 @@
 //! garbage output).
 //!
 //! Usage:
-//!   cargo run --release -p hipfire-runtime --example parity_gemm_oq_compact_moe_grouped [M K n_exp N]
+//!   cargo run --release -p hipfire-runtime --example parity_gemm_oq_compact_moe_grouped [M K n_exp N [n_out]]
+//!
+//! `n_out` is the overlay entries per 256-weight group (default 3, as oq4.25).
+//! Past 8 (wide shape) or 32 (narrow) a lane owns more than one, which takes
+//! the f32 kernels' second slot loop; the serving-shape gate checks both.
 
 use hipfire_rdna::{DType, Gpu};
 use hipfire_runtime::oq8_arch::{normalize_compact_overlays, split_compact_planes};
 
 const GROUP: usize = 256;
 const K_TOP: usize = 8;
-const N_OUT: usize = 3;
-const BLOCK_STRIDE: usize = 130 + 2 * N_OUT;
 const TILE: usize = 16; // slots per tile — the kernel's blockIdx.y granularity
 
 fn lcg(seed: u32) -> impl FnMut() -> u32 {
@@ -63,18 +65,19 @@ fn sext4(nib: u8) -> i32 {
     ((nib as i32) << 28) >> 28
 }
 
-fn build_expert(seed: u32, m: usize, k: usize) -> Vec<u8> {
+fn build_expert(seed: u32, m: usize, k: usize, n_out: usize) -> Vec<u8> {
     let ng = k / GROUP;
+    let block_stride = 130 + 2 * n_out;
     let mut rng = lcg(seed);
-    let mut blob = vec![0u8; m * ng * BLOCK_STRIDE];
+    let mut blob = vec![0u8; m * ng * block_stride];
     for b in 0..(m * ng) {
-        let base = b * BLOCK_STRIDE;
+        let base = b * block_stride;
         let scale = f16_bits_to_f32(f32_to_f16_bits(0.004 + (rng() % 64) as f32 * 0.001));
         blob[base..base + 2].copy_from_slice(&f32_to_f16_bits(scale).to_le_bytes());
         for i in 0..128 {
             blob[base + 2 + i] = (rng() & 0xff) as u8;
         }
-        for e in 0..N_OUT {
+        for e in 0..n_out {
             blob[base + 130 + 2 * e] = (rng() % GROUP as u32) as u8;
             blob[base + 130 + 2 * e + 1] = (rng() & 0xff) as u8;
         }
@@ -82,12 +85,13 @@ fn build_expert(seed: u32, m: usize, k: usize) -> Vec<u8> {
     blob
 }
 
-fn decode_logical(blob: &[u8], m: usize, k: usize) -> Vec<f32> {
+fn decode_logical(blob: &[u8], m: usize, k: usize, n_out: usize) -> Vec<f32> {
     let ng = k / GROUP;
+    let block_stride = 130 + 2 * n_out;
     let mut w = vec![0f32; m * k];
     for row in 0..m {
         for g in 0..ng {
-            let base = (row * ng + g) * BLOCK_STRIDE;
+            let base = (row * ng + g) * block_stride;
             let scale = f16_bits_to_f32(u16::from_le_bytes([blob[base], blob[base + 1]]));
             let mut code = [0i32; GROUP];
             for i in 0..128 {
@@ -95,7 +99,7 @@ fn decode_logical(blob: &[u8], m: usize, k: usize) -> Vec<f32> {
                 code[2 * i] = sext4(byte & 0x0f);
                 code[2 * i + 1] = sext4(byte >> 4);
             }
-            for e in 0..N_OUT {
+            for e in 0..n_out {
                 code[blob[base + 130 + 2 * e] as usize] = blob[base + 130 + 2 * e + 1] as i8 as i32;
             }
             for i in 0..GROUP {
@@ -155,18 +159,20 @@ fn build_sort(topk: &[i32], n_exp: usize) -> (Vec<i32>, Vec<i32>, Vec<usize>) {
 fn main() {
     let a: Vec<String> = std::env::args().collect();
     let p = |i: usize, d: usize| a.get(i).and_then(|s| s.parse().ok()).unwrap_or(d);
-    let (m, k, n_exp, batch) = (p(1, 512), p(2, 1024), p(3, 8), p(4, 16));
+    let (m, k, n_exp, batch, n_out) = (p(1, 512), p(2, 1024), p(3, 8), p(4, 16), p(5, 3));
+    assert!((1..=63).contains(&n_out), "n_out in 1..=63");
+    let block_stride = 130 + 2 * n_out;
     assert!(m % 2 == 0 && k % GROUP == 0, "M even, K a multiple of 256");
 
     let mut gpu = Gpu::init().expect("gpu");
     println!("gpu: {}", gpu.arch);
-    println!("M={m} K={k} n_exp={n_exp} batch={batch} K_TOP={K_TOP}");
+    println!("M={m} K={k} n_exp={n_exp} batch={batch} K_TOP={K_TOP} n_out={n_out}");
 
     let mi = m / 2;
     let raw: Vec<Vec<u8>> = (0..n_exp)
-        .map(|e| build_expert(11 + e as u32, m, k))
+        .map(|e| build_expert(11 + e as u32, m, k, n_out))
         .collect();
-    let logical: Vec<Vec<f32>> = raw.iter().map(|b| decode_logical(b, m, k)).collect();
+    let logical: Vec<Vec<f32>> = raw.iter().map(|b| decode_logical(b, m, k, n_out)).collect();
     let planes: Vec<Vec<u8>> = raw
         .iter()
         .map(|b| {
@@ -213,7 +219,7 @@ fn main() {
         )
         .unwrap();
     let strides = gpu
-        .upload_raw(&i32b(&vec![BLOCK_STRIDE as i32; n_exp]), &[n_exp])
+        .upload_raw(&i32b(&vec![block_stride as i32; n_exp]), &[n_exp])
         .unwrap();
     let idx_t = gpu.upload_raw(&i32b(&topk), &[topk.len()]).unwrap();
     let x_t = gpu.upload_raw(&f32b(&x), &[x.len()]).unwrap();
@@ -253,7 +259,7 @@ fn main() {
         1, // x rows ARE flat slots here (x is per-slot), so no division
         m_total,
         batch * K_TOP,
-        BLOCK_STRIDE,
+        block_stride,
     )
     .unwrap();
     gpu.device_synchronize().unwrap();
@@ -278,7 +284,7 @@ fn main() {
         k,
         1,
         m_total,
-        BLOCK_STRIDE,
+        block_stride,
     )
     .unwrap();
     gpu.device_synchronize().unwrap();
@@ -322,7 +328,7 @@ fn main() {
                 k,
                 1,
                 m_total,
-                BLOCK_STRIDE,
+                block_stride,
             )
             .unwrap();
         }
@@ -356,11 +362,20 @@ fn main() {
     // f16 activations put the floor near 1e-3; a layout/addressing defect is
     // orders above that, which is how the Oq8 sibling failed.
     // The f32 arm's bar is strict equality; the WMMA arm's is the f16 floor.
-    let ok = e_grp < 5e-3 && cross < 5e-3 && exact == 0;
+    // The WMMA kernel scans at most 4 overlay records per group (its `OQC_DQ`),
+    // which covers oq4.25's 3 and nothing past it; nothing routes it today, so
+    // a wider n_out checks the f32 arm alone.
+    let wmma_checked = n_out <= 4;
+    if !wmma_checked {
+        println!("  (wmma arm not held to the floor: it reads 4 overlay records, n_out={n_out})");
+    }
+    let ok = (!wmma_checked || (e_grp < 5e-3 && cross < 5e-3)) && exact == 0;
     println!(
         "{}",
-        if ok {
+        if ok && wmma_checked {
             "PASS — wmma arm at the f16 floor, f32 arm BIT-EXACT vs the decode GEMV"
+        } else if ok {
+            "PASS — f32 arm BIT-EXACT vs the decode GEMV"
         } else {
             "FAIL — see which arm: wmma above the f16 floor, or f32 arm not bit-exact"
         }
