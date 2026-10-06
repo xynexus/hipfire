@@ -759,6 +759,50 @@ impl Tokenizer {
         }
     }
 
+    /// How many more tokens the think block open at the end of `history`
+    /// (oldest first) may take under `budget`; `None` when no block is open,
+    /// the budget is unbounded (0) or thinking is off (1, the template closed it).
+    pub fn think_room<I>(&self, history: I, budget: u32) -> Option<usize>
+    where
+        I: IntoIterator<Item = u32>,
+        I::IntoIter: DoubleEndedIterator,
+    {
+        if budget <= 1 {
+            return None;
+        }
+        let open = self.special_token_id("<think>")?;
+        let close = self.special_token_id("</think>");
+        let turn = self.special_token_id("<|im_start|>");
+        let mut thought = 0usize;
+        for t in history.into_iter().rev() {
+            if t == open {
+                return Some((budget as usize).saturating_sub(thought));
+            }
+            if Some(t) == close || Some(t) == turn {
+                return None;
+            }
+            thought += 1;
+        }
+        None
+    }
+
+    /// `token`, or `</think>` in its place once the open think block has used
+    /// its budget ([`Tokenizer::think_room`]): the budget is enforced by closing
+    /// the block, so the model goes on to answer.
+    pub fn close_think_at_budget<I>(&self, history: I, budget: u32, token: u32) -> u32
+    where
+        I: IntoIterator<Item = u32>,
+        I::IntoIter: DoubleEndedIterator,
+    {
+        match (
+            self.think_room(history, budget),
+            self.special_token_id("</think>"),
+        ) {
+            (Some(0), Some(close)) => close,
+            _ => token,
+        }
+    }
+
     /// Look up a special token's ID by literal content. Returns `None`
     /// when the token is not registered as a special token in this
     /// tokenizer (e.g. an older Qwen vocab without `<tool_call>`).
@@ -2662,6 +2706,7 @@ mod literal_escape_tests {
                 "<think>",
                 "</tool_call>",
                 "<|im_start|>",
+                "</think>",
             ]
             .map(String::from),
         );
@@ -2800,6 +2845,25 @@ mod literal_escape_tests {
         assert_eq!(unmark_literal(&piece), "m_end|>");
         // The control token itself is never marked.
         assert_eq!(t.decode_marked(&ids, &[im_end]), t.decode(&[im_end]));
+    }
+
+    #[test]
+    fn the_think_budget_closes_an_open_block_at_its_size() {
+        let t = tok();
+        let id = |s: &str| t.special_token_id(s).unwrap();
+        let (open, close, turn, x) = (id("<think>"), id("</think>"), id("<|im_start|>"), 97);
+        // Three tokens thought under a budget of 3: the next one is </think>.
+        assert_eq!(t.close_think_at_budget([turn, open, x, x, x], 3, x), close);
+        assert_eq!(t.close_think_at_budget([turn, open, x, x], 3, x), x);
+        // Closed, unbounded (0), thinking off (1), or no block: untouched.
+        assert_eq!(t.close_think_at_budget([open, x, x, x, close, x], 3, x), x);
+        assert_eq!(t.close_think_at_budget([turn, open, x, x, x], 0, x), x);
+        assert_eq!(t.close_think_at_budget([turn, open, x, x, x], 1, x), x);
+        assert_eq!(t.close_think_at_budget([x, x, x, x], 3, x), x);
+        // An earlier turn's block does not count against this one.
+        assert_eq!(t.close_think_at_budget([open, x, x, x, turn, x], 3, x), x);
+        assert_eq!(t.think_room([turn, open, x], 3), Some(2));
+        assert_eq!(t.think_room([turn, open, x, close], 3), None);
     }
 
     #[test]

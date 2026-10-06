@@ -125,7 +125,7 @@ pub enum FailKind {
 
 /// The kind of a failure that ended a cycle: a worker that is no longer alive
 /// (it crashed, or the deadline killed it as wedged) makes it `Unavailable`.
-fn cycle_failure_kind(engine: &mut DaemonEngine) -> FailKind {
+fn cycle_failure_kind(engine: &mut impl CycleEngine) -> FailKind {
     if engine.worker_alive() {
         FailKind::Server
     } else {
@@ -146,7 +146,7 @@ pub struct PendingRequest {
     /// Set when this request was preempted mid-generation and re-queued: the
     /// daemon session is already prefilled and resident at this `logical_position`,
     /// so the resume cycle skips prefill and continues decoding from here. `None`
-    /// for a fresh request. `spec.max_tokens` carries the remaining token budget.
+    /// for a fresh request. `spec.policy.max_tokens` carries the remaining token budget.
     pub resume_position: Option<usize>,
 }
 
@@ -310,6 +310,73 @@ pub trait BatchableSession {
     fn batch_key(&self) -> String;
 }
 
+/// The engine operations a text batch cycle runs: [`DaemonEngine`] when
+/// serving, a scripted fake in the tests, so this file's scheduling policy --
+/// parking, out-of-memory splits, a dead worker -- runs without a GPU.
+pub trait CycleEngine: Send {
+    fn worker_alive(&mut self) -> bool;
+    fn prefix_hash_preflight(
+        &mut self,
+        request: serde_json::Value,
+    ) -> impl std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send;
+    fn generate_batch_prefill(
+        &mut self,
+        request: serde_json::Value,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<serde_json::Value>>> + Send;
+    fn generate_batch_decode_step(
+        &mut self,
+        request: serde_json::Value,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<serde_json::Value>>> + Send;
+    fn release_sessions(
+        &mut self,
+        request: serde_json::Value,
+    ) -> impl std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send;
+}
+
+impl CycleEngine for DaemonEngine {
+    fn worker_alive(&mut self) -> bool {
+        DaemonEngine::worker_alive(self)
+    }
+    fn prefix_hash_preflight(
+        &mut self,
+        request: serde_json::Value,
+    ) -> impl std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send {
+        DaemonEngine::prefix_hash_preflight(self, request)
+    }
+    fn generate_batch_prefill(
+        &mut self,
+        request: serde_json::Value,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<serde_json::Value>>> + Send {
+        DaemonEngine::generate_batch_prefill(self, request)
+    }
+    fn generate_batch_decode_step(
+        &mut self,
+        request: serde_json::Value,
+    ) -> impl std::future::Future<Output = anyhow::Result<Vec<serde_json::Value>>> + Send {
+        DaemonEngine::generate_batch_decode_step(self, request)
+    }
+    fn release_sessions(
+        &mut self,
+        request: serde_json::Value,
+    ) -> impl std::future::Future<Output = anyhow::Result<serde_json::Value>> + Send {
+        DaemonEngine::release_sessions(self, request)
+    }
+}
+
+/// The part of a request's generation contract the batched path carries, typed.
+/// Its decode is greedy (argmax); a request asking for more -- sampling,
+/// penalties, stop sequences, an image -- takes the legacy path instead
+/// (`routes::chat::batch_unhonoured`), so nothing it asks for is dropped.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct GenerationPolicy {
+    /// Total tokens this request may still generate.
+    pub max_tokens: usize,
+    /// Thinking: `1` turns it off (the template closes the think block), `0`
+    /// leaves it unbounded, and n > 1 is a budget the decode enforces by
+    /// closing the block after n tokens (`Tokenizer::close_think_at_budget`).
+    pub max_think_tokens: u32,
+}
+
 /// Minimal per-session inputs the runner needs to build the daemon batch
 /// requests. The route fills one of these per admitted request; how the prompt
 /// is rendered (chat template, raw text) is the route's concern, not the
@@ -332,11 +399,8 @@ pub struct SessionSpec {
     pub state_kinds: Vec<String>,
     /// Assistant-turn prefix mode passed through to the daemon template.
     pub assistant_prefix: String,
-    /// Thinking budget marker. The daemon derives `enable_thinking =
-    /// max_think_tokens != 1`, so `1` disables thinking and `0` enables it.
-    pub max_think_tokens: u32,
-    /// Total tokens this request may still generate.
-    pub max_tokens: usize,
+    /// What the request asks of generation.
+    pub policy: GenerationPolicy,
     /// Run alone: no other session shares its prefill or decode, so its answer does
     /// not depend on what else the server is doing (`ChatRequest::deterministic`).
     pub solo: bool,
@@ -354,6 +418,7 @@ pub struct DecodeCursor {
     pub id: String,
     pub logical_position: usize,
     pub max_tokens_remaining: usize,
+    pub max_think_tokens: u32,
 }
 
 /// How one session of a prefill uses the prefix cache.
@@ -511,12 +576,12 @@ fn session_json(s: &SessionSpec, reuse: Option<&PrefixReuse>) -> serde_json::Val
         "prompt": s.prompt,
         "params": {
             "assistant_prefix": s.assistant_prefix,
-            "max_think_tokens": s.max_think_tokens,
+            "max_think_tokens": s.policy.max_think_tokens,
             // An attached session checkpoints the boundaries past its prefix, so a
             // conversation's next step can attach at this one's end.
             "semantic_boundary_checkpoints": reuse.is_some(),
             // Sizes the session's KV to prompt + this, not the model's max_seq.
-            "max_tokens": s.max_tokens,
+            "max_tokens": s.policy.max_tokens,
         },
         "state_handle": {
             "state_kinds": s.state_kinds,
@@ -598,7 +663,7 @@ pub fn build_prefix_preflight_request(
 /// budget works from — so it runs even with the cache off (`use_cache` false:
 /// lengths only).
 async fn plan_prefix_reuse(
-    engine: &mut DaemonEngine,
+    engine: &mut impl CycleEngine,
     worker: &str,
     specs: &[SessionSpec],
     index: &mut PrefixIndex,
@@ -802,7 +867,7 @@ fn prefill_groups(
 /// out of memory.
 #[allow(clippy::too_many_arguments)]
 async fn prefill_budgeted(
-    engine: &mut DaemonEngine,
+    engine: &mut impl CycleEngine,
     batch_id: &str,
     worker: &str,
     specs: &[SessionSpec],
@@ -902,7 +967,7 @@ type Overlong = Vec<(String, usize)>;
 /// extra; with the prefix cache and row budget both off there is no preflight,
 /// and the daemon's own guard is all that applies.
 async fn prefill_with_prefix_reuse(
-    engine: &mut DaemonEngine,
+    engine: &mut impl CycleEngine,
     batch_id: &str,
     worker: &str,
     specs: &[SessionSpec],
@@ -986,7 +1051,7 @@ async fn loaded_max_seq(state: &SharedState, worker: &str) -> Option<usize> {
 
 /// Index the checkpoints a prefill minted, releasing duplicates and evictions.
 async fn record_prefix_checkpoints(
-    engine: &mut DaemonEngine,
+    engine: &mut impl CycleEngine,
     worker: &str,
     events: &[serde_json::Value],
     index: &mut PrefixIndex,
@@ -1111,6 +1176,7 @@ pub fn build_batch_decode_request(
                 "session_id": c.id,
                 "max_tokens_remaining": c.max_tokens_remaining,
                 "logical_position": c.logical_position,
+                "max_think_tokens": c.max_think_tokens,
             })
         })
         .collect();
@@ -1267,7 +1333,7 @@ async fn batch_runner_loop(state: SharedState) {
     // prefill. Depth is bounded (each level pins resident VRAM) — see
     // `preempt_max_depth`. `.1` is the priority the batch was running at, `.2` when
     // it was parked (it has left the scheduler's queue, so only this ages it).
-    let mut parked: Vec<(Vec<PendingRequest>, u8, u64)> = Vec::new();
+    let mut parked: Parked = Vec::new();
     let max_depth = preempt_max_depth();
     // Largest fresh batch known to fit in device memory, learned from prefill OOMs.
     // ponytail: only ratchets down until restart; probe upward if memory is freed
@@ -1448,23 +1514,33 @@ async fn batch_runner_loop(state: SharedState) {
 
         match dispatch {
             Dispatch::Text {
-                mut batch,
+                batch,
                 running_priority,
                 lease_id,
             } => {
-                // Split before attempting a batch already known not to fit. The
-                // remainder waits on the parked stack as a fresh batch: it holds no
-                // resident state, so it pins nothing while it waits.
-                if batch.len() > fit_cap && batch[0].resume_position.is_none() {
-                    parked.push((batch.split_off(fit_cap), running_priority, now_ms()));
-                }
                 // Let a caller blocked on the engine have it first (it polls every
                 // 20 ms; taking it straight back would starve it again).
                 while state.engine_wanted() {
                     tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                 }
-                let mut engine = match state.engine.lock().await.take() {
-                    Some(e) => e,
+                let engine = state.engine.lock().await.take();
+                match engine {
+                    Some(engine) => {
+                        let engine = run_text_batch(
+                            &state,
+                            engine,
+                            batch,
+                            running_priority,
+                            max_depth,
+                            &mut prefix_index,
+                            &mut parked,
+                            &mut fit_cap,
+                        )
+                        .await;
+                        if engine.is_some() {
+                            *state.engine.lock().await = engine;
+                        }
+                    }
                     None => {
                         for p in &batch {
                             let _ = p.tx.send(BatchEvent::Error(
@@ -1472,72 +1548,10 @@ async fn batch_runner_loop(state: SharedState) {
                                 "daemon not running".to_string(),
                             ));
                         }
-                        if let Some(id) = lease_id {
-                            state.work_scheduler.lock().await.complete(id);
-                        }
-                        continue;
                     }
-                };
-                // Park only while the stack has room (bounds resident VRAM from
-                // nested preemption); at the cap the batch runs to completion.
-                let can_park = parked.len() < max_depth;
-                let cycle_worker = batch.first().map(|p| p.worker_key_id.clone());
-                let outcome = run_batch_cycle(
-                    &mut engine,
-                    &state,
-                    batch,
-                    running_priority,
-                    can_park,
-                    &mut prefix_index,
-                )
-                .await;
-                if let Some(w) = &cycle_worker {
-                    gauges(&state, w, |g| {
-                        g.active = 0;
-                        g.cycle_started_ms = None;
-                    });
-                }
-                // A worker that died during the cycle (panic, OOM, killed) must not go
-                // back in the slot: requests take `ensure_model_loaded`'s fast path,
-                // which trusts `loaded_models` and never pings, so every later request
-                // -- to either resident model -- failed against the dead engine for the
-                // rest of the run. Drop it and forget the models; the next request
-                // respawns the daemon.
-                if engine.worker_alive() {
-                    *state.engine.lock().await = Some(engine);
-                } else {
-                    tracing::error!(
-                        "inference daemon died during a batch cycle; next request respawns it"
-                    );
-                    drop(engine);
-                    crate::routes::chat::clear_loaded_model_state_for_failed_daemon(&state).await;
                 }
                 if let Some(id) = lease_id {
                     state.work_scheduler.lock().await.complete(id);
-                }
-                match outcome {
-                    CycleOutcome::Completed => {}
-                    CycleOutcome::Parked(remaining) => {
-                        parked.push((remaining, running_priority, now_ms()))
-                    }
-                    CycleOutcome::OutOfMemory(batch) if batch.len() == 1 => {
-                        // Retried once on the memory its released checkpoints freed;
-                        // with none left to release, a second OOM fails it.
-                        parked.push((batch, running_priority, now_ms()));
-                    }
-                    CycleOutcome::OutOfMemory(mut batch) => {
-                        let half = batch.len() / 2;
-                        fit_cap = half;
-                        tracing::warn!(
-                            "batch of {} ran out of device memory; retrying as {} + {}",
-                            batch.len(),
-                            half,
-                            batch.len() - half
-                        );
-                        // LIFO: push the second half first so the first runs next.
-                        parked.push((batch.split_off(half), running_priority, now_ms()));
-                        parked.push((batch, running_priority, now_ms()));
-                    }
                 }
             }
             Dispatch::Embed { jobs, lease_id } => {
@@ -1910,7 +1924,7 @@ fn midcycle_admit_enabled() -> bool {
 /// reusing cached prefixes. Returns each with its logical position and remaining
 /// budget. A failed prefill fails and releases only the newcomers.
 async fn admit_into_cycle(
-    engine: &mut DaemonEngine,
+    engine: &mut impl CycleEngine,
     state: &SharedState,
     worker: &str,
     batch_id: &str,
@@ -1962,7 +1976,7 @@ async fn admit_into_cycle(
     let mut cached: HashMap<String, usize> = HashMap::new();
     let mut remaining: HashMap<String, usize> = specs
         .iter()
-        .map(|s| (s.id.clone(), s.max_tokens.max(1)))
+        .map(|s| (s.id.clone(), s.policy.max_tokens.max(1)))
         .collect();
     let max_seq = loaded_max_seq(state, worker).await;
     match prefill_with_prefix_reuse(engine, batch_id, worker, &specs, prefix_index, max_seq).await {
@@ -2005,13 +2019,98 @@ async fn admit_into_cycle(
         .collect()
 }
 
+/// The work parked on the runner's stack: a batch, its priority, and when it
+/// was parked.
+type Parked = Vec<(Vec<PendingRequest>, u8, u64)>;
+
+/// One text batch through `engine`, and what follows from how it ended. A
+/// parked batch goes onto `parked` with its resume cursors; one that ran out of
+/// device memory goes back as a retry (alone) or as two halves, with `fit_cap`
+/// lowered so later batches start small enough. A batch already known not to
+/// fit is split before it runs. The engine comes back only while its worker
+/// lives: a dead one is dropped and the loaded models forgotten, so the next
+/// request respawns the daemon. Out of the loop so the policy runs against a
+/// fake engine.
+#[allow(clippy::too_many_arguments)]
+async fn run_text_batch<E: CycleEngine>(
+    state: &SharedState,
+    mut engine: E,
+    mut batch: Vec<PendingRequest>,
+    running_priority: u8,
+    max_depth: usize,
+    prefix_index: &mut PrefixIndex,
+    parked: &mut Parked,
+    fit_cap: &mut usize,
+) -> Option<E> {
+    // Split before attempting a batch already known not to fit. The remainder
+    // waits on the parked stack as a fresh batch: it holds no resident state,
+    // so it pins nothing while it waits.
+    if batch.len() > *fit_cap && batch[0].resume_position.is_none() {
+        parked.push((batch.split_off(*fit_cap), running_priority, now_ms()));
+    }
+    // Park only while the stack has room (bounds resident VRAM from nested
+    // preemption); at the cap the batch runs to completion.
+    let can_park = parked.len() < max_depth;
+    let cycle_worker = batch.first().map(|p| p.worker_key_id.clone());
+    let outcome = run_batch_cycle(
+        &mut engine,
+        state,
+        batch,
+        running_priority,
+        can_park,
+        prefix_index,
+    )
+    .await;
+    if let Some(w) = &cycle_worker {
+        gauges(state, w, |g| {
+            g.active = 0;
+            g.cycle_started_ms = None;
+        });
+    }
+    match outcome {
+        CycleOutcome::Completed => {}
+        CycleOutcome::Parked(remaining) => parked.push((remaining, running_priority, now_ms())),
+        CycleOutcome::OutOfMemory(batch) if batch.len() == 1 => {
+            // Retried once on the memory its released checkpoints freed; with
+            // none left to release, a second OOM fails it.
+            parked.push((batch, running_priority, now_ms()));
+        }
+        CycleOutcome::OutOfMemory(mut batch) => {
+            let half = batch.len() / 2;
+            *fit_cap = half;
+            tracing::warn!(
+                "batch of {} ran out of device memory; retrying as {} + {}",
+                batch.len(),
+                half,
+                batch.len() - half
+            );
+            // LIFO: push the second half first so the first runs next.
+            parked.push((batch.split_off(half), running_priority, now_ms()));
+            parked.push((batch, running_priority, now_ms()));
+        }
+    }
+    // A worker that died during the cycle (panic, OOM, killed) must not go back
+    // in the slot: requests take `ensure_model_loaded`'s fast path, which trusts
+    // `loaded_models` and never pings, so every later request -- to either
+    // resident model -- failed against the dead engine for the rest of the run.
+    // Drop it and forget the models; the next request respawns the daemon.
+    if engine.worker_alive() {
+        Some(engine)
+    } else {
+        tracing::error!("inference daemon died during a batch cycle; next request respawns it");
+        drop(engine);
+        crate::routes::chat::clear_loaded_model_state_for_failed_daemon(state).await;
+        None
+    }
+}
+
 /// One fused prefill + decode cycle over `batch`. Runs to completion unless
 /// `can_park` and a higher-priority (lower number than `running_priority`)
 /// workload appears after the min-quantum floor, in which case the still-active
 /// requests are returned as `Parked` with their resume cursors and the daemon
 /// sessions are left resident.
 async fn run_batch_cycle(
-    engine: &mut DaemonEngine,
+    engine: &mut impl CycleEngine,
     state: &SharedState,
     batch: Vec<PendingRequest>,
     running_priority: u8,
@@ -2034,7 +2133,7 @@ async fn run_batch_cycle(
     let mut resume_pos: HashMap<String, usize> = HashMap::new();
     for p in &batch {
         txs.insert(p.spec.id.clone(), p.tx.clone());
-        remaining.insert(p.spec.id.clone(), p.spec.max_tokens.max(1));
+        remaining.insert(p.spec.id.clone(), p.spec.policy.max_tokens.max(1));
         specs_by_id.insert(p.spec.id.clone(), p.spec.clone());
         if let Some(pos) = p.resume_position {
             resume_pos.insert(p.spec.id.clone(), pos);
@@ -2175,6 +2274,7 @@ async fn run_batch_cycle(
                 id: id.clone(),
                 logical_position: positions[id],
                 max_tokens_remaining: remaining[id],
+                max_think_tokens: specs_by_id[id].policy.max_think_tokens,
             })
             .collect();
         let decode_req = build_batch_decode_request(&batch_id, &worker, &cursors);
@@ -2414,7 +2514,7 @@ async fn run_batch_cycle(
                     .iter()
                     .filter_map(|id| {
                         let mut spec = specs_by_id.get(id)?.clone();
-                        spec.max_tokens = remaining[id];
+                        spec.policy.max_tokens = remaining[id];
                         Some(PendingRequest {
                             spec,
                             worker_key_id: worker.clone(),
@@ -2570,8 +2670,10 @@ mod tests {
             system_prompt: None,
             state_kinds: vec!["attention_kv".to_string(), "deltanet_recurrent".to_string()],
             assistant_prefix: "plain".to_string(),
-            max_think_tokens: 0,
-            max_tokens: 16,
+            policy: GenerationPolicy {
+                max_tokens: 16,
+                max_think_tokens: 0,
+            },
             tools: None,
             solo: false,
         }
@@ -2631,7 +2733,7 @@ mod tests {
     fn prefill_request_passes_daemon_validator() {
         let mut a = spec("req-a");
         a.assistant_prefix = "closed_think".to_string();
-        a.max_think_tokens = 1; // thinking disabled (daemon: enable_thinking = != 1)
+        a.policy.max_think_tokens = 1; // thinking disabled (daemon: enable_thinking = != 1)
         let specs = [a, spec("req-b")];
         let req = build_batch_prefill_request("batch-1", "worker-xyz", &specs, &HashMap::new());
         let env = hipfire_generate::validate_generate_batch_prefill(&req)
@@ -2903,11 +3005,13 @@ mod tests {
                 id: "req-a".to_string(),
                 logical_position: 7,
                 max_tokens_remaining: 15,
+                max_think_tokens: 1024,
             },
             DecodeCursor {
                 id: "req-b".to_string(),
                 logical_position: 9,
                 max_tokens_remaining: 15,
+                max_think_tokens: 0,
             },
         ];
         let req = build_batch_decode_request("batch-1", "worker-xyz", &cursors);
@@ -2918,6 +3022,9 @@ mod tests {
         assert_eq!(env.sessions[1].session_id, "req-b");
         assert_eq!(env.sessions[0].logical_position, 7);
         assert_eq!(env.cached_prefix_tokens, 7);
+        // The think budget reaches the daemon's decode, which enforces it.
+        assert_eq!(env.sessions[0].max_think_tokens, 1024);
+        assert_eq!(env.sessions[1].max_think_tokens, 0);
     }
 
     // Dummy impl exercises the generic seam without a GPU or a real arch:
@@ -3009,6 +3116,290 @@ mod tests {
         assert_eq!(req["type"], "release_sessions");
         assert_eq!(req["worker_key_id"], "worker-xyz");
         assert_eq!(req["sessions"], serde_json::json!(["h1", "h2"]));
+    }
+
+    /// A scripted engine: prefill places every session at position 8; each
+    /// decode step gives every session one token and stops it after
+    /// `stop_after` of them. `prefill_error` / `decode_error` fail those calls
+    /// instead (a failed decode also kills the worker, as a wedge does).
+    struct FakeEngine {
+        alive: bool,
+        stop_after: usize,
+        prefill_error: Option<&'static str>,
+        decode_error: Option<&'static str>,
+        decoded: HashMap<String, usize>,
+        prefills: usize,
+        decodes: Vec<serde_json::Value>,
+        released: Vec<String>,
+    }
+
+    impl FakeEngine {
+        fn new() -> Self {
+            FakeEngine {
+                alive: true,
+                stop_after: 2,
+                prefill_error: None,
+                decode_error: None,
+                decoded: HashMap::new(),
+                prefills: 0,
+                decodes: Vec::new(),
+                released: Vec::new(),
+            }
+        }
+
+        fn ids(request: &serde_json::Value) -> Vec<String> {
+            request["sessions"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|s| s["id"].as_str().map(str::to_string))
+                .collect()
+        }
+    }
+
+    impl CycleEngine for FakeEngine {
+        fn worker_alive(&mut self) -> bool {
+            self.alive
+        }
+        async fn prefix_hash_preflight(
+            &mut self,
+            _request: serde_json::Value,
+        ) -> anyhow::Result<serde_json::Value> {
+            Ok(serde_json::json!({"full": {"prefix_len": 8}, "prefixes": []}))
+        }
+        async fn generate_batch_prefill(
+            &mut self,
+            request: serde_json::Value,
+        ) -> anyhow::Result<Vec<serde_json::Value>> {
+            self.prefills += 1;
+            if let Some(e) = self.prefill_error {
+                anyhow::bail!("{e}");
+            }
+            Ok(Self::ids(&request)
+                .into_iter()
+                .map(|id| {
+                    serde_json::json!({"type": "generate_batch_prefill_session_done",
+                           "session_id": id, "logical_position": 8})
+                })
+                .collect())
+        }
+        async fn generate_batch_decode_step(
+            &mut self,
+            request: serde_json::Value,
+        ) -> anyhow::Result<Vec<serde_json::Value>> {
+            self.decodes.push(request.clone());
+            if let Some(e) = self.decode_error {
+                self.alive = false;
+                anyhow::bail!("{e}");
+            }
+            let stop_after = self.stop_after;
+            Ok(request["sessions"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .map(|s| {
+                    let id = s["id"].as_str().unwrap().to_string();
+                    let n = self.decoded.entry(id.clone()).or_default();
+                    *n += 1;
+                    serde_json::json!({"type": "generate_batch_decode_step_session_done",
+                           "session_id": id, "text": "x", "stop": *n >= stop_after,
+                           "logical_position": s["logical_position"].as_u64().unwrap() + 1})
+                })
+                .collect())
+        }
+        async fn release_sessions(
+            &mut self,
+            request: serde_json::Value,
+        ) -> anyhow::Result<serde_json::Value> {
+            let handles = request["sessions"].as_array().cloned().unwrap_or_default();
+            self.released.extend(
+                handles
+                    .iter()
+                    .filter_map(|h| h.as_str().map(str::to_string)),
+            );
+            Ok(serde_json::json!({}))
+        }
+    }
+
+    fn pending(id: &str) -> (PendingRequest, mpsc::UnboundedReceiver<BatchEvent>) {
+        let (tx, rx) = mpsc::unbounded_channel();
+        let request = PendingRequest {
+            spec: spec(id),
+            worker_key_id: "w".to_string(),
+            tx,
+            resume_position: None,
+        };
+        (request, rx)
+    }
+
+    fn events(rx: &mut mpsc::UnboundedReceiver<BatchEvent>) -> Vec<BatchEvent> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
+    // Preempted after its quantum, a batch parks with its resume cursors, and
+    // resumes from them: no second prefill, decode picks up at the cursor, the
+    // requests finish, and every session is released.
+    #[tokio::test]
+    async fn a_preempted_batch_parks_and_resumes_from_its_cursor() {
+        let state = crate::state::AppState::new(hipfire_config::HipfireConfig::default());
+        let (mut parked, mut fit_cap, mut index) = (Vec::new(), usize::MAX, PrefixIndex::default());
+        let (a, mut rx_a) = pending("a");
+        let (b, mut rx_b) = pending("b");
+        let mut engine = FakeEngine::new();
+        engine.stop_after = 100;
+        // Somebody wants the engine: the batch yields after its quantum.
+        state
+            .engine_waiters
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let engine = run_text_batch(
+            &state,
+            engine,
+            vec![a, b],
+            64,
+            4,
+            &mut index,
+            &mut parked,
+            &mut fit_cap,
+        )
+        .await
+        .expect("a live worker keeps its engine");
+        state
+            .engine_waiters
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        let quantum = min_quantum() as usize;
+        assert_eq!(parked.len(), 1);
+        let (batch, priority, _) = parked.pop().unwrap();
+        assert_eq!(priority, 64);
+        for p in &batch {
+            assert_eq!(p.resume_position, Some(8 + quantum), "{}", p.spec.id);
+            assert_eq!(p.spec.policy.max_tokens, 16 - quantum);
+        }
+        assert!(events(&mut rx_a)
+            .iter()
+            .all(|e| matches!(e, BatchEvent::Token(_))));
+
+        let mut engine = engine;
+        engine.stop_after = quantum + 2;
+        let decodes_before = engine.decodes.len();
+        let engine = run_text_batch(
+            &state,
+            engine,
+            batch,
+            64,
+            4,
+            &mut index,
+            &mut parked,
+            &mut fit_cap,
+        )
+        .await
+        .unwrap();
+        assert!(parked.is_empty());
+        assert_eq!(engine.prefills, 1, "a resumed batch is already resident");
+        let resumed = &engine.decodes[decodes_before];
+        assert_eq!(
+            resumed["sessions"][0]["logical_position"],
+            8 + quantum as u64
+        );
+        for rx in [&mut rx_a, &mut rx_b] {
+            assert!(matches!(events(rx).last(), Some(BatchEvent::Done(_))));
+        }
+        for id in ["a", "b"] {
+            assert!(
+                engine.released.iter().any(|r| r == id),
+                "{id} never released"
+            );
+        }
+    }
+
+    // A batch whose prefill runs out of device memory comes back as two halves,
+    // first half next, and later batches start no larger; nothing is failed. A
+    // lone request with no checkpoints to free fails instead of retrying.
+    #[tokio::test]
+    async fn an_out_of_memory_batch_splits_and_a_lone_request_fails() {
+        let state = crate::state::AppState::new(hipfire_config::HipfireConfig::default());
+        let (mut parked, mut fit_cap, mut index) = (Vec::new(), usize::MAX, PrefixIndex::default());
+        let mut rxs = Vec::new();
+        let batch: Vec<PendingRequest> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|id| {
+                let (p, rx) = pending(id);
+                rxs.push(rx);
+                p
+            })
+            .collect();
+        let mut engine = FakeEngine::new();
+        engine.prefill_error = Some("batch prefill: hip call failed (hipError=2)");
+        let engine = run_text_batch(
+            &state,
+            engine,
+            batch,
+            64,
+            4,
+            &mut index,
+            &mut parked,
+            &mut fit_cap,
+        )
+        .await
+        .unwrap();
+        assert_eq!(fit_cap, 2);
+        let ids = |b: &Vec<PendingRequest>| b.iter().map(|p| p.spec.id.clone()).collect::<Vec<_>>();
+        assert_eq!(parked.len(), 2);
+        assert_eq!(ids(&parked[1].0), ["a", "b"], "the first half runs next");
+        assert_eq!(ids(&parked[0].0), ["c", "d"]);
+        assert!(
+            rxs.iter_mut().all(|rx| events(rx).is_empty()),
+            "nothing failed"
+        );
+
+        let (lone, mut rx) = pending("e");
+        let mut parked = Vec::new();
+        run_text_batch(
+            &state,
+            engine,
+            vec![lone],
+            64,
+            4,
+            &mut index,
+            &mut parked,
+            &mut fit_cap,
+        )
+        .await;
+        assert!(parked.is_empty());
+        assert!(matches!(
+            events(&mut rx).as_slice(),
+            [BatchEvent::Error(_, _)]
+        ));
+    }
+
+    // A worker that dies mid-cycle (here, killed at a wedged decode) fails its
+    // requests as unavailable, and its engine is not handed back.
+    #[tokio::test]
+    async fn a_worker_that_dies_mid_cycle_fails_its_requests_and_is_dropped() {
+        let state = crate::state::AppState::new(hipfire_config::HipfireConfig::default());
+        let (mut parked, mut fit_cap, mut index) = (Vec::new(), usize::MAX, PrefixIndex::default());
+        let (a, mut rx) = pending("a");
+        let mut engine = FakeEngine::new();
+        engine.decode_error = Some("inference worker wedged");
+        let kept = run_text_batch(
+            &state,
+            engine,
+            vec![a],
+            64,
+            4,
+            &mut index,
+            &mut parked,
+            &mut fit_cap,
+        )
+        .await;
+        assert!(
+            kept.is_none(),
+            "a dead worker's engine goes back in the slot"
+        );
+        assert!(parked.is_empty());
+        assert!(matches!(
+            events(&mut rx).as_slice(),
+            [BatchEvent::Error(FailKind::Unavailable, _)]
+        ));
     }
 }
 

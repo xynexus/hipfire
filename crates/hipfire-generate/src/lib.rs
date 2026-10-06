@@ -657,6 +657,9 @@ pub struct GenerateBatchDecodeSession {
     pub session_id: String,
     pub max_tokens_remaining: usize,
     pub logical_position: usize,
+    /// The think budget: past it the decode closes the think block. 0 is
+    /// unbounded, 1 is thinking off. Absent means 0.
+    pub max_think_tokens: u32,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1108,11 +1111,19 @@ pub fn validate_generate_batch_decode(
             .and_then(|v| v.as_u64())
             .ok_or_else(|| format!("{prefix}.logical_position must be an integer >= 0"))?
             as usize;
+        let max_think_tokens = match session.get("max_think_tokens") {
+            None | Some(serde_json::Value::Null) => 0,
+            Some(v) => v
+                .as_u64()
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| format!("{prefix}.max_think_tokens must be an integer >= 0"))?,
+        };
         parsed.push(GenerateBatchDecodeSession {
             id: id.to_string(),
             session_id: session_id.to_string(),
             max_tokens_remaining,
             logical_position,
+            max_think_tokens,
         });
     }
     Ok(GenerateBatchDecodeEnvelope {

@@ -982,6 +982,7 @@ pub fn qwen35_decode_token_outcome(
     max_tokens_remaining: usize,
     im_end_token: Option<u32>,
     history: &[u32],
+    max_think_tokens: u32,
 ) -> Result<Qwen35DecodeTokenOutcome, String> {
     let config = m
         .q35_config
@@ -994,6 +995,7 @@ pub fn qwen35_decode_token_outcome(
     let token = gpu
         .argmax_f32(logits, config.vocab_size)
         .map_err(|e| format!("qwen35 decode argmax: {e:?}"))?;
+    let token = tokenizer.close_think_at_budget(history.iter().copied(), max_think_tokens, token);
     let is_terminator = (token == config.eos_token
         || im_end_token == Some(token)
         || tokenizer.is_terminator(token))
@@ -1052,6 +1054,7 @@ pub fn qwen35_decode_step_serial_reference(
             session.max_tokens_remaining,
             im_end_token,
             &state.cursor.conversation_tokens,
+            session.max_think_tokens,
         )?;
         state.cursor.conversation_tokens.push(outcome.token);
         {
@@ -1268,6 +1271,7 @@ pub fn qwen35_decode_step_fused_grouped_moe_native_chunk(
                 session.max_tokens_remaining,
                 im_end_token,
                 &state.cursor.conversation_tokens,
+                session.max_think_tokens,
             )?);
         }
         let mut oracle_states = if qwen35_decode_internal_parity_enabled() {
@@ -1370,6 +1374,7 @@ pub fn qwen35_decode_step_fused_grouped_moe_native_chunk(
                     session.max_tokens_remaining,
                     im_end_token,
                     &fused_state.cursor.conversation_tokens,
+                    session.max_think_tokens,
                 )?;
                 if oracle_outcome.token != outcome.token {
                     return Err(format!(
@@ -1554,6 +1559,7 @@ pub fn qwen35_decode_step_fused_dense_native_chunk(
                 session.max_tokens_remaining,
                 im_end_token,
                 &state.cursor.conversation_tokens,
+                session.max_think_tokens,
             )?);
         }
         let mut oracle_states = if qwen35_decode_internal_parity_enabled() {
@@ -1654,6 +1660,7 @@ pub fn qwen35_decode_step_fused_dense_native_chunk(
                     session.max_tokens_remaining,
                     im_end_token,
                     &fused_state.cursor.conversation_tokens,
+                    session.max_think_tokens,
                 )?;
                 if oracle_outcome.token != outcome.token {
                     return Err(format!(
@@ -1756,6 +1763,7 @@ pub fn qwen35_decode_step_fused_dense_native_singleton(
             session.max_tokens_remaining,
             im_end_token,
             &state.cursor.conversation_tokens,
+            session.max_think_tokens,
         )?;
         state.cursor.conversation_tokens.push(outcome.token);
         {
