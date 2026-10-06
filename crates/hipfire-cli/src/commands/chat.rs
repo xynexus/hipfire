@@ -183,6 +183,132 @@ async fn load_with_progress<T>(
     }
 }
 
+/// The id a server knows a resolved model by: its file's stem. The server
+/// resolves names, not paths, so `--model ./x.hfq` must not reach it as given.
+pub(crate) fn server_model_id(model_path: &Path) -> String {
+    let name = model_path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default();
+    name.strip_suffix(".hfq").unwrap_or(name).to_string()
+}
+
+/// The chat completion request `hipfire chat` sends a running server.
+fn server_chat_request(model: &str, args: &ChatArgs, image_b64: Option<&str>) -> serde_json::Value {
+    let content = match image_b64 {
+        Some(b64) => serde_json::json!([
+            {"type": "text", "text": args.prompt},
+            {"type": "image_url", "image_url": {"url": format!("data:image/png;base64,{b64}")}},
+        ]),
+        None => serde_json::json!(args.prompt),
+    };
+    let mut body = serde_json::json!({
+        "model": model,
+        "messages": [{"role": "user", "content": content}],
+        "stream": true,
+        "stream_options": {"include_usage": true},
+    });
+    if let Some(n) = args.max_tokens {
+        body["max_tokens"] = serde_json::json!(n);
+    }
+    if let Some(t) = args.temperature {
+        body["temperature"] = serde_json::json!(t);
+    }
+    body
+}
+
+/// What a streamed chat completion ended with.
+pub(crate) struct StreamedCompletion {
+    /// The final chunk's `timings` (prefill/decode tokens, ms, tok/s, TTFT).
+    pub timings: serde_json::Value,
+    pub usage: serde_json::Value,
+}
+
+/// POST `body` (a streaming request) to `{url}/v1/chat/completions`, handing
+/// each content delta to `on_text` as it arrives.
+pub(crate) async fn stream_chat_completion(
+    client: &reqwest::Client,
+    url: &str,
+    body: &serde_json::Value,
+    mut on_text: impl FnMut(&str),
+) -> anyhow::Result<StreamedCompletion> {
+    let mut response = client
+        .post(format!("{url}/v1/chat/completions"))
+        .json(body)
+        .send()
+        .await?;
+    if !response.status().is_success() {
+        let status = response.status();
+        anyhow::bail!(
+            "{url}: {status}: {}",
+            response.text().await.unwrap_or_default()
+        );
+    }
+    let mut done = StreamedCompletion {
+        timings: serde_json::Value::Null,
+        usage: serde_json::Value::Null,
+    };
+    let mut buffered = String::new();
+    while let Some(chunk) = response.chunk().await? {
+        buffered.push_str(&String::from_utf8_lossy(&chunk));
+        while let Some(end) = buffered.find('\n') {
+            let line: String = buffered.drain(..=end).collect();
+            let Some(data) = line.trim().strip_prefix("data:").map(str::trim) else {
+                continue;
+            };
+            let Ok(event) = serde_json::from_str::<serde_json::Value>(data) else {
+                continue; // `[DONE]`
+            };
+            // A stream that fails after its 200 says so in-band.
+            if let Some(message) = event["error"]["message"].as_str() {
+                anyhow::bail!("{url}: {message}");
+            }
+            if let Some(text) = event["choices"][0]["delta"]["content"].as_str() {
+                on_text(text);
+            }
+            for (key, slot) in [("timings", &mut done.timings), ("usage", &mut done.usage)] {
+                if !event[key].is_null() {
+                    *slot = event[key].clone();
+                }
+            }
+        }
+    }
+    Ok(done)
+}
+
+/// Stream one chat turn from a running server's `/v1/chat/completions`.
+async fn chat_via_server(
+    url: &str,
+    model: &str,
+    args: &ChatArgs,
+    image: Option<&Path>,
+) -> anyhow::Result<()> {
+    let image_b64 =
+        match image {
+            Some(path) => Some(base64::engine::general_purpose::STANDARD.encode(
+                std::fs::read(path).map_err(|e| {
+                    anyhow::anyhow!("--attach {}: read failed: {e}", path.display())
+                })?,
+            )),
+            None => None,
+        };
+    let done = stream_chat_completion(
+        &reqwest::Client::new(),
+        url,
+        &server_chat_request(model, args, image_b64.as_deref()),
+        |text| {
+            print!("{text}");
+            let _ = std::io::stdout().flush();
+        },
+    )
+    .await?;
+    println!();
+    let tokens = done.usage["completion_tokens"].as_u64().unwrap_or(0);
+    let tok_s = done.timings["decode_tok_s"].as_f64().unwrap_or(0.0);
+    eprintln!("\n[{tokens} tokens, {tok_s:.2} tok/s, via {url}]");
+    Ok(())
+}
+
 pub async fn run(args: ChatArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
     // Resolve the model first (using the global config for `default_model`),
     // then re-resolve the config with that model's tag so per-model overrides
@@ -207,14 +333,20 @@ pub async fn run(args: ChatArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
     // (potentially large) model load.
     let image_attachment = resolve_image_attachment(&args.attach)?;
 
-    let bin = find_daemon_bin_or_error()?;
+    // With `hipfire serve` up, chat through it like any client: its worker is
+    // shared, and a request on the worker's socket that names no worker lands
+    // on whatever the server has active -- a reset or load there wipes other
+    // clients' sessions (the worker now refuses them). Through the HTTP API the
+    // server schedules this request beside everything else, on the model it
+    // already has resident.
+    if let Some(url) = crate::commands::bench::running_server_url(&loaded).await {
+        let name = server_model_id(&model_path);
+        return chat_via_server(&url, &name, &args, image_attachment.as_deref()).await;
+    }
 
-    // Share the machine's daemon when one is listening. Only one daemon may hold
-    // the `daemon.pid` flock, so spawning here used to fail outright whenever
-    // `hipfire serve` was already up; attaching also reuses whatever model that
-    // daemon has resident instead of loading a second copy. Falls back to
-    // spawning a private daemon when nothing is listening.
-    let mut engine = DaemonEngine::attach_or_spawn(&bin).await?;
+    // No server: a private worker of our own. Never the shared socket.
+    let bin = find_daemon_bin_or_error()?;
+    let mut engine = DaemonEngine::spawn(&bin).await?;
 
     let model_path_str = model_path.to_string_lossy().into_owned();
     let load = engine.load(&model_path_str, load_params_from_config(&config));
@@ -263,6 +395,31 @@ pub async fn run(args: ChatArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // Through a server, chat streams (full timings), sends an image as a data-URI
+    // content part, and leaves sampling to the server's config unless given.
+    #[test]
+    fn the_server_request_streams_and_carries_only_what_was_asked() {
+        let mut args = ChatArgs {
+            model: None,
+            prompt: "hi".to_string(),
+            max_tokens: None,
+            temperature: None,
+            attach: Vec::new(),
+        };
+        let body = server_chat_request("m", &args, None);
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["messages"][0]["content"], "hi");
+        assert!(body.get("max_tokens").is_none() && body.get("temperature").is_none());
+        args.max_tokens = Some(7);
+        args.temperature = Some(0.0);
+        let body = server_chat_request("m", &args, Some("QUJD"));
+        assert_eq!(body["max_tokens"], 7);
+        assert_eq!(body["temperature"], 0.0);
+        let parts = &body["messages"][0]["content"];
+        assert_eq!(parts[0]["text"], "hi");
+        assert_eq!(parts[1]["image_url"]["url"], "data:image/png;base64,QUJD");
+    }
 
     #[test]
     fn classify_attachment_by_extension() {

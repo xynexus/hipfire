@@ -53,15 +53,13 @@ pub async fn run(args: BenchArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
     let model_path = find_model(&model, &loaded.config)
         .ok_or_else(|| anyhow::anyhow!("model not found: {model}"))?;
     let config: HipfireConfig = loaded.resolve_for_model(&model).config;
-    // Prefer the daemon socket over the server's HTTP API. Both reach the same
-    // daemon, but the socket measures it DIRECTLY: no HTTP hop in the number, no
-    // resetting the server's session state to get a clean sample. HTTP remains
-    // the fallback for a server whose daemon predates `--listen` and so exposes
-    // no socket to share.
-    if !hipfire_daemon_adapter::shared_daemon_listening() {
-        if let Some(url) = running_server_url(&loaded).await {
-            return run_server_bench(args, model, model_path.display().to_string(), url).await;
-        }
+    // With `hipfire serve` up, measure through its HTTP API, as a client sees
+    // it. Its worker is shared: driving it over the worker socket (a load, a
+    // `bench_prefill`, a reset between samples) acted on whatever the server had
+    // active, wiping other clients' sessions, and the worker now refuses it.
+    if let Some(url) = running_server_url(&loaded).await {
+        let name = crate::commands::chat::server_model_id(&model_path);
+        return run_server_bench(args, name, model_path.display().to_string(), url).await;
     }
     let mut load_params = ModelLoadParams::from_hipfire_config(&config);
     let needed_seq = args
@@ -71,22 +69,9 @@ pub async fn run(args: BenchArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
         .min(u32::MAX as usize) as u32;
     load_params.max_seq = load_params.max_seq.max(needed_seq);
 
+    // No server: a private worker, spawned for this run from the build at hand.
     let bin = find_daemon_bin_or_error()?;
-    // Attach to the machine's daemon when one is listening, else spawn a private
-    // one. Spawning unconditionally could not coexist with `hipfire serve` at
-    // all: one daemon per machine holds the `daemon.pid` flock, so benchmarking
-    // while serving simply failed to start.
-    //
-    // The tradeoff this accepts: an attached run measures the daemon that is
-    // ALREADY RUNNING, which may be an older build than the one you just
-    // compiled. `attached_to_shared_daemon` is reported in the result so a
-    // number is never silently attributed to the wrong binary; re-run with the
-    // server stopped to measure a freshly built daemon.
-    let mut engine = DaemonEngine::attach_or_spawn(&bin).await?;
-    let shared = engine.is_attached();
-    if shared {
-        progress("attached to the running daemon (measuring that build, not a fresh spawn)");
-    }
+    let mut engine = DaemonEngine::spawn(&bin).await?;
 
     progress(format!("loading {}", model_path.display()));
     let load_start = Instant::now();
@@ -172,7 +157,6 @@ pub async fn run(args: BenchArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
         model,
         path: model_path.display().to_string(),
         server_url: None,
-        attached_to_shared_daemon: shared,
         load_ms: Some(load_ms),
         pp_target: args.pp_tokens,
         tg_target: args.tg_tokens,
@@ -191,7 +175,7 @@ pub async fn run(args: BenchArgs, loaded: LoadedConfig) -> anyhow::Result<()> {
     Ok(())
 }
 
-async fn running_server_url(loaded: &LoadedConfig) -> Option<String> {
+pub(crate) async fn running_server_url(loaded: &LoadedConfig) -> Option<String> {
     let host = if loaded.config.host == "0.0.0.0" {
         "127.0.0.1"
     } else {
@@ -214,15 +198,8 @@ async fn run_server_bench(
     server_url: String,
 ) -> anyhow::Result<()> {
     progress(format!("using running server at {server_url}"));
-    warn_server_reset(&server_url);
     let client = reqwest::Client::new();
     if !args.no_warmup {
-        progress("warmup: reset server state");
-        with_heartbeat(
-            "warmup server reset".to_string(),
-            server_reset(&client, &server_url),
-        )
-        .await?;
         progress(format!("warmup: pp{}+tg1", args.pp_tokens));
         let _ = with_heartbeat(
             format!("warmup pp{}+tg1", args.pp_tokens),
@@ -233,15 +210,6 @@ async fn run_server_bench(
     let mut samples = Vec::with_capacity(args.repetitions);
     for index in 0..args.repetitions {
         let sample_index = index + 1;
-        progress(format!(
-            "sample {sample_index}/{}: reset server state",
-            args.repetitions
-        ));
-        with_heartbeat(
-            format!("sample {sample_index}/{} server reset", args.repetitions),
-            server_reset(&client, &server_url),
-        )
-        .await?;
         progress(format!(
             "sample {sample_index}/{}: pp{}+tg{}",
             args.repetitions, args.pp_tokens, args.tg_tokens
@@ -267,8 +235,6 @@ async fn run_server_bench(
         model,
         path: model_path,
         server_url: Some(server_url),
-        // The server owns the daemon; this path never spawns one.
-        attached_to_shared_daemon: true,
         load_ms: None,
         pp_target: args.pp_tokens,
         tg_target: args.tg_tokens,
@@ -339,11 +305,6 @@ struct BenchReport {
     model: String,
     path: String,
     server_url: Option<String>,
-    /// True when the run measured the daemon that was already running rather
-    /// than a daemon spawned for this benchmark. Recorded because the two can be
-    /// different BUILDS, and a throughput number is worthless if it cannot be
-    /// attributed to a binary.
-    attached_to_shared_daemon: bool,
     load_ms: Option<f64>,
     pp_target: usize,
     tg_target: u32,
@@ -385,30 +346,33 @@ async fn server_bench_sample(
     pp_tokens: usize,
     tg_tokens: u32,
 ) -> anyhow::Result<BenchSample> {
-    let prompt = synthetic_prefill_prompt(pp_tokens);
+    // A fresh head, so no sample prefills from a prefix the server cached for
+    // an earlier one: what resetting the server's state was for, without
+    // touching anyone else's sessions.
+    let prompt = format!(
+        "[{}] {}",
+        Uuid::new_v4(),
+        synthetic_prefill_prompt(pp_tokens)
+    );
     let started = Instant::now();
-    let response: serde_json::Value = client
-        .post(format!("{server_url}/v1/chat/completions"))
-        .json(&json!({
+    let mut output_bytes = 0usize;
+    // Streamed: a streamed request reports full timings, and runs on its own.
+    let done = crate::commands::chat::stream_chat_completion(
+        client,
+        server_url,
+        &json!({
             "model": model,
             "messages": [{"role": "user", "content": prompt}],
             "temperature": 0.0,
             "max_tokens": tg_tokens,
-        }))
-        .send()
-        .await?
-        .error_for_status()?
-        .json()
-        .await?;
+            "stream": true,
+            "stream_options": {"include_usage": true},
+        }),
+        |text| output_bytes += text.len(),
+    )
+    .await?;
     let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
-    let timings = response.get("timings").cloned().unwrap_or_default();
-    let text = response
-        .get("choices")
-        .and_then(|v| v.as_array())
-        .and_then(|choices| choices.first())
-        .and_then(|choice| choice.pointer("/message/content"))
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let timings = done.timings;
     Ok(BenchSample {
         pp_tokens: timings
             .get("prefill_tokens")
@@ -423,31 +387,8 @@ async fn server_bench_sample(
             .and_then(|v| v.as_f64()),
         ttft_ms: timings.get("ttft_ms").and_then(|v| v.as_f64()),
         generate_wall_ms: wall_ms,
-        output_bytes: text.len(),
+        output_bytes,
     })
-}
-
-async fn server_reset(client: &reqwest::Client, server_url: &str) -> anyhow::Result<()> {
-    let mut request = client.post(format!("{server_url}/admin/runtime/reset"));
-    if let Some(secret) = hipfire_config::read_admin_secret() {
-        request = request.bearer_auth(secret);
-    }
-    let response = request.send().await?;
-    if !response.status().is_success() {
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        anyhow::bail!("server reset failed with {status}: {body}");
-    }
-    Ok(())
-}
-
-fn warn_server_reset(server_url: &str) {
-    eprintln!(
-        "\x1b[1;31mWARNING: hipfire bench is attached to a running server at {server_url}.\x1b[0m"
-    );
-    eprintln!(
-        "\x1b[1;31mWARNING: benchmark repetitions will reset the server daemon state and clear active KV/session state.\x1b[0m"
-    );
 }
 
 fn prefill_tok_s(done: &DoneEvent) -> Option<f64> {
@@ -497,9 +438,6 @@ fn stdev_or_zero(v: &[f64]) -> f64 {
 fn print_text_report(report: &BenchReport) {
     println!("model: {}", report.model);
     println!("path: {}", report.path);
-    if report.attached_to_shared_daemon {
-        println!("daemon: attached to the running daemon (not a fresh spawn)");
-    }
     if let Some(url) = &report.server_url {
         println!("server_url: {url}");
         println!("load_ms: n/a (server-owned daemon)");
@@ -545,7 +483,6 @@ fn print_json_report(report: &BenchReport) {
         "model": &report.model,
         "path": &report.path,
         "server_url": &report.server_url,
-        "attached_to_shared_daemon": report.attached_to_shared_daemon,
         "load_ms": report.load_ms,
         "pp_target": report.pp_target,
         "tg_target": report.tg_target,

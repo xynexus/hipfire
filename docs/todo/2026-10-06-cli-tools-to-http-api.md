@@ -1,6 +1,6 @@
 # Move the daemon-socket CLI tools to the HTTP API
 
-Status: open. Decided 2026-10-06: these tools are deprecated in their current form.
+Status: done 2026-10-07 (see "Done" at the end). Decided 2026-10-06: these tools are deprecated in their current form.
 
 ## Why
 
@@ -42,3 +42,32 @@ while serve runs, and still work against a worker with no serve beside it.
 
 Do not relax `refuse_unscoped` to get a tool working again. The refusal is the
 protection; the port is the fix.
+
+## Done (2026-10-07)
+
+None of the three attaches to the shared socket any more. The adapter's
+client side of it (`connect`, `attach_or_spawn`, `shared_daemon_listening`,
+`SocketTransport`) is gone. The worker still listens beside serve, and
+`refuse_unscoped` still guards that door.
+
+- **`hipfire chat`.** With serve up, it streams `/v1/chat/completions`.
+  Otherwise it spawns a private worker.
+- **`hipfire bench`.**
+  - With serve up, it measures through `/v1/chat/completions`, streamed: a
+    streamed request reports full timings and runs on its own.
+  - A per-sample nonce at the head of the prompt replaces the
+    `/admin/runtime/reset` between samples, which wiped every other client's
+    sessions.
+  - Otherwise it spawns a private worker, which keeps the exact `bench_prefill`.
+- **`hipfire eval`.**
+  - With serve healthy, the smoke and speed batteries go through it, streamed.
+  - The smoke row that reset the server between turns now checks that the same
+    greedy request answers the same with another in between.
+  - The batteries that drive a worker directly (quality/KLD, cask, profile,
+    vision) spawn a private one. While serve holds the worker that fails on the
+    `daemon.pid` flock and is reported as a failed row.
+
+Still open: on the batched path, a non-streamed request's `timings` carry
+token counts only. The batch runner's `DoneEvent` sets the rates and TTFT to
+`None`. The tools stream to avoid it; a client that does not stream gets no
+throughput numbers.

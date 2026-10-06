@@ -180,7 +180,7 @@ pub(crate) async fn run_daemon_quality_rows_async(
     // The tradeoff this accepts: an attached run exercises the daemon ALREADY
     // RUNNING, which may not be the build under test. Stop the server first when
     // the evidence has to be attributed to a freshly built binary.
-    let mut engine = hipfire_daemon_adapter::DaemonEngine::attach_or_spawn(bin).await?;
+    let mut engine = hipfire_daemon_adapter::DaemonEngine::spawn(bin).await?;
     let ref_path = match ref_plan {
         ReferencePlan::Existing(path) => path,
         ReferencePlan::Build {
@@ -434,7 +434,7 @@ pub(crate) async fn load_daemon_eval_session_for_model(
     // The tradeoff this accepts: an attached run exercises the daemon ALREADY
     // RUNNING, which may not be the build under test. Stop the server first when
     // the evidence has to be attributed to a freshly built binary.
-    let mut engine = hipfire_daemon_adapter::DaemonEngine::attach_or_spawn(bin).await?;
+    let mut engine = hipfire_daemon_adapter::DaemonEngine::spawn(bin).await?;
     let loaded = engine
         .load(model, daemon_model_load_params(config, max_seq))
         .await?;
@@ -1039,7 +1039,7 @@ pub(crate) async fn run_daemon_cask_rows_async(
     // The tradeoff this accepts: an attached run exercises the daemon ALREADY
     // RUNNING, which may not be the build under test. Stop the server first when
     // the evidence has to be attributed to a freshly built binary.
-    let mut engine = hipfire_daemon_adapter::DaemonEngine::attach_or_spawn(bin).await?;
+    let mut engine = hipfire_daemon_adapter::DaemonEngine::spawn(bin).await?;
     let loaded = engine
         .load(
             &config.model,
@@ -1439,7 +1439,7 @@ fn run_server_smoke_rows(
         ("max_tokens".to_string(), json!(config.max_tokens)),
     ]);
     insert_timing_metrics(&mut decode_metrics, &result.timings);
-    let session_row = server_reset_recall_row(config, ctx, server_url, started);
+    let session_row = server_repeat_recall_row(config, ctx, server_url, started);
     vec![
         row(
             BatteryId::Smoke,
@@ -1474,7 +1474,7 @@ fn run_server_smoke_rows(
     ]
 }
 
-fn server_reset_recall_row(
+fn server_repeat_recall_row(
     config: &EvalConfig,
     ctx: &EvalContext,
     server_url: &str,
@@ -1513,9 +1513,6 @@ fn server_reset_recall_row(
                 ("executor".to_string(), json!("server")),
                 ("implemented".to_string(), json!(true)),
                 ("server_url".to_string(), json!(server_url)),
-                ("reset_count".to_string(), json!(2)),
-                ("kv_reset".to_string(), json!(true)),
-                ("dn_state_reset".to_string(), json!(true)),
                 ("max_tokens".to_string(), json!(config.max_tokens)),
             ]),
             config,
@@ -1524,11 +1521,10 @@ fn server_reset_recall_row(
             elapsed_since_ms(started),
         )
     };
-    if let Err(err) = server_reset(server_url) {
-        return fail(format!(
-            "server reset failed before first session turn: {err}"
-        ));
-    }
+    // Each request is its own session on a server, so there is nothing to reset
+    // between turns -- and resetting a shared server's worker wiped every other
+    // client's sessions. What this checks is that the same greedy request gives
+    // the same answer with another one in between.
     let first = match server_chat_completion(
         server_url,
         &config.model,
@@ -1551,11 +1547,6 @@ fn server_reset_recall_row(
         Ok(result) => result,
         Err(err) => return fail(format!("distractor session turn failed: {err}")),
     };
-    if let Err(err) = server_reset(server_url) {
-        return fail(format!(
-            "server reset failed before repeated session turn: {err}"
-        ));
-    }
     let second = match server_chat_completion(
         server_url,
         &config.model,
@@ -1579,7 +1570,8 @@ fn server_reset_recall_row(
     };
     let reason = if !session_finite {
         Some(
-            "server session reset smoke returned empty or replacement-character output".to_string(),
+            "server repeated-request smoke returned empty or replacement-character output"
+                .to_string(),
         )
     } else if !session_match {
         Some("server repeated greedy session request produced different output".to_string())
@@ -1597,9 +1589,6 @@ fn server_reset_recall_row(
             ("executor".to_string(), json!("server")),
             ("implemented".to_string(), json!(true)),
             ("server_url".to_string(), json!(server_url)),
-            ("reset_count".to_string(), json!(2)),
-            ("kv_reset".to_string(), json!(true)),
-            ("dn_state_reset".to_string(), json!(true)),
             ("session_turns".to_string(), json!(3)),
             (
                 "first_tokens".to_string(),
