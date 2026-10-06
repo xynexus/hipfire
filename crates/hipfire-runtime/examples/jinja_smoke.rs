@@ -269,6 +269,7 @@ fn main() {
         user: "",
         enable_thinking,
         bos_token: None,
+        reasoning_effort: None,
     };
 
     let t_render = Instant::now();

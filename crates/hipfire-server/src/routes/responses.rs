@@ -605,8 +605,11 @@ async fn stream_responses(
 
         let gen_req = {
             let cfg = state.config.lock().await;
+            // Per-model overrides (thinking, reasoning_effort) apply here as on the
+            // chat route; the global config alone ignored them on this path.
+            let resolved = cfg.resolve_for_model(&model_arg);
             let controls = request_generation_controls(
-                &cfg,
+                &resolved,
                 body.chat_template_kwargs.as_ref(),
                 body.reasoning_effort.as_deref(),
                 body.reasoning.as_ref(),

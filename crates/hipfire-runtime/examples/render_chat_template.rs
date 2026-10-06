@@ -59,6 +59,7 @@ fn main() {
         template: &template,
         system: None,
         user: &prompt,
+        reasoning_effort: None,
         enable_thinking: true,
         bos_token: None,
     };

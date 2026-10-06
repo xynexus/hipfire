@@ -1052,7 +1052,13 @@ pub(crate) fn request_generation_controls(
     let nested_effort = reasoning
         .and_then(|v| v.get("effort"))
         .and_then(Value::as_str);
-    let effort = reasoning_effort.or(nested_effort);
+    // The model's configured default applies only to a request that named no effort
+    // and left thinking on: an explicit effort, or thinking turned off, wins.
+    let effort = reasoning_effort.or(nested_effort).or_else(|| {
+        (cfg.thinking != "off" && enable_thinking != Some(false))
+            .then_some(cfg.reasoning_effort.as_deref())
+            .flatten()
+    });
     let effort_budget = effort.and_then(reasoning_effort_budget);
 
     let mut max_think_tokens = None;
@@ -4133,6 +4139,29 @@ mod tests {
         assert_eq!(controls.reasoning_effort.as_deref(), Some("xhigh"));
         assert_eq!(controls.thinking_mode.as_deref(), Some("max"));
         assert_eq!(controls.max_think_tokens, None);
+    }
+
+    // A model's configured effort budgets a request that named none; an explicit
+    // effort or thinking turned off still wins.
+    #[test]
+    fn configured_effort_is_the_default_not_an_override() {
+        let mut cfg = HipfireConfig::default();
+        cfg.thinking = "on".to_string();
+        cfg.reasoning_effort = Some("medium".to_string());
+        let c = |cfg: &HipfireConfig, kwargs: Option<Value>, effort: Option<&str>| {
+            request_generation_controls(cfg, kwargs.as_ref(), effort, None, None, None)
+        };
+        assert_eq!(c(&cfg, None, None).max_think_tokens, Some(1024));
+        assert_eq!(
+            c(&cfg, None, None).reasoning_effort.as_deref(),
+            Some("medium")
+        );
+        assert_eq!(c(&cfg, None, Some("low")).max_think_tokens, Some(256));
+        assert_eq!(c(&cfg, None, Some("none")).max_think_tokens, Some(1));
+        let off = Some(json!({"enable_thinking": false}));
+        assert_eq!(c(&cfg, off, None).max_think_tokens, Some(1));
+        cfg.thinking = "off".to_string();
+        assert_eq!(c(&cfg, None, None).max_think_tokens, Some(1));
     }
 
     #[test]

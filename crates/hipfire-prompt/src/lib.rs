@@ -670,6 +670,31 @@ pub struct JinjaChatFrame<'a> {
     /// single special token id=2 (the actual BOS the model trained on).
     /// When None, falls back to decoding bos_id (works for Qwen3.5/3.6).
     pub bos_token: Option<&'a str>,
+    /// The template's `reasoning_effort` kwarg; see [`template_reasoning_effort`].
+    /// `None` leaves the key out of the render context entirely: Qwen3.8's template
+    /// raises on a null, and falls back to its own default when it is absent.
+    pub reasoning_effort: Option<&'static str>,
+}
+
+/// The `reasoning_effort` a template is told, from the think budget the request
+/// runs under, so the instruction matches what the budget allows. Qwen3.8's
+/// template defaulted to `xhigh` -- "think as long as you need" -- whenever thinking
+/// was on, because nothing put the key in the render context, while hipfire cut
+/// the thinking at the request's budget.
+///
+/// Only the effort-sized budgets are named (`low` 256, `medium` 1024, `high` 4096),
+/// and only with values that template accepts -- it raises on anything else:
+/// `low` up to 256 tokens, `medium` up to 4096. Telling a model less than its budget
+/// is benign; more gets its thinking cut off, so a `high` budget is told `medium`.
+/// Thinking off (1), unbounded (0) and anything larger (a global `max_think_tokens`
+/// such as 32768) leave the key out, so the template keeps its own default.
+pub fn template_reasoning_effort(max_think_tokens: usize) -> Option<&'static str> {
+    match max_think_tokens {
+        0 | 1 => None,
+        n if n <= 256 => Some("low"),
+        n if n <= 4096 => Some("medium"),
+        _ => None,
+    }
 }
 
 /// Multi-turn message representation for `JinjaChatFrame::render_messages`.
@@ -792,6 +817,7 @@ impl ChatTemplateProfile {
             template,
             system: None,
             user: "",
+            reasoning_effort: None,
             enable_thinking: true,
             bos_token: None,
         };
@@ -1257,8 +1283,38 @@ impl<'a> JinjaChatFrame<'a> {
             documents => Value::from_serialize(&empty_list),
             tool_call_kwargs => kwargs_val,
         };
+        let ctx = match self.reasoning_effort {
+            Some(effort) => minijinja::context! { reasoning_effort => effort, ..ctx },
+            None => ctx,
+        };
         tmpl.render(ctx)
             .map_err(|e| format!("template render: {e}"))
+    }
+}
+
+#[cfg(test)]
+mod reasoning_effort_tests {
+    use super::template_reasoning_effort;
+
+    // Bounded budgets are named with values Qwen3.8's template accepts; off and
+    // unbounded leave the key out for the template's own default.
+    #[test]
+    fn the_template_is_told_the_budget_it_runs_under() {
+        assert_eq!(template_reasoning_effort(1), None, "thinking off");
+        assert_eq!(template_reasoning_effort(0), None, "unbounded");
+        assert_eq!(template_reasoning_effort(64), Some("low"));
+        assert_eq!(template_reasoning_effort(256), Some("low"));
+        assert_eq!(template_reasoning_effort(1024), Some("medium"));
+        assert_eq!(
+            template_reasoning_effort(4096),
+            Some("medium"),
+            "never more than the budget"
+        );
+        assert_eq!(
+            template_reasoning_effort(32768),
+            None,
+            "a global cap is not an effort"
+        );
     }
 }
 
@@ -1586,6 +1642,7 @@ mod tests {
             template,
             system: None,
             user: "hi",
+            reasoning_effort: None,
             enable_thinking: false,
             bos_token: Some("<|im_start|>"),
         };
@@ -1625,6 +1682,7 @@ mod tests {
             template,
             system: None,
             user: "hi",
+            reasoning_effort: None,
             enable_thinking: false,
             bos_token: Some(""),
         };
@@ -1682,6 +1740,7 @@ mod tests {
             template,
             system: None,
             user: "hi",
+            reasoning_effort: None,
             enable_thinking: false,
             bos_token: Some(""),
         };
@@ -2187,6 +2246,7 @@ mod tests {
             template,
             system: None,
             user: "",
+            reasoning_effort: None,
             enable_thinking: true,
             bos_token: Some(""),
         };
@@ -2284,6 +2344,7 @@ mod tests {
             template,
             system: None,
             user: "",
+            reasoning_effort: None,
             enable_thinking: true,
             bos_token: Some(""),
         };
@@ -2345,6 +2406,7 @@ mod tests {
             template,
             system: None,
             user: "",
+            reasoning_effort: None,
             enable_thinking: true,
             bos_token: Some(""),
         };
@@ -2538,6 +2600,7 @@ mod tests {
                 template,
                 system: None,
                 user: "",
+                reasoning_effort: None,
                 enable_thinking: case
                     .get("enable_thinking")
                     .and_then(serde_json::Value::as_bool)

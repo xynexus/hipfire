@@ -972,6 +972,19 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         "Reasoning/thinking display policy for compatible models."
     ),
     field!(
+        "reasoning_effort",
+        ConfigType::Enum {
+            values: &["none", "minimal", "low", "medium", "high", "xhigh"]
+        },
+        Requirement::Optional,
+        None,
+        GLOBAL_MODEL_REQUEST,
+        ConfigMutability::RequestOnly,
+        "Effort (and so the thinking budget) a request runs at when it names none and \
+         leaves thinking on. Unset: unbudgeted, and a template that reads \
+         `reasoning_effort` uses its own default -- Qwen3.8-27B's is `xhigh`. Set per model."
+    ),
+    field!(
         "gpu_slab_load",
         ConfigType::Enum {
             values: &["auto", "off", "on"]
