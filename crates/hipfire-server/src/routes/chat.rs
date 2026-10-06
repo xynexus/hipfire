@@ -1008,6 +1008,25 @@ pub(crate) fn effective_request_max_tokens(default_max_tokens: u32, requested: O
 /// A request whose budget exceeds the context now truncates instead of resizing
 /// the server. `request_max_tokens` and `has_image` are kept in the signature
 /// because callers pass them and because the shortfall is worth reporting.
+/// A request's output budget and the context to load its model with -- both from the
+/// model's RESOLVED config. Every route goes through here: the streaming Responses
+/// route read the global `max_seq` (262144 on this host) while the swarm's models load
+/// at their 32768 override, so its first request reloaded a resident model at full
+/// context -- the size that once took the host down.
+pub(crate) fn request_budget(
+    cfg: &HipfireConfig,
+    model_arg: &str,
+    requested_max_tokens: Option<u32>,
+    has_image: bool,
+) -> (u32, u32) {
+    let resolved = cfg.resolve_for_model(model_arg);
+    let max_tokens = effective_request_max_tokens(resolved.max_tokens, requested_max_tokens);
+    (
+        max_tokens,
+        required_load_max_seq(resolved.max_seq, max_tokens, has_image),
+    )
+}
+
 pub(crate) fn required_load_max_seq(
     default_max_seq: u32,
     request_max_tokens: u32,
@@ -2137,12 +2156,7 @@ where
     };
     let (request_max_tokens, required_max_seq) = {
         let cfg = state.config.lock().await;
-        let resolved = cfg.resolve_for_model(&model_arg);
-        let request_max_tokens = effective_request_max_tokens(resolved.max_tokens, body.max_tokens);
-        (
-            request_max_tokens,
-            required_load_max_seq(resolved.max_seq, request_max_tokens, image_base64.is_some()),
-        )
+        request_budget(&cfg, &model_arg, body.max_tokens, image_base64.is_some())
     };
 
     let loaded = match ensure_model_loaded(&state, &model_arg, required_max_seq).await {
@@ -2685,13 +2699,7 @@ async fn stream_chat(
         };
         let (request_max_tokens, required_max_seq) = {
             let cfg = state.config.lock().await;
-            let resolved = cfg.resolve_for_model(&model_arg);
-            let request_max_tokens =
-                effective_request_max_tokens(resolved.max_tokens, body.max_tokens);
-            (
-                request_max_tokens,
-                required_load_max_seq(resolved.max_seq, request_max_tokens, image_base64.is_some()),
-            )
+            request_budget(&cfg, &model_arg, body.max_tokens, image_base64.is_some())
         };
 
         let loaded = match ensure_model_loaded(&state, &model_arg, required_max_seq).await {
@@ -4019,8 +4027,10 @@ mod tests {
 
     #[test]
     fn request_sizing_uses_per_model_generation_defaults() {
+        // A global max_seq far above the model's own: the budget must still be the
+        // model's, or a request reloads it at the global size.
         let mut cfg = HipfireConfig {
-            max_seq: 4096,
+            max_seq: 262144,
             max_tokens: 512,
             ..Default::default()
         };
@@ -4031,12 +4041,11 @@ mod tests {
                 "max_tokens": 8192
             }),
         );
-        let resolved = cfg.resolve_for_model("big");
-        let request_max_tokens = effective_request_max_tokens(resolved.max_tokens, None);
-        let required_max_seq = required_load_max_seq(resolved.max_seq, request_max_tokens, false);
-
+        let (request_max_tokens, required_max_seq) = request_budget(&cfg, "big", None, false);
         assert_eq!(request_max_tokens, 8192);
         assert_eq!(required_max_seq, 16384);
+        // A requested budget is honoured but never grows the context past the model's.
+        assert_eq!(request_budget(&cfg, "big", Some(100_000), false).1, 16384);
     }
 
     #[tokio::test]

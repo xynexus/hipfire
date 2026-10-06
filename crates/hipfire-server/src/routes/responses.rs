@@ -14,10 +14,10 @@ use tokio::sync::mpsc;
 use uuid::Uuid;
 
 use crate::routes::chat::{
-    effective_request_max_tokens, ensure_model_loaded, execute_blocking_chat_owned,
-    extract_request_image_base64, generate_request_from_chat, normalize_stop_sequences,
-    request_generation_controls, required_load_max_seq, scheduler_owner_from_principal,
-    wait_for_prefill_scheduler_turn, AssistantDelta, ChatMessage, ChatRequest, ThinkStreamFilter,
+    ensure_model_loaded, execute_blocking_chat_owned, extract_request_image_base64,
+    generate_request_from_chat, normalize_stop_sequences, request_budget,
+    request_generation_controls, scheduler_owner_from_principal, wait_for_prefill_scheduler_turn,
+    AssistantDelta, ChatMessage, ChatRequest, ThinkStreamFilter,
 };
 use crate::state::{SharedState, StoredResponsesContext};
 use hipfire_auth::{RequestPrincipal, ResponseContextRecord};
@@ -604,11 +604,7 @@ async fn stream_responses(
         let (request_max_tokens, required_max_seq) = {
             let cfg = state.config.lock().await;
             let requested = body.max_output_tokens.or(body.max_tokens);
-            let request_max_tokens = effective_request_max_tokens(cfg.max_tokens, requested);
-            (
-                request_max_tokens,
-                required_load_max_seq(cfg.max_seq, request_max_tokens, image_base64.is_some()),
-            )
+            request_budget(&cfg, &model_arg, requested, image_base64.is_some())
         };
 
         let loaded = match ensure_model_loaded(&state, &model_arg, required_max_seq).await {
