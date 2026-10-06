@@ -2361,8 +2361,10 @@ where
             system_prompt: body.system.clone(),
             state_kinds: vec!["attention_kv".to_string(), "deltanet_recurrent".to_string()],
             assistant_prefix,
-            max_think_tokens,
-            max_tokens: request_max_tokens as usize,
+            policy: crate::batch_runner::GenerationPolicy {
+                max_tokens: request_max_tokens as usize,
+                max_think_tokens,
+            },
             tools: body.tools.clone(),
             solo: body.deterministic.unwrap_or(false),
         };

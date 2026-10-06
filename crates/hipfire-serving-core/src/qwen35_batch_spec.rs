@@ -333,6 +333,11 @@ fn step(
             let token = fresh_tokens
                 .next()
                 .ok_or("qwen35 decode argmax: missing a session's token")?;
+            let token = tokenizer.close_think_at_budget(
+                state.cursor.conversation_tokens.iter().copied(),
+                session.max_think_tokens,
+                token,
+            );
             let term_stop = is_terminator(config, tokenizer, im_end_token, token)
                 && !tokenizer.tool_call_open(state.cursor.conversation_tokens.iter().copied());
             SessionPlan {
@@ -361,6 +366,21 @@ fn step(
                 !plan.emitted.is_empty(),
                 remaining,
             );
+            // No drafting across the think budget: drafts and the step's bonus
+            // token stay within it, so the token that closes the block is a
+            // fresh one, where `close_think_at_budget` runs.
+            let cap = match tokenizer.think_room(
+                state
+                    .cursor
+                    .conversation_tokens
+                    .iter()
+                    .chain(&plan.feed)
+                    .copied(),
+                session.max_think_tokens,
+            ) {
+                Some(room) => cap.min(room.saturating_sub(1)),
+                None => cap,
+            };
             // History = everything committed before this step's feed. A pending
             // run was observed when it was emitted.
             let spec = m
