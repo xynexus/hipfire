@@ -158,7 +158,12 @@ pub(crate) fn default_socket_path() -> PathBuf {
 /// connections: each reader already carries its own `ReplySink` and connection
 /// id, so replies route back without the executor knowing which door they came
 /// through.
-pub(crate) fn spawn_readers(listen: Option<&Path>) -> std::io::Result<Receiver<Inbound>> {
+/// Also returns the stdio owner's connection id when the daemon is SHARED -- a
+/// socket served beside a stdio owner (`hipfire serve`'s worker): the executor
+/// treats the owner's frames and the socket clients' differently.
+pub(crate) fn spawn_readers(
+    listen: Option<&Path>,
+) -> std::io::Result<(Receiver<Inbound>, Option<u64>)> {
     let (tx, rx) = sync_channel(INBOUND_CAPACITY);
     let shared = match listen {
         Some(path) => {
@@ -185,7 +190,7 @@ pub(crate) fn spawn_readers(listen: Option<&Path>) -> std::io::Result<Receiver<I
         .name("hipfire-daemon-stdin".to_string())
         .spawn(move || read_owned(std::io::stdin().lock(), &tx, &reply, conn, owned))
         .expect("spawn stdin reader thread");
-    Ok(rx)
+    Ok((rx, owned.then_some(conn)))
 }
 
 /// Read frames until EOF, then report the hangup when this reader is the one
