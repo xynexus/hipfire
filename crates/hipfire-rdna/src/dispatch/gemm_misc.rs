@@ -587,9 +587,18 @@ impl Gpu {
             k % 256 == 0,
             "gemm_oq_compact_moe_grouped_f32: needs K % 256 == 0, got K={k}"
         );
-        let kernel_name = "gemm_oq_compact_moe_grouped_f32";
+        // Two entry points, one per lane shape of the reference GEMV, so each
+        // gets its own register budget: K/256 groups divisible by 4 take the
+        // wide shape (routed gate_up), anything else the narrow one (routed
+        // down_proj, K=512).
+        let wide = (k / 256) % 4 == 0;
+        let kernel_name = if wide {
+            "gemm_oq_compact_moe_grouped_f32"
+        } else {
+            "gemm_oq_compact_moe_grouped_f32_narrow"
+        };
         self.ensure_kernel(
-            kernel_name,
+            "gemm_oq_compact_moe_grouped_f32",
             kernels::GEMM_OQ_COMPACT_MOE_GROUPED_F32_SRC,
             kernel_name,
         )?;
