@@ -80,6 +80,12 @@ pub struct SequenceState {
     /// Recurrent state for the short-conv / DeltaNet / Mamba-2 layers. `None`
     /// for a pure-attention model (`profile.has_recurrent_state() == false`).
     pub recurrent: Option<Box<dyn RecurrentMixerState>>,
+    /// KV positions below this share pages with another sequence: a paged fork
+    /// maps its source's written prefix instead of copying it
+    /// (`KvCache::fork_paged`), and both sides hold the floor. Neither may write
+    /// there again, or the other -- often a prefix checkpoint every request
+    /// attaches to -- reads the overwrite. 0 means every page is private.
+    pub shared_floor: usize,
 }
 
 impl SequenceState {
@@ -105,7 +111,24 @@ impl SequenceState {
             profile,
             kv,
             recurrent,
+            shared_floor: 0,
         }
+    }
+
+    /// Make KV positions from `pos` on writable before writing there again (a
+    /// rewind, a re-prefill from the start). Below the shared floor the pages are
+    /// another sequence's too, so the cache is first re-homed into private pages
+    /// of the same shape; the old mapping, and only its own pages, are freed.
+    pub fn rewind_kv_to(&mut self, gpu: &mut Gpu, pos: usize) -> HipResult<()> {
+        if pos >= self.shared_floor {
+            return Ok(());
+        }
+        if let Some(kv) = self.kv.as_mut() {
+            let private = kv.fork_paged(gpu, 0, kv.physical_cap)?;
+            std::mem::replace(kv, private).free_gpu(gpu);
+        }
+        self.shared_floor = 0;
+        Ok(())
     }
 
     /// Does this sequence keep a KV cache? (Attention or hybrid model.)

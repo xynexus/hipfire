@@ -73,6 +73,17 @@ pub struct LoadedModelState {
     pub batch_prefill_capable: Option<bool>,
     /// A DFlash drafter is loaded, so this model can speculate on the legacy path.
     pub has_draft_model: bool,
+    /// When a request last used it ([`next_use_stamp`]): residency planning
+    /// unloads the stalest model first.
+    pub last_used: u64,
+}
+
+/// A recency stamp, increasing across the process: what residency planning
+/// orders models by. It used to order them by `max_seq`, so a long-context
+/// model was never the victim and two chat models evicted each other.
+pub fn next_use_stamp() -> u64 {
+    static STAMP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    STAMP.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
 }
 
 pub struct AppState {
@@ -449,6 +460,7 @@ mod lock_engine_tests {
                 arch: None,
                 batch_prefill_capable: None,
                 has_draft_model: false,
+                last_used: 0,
             },
         );
         let waited =

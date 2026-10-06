@@ -26,6 +26,7 @@ CASES=(
     "hipfire-rdna parity_kvarn_routed"                                # routed batched KVarN attention, head_dim 256, GQA
     "hipfire-rdna parity_gemm_q8_0_x64"                               # Q8_0 batched at prefill widths (MoE router/shared gate): WMMA rows + scalar tail
     "hipfire-runtime parity_gemv_oq_compact_moe"                      # compact-resident indexed MoE GEMVs (coder decode)
+    "hipfire-runtime parity_kvarn_grow paged"                         # paged KV grow and fork: shared prefix pages, rewind re-homes before a write below the floor
     "hipfire-runtime parity_gemm_oq_compact_moe_grouped 1024 2048 16 64"  # 35B-A3B gate/up, grouped f32 at n >= 64 (prefill)
     "hipfire-runtime parity_gemm_oq_compact_moe_grouped 2048 512 16 128"  # 35B-A3B down
     "hipfire-runtime parity_gemm_oq_compact_moe_grouped 1024 2048 16 64 12"   # gate/up, a 2nd overlay entry per lane

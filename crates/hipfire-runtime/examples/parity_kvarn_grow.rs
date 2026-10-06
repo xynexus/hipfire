@@ -191,6 +191,32 @@ fn paged_main() {
         "a fork write past its seal reached the source"
     );
 
+    // A sequence holding the fork must not write below its floor: rewinding it
+    // re-homes the KV into private pages, so a write from position 0 (a reset,
+    // a re-prefill) no longer reaches the source it shares pages with.
+    let mut seq = hipfire_runtime::sequence_state::SequenceState::new(
+        hipfire_mixer::MixerProfile::uniform(hipfire_mixer::MixerKind::FullAttn, 1),
+        Some(fork),
+        None,
+    );
+    seq.shared_floor = sealed;
+    seq.rewind_kv_to(&mut gpu, sealed).unwrap();
+    assert_eq!(
+        seq.shared_floor, sealed,
+        "a rewind above the floor re-homed"
+    );
+    seq.rewind_kv_to(&mut gpu, 0).unwrap();
+    assert_eq!(seq.shared_floor, 0);
+    let fork = seq.kv.take().unwrap();
+    gpu.hip
+        .memcpy_htod_offset(&fork.v_gpu[0].buf, 1, &[0xCD])
+        .unwrap();
+    let src_byte = gpu.download_raw(&src.v_gpu[0], 2).unwrap()[1];
+    assert_eq!(
+        src_byte, v0[1],
+        "a write below the floor after rewind reached the source"
+    );
+
     fork.free_gpu(&mut gpu);
     // Source still intact after the fork's pages are unmapped.
     let v_again = gpu.download_raw(&src.v_gpu[0], v_sealed).unwrap();

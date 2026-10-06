@@ -302,6 +302,15 @@ impl Qwen35RequestSessionState {
         })
     }
 
+    /// A paged fork was just taken from this session: the pages behind what it
+    /// has written are the fork's too, so it must not write below them again.
+    pub fn mark_shared_through(&mut self) {
+        if self.kv_cache().pages.is_some() {
+            let floor = self.cursor.seq_pos;
+            self.sequence_state.shared_floor = self.sequence_state.shared_floor.max(floor);
+        }
+    }
+
     /// Deep-copy an existing saved session into a new independent one (KV +
     /// DeltaNet + logits cloned), for branching a conversation without
     /// disturbing the source.
@@ -334,14 +343,20 @@ impl Qwen35RequestSessionState {
             Self::clone_kv_cache(gpu, src_kv)?
         };
         let dn = Self::clone_dn_state(gpu, source.dn_state())?;
+        let mut sequence_state = SequenceState::new(
+            source.sequence_state.profile.clone(),
+            Some(kv),
+            Some(Box::new(dn)),
+        );
+        // A paged fork shares what the source had written. The caller marks the
+        // source too (`mark_shared_through`).
+        if src_kv.pages.is_some() {
+            sequence_state.shared_floor = source.cursor.seq_pos;
+        }
         Ok(Self {
             cursor: source.cursor.clone(),
             prefix_hash: source.prefix_hash.clone(),
-            sequence_state: SequenceState::new(
-                source.sequence_state.profile.clone(),
-                Some(kv),
-                Some(Box::new(dn)),
-            ),
+            sequence_state,
             logits: Self::clone_gpu_tensor(gpu, &source.logits, "logits")?,
             prefilled_generated_suffix_len: source.prefilled_generated_suffix_len,
             allocation_epoch: next_qwen35_state_allocation_epoch(),
@@ -2367,6 +2382,7 @@ fn qwen35_fork_session_state_impl(
     // the first thing evicted, and each request then re-prefilled it in full.
     if let Some(source) = m.q35_registry.sessions.get_mut(request.source_session_id) {
         source.allocation_epoch = next_qwen35_state_allocation_epoch();
+        source.mark_shared_through();
     }
     // A checkpoint maps only its prefix; the request attaching to it needs room to
     // decode: its own capacity (the batch prefill sets it), else the full one.
@@ -2499,6 +2515,13 @@ pub fn qwen35_reset_active_session(
         return Err(
             "failed to reset qwen35 session: qwen35 session missing decode state".to_string(),
         );
+    }
+    // A fork's pages below its floor are shared: re-home them before writing
+    // from position 0 again, or the next prefill overwrites a checkpoint.
+    if let Some(state) = m.active.sequence_state.as_mut() {
+        state
+            .rewind_kv_to(gpu, 0)
+            .map_err(|e| format!("failed to reset qwen35 session: re-home shared KV: {e}"))?;
     }
     // Disjoint fields of `m.active`: the cursor and the sequence state.
     m.active.cursor.seq_pos = 0;
