@@ -310,6 +310,9 @@ fi
 #            HIPFIRE_SKIP_TINY_AFFECTED=1 disables the tripwire (battery runs).
 # DFlash/spec-decode uses the same tiny-model front tier; its heavyweight
 # diagnostic is manual-only.
+# The code the deployed models run that the tiny fixtures do not reach: the
+# serving routes above, the qwen35 forward/prefill, and serving-core.
+SERVED_PATH="$SERVING_ROUTE"'|^crates/hipfire-arch-qwen35/src/|^crates/hipfire-serving-core/src/|^kernels/src/.*(oq_compact|overlay).*\.hip$'
 RUN_COHERENCE=1
 if [ "$GPU_GATES" = 0 ]; then
     RUN_COHERENCE=0
@@ -322,8 +325,18 @@ else
     tg=0
     ./tests/tiny-affected-gate.sh --require-coverage || tg=$?
     case "$tg" in
-        0) echo "tiny affected: selected coverage passed → SKIPPING heavy coherence battery."
-           RUN_COHERENCE=0 ;;
+        0) if echo "$CODE_CHANGED" | grep -qE "$SERVED_PATH"; then
+               # The tiny fixtures quantize to a non-compact layout and never
+               # reach the compact-overlay kernels or the batched serving
+               # prefill the deployed models take: a tiny pass says nothing
+               # about those. Measured: dropping the oq4.25++ overlay correction
+               # left every tiny cell's KLD unchanged (0.1691) while the battery
+               # caught it. Changes on the served path run the battery anyway.
+               echo "tiny affected: passed, but the change touches the served path → running the battery."
+           else
+               echo "tiny affected: selected coverage passed → SKIPPING heavy coherence battery."
+               RUN_COHERENCE=0
+           fi ;;
         1) echo "tiny affected: FAIL → escalating to the full coherence battery." ;;
         3) echo "tiny affected: inconclusive/no coverage → running full battery." ;;
         *) echo "tiny affected: could not run → running full battery." ;;
