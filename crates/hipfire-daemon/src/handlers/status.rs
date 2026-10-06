@@ -115,7 +115,9 @@ pub(crate) fn inventory(daemon_state: &mut DaemonState) {
 }
 
 pub(crate) fn ping(daemon_state: &mut DaemonState) {
-    daemon_state.out.emit(serde_json::json!({ "type": "pong" }));
+    daemon_state
+        .out
+        .emit(serde_json::json!({ "type": "pong", "version": hipfire_build_info::VERSION }));
 }
 
 /// A control frame (`abort` / `force_answer`) that named no request.

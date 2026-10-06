@@ -899,6 +899,21 @@ fn write_private(path: &Path, contents: &str) -> std::io::Result<()> {
     Ok(())
 }
 
+impl LoadedConfig {
+    /// Why a config file present on disk could not be used, if one could not: it did
+    /// not parse, or could not be read. Such a file is otherwise read as empty, and
+    /// whoever serves from it runs on defaults -- every model at the global
+    /// `max_seq`, none of its overrides -- having said so only in a log line.
+    pub fn unreadable(&self) -> Option<String> {
+        [
+            (&self.config_path, &self.read_error),
+            (&self.host_config_path, &self.host_read_error),
+        ]
+        .into_iter()
+        .find_map(|(path, err)| err.as_ref().map(|e| format!("{}: {e}", path.display())))
+    }
+}
+
 pub fn load_config_bundle() -> LoadedConfig {
     let (path, document, read_error) = read_config_document(config_path());
     let (host_path, host_document, host_read_error) = read_config_document(host_config_path());
@@ -1448,6 +1463,34 @@ pub(crate) static TEST_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_unparseable_config_is_reported_not_read_as_empty() {
+        let dir = std::env::temp_dir().join(format!("hipfire-badcfg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("config.json");
+        std::fs::write(&path, "{ \"max_seq\": 32768, }").unwrap();
+        let (p, doc, err) = read_config_document(path.clone());
+        let loaded = loaded_config_from_document(p, doc, err, Vec::new());
+        let why = loaded.unreadable().expect("a trailing comma is not JSON");
+        assert!(
+            why.contains("config.json") && why.contains("parse error"),
+            "{why}"
+        );
+        std::fs::write(&path, "{ \"max_seq\": 32768 }").unwrap();
+        let (p, doc, err) = read_config_document(path.clone());
+        assert!(loaded_config_from_document(p, doc, err, Vec::new())
+            .unreadable()
+            .is_none());
+        let (p, doc, err) = read_config_document(dir.join("absent.json"));
+        assert!(
+            loaded_config_from_document(p, doc, err, Vec::new())
+                .unreadable()
+                .is_none(),
+            "absent is fine"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
     use super::*;
 
     #[test]

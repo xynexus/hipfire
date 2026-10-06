@@ -233,7 +233,17 @@ impl StdioTransport {
         // An operator-provided value (`=0` to keep the allocator) wins.
         let no_fragments =
             std::env::var("HSA_DISABLE_FRAGMENT_ALLOCATOR").unwrap_or_else(|_| "1".to_string());
-        let mut child = Command::new(bin)
+        let mut cmd = Command::new(bin);
+        // Spawned as `/proc/self/exe` (the server's own image), argv[0] stays the
+        // program's path: the worker must still read as `<path>/hipfire daemon` to
+        // ps, the host's memory watchdog, and anything else that finds it by argv.
+        #[cfg(unix)]
+        if bin == Path::new("/proc/self/exe") {
+            if let Some(path) = program_path(bin) {
+                cmd.arg0(path);
+            }
+        }
+        let mut child = cmd
             .args(daemon_argv(bin))
             .args(extra)
             .env("RUST_BACKTRACE", backtrace)
@@ -1125,7 +1135,19 @@ impl DaemonEngine {
         self.send(&DaemonRequest::Ping).await?;
         loop {
             match self.recv().await? {
-                DaemonResponse::Pong => return Ok(()),
+                DaemonResponse::Pong { version } => {
+                    // A worker on other code than this server -- one built before a
+                    // rebuild of only part of the binaries -- runs stale code that
+                    // looks current. Say so.
+                    if let Some(v) = version.filter(|v| v != hipfire_build_info::VERSION) {
+                        tracing::warn!(
+                            "inference worker is build {v}, this server is {}: restart hipfire \
+                             so both run the same code",
+                            hipfire_build_info::VERSION
+                        );
+                    }
+                    return Ok(());
+                }
                 DaemonResponse::Unknown => {}
                 other => {
                     tracing::warn!("unexpected response during ping: {other:?}");
@@ -1697,10 +1719,29 @@ fn tagged_extended_event(
 /// Dispatching on the file name is the usual multi-call convention, and it is
 /// what makes `HIPFIRE_DAEMON_BIN=/path/to/hipfire` work as an override too.
 fn daemon_argv(bin: &Path) -> &'static [&'static str] {
-    match bin.file_stem().and_then(|s| s.to_str()) {
+    match bin_stem(bin).as_deref() {
         Some("hipfire") => &["daemon"],
         _ => &[],
     }
+}
+
+/// The program `bin` runs: `/proc/self/exe` read through to the running image, less
+/// the ` (deleted)` the kernel appends once that image was replaced on disk (a rebuild).
+fn program_path(bin: &Path) -> Option<PathBuf> {
+    let path = if bin == Path::new("/proc/self/exe") {
+        std::fs::read_link(bin).ok()?
+    } else {
+        bin.to_path_buf()
+    };
+    let text = path.to_str()?;
+    Some(PathBuf::from(
+        text.strip_suffix(" (deleted)").unwrap_or(text),
+    ))
+}
+
+/// The program name `bin` runs, for dispatch (see [`program_path`]).
+fn bin_stem(bin: &Path) -> Option<String> {
+    Some(program_path(bin)?.file_stem()?.to_str()?.to_string())
 }
 
 /// Locate a binary that can serve as the daemon. Priority:
@@ -1739,7 +1780,13 @@ fn find_daemon_bin_candidates() -> Vec<PathBuf> {
     // a running `hipfire` never spawns some older build of itself that happens
     // to sit in ~/.hipfire/bin or a stale target/.
     if let Ok(exe) = std::env::current_exe() {
-        if exe.file_stem().and_then(|s| s.to_str()) == Some("hipfire") {
+        if bin_stem(&exe).as_deref() == Some("hipfire") {
+            // The running image itself, even after a rebuild replaced the file:
+            // `current_exe` then reads `<path> (deleted)`, which used to fail the
+            // name check and respawn the NEW build beside it -- a worker on other
+            // code than the server talking to it.
+            #[cfg(target_os = "linux")]
+            candidates.push(PathBuf::from("/proc/self/exe"));
             candidates.push(exe.clone());
         }
         // Shipped beside us: this is how hipfire-eval and friends reach the
@@ -2308,6 +2355,15 @@ mod tests {
         // (Spelled without a drive prefix: `\` is not a separator on unix, so
         // a literal windows path would not parse here even though it does there.)
         assert_eq!(daemon_argv(Path::new("hipfire.exe")), &["daemon"]);
+        // The running image after a rebuild replaced it on disk is still hipfire.
+        assert_eq!(
+            daemon_argv(Path::new("/opt/hipfire (deleted)")),
+            &["daemon"]
+        );
+        assert_eq!(
+            bin_stem(Path::new("/x/hipfire-daemon (deleted)")).as_deref(),
+            Some("hipfire-daemon")
+        );
     }
 
     #[test]

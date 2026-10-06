@@ -9,6 +9,7 @@ description = "Async daemon JSONL process adapter for hipfire"
 anyhow.workspace = true
 dirs = "5"
 futures = "0.3"
+hipfire-build-info = { path = "../hipfire-build-info" }
 hipfire-daemon-protocol = { path = "../hipfire-daemon-protocol" }
 hipfire-env = { path = "../hipfire-env" }
 hipfire-generate = { path = "../hipfire-generate" }

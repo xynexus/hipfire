@@ -469,7 +469,12 @@ pub enum DaemonResponse {
     Loaded(ModelLoadedResponse),
     Unloaded,
     Reset,
-    Pong,
+    /// `version`: the worker's build (`hipfire_build_info::VERSION`); absent from an
+    /// older worker.
+    Pong {
+        #[serde(default)]
+        version: Option<String>,
+    },
     Inventory(AcceleratorInventory),
     ModelRegistry {
         registry: LlmModelRegistry,
@@ -581,6 +586,16 @@ pub enum DaemonResponse {
 
 #[cfg(test)]
 mod tests {
+    // A worker reports its build in `pong`; an older one sends a bare pong.
+    #[test]
+    fn pong_carries_the_worker_build_when_it_has_one() {
+        let new: DaemonResponse =
+            serde_json::from_str(r#"{"type":"pong","version":"v1-2-g3"}"#).unwrap();
+        assert!(matches!(new, DaemonResponse::Pong { version: Some(v) } if v == "v1-2-g3"));
+        let old: DaemonResponse = serde_json::from_str(r#"{"type":"pong","id":""}"#).unwrap();
+        assert!(matches!(old, DaemonResponse::Pong { version: None }));
+    }
+
     use super::*;
     use hipfire_generate::{GenerateTextRequest, GenerationSamplingPolicy};
     use hipfire_prompt::{Message, Role};
