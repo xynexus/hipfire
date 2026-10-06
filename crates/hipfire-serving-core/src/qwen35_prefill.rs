@@ -362,7 +362,7 @@ pub fn qwen35_materialize_batch_prefill_prompt(
                     assistant_prefix,
                     raw: effective_raw(m, session.raw),
                 }
-                .build_with_user_tokens(&raw_q_tokens))
+                .build_tokens_with_history(&raw_q_tokens, messages_history))
             }
         }
     } else {
@@ -377,7 +377,10 @@ pub fn qwen35_materialize_batch_prefill_prompt(
             assistant_prefix,
             raw: effective_raw(m, session.raw),
         }
-        .build_with_user_tokens(&raw_q_tokens))
+        .build_tokens_with_history(
+            &raw_q_tokens,
+            messages_history.filter(|_| seq_pos_for_prompt == 0),
+        ))
     }
 }
 

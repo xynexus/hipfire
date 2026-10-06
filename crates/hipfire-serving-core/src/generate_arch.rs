@@ -121,7 +121,7 @@ pub fn generate_registered_backend(
                     assistant_prefix,
                     raw: false,
                 }
-                .build();
+                .build_with_history(messages_history);
                 tokenizer.decode(&ids)
             }
         }
@@ -140,7 +140,7 @@ pub fn generate_registered_backend(
             assistant_prefix,
             raw: false,
         }
-        .build();
+        .build_with_history(messages_history);
         tokenizer.decode(&ids)
     };
 
@@ -1383,7 +1383,7 @@ pub fn generate_nemotron(
                         assistant_prefix,
                         raw,
                     }
-                    .build()
+                    .build_with_history(messages_history)
                 }
             }
         } else {
@@ -1394,7 +1394,7 @@ pub fn generate_nemotron(
                 assistant_prefix,
                 raw,
             }
-            .build()
+            .build_with_history(messages_history)
         }
     };
     if prompt_tokens.is_empty() {
@@ -1563,7 +1563,7 @@ pub fn generate_zaya(
                         assistant_prefix,
                         raw,
                     }
-                    .build()
+                    .build_with_history(messages_history)
                 }
             }
         } else {
@@ -1574,7 +1574,7 @@ pub fn generate_zaya(
                 assistant_prefix,
                 raw,
             }
-            .build()
+            .build_with_history(messages_history)
         }
     };
     if prompt_tokens.is_empty() {
@@ -1818,7 +1818,7 @@ pub fn generate_llama(
                         assistant_prefix,
                         raw,
                     }
-                    .build()
+                    .build_with_history(messages_history)
                 }
             }
         } else {
@@ -1829,7 +1829,7 @@ pub fn generate_llama(
                 assistant_prefix,
                 raw,
             }
-            .build()
+            .build_with_history(messages_history)
         }
     };
     if prompt_tokens.is_empty() {
@@ -2213,7 +2213,7 @@ pub fn generate_minimax(
                         assistant_prefix: prompt_frame::AssistantPrefix::Plain,
                         raw: effective_raw(m, raw_override),
                     }
-                    .build()
+                    .build_with_history(messages_history)
                 }
             }
         } else {
@@ -2224,7 +2224,7 @@ pub fn generate_minimax(
                 assistant_prefix: prompt_frame::AssistantPrefix::Plain,
                 raw: effective_raw(m, raw_override),
             }
-            .build()
+            .build_with_history(messages_history)
         }
     };
 
@@ -2506,7 +2506,7 @@ pub fn generate_lfm2moe(
                         assistant_prefix: prompt_frame::AssistantPrefix::Plain,
                         raw: effective_raw(m, raw_override),
                     }
-                    .build()
+                    .build_with_history(messages_history)
                 }
             }
         } else {
@@ -2517,7 +2517,7 @@ pub fn generate_lfm2moe(
                 assistant_prefix: prompt_frame::AssistantPrefix::Plain,
                 raw: effective_raw(m, raw_override),
             }
-            .build()
+            .build_with_history(messages_history)
         }
     };
 
@@ -2858,7 +2858,7 @@ fn generate_lfm2moe_dflash(
                         assistant_prefix: prompt_frame::AssistantPrefix::Plain,
                         raw: effective_raw(m, raw_override),
                     }
-                    .build()
+                    .build_with_history(messages_history)
                 }
             }
         } else {
@@ -2869,7 +2869,7 @@ fn generate_lfm2moe_dflash(
                 assistant_prefix: prompt_frame::AssistantPrefix::Plain,
                 raw: effective_raw(m, raw_override),
             }
-            .build()
+            .build_with_history(messages_history)
         }
     };
     if prompt_ids.is_empty() && !prefill_already_done {
