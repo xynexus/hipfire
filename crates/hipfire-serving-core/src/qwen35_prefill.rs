@@ -1943,6 +1943,193 @@ pub fn qwen35_prefill_suffix_batch_serial_reference(
     })
 }
 
+/// One session of a batch prefill, made resident (allocated, forked from its
+/// checkpoint, or found) and rendered into the tokens it still needs prefilled.
+fn qwen35_prepare_batch_prefill_session(
+    m: &mut LoadedModel,
+    gpu: &mut hipfire_rdna::Gpu,
+    arena_backend: SequenceStateArenaBackend,
+    session: &GenerateBatchPrefillSession,
+) -> Result<Qwen35PreparedPrefillSession, String> {
+    if !generate_state_kinds_include_required(
+        &session.state_handle.state_kinds,
+        SequenceStatePageKind::Kv,
+    ) {
+        return Err(format!(
+            "generate_batch_prefill session {} missing attention_kv state kind",
+            session.id
+        ));
+    }
+    if !generate_state_kinds_include_required(
+        &session.state_handle.state_kinds,
+        SequenceStatePageKind::DeltaNet,
+    ) {
+        return Err(format!(
+            "generate_batch_prefill session {} missing deltanet_recurrent state kind",
+            session.id
+        ));
+    }
+
+    // Size a session about to be created, or forked from a checkpoint, to what
+    // this request can reach — prompt + max_tokens — instead of the model's full
+    // context. Only a prompt starting at position zero renders independently of
+    // the active slot, so only that case renders here; the tokens are reused
+    // below. KVarN only, because only KVarN can grow a forked session later.
+    let mut pre_rendered: Option<Vec<u32>> = None;
+    if let (Some(max_tokens), Some(_)) = (session.max_tokens, session.prompt.as_ref()) {
+        let starts_at_zero = session.state_handle.runtime_state_handle.is_some()
+            || (session.state_handle.logical_position == 0
+                && session.state_handle.cached_prefix_tokens == 0);
+        let kvarn = m
+            .q35_kv_mode
+            .as_deref()
+            .is_some_and(|k| k.starts_with("kvarn"));
+        if starts_at_zero
+            && kvarn
+            && !sequence_state_arena_is_session_resident(arena_backend, m, &session.id)
+        {
+            let tokens = qwen35_materialize_batch_prefill_prompt(m, session)?;
+            let group = hipfire_runtime::kv::KvCache::KVARN_GROUP;
+            let cap = (tokens.len() + max_tokens).div_ceil(group) * group;
+            m.q35_registry.kv_caps.insert(session.id.clone(), cap);
+            pre_rendered = Some(tokens);
+        }
+    }
+
+    if let Some(runtime_state_handle) = session.state_handle.runtime_state_handle.as_deref() {
+        sequence_state_arena_fork_session_state(
+            arena_backend,
+            m,
+            gpu,
+            SequenceStateForkRequest {
+                source_session_id: runtime_state_handle,
+                dest_session_id: &session.id,
+                requested_prefix_hash: session.state_handle.prefix_hash.as_ref(),
+            },
+        )
+        .map_err(|e| {
+            format!(
+                "generate_batch_prefill session {} failed to attach checkpoint {}: {}",
+                session.id, runtime_state_handle, e
+            )
+        })?;
+    }
+
+    let resident = sequence_state_arena_is_session_resident(arena_backend, m, &session.id);
+    if !resident
+        && (session.state_handle.logical_position > 0
+            || session.state_handle.cached_prefix_tokens > 0)
+    {
+        return Err(format!(
+            "generate_batch_prefill session {} references cached state at logical_position={} cached_prefix_tokens={} but no resident session exists",
+            session.id,
+            session.state_handle.logical_position,
+            session.state_handle.cached_prefix_tokens
+        ));
+    }
+
+    let created = sequence_state_arena_activate_session(arena_backend, m, gpu, &session.id)?;
+    // Consumed by the allocation or fork above if one happened; a session that
+    // was already resident allocated nothing, so drop the unused entry.
+    m.q35_registry.kv_caps.remove(&session.id);
+    let mut boundary_checkpoints = Vec::new();
+    let tokens: Vec<u32> = if session.prompt.is_some() {
+        let full_tokens = match pre_rendered.take() {
+            Some(tokens) => tokens,
+            None => qwen35_materialize_batch_prefill_prompt(m, session)?,
+        };
+        if session.state_handle.runtime_state_handle.is_some() {
+            let prefix_len = session
+                .state_handle
+                .prefix_hash
+                .as_ref()
+                .map(|hash| hash.prefix_len)
+                .unwrap_or(session.state_handle.cached_prefix_tokens);
+            if prefix_len > full_tokens.len() {
+                return Err(format!(
+                    "generate_batch_prefill prompt session {} cached prefix length {} exceeds rendered token length {}",
+                    session.id,
+                    prefix_len,
+                    full_tokens.len()
+                ));
+            }
+            // Checkpoint the boundaries past the attached prefix too. Without
+            // this only a cold request ever minted, so a conversation that
+            // attached at step N had nothing to attach to at step N+1 and
+            // re-prefilled everything since its first turn. Stored relative to
+            // the tokens prefilled here (they start at `prefix_len`); the hash
+            // keeps the absolute length a later request will look up by.
+            //
+            // Only the LAST boundary: an attached session is continuing a
+            // conversation, and where it ends is the only place the next step
+            // attaches. Checkpointing every boundary had 16 concurrent attaches
+            // mint ~40 checkpoints, past the resident limit, evicting the shared
+            // prefix they had all just attached to.
+            //
+            // Plus any boundary the server asked for (`checkpoint_at`): the
+            // deepest one this session shares with a sibling in the batch,
+            // which the sibling waits to attach.
+            let past: Vec<_> = qwen35_semantic_boundary_checkpoints(m, session, &full_tokens)?
+                .into_iter()
+                .filter(|boundary| boundary.prefix_len > prefix_len)
+                .collect();
+            let last = past.iter().map(|b| b.prefix_len).max();
+            boundary_checkpoints = past
+                .into_iter()
+                .filter(|b| {
+                    Some(b.prefix_len) == last || session.checkpoint_at.contains(&b.prefix_len)
+                })
+                .map(|mut boundary| {
+                    boundary.prefix_len -= prefix_len;
+                    boundary
+                })
+                .collect();
+            full_tokens[prefix_len..].to_vec()
+        } else if session.state_handle.logical_position != 0
+            || session.state_handle.cached_prefix_tokens != 0
+        {
+            return Err(format!(
+                "generate_batch_prefill prompt session {} must start at logical_position=0 cached_prefix_tokens=0 in the first slice",
+                session.id
+            ));
+        } else {
+            let _ = created;
+            sequence_state_arena_reset_active_session(arena_backend, m, gpu)?;
+            boundary_checkpoints = cap_cold_boundaries(
+                qwen35_semantic_boundary_checkpoints(m, session, &full_tokens)?,
+                cold_mint_max(),
+            );
+            full_tokens
+        }
+    } else {
+        let current_position = sequence_state_arena_active_logical_position(arena_backend, m)?;
+        if created && session.state_handle.logical_position != 0 {
+            return Err(format!(
+                "generate_batch_prefill suffix session {} is new but logical_position={} (expected 0)",
+                session.id, session.state_handle.logical_position
+            ));
+        }
+        if !created && current_position != session.state_handle.logical_position {
+            return Err(format!(
+                "generate_batch_prefill session {} logical_position mismatch: request={} resident={}",
+                session.id, session.state_handle.logical_position, current_position
+            ));
+        }
+        session.suffix_tokens.clone().unwrap_or_default()
+    };
+
+    Ok(Qwen35PreparedPrefillSession {
+        id: session.id.clone(),
+        tokens,
+        cached_prefix_tokens: session.state_handle.cached_prefix_tokens,
+        replay_as_generated_suffix: session.suffix_tokens.is_some(),
+        state_kinds: session.state_handle.state_kinds.clone(),
+        assistant_prefix: session.assistant_prefix.clone(),
+        max_think_tokens: session.max_think_tokens,
+        boundary_checkpoints,
+    })
+}
+
 /// Drive a multi-session `generate_batch_prefill` request serially: materialize
 /// each session's prompt, prefill it, save its state, and emit per-session +
 /// batch done events. The non-fused multi-session prefill entry point.
@@ -1984,11 +2171,48 @@ pub fn run_generate_batch_prefill_serial_qwen35(
     // per-token dispatch and cannot populate the hot ring; the override avoids them.)
     let arena_backend = loaded_model_state_arena_backend(m);
 
-    let plan = plan_generate_batch_prefill_qwen35(m.arch_id, envelope.session_count);
+    let t0 = Instant::now();
+    let mut prepared = Vec::with_capacity(envelope.sessions.len());
+    for session in &envelope.sessions {
+        // One session's problem -- a checkpoint it can no longer attach, history
+        // that will not render, a cursor out of step -- is its own. Report it and
+        // prefill the rest: failing the call failed every request in the batch.
+        // Whatever this session left resident goes with the batch's release.
+        match qwen35_prepare_batch_prefill_session(m, gpu, arena_backend, session) {
+            Ok(session) => prepared.push(session),
+            Err(message) => {
+                let line = serde_json::json!({
+                    "type": "generate_batch_prefill_session_error",
+                    "id": envelope.id,
+                    "batch_id": envelope.batch_id,
+                    "session_id": session.id,
+                    "attached": session.state_handle.runtime_state_handle,
+                    "message": message,
+                });
+                let _ = writeln!(stdout, "{line}");
+                let _ = stdout.flush();
+            }
+        }
+    }
+    if prepared.is_empty() {
+        let done = serde_json::json!({
+            "type": "generate_batch_prefill_done",
+            "id": envelope.id,
+            "batch_id": envelope.batch_id,
+            "sessions": 0,
+        });
+        let _ = writeln!(stdout, "{done}");
+        let _ = stdout.flush();
+        return Ok(());
+    }
+
+    // Planned on the sessions that made it: a fused backend needs at least two,
+    // and one that failed above leaves fewer than the envelope had.
+    let plan = plan_generate_batch_prefill_qwen35(m.arch_id, prepared.len());
     let requested_backend = std::env::var("HIPFIRE_QWEN35_PREFILL_SESSION_BATCH").ok();
     let fused_dense_supported = validate_qwen35_fused_dense_prefill_model_capability(m);
     let fused_grouped_moe_supported =
-        validate_qwen35_fused_grouped_moe_prefill_model_capability(m, envelope.session_count);
+        validate_qwen35_fused_grouped_moe_prefill_model_capability(m, prepared.len());
     let backend = select_qwen35_prefill_batch_backend(
         plan,
         requested_backend.as_deref(),
@@ -1999,195 +2223,13 @@ pub fn run_generate_batch_prefill_serial_qwen35(
         "type": "generate_batch_prefill_started",
         "id": envelope.id,
         "batch_id": envelope.batch_id,
-        "sessions": envelope.session_count,
+        "sessions": prepared.len(),
         "mode": "serial_prefill",
         "plan": plan.as_str(),
         "backend": backend.as_str(),
     });
     let _ = writeln!(stdout, "{started}");
     let _ = stdout.flush();
-
-    let t0 = Instant::now();
-    let mut prepared = Vec::with_capacity(envelope.sessions.len());
-    for session in &envelope.sessions {
-        if !generate_state_kinds_include_required(
-            &session.state_handle.state_kinds,
-            SequenceStatePageKind::Kv,
-        ) {
-            return Err(format!(
-                "generate_batch_prefill session {} missing attention_kv state kind",
-                session.id
-            ));
-        }
-        if !generate_state_kinds_include_required(
-            &session.state_handle.state_kinds,
-            SequenceStatePageKind::DeltaNet,
-        ) {
-            return Err(format!(
-                "generate_batch_prefill session {} missing deltanet_recurrent state kind",
-                session.id
-            ));
-        }
-
-        // Size a session about to be created, or forked from a checkpoint, to what
-        // this request can reach — prompt + max_tokens — instead of the model's full
-        // context. Only a prompt starting at position zero renders independently of
-        // the active slot, so only that case renders here; the tokens are reused
-        // below. KVarN only, because only KVarN can grow a forked session later.
-        let mut pre_rendered: Option<Vec<u32>> = None;
-        if let (Some(max_tokens), Some(_)) = (session.max_tokens, session.prompt.as_ref()) {
-            let starts_at_zero = session.state_handle.runtime_state_handle.is_some()
-                || (session.state_handle.logical_position == 0
-                    && session.state_handle.cached_prefix_tokens == 0);
-            let kvarn = m
-                .q35_kv_mode
-                .as_deref()
-                .is_some_and(|k| k.starts_with("kvarn"));
-            if starts_at_zero
-                && kvarn
-                && !sequence_state_arena_is_session_resident(arena_backend, m, &session.id)
-            {
-                let tokens = qwen35_materialize_batch_prefill_prompt(m, session)?;
-                let group = hipfire_runtime::kv::KvCache::KVARN_GROUP;
-                let cap = (tokens.len() + max_tokens).div_ceil(group) * group;
-                m.q35_registry.kv_caps.insert(session.id.clone(), cap);
-                pre_rendered = Some(tokens);
-            }
-        }
-
-        if let Some(runtime_state_handle) = session.state_handle.runtime_state_handle.as_deref() {
-            sequence_state_arena_fork_session_state(
-                arena_backend,
-                m,
-                gpu,
-                SequenceStateForkRequest {
-                    source_session_id: runtime_state_handle,
-                    dest_session_id: &session.id,
-                    requested_prefix_hash: session.state_handle.prefix_hash.as_ref(),
-                },
-            )
-            .map_err(|e| {
-                format!(
-                    "generate_batch_prefill session {} failed to attach checkpoint {}: {}",
-                    session.id, runtime_state_handle, e
-                )
-            })?;
-        }
-
-        let resident = sequence_state_arena_is_session_resident(arena_backend, m, &session.id);
-        if !resident
-            && (session.state_handle.logical_position > 0
-                || session.state_handle.cached_prefix_tokens > 0)
-        {
-            return Err(format!(
-                "generate_batch_prefill session {} references cached state at logical_position={} cached_prefix_tokens={} but no resident session exists",
-                session.id,
-                session.state_handle.logical_position,
-                session.state_handle.cached_prefix_tokens
-            ));
-        }
-
-        let created = sequence_state_arena_activate_session(arena_backend, m, gpu, &session.id)?;
-        // Consumed by the allocation or fork above if one happened; a session that
-        // was already resident allocated nothing, so drop the unused entry.
-        m.q35_registry.kv_caps.remove(&session.id);
-        let mut boundary_checkpoints = Vec::new();
-        let tokens: Vec<u32> = if session.prompt.is_some() {
-            let full_tokens = match pre_rendered.take() {
-                Some(tokens) => tokens,
-                None => qwen35_materialize_batch_prefill_prompt(m, session)?,
-            };
-            if session.state_handle.runtime_state_handle.is_some() {
-                let prefix_len = session
-                    .state_handle
-                    .prefix_hash
-                    .as_ref()
-                    .map(|hash| hash.prefix_len)
-                    .unwrap_or(session.state_handle.cached_prefix_tokens);
-                if prefix_len > full_tokens.len() {
-                    return Err(format!(
-                        "generate_batch_prefill prompt session {} cached prefix length {} exceeds rendered token length {}",
-                        session.id,
-                        prefix_len,
-                        full_tokens.len()
-                    ));
-                }
-                // Checkpoint the boundaries past the attached prefix too. Without
-                // this only a cold request ever minted, so a conversation that
-                // attached at step N had nothing to attach to at step N+1 and
-                // re-prefilled everything since its first turn. Stored relative to
-                // the tokens prefilled here (they start at `prefix_len`); the hash
-                // keeps the absolute length a later request will look up by.
-                //
-                // Only the LAST boundary: an attached session is continuing a
-                // conversation, and where it ends is the only place the next step
-                // attaches. Checkpointing every boundary had 16 concurrent attaches
-                // mint ~40 checkpoints, past the resident limit, evicting the shared
-                // prefix they had all just attached to.
-                //
-                // Plus any boundary the server asked for (`checkpoint_at`): the
-                // deepest one this session shares with a sibling in the batch,
-                // which the sibling waits to attach.
-                let past: Vec<_> = qwen35_semantic_boundary_checkpoints(m, session, &full_tokens)?
-                    .into_iter()
-                    .filter(|boundary| boundary.prefix_len > prefix_len)
-                    .collect();
-                let last = past.iter().map(|b| b.prefix_len).max();
-                boundary_checkpoints = past
-                    .into_iter()
-                    .filter(|b| {
-                        Some(b.prefix_len) == last || session.checkpoint_at.contains(&b.prefix_len)
-                    })
-                    .map(|mut boundary| {
-                        boundary.prefix_len -= prefix_len;
-                        boundary
-                    })
-                    .collect();
-                full_tokens[prefix_len..].to_vec()
-            } else if session.state_handle.logical_position != 0
-                || session.state_handle.cached_prefix_tokens != 0
-            {
-                return Err(format!(
-                    "generate_batch_prefill prompt session {} must start at logical_position=0 cached_prefix_tokens=0 in the first slice",
-                    session.id
-                ));
-            } else {
-                let _ = created;
-                sequence_state_arena_reset_active_session(arena_backend, m, gpu)?;
-                boundary_checkpoints = cap_cold_boundaries(
-                    qwen35_semantic_boundary_checkpoints(m, session, &full_tokens)?,
-                    cold_mint_max(),
-                );
-                full_tokens
-            }
-        } else {
-            let current_position = sequence_state_arena_active_logical_position(arena_backend, m)?;
-            if created && session.state_handle.logical_position != 0 {
-                return Err(format!(
-                    "generate_batch_prefill suffix session {} is new but logical_position={} (expected 0)",
-                    session.id, session.state_handle.logical_position
-                ));
-            }
-            if !created && current_position != session.state_handle.logical_position {
-                return Err(format!(
-                    "generate_batch_prefill session {} logical_position mismatch: request={} resident={}",
-                    session.id, session.state_handle.logical_position, current_position
-                ));
-            }
-            session.suffix_tokens.clone().unwrap_or_default()
-        };
-
-        prepared.push(Qwen35PreparedPrefillSession {
-            id: session.id.clone(),
-            tokens,
-            cached_prefix_tokens: session.state_handle.cached_prefix_tokens,
-            replay_as_generated_suffix: session.suffix_tokens.is_some(),
-            state_kinds: session.state_handle.state_kinds.clone(),
-            assistant_prefix: session.assistant_prefix.clone(),
-            max_think_tokens: session.max_think_tokens,
-            boundary_checkpoints,
-        });
-    }
 
     let result = qwen35_prefill_suffix_batch(m, gpu, &envelope.batch_id, &prepared, plan, backend)?;
     let mint_final_checkpoints = qwen35_final_checkpoints_enabled();

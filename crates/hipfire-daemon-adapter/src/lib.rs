@@ -959,6 +959,9 @@ impl DaemonEngine {
                 DaemonResponse::GenerateBatchPrefillSessionDone { payload } => events.push(
                     tagged_extended_event("generate_batch_prefill_session_done", payload),
                 ),
+                DaemonResponse::GenerateBatchPrefillSessionError { payload } => events.push(
+                    tagged_extended_event("generate_batch_prefill_session_error", payload),
+                ),
                 DaemonResponse::GenerateBatchPrefillDone { payload } => {
                     events.push(tagged_extended_event(
                         "generate_batch_prefill_done",
