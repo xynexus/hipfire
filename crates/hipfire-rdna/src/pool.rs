@@ -24,6 +24,48 @@ pub fn pool_headroom_bytes() -> usize {
 }
 use std::collections::HashMap;
 
+/// Host `MemAvailable` in bytes; `None` where `/proc/meminfo` is absent.
+///
+/// `MemAvailable`, not `MemFree`: reclaimable page cache is genuinely available,
+/// and on this box the cache is routinely tens of GiB. `MemFree` would refuse
+/// allocations (and loads) that fit comfortably.
+pub fn mem_available_bytes() -> Option<usize> {
+    let meminfo = std::fs::read_to_string("/proc/meminfo").ok()?;
+    meminfo.lines().find_map(|line| {
+        let kib: usize = line
+            .strip_prefix("MemAvailable:")?
+            .split_whitespace()
+            .next()?
+            .parse()
+            .ok()?;
+        Some(kib * 1024)
+    })
+}
+
+/// What an allocation may draw on. On an integrated GPU, GTT is carved from the
+/// same RAM as everything else on the host, so GTT free alone (`hipMemGetInfo`)
+/// overstates it whenever something else -- the swarm's own builds -- holds RAM
+/// GTT still counts as free: hipfire would map pages the kernel then has to reap
+/// processes for (load.rs records this host losing dbus, pipewire and both agents
+/// that way). A discrete GPU's VRAM is its own pool.
+pub fn admissible(gtt_free: usize, host_available: Option<usize>, integrated: bool) -> usize {
+    match host_available {
+        Some(host) if integrated => gtt_free.min(host),
+        _ => gtt_free,
+    }
+}
+
+/// [`admissible`] for this device, now. `None` if HIP cannot report.
+pub fn admissible_free(hip: &HipRuntime, integrated: bool) -> Option<usize> {
+    let (gtt, _) = hip.get_vram_info().ok()?;
+    let host = if integrated {
+        mem_available_bytes()
+    } else {
+        None
+    };
+    Some(admissible(gtt, host, integrated))
+}
+
 /// Bytes the pool may keep parked on its free lists, `HIPFIRE_POOL_CACHE_MAX_MB`
 /// (default 4096). Past it, a returned buffer goes straight back to HIP.
 ///
@@ -63,6 +105,8 @@ pub struct GpuPool {
     pub total_new: usize,
     /// Bytes currently parked on `free_lists`.
     cached_bytes: usize,
+    /// Integrated GPU: allocations also come out of host RAM (see [`admissible`]).
+    pub integrated: bool,
 }
 
 /// A snapshot of pool accounting, for leak hunting.
@@ -114,6 +158,7 @@ impl GpuPool {
             total_reused: 0,
             total_new: 0,
             cached_bytes: 0,
+            integrated: false,
         }
     }
 
@@ -174,11 +219,9 @@ impl GpuPool {
         // a clean `hipError=2` the batch runner splits and retries on.
         let headroom = pool_headroom_bytes();
         if headroom > 0 {
+            let integrated = self.integrated;
             let short = |hip: &HipRuntime| {
-                hip.get_vram_info()
-                    .ok()
-                    .filter(|&(free, _)| free < actual + headroom)
-                    .map(|(free, _)| free)
+                admissible_free(hip, integrated).filter(|&free| free < actual + headroom)
             };
             if short(hip).is_some() && self.free_lists.values().any(|list| !list.is_empty()) {
                 self.drain(hip);
@@ -187,7 +230,7 @@ impl GpuPool {
                 return Err(HipError::new(
                     HIP_ERROR_OUT_OF_MEMORY,
                     &format!(
-                        "hipMalloc({actual} bytes) would leave {:.1} MiB free, under the {} MiB headroom kept for the runtime (hipError=2)",
+                        "hipMalloc({actual} bytes) would leave {:.1} MiB free (GTT, or host MemAvailable on an integrated GPU), under the {} MiB headroom kept for the runtime",
                         free.saturating_sub(actual) as f64 / 1048576.0,
                         headroom / 1048576
                     ),
@@ -235,5 +278,21 @@ impl GpuPool {
                 let _ = hip.free(buf.with_origin(BufferOrigin::Direct));
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::admissible;
+
+    // An integrated GPU's GTT is host RAM: whichever is lower bounds it. A
+    // discrete GPU's VRAM is not, and a missing /proc leaves GTT alone.
+    #[test]
+    fn host_memory_bounds_only_an_integrated_gpu() {
+        const GIB: usize = 1 << 30;
+        assert_eq!(admissible(40 * GIB, Some(3 * GIB), true), 3 * GIB);
+        assert_eq!(admissible(2 * GIB, Some(30 * GIB), true), 2 * GIB);
+        assert_eq!(admissible(40 * GIB, Some(3 * GIB), false), 40 * GIB);
+        assert_eq!(admissible(40 * GIB, None, true), 40 * GIB);
     }
 }

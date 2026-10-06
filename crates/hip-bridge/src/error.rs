@@ -76,10 +76,19 @@ impl HipError {
                 }
             })
             .unwrap_or_else(|| format!("error code {code}"));
+        // The code rides in the message too, as `new` puts it: errors cross the
+        // daemon -> server boundary as text, and the server tells OOM (worth
+        // splitting the batch for) from everything else by it. Without it an OOM
+        // from hipMemCreate / hipMemMap (paged KV) read as a generic failure.
         Self {
             code,
-            message: format!("{context}: {detail}"),
+            message: format!("{context}: {detail} (hipError={code})"),
         }
+    }
+
+    /// Device out of memory, by code (not by message).
+    pub fn is_oom(&self) -> bool {
+        self.code == HIP_ERROR_OUT_OF_MEMORY
     }
 }
 
@@ -105,5 +114,17 @@ mod tests {
         // A genuine HIP runtime failure must NOT be mistaken for a capability gap.
         let real = HipError::new(700, "out of memory");
         assert!(!real.is_unsupported());
+    }
+
+    // Every constructor carries the code into the message the server classifies.
+    #[test]
+    fn the_code_survives_into_the_message() {
+        let oom = HipError::from_code(HIP_ERROR_OUT_OF_MEMORY, "hipMemCreate", None);
+        assert!(oom.is_oom());
+        assert!(oom.message.ends_with("(hipError=2)"), "{}", oom.message);
+        assert!(HipError::new(HIP_ERROR_OUT_OF_MEMORY, "hipMalloc")
+            .message
+            .ends_with("(hipError=2)"));
+        assert!(!HipError::new(98, "launch").is_oom());
     }
 }

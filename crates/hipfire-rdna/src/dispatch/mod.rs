@@ -1061,7 +1061,11 @@ impl Gpu {
             compiler,
             modules: HashMap::new(),
             functions: HashMap::new(),
-            pool: crate::pool::GpuPool::new(),
+            pool: {
+                let mut pool = crate::pool::GpuPool::new();
+                pool.integrated = integrated;
+                pool
+            },
             free_mailbox: Arc::new(Mutex::new(Vec::new())),
             fwht_signs_256: None,
             active_capture: None,

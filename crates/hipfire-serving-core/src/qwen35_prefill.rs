@@ -788,6 +788,28 @@ fn fused_prefill_chunk_tokens() -> Option<usize> {
         .filter(|&v| v >= 2)
 }
 
+/// Run a fused prefill with the sessions it takes out of the registry in custody:
+/// whatever `body` still holds when it returns -- on an error, a `?` included -- goes
+/// back in the registry. The fused workers moved sessions into a local vector and
+/// several exits (a scratch or checkpoint allocation failing under OOM, a missing
+/// scratch) returned without restoring them, so each retried OOM stranded those
+/// sessions' KV and DeltaNet state: a ratchet toward host OOM. On success `body`
+/// has already consumed the vector and re-registered every session itself.
+fn with_session_custody<T>(
+    m: &mut LoadedModel,
+    body: impl FnOnce(
+        &mut LoadedModel,
+        &mut Vec<(String, Qwen35RequestSessionState)>,
+    ) -> Result<T, String>,
+) -> Result<T, String> {
+    let mut custody = Vec::new();
+    let result = body(m, &mut custody);
+    for (id, state) in custody {
+        m.q35_registry.sessions.insert(id, state);
+    }
+    result
+}
+
 pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
     m: &mut LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
@@ -795,6 +817,20 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
     prepared: &[Qwen35PreparedPrefillSession],
     plan: GenerateBatchPrefillPlan,
     backend: Qwen35PrefillBatchBackend,
+) -> Result<Qwen35PrefillBatchResult, String> {
+    with_session_custody(m, |m, owned_sessions| {
+        fused_grouped_moe_in_custody(m, gpu, batch_id, prepared, plan, backend, owned_sessions)
+    })
+}
+
+fn fused_grouped_moe_in_custody(
+    m: &mut LoadedModel,
+    gpu: &mut hipfire_rdna::Gpu,
+    batch_id: &str,
+    prepared: &[Qwen35PreparedPrefillSession],
+    plan: GenerateBatchPrefillPlan,
+    backend: Qwen35PrefillBatchBackend,
+    owned_sessions: &mut Vec<(String, Qwen35RequestSessionState)>,
 ) -> Result<Qwen35PrefillBatchResult, String> {
     if plan != GenerateBatchPrefillPlan::GroupedMoeQwen35Candidate {
         return Err(format!(
@@ -819,17 +855,12 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
         .as_ref()
         .ok_or_else(|| "qwen35 weights missing".to_string())?;
     let boundary_cuts = qwen35_fused_prefill_boundary_cuts(prepared)?;
-    let mut owned_sessions: Vec<(String, Qwen35RequestSessionState)> =
-        Vec::with_capacity(prepared.len());
     for spec in prepared {
         let state = match m.q35_registry.sessions.remove(&spec.id) {
             Some(state) => state,
             None => match qwen35_allocate_session_state(m, gpu, &spec.id) {
                 Ok(state) => state,
                 Err(e) => {
-                    for (restore_id, restore_state) in owned_sessions {
-                        m.q35_registry.sessions.insert(restore_id, restore_state);
-                    }
                     return Err(e);
                 }
             },
@@ -839,9 +870,6 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
             let id = spec.id.to_string();
             let seq_pos = state.cursor.seq_pos;
             m.q35_registry.sessions.insert(id.clone(), state);
-            for (restore_id, restore_state) in owned_sessions {
-                m.q35_registry.sessions.insert(restore_id, restore_state);
-            }
             return Err(format!(
                 "generate_batch_prefill exceeds loaded KV budget for session {}: seq_pos={} + prefill={} > physical_cap={}",
                 id,
@@ -886,9 +914,6 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
                     ) {
                         Ok(tokens) => tokens,
                         Err(err) => {
-                            for (id, state) in owned_sessions {
-                                m.q35_registry.sessions.insert(id, state);
-                            }
                             return Err(err);
                         }
                     };
@@ -996,9 +1021,6 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
             let shape = match worker_result {
                 Ok(shape) => shape,
                 Err(e) => {
-                    for (id, state) in owned_sessions {
-                        m.q35_registry.sessions.insert(id, state);
-                    }
                     return Err(format!(
                         "qwen35 grouped-MoE fused boundary prefill-session batch backend failed: {e:?}; \
                          use HIPFIRE_QWEN35_PREFILL_SESSION_BATCH=auto or serial"
@@ -1047,7 +1069,7 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
             }
         }
         let mut sessions = Vec::with_capacity(owned_sessions.len());
-        for (idx, (id, mut state)) in owned_sessions.into_iter().enumerate() {
+        for (idx, (id, mut state)) in std::mem::take(owned_sessions).into_iter().enumerate() {
             state.prefilled_generated_suffix_len = 0;
             let logical_position = state.cursor.seq_pos + state.kv_cache().compact_offset;
             let prefix_hash = compute_qwen35_prefix_hash(
@@ -1228,9 +1250,6 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
     let shape = match worker_result {
         Ok(shape) => shape,
         Err(e) => {
-            for (id, state) in owned_sessions {
-                m.q35_registry.sessions.insert(id, state);
-            }
             return Err(format!(
                 "qwen35 grouped-MoE fused prefill-session batch backend failed: {e:?}; \
                  use HIPFIRE_QWEN35_PREFILL_SESSION_BATCH=auto or serial"
@@ -1239,7 +1258,10 @@ pub fn qwen35_prefill_suffix_batch_fused_grouped_moe(
     };
 
     let mut sessions = Vec::with_capacity(owned_sessions.len());
-    for ((id, mut state), spec) in owned_sessions.into_iter().zip(prepared.iter()) {
+    for ((id, mut state), spec) in std::mem::take(owned_sessions)
+        .into_iter()
+        .zip(prepared.iter())
+    {
         state.cursor.seq_pos += spec.tokens.len();
         state
             .cursor
@@ -1325,6 +1347,20 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
     plan: GenerateBatchPrefillPlan,
     backend: Qwen35PrefillBatchBackend,
 ) -> Result<Qwen35PrefillBatchResult, String> {
+    with_session_custody(m, |m, owned_sessions| {
+        fused_dense_in_custody(m, gpu, batch_id, prepared, plan, backend, owned_sessions)
+    })
+}
+
+fn fused_dense_in_custody(
+    m: &mut LoadedModel,
+    gpu: &mut hipfire_rdna::Gpu,
+    batch_id: &str,
+    prepared: &[Qwen35PreparedPrefillSession],
+    plan: GenerateBatchPrefillPlan,
+    backend: Qwen35PrefillBatchBackend,
+    owned_sessions: &mut Vec<(String, Qwen35RequestSessionState)>,
+) -> Result<Qwen35PrefillBatchResult, String> {
     let contract = build_qwen35_fused_dense_prefill_batch_contract(prepared, plan)?;
 
     // Worker API seam for the real dense implementation:
@@ -1353,17 +1389,12 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
         .as_ref()
         .ok_or_else(|| "qwen35 weights missing".to_string())?;
     let boundary_cuts = qwen35_fused_prefill_boundary_cuts(prepared)?;
-    let mut owned_sessions: Vec<(String, Qwen35RequestSessionState)> =
-        Vec::with_capacity(contract.sessions.len());
     for spec in &contract.sessions {
         let state = match m.q35_registry.sessions.remove(spec.id) {
             Some(state) => state,
             None => match qwen35_allocate_session_state(m, gpu, &spec.id) {
                 Ok(state) => state,
                 Err(e) => {
-                    for (restore_id, restore_state) in owned_sessions {
-                        m.q35_registry.sessions.insert(restore_id, restore_state);
-                    }
                     return Err(e);
                 }
             },
@@ -1373,9 +1404,6 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
             let id = spec.id.to_string();
             let seq_pos = state.cursor.seq_pos;
             m.q35_registry.sessions.insert(id.clone(), state);
-            for (restore_id, restore_state) in owned_sessions {
-                m.q35_registry.sessions.insert(restore_id, restore_state);
-            }
             return Err(format!(
                 "generate_batch_prefill exceeds loaded KV budget for session {}: seq_pos={} + prefill={} > physical_cap={}",
                 id,
@@ -1420,9 +1448,6 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
                     ) {
                         Ok(tokens) => tokens,
                         Err(err) => {
-                            for (id, state) in owned_sessions {
-                                m.q35_registry.sessions.insert(id, state);
-                            }
                             return Err(err);
                         }
                     };
@@ -1526,9 +1551,6 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
             let shape = match worker_result {
                 Ok(shape) => shape,
                 Err(e) => {
-                    for (id, state) in owned_sessions {
-                        m.q35_registry.sessions.insert(id, state);
-                    }
                     return Err(format!(
                         "qwen35 fused dense boundary prefill-session batch backend failed: {e:?}; \
                          use HIPFIRE_QWEN35_PREFILL_SESSION_BATCH=auto or serial"
@@ -1577,7 +1599,7 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
             }
         }
         let mut sessions = Vec::with_capacity(owned_sessions.len());
-        for (idx, (id, mut state)) in owned_sessions.into_iter().enumerate() {
+        for (idx, (id, mut state)) in std::mem::take(owned_sessions).into_iter().enumerate() {
             state.prefilled_generated_suffix_len = 0;
             let logical_position = state.cursor.seq_pos + state.kv_cache().compact_offset;
             let prefix_hash = compute_qwen35_prefix_hash(
@@ -1665,9 +1687,6 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
     let shape = match worker_result {
         Ok(shape) => shape,
         Err(e) => {
-            for (id, state) in owned_sessions {
-                m.q35_registry.sessions.insert(id, state);
-            }
             return Err(format!(
                 "qwen35 fused dense prefill-session batch backend failed: {e:?}; \
                  use HIPFIRE_QWEN35_PREFILL_SESSION_BATCH=auto or serial"
@@ -1676,7 +1695,10 @@ pub fn qwen35_prefill_suffix_batch_fused_dense(
     };
 
     let mut sessions = Vec::with_capacity(owned_sessions.len());
-    for ((id, mut state), spec) in owned_sessions.into_iter().zip(contract.sessions.iter()) {
+    for ((id, mut state), spec) in std::mem::take(owned_sessions)
+        .into_iter()
+        .zip(contract.sessions.iter())
+    {
         state.cursor.seq_pos += spec.tokens.len();
         state
             .cursor

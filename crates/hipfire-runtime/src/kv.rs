@@ -1598,12 +1598,12 @@ impl KvCache {
                 .map_or(0, |p| p.iter().flatten().count());
             let (k_have, v_have) = self.kvarn_layer_bytes(self.physical_cap);
             let need = n_kv * (k_bytes.saturating_sub(k_have) + v_bytes.saturating_sub(v_have));
-            if let Ok((free, _)) = gpu.hip.get_vram_info() {
+            if let Some(free) = hipfire_rdna::pool::admissible_free(&gpu.hip, gpu.integrated) {
                 if free < need + headroom {
                     return Err(hip_bridge::HipError::new(
                         hip_bridge::HIP_ERROR_OUT_OF_MEMORY,
                         &format!(
-                            "paged KV growth to {physical_cap} positions needs up to {:.1} MiB, {:.1} MiB free under the {} MiB headroom (hipError=2)",
+                            "paged KV growth to {physical_cap} positions needs up to {:.1} MiB, {:.1} MiB free (GTT, or host MemAvailable on an integrated GPU) under the {} MiB headroom",
                             need as f64 / 1048576.0,
                             free as f64 / 1048576.0,
                             headroom / 1048576

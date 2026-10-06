@@ -1883,6 +1883,10 @@ pub fn qwen35_allocate_session_state(
         .q35_kv_mode
         .as_deref()
         .ok_or_else(|| "qwen35 KV mode missing; reload model before batch prefill".to_string())?;
+    // Checked before anything is allocated, so a missing quant leaks nothing.
+    let dn_quant = m.q35_state_quant.ok_or_else(|| {
+        "qwen35 DeltaNet state quant missing; reload model before batch prefill".to_string()
+    })?;
     // What this session is actually sized for. Printed unconditionally because
     // the per-mode constructor banners are inconsistent — asym/q8 report
     // `physical_cap=N / max_seq=N`, kvarn reports neither — so an over-sized KV
@@ -2036,11 +2040,23 @@ pub fn qwen35_allocate_session_state(
             .map_err(|e| format!("{e}"))?
         }
     };
-    let dn_quant = m.q35_state_quant.ok_or_else(|| {
-        "qwen35 DeltaNet state quant missing; reload model before batch prefill".to_string()
-    })?;
-    let dn_state = DeltaNetState::new_with_quant(gpu, config, dn_quant)
-        .map_err(|e| format!("DeltaNetState::new_with_quant: {e:?}"))?;
+    // Each later step frees what the earlier ones allocated when it fails: these
+    // fail under OOM, which the runner retries, so a leak here compounds.
+    let dn_state = match DeltaNetState::new_with_quant(gpu, config, dn_quant) {
+        Ok(dn) => dn,
+        Err(e) => {
+            kv_cache.free_gpu(gpu);
+            return Err(format!("DeltaNetState::new_with_quant: {e:?}"));
+        }
+    };
+    let logits = match gpu.alloc_tensor(&[config.vocab_size], hipfire_rdna::DType::F32) {
+        Ok(t) => t,
+        Err(e) => {
+            kv_cache.free_gpu(gpu);
+            dn_state.free_gpu(gpu);
+            return Err(format!("alloc qwen35 session logits snapshot: {e:?}"));
+        }
+    };
     let sequence_state = SequenceState::new(
         qwen35_mixer_profile(&config.layer_types),
         Some(kv_cache),
@@ -2050,9 +2066,7 @@ pub fn qwen35_allocate_session_state(
         cursor: SessionCursor::default(),
         prefix_hash: None,
         sequence_state,
-        logits: gpu
-            .alloc_tensor(&[config.vocab_size], hipfire_rdna::DType::F32)
-            .map_err(|e| format!("alloc qwen35 session logits snapshot: {e:?}"))?,
+        logits,
         prefilled_generated_suffix_len: 0,
         allocation_epoch: next_qwen35_state_allocation_epoch(),
     })
