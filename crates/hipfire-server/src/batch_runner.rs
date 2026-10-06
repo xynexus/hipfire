@@ -893,7 +893,43 @@ async fn prefill_budgeted(
         let e = match result {
             Ok(call_events) => {
                 record_prefix_checkpoints(engine, worker, &call_events, index).await;
-                events.extend(call_events);
+                // A session whose checkpoint would not attach goes again without
+                // it, as the whole call used to; any other session error stands.
+                let failed = prefill_session_errors(&call_events);
+                let retry: Vec<SessionSpec> = group
+                    .iter()
+                    .filter(|s| failed.contains_key(&s.id))
+                    .filter(|s| matches!(reuse.get(&s.id), Some(PrefixReuse::Attach(_))))
+                    .cloned()
+                    .collect();
+                events.extend(call_events.into_iter().filter(|e| {
+                    let retried = e["type"] == "generate_batch_prefill_session_error"
+                        && e["session_id"]
+                            .as_str()
+                            .is_some_and(|id| retry.iter().any(|s| s.id == id));
+                    !retried
+                }));
+                if !retry.is_empty() {
+                    let mut handles: Vec<String> = Vec::new();
+                    for s in &retry {
+                        if let Some(PrefixReuse::Attach(entry)) = reuse.remove(&s.id) {
+                            tracing::warn!(
+                                "session {}: cached prefix {} would not attach ({}); retrying \
+                                 without it",
+                                s.id,
+                                entry.checkpoint_id,
+                                failed[&s.id]
+                            );
+                            index.forget(&entry.checkpoint_id);
+                            handles.push(entry.checkpoint_id);
+                        }
+                        handles.push(s.id.clone());
+                    }
+                    let _ = engine
+                        .release_sessions(build_release_request(worker, &handles))
+                        .await;
+                    queue.push_front(retry);
+                }
                 continue;
             }
             Err(e) => e,
@@ -974,12 +1010,11 @@ async fn prefill_with_prefix_reuse(
     index: &mut PrefixIndex,
     max_seq: Option<usize>,
 ) -> anyhow::Result<(Vec<serde_json::Value>, Overlong)> {
+    // With the cache and the row budget both off this is still the path: the
+    // preflight is what measures each prompt, and a prompt that fills the
+    // context is refused here rather than failing the batch at the daemon.
     let use_cache = prefix_cache_enabled();
     let budget = prefill_row_budget();
-    if !use_cache && budget == 0 {
-        let request = build_batch_prefill_request(batch_id, worker, specs, &HashMap::new());
-        return Ok((engine.generate_batch_prefill(request).await?, Vec::new()));
-    }
     const MAX_ROUNDS: usize = 3;
     let mut events = Vec::new();
     let mut overlong = Vec::new();
@@ -1095,6 +1130,20 @@ fn prefix_cache_enabled() -> bool {
         std::env::var("HIPFIRE_SERVER_PREFIX_CACHE").as_deref(),
         Ok("0" | "off" | "false" | "no")
     )
+}
+
+/// The sessions a batch prefill reported failed, with the worker's reason: the
+/// daemon fails one session (an attach, a render) and prefills the rest.
+fn prefill_session_errors(events: &[serde_json::Value]) -> HashMap<String, String> {
+    events
+        .iter()
+        .filter(|e| e["type"] == "generate_batch_prefill_session_error")
+        .filter_map(|e| {
+            let id = e["session_id"].as_str()?;
+            let message = e["message"].as_str().unwrap_or("batch prefill failed");
+            Some((id.to_string(), format!("batch prefill: {message}")))
+        })
+        .collect()
 }
 
 /// A request's terminal payload: why it stopped, and its usage in tokens.
@@ -1974,6 +2023,7 @@ async fn admit_into_cycle(
     let specs: Vec<SessionSpec> = newcomers.iter().map(|p| p.spec.clone()).collect();
     let mut positions = HashMap::new();
     let mut cached: HashMap<String, usize> = HashMap::new();
+    let mut failed: HashMap<String, String> = HashMap::new();
     let mut remaining: HashMap<String, usize> = specs
         .iter()
         .map(|s| (s.id.clone(), s.policy.max_tokens.max(1)))
@@ -1987,7 +2037,8 @@ async fn admit_into_cycle(
                 .collect();
             reject_overlong(&overlong, max_seq, &mut txs);
             newcomers.retain(|p| txs.contains_key(&p.spec.id));
-            fold_prefill_events(&events, &mut positions, &mut remaining, &mut cached)
+            fold_prefill_events(&events, &mut positions, &mut remaining, &mut cached);
+            failed = prefill_session_errors(&events);
         }
         Err(e) => {
             let handles: Vec<String> = specs.iter().map(|s| s.id.clone()).collect();
@@ -2002,13 +2053,26 @@ async fn admit_into_cycle(
             return Vec::new();
         }
     }
+    // A newcomer that failed is not in the cycle's release set: give back what
+    // its prefill left resident now. Unknown ids are a no-op.
+    let lost: Vec<String> = newcomers
+        .iter()
+        .filter(|p| !positions.contains_key(&p.spec.id))
+        .map(|p| p.spec.id.clone())
+        .collect();
+    if !lost.is_empty() {
+        let _ = engine
+            .release_sessions(build_release_request(worker, &lost))
+            .await;
+    }
     newcomers
         .into_iter()
         .filter_map(|p| {
             let Some(&pos) = positions.get(&p.spec.id) else {
+                let reason = failed.get(&p.spec.id).cloned();
                 let _ = p.tx.send(BatchEvent::Error(
                     FailKind::Server,
-                    "batch prefill produced no session state".to_string(),
+                    reason.unwrap_or_else(|| "batch prefill produced no session state".into()),
                 ));
                 return None;
             };
@@ -2144,6 +2208,7 @@ async fn run_batch_cycle(
     // batches skip prefill: the sessions are already resident at their cursor.
     let mut positions: HashMap<String, usize> = HashMap::new();
     let mut cached: HashMap<String, usize> = HashMap::new();
+    let mut failed: HashMap<String, String> = HashMap::new();
     if resuming {
         positions = resume_pos.clone();
     } else {
@@ -2192,6 +2257,7 @@ async fn run_batch_cycle(
             }
         };
         fold_prefill_events(&events, &mut positions, &mut remaining, &mut cached);
+        failed = prefill_session_errors(&events);
     }
     // Usage for each request's Done: its prompt length (the position prefill left
     // it at) and the tokens it committed. A resumed (parked) session's prompt
@@ -2225,13 +2291,15 @@ async fn run_batch_cycle(
         }
         false
     });
-    // Any session with no prefill checkpoint can't decode — fail it, don't hang.
+    // Any session with no prefill checkpoint can't decode — fail it, don't hang,
+    // with the worker's reason when it gave one. The rest of the batch goes on.
     for s in &specs {
         if !positions.contains_key(&s.id) {
             if let Some(tx) = txs.get(&s.id) {
+                let reason = failed.get(&s.id).cloned();
                 let _ = tx.send(BatchEvent::Error(
                     FailKind::Server,
-                    "batch prefill produced no session state".to_string(),
+                    reason.unwrap_or_else(|| "batch prefill produced no session state".into()),
                 ));
             }
         }
@@ -3121,12 +3189,17 @@ mod tests {
     /// A scripted engine: prefill places every session at position 8; each
     /// decode step gives every session one token and stops it after
     /// `stop_after` of them. `prefill_error` / `decode_error` fail those calls
-    /// instead (a failed decode also kills the worker, as a wedge does).
+    /// instead (a failed decode also kills the worker, as a wedge does), and
+    /// the sessions in `failing` -- or any that attaches a checkpoint, while
+    /// `attach_fails` -- get a per-session prefill error as the daemon reports it.
     struct FakeEngine {
         alive: bool,
         stop_after: usize,
         prefill_error: Option<&'static str>,
         decode_error: Option<&'static str>,
+        failing: Vec<&'static str>,
+        attach_fails: bool,
+        prefill_requests: Vec<serde_json::Value>,
         decoded: HashMap<String, usize>,
         prefills: usize,
         decodes: Vec<serde_json::Value>,
@@ -3140,6 +3213,9 @@ mod tests {
                 stop_after: 2,
                 prefill_error: None,
                 decode_error: None,
+                failing: Vec::new(),
+                attach_fails: false,
+                prefill_requests: Vec::new(),
                 decoded: HashMap::new(),
                 prefills: 0,
                 decodes: Vec::new(),
@@ -3172,14 +3248,26 @@ mod tests {
             request: serde_json::Value,
         ) -> anyhow::Result<Vec<serde_json::Value>> {
             self.prefills += 1;
+            self.prefill_requests.push(request.clone());
             if let Some(e) = self.prefill_error {
                 anyhow::bail!("{e}");
             }
-            Ok(Self::ids(&request)
+            let attach_fails = self.attach_fails;
+            Ok(request["sessions"]
+                .as_array()
                 .into_iter()
-                .map(|id| {
-                    serde_json::json!({"type": "generate_batch_prefill_session_done",
-                           "session_id": id, "logical_position": 8})
+                .flatten()
+                .map(|s| {
+                    let id = s["id"].as_str().unwrap();
+                    let attached = s["state_handle"]["runtime_state_handle"].as_str();
+                    if self.failing.contains(&id) || (attach_fails && attached.is_some()) {
+                        serde_json::json!({"type": "generate_batch_prefill_session_error",
+                               "session_id": id, "attached": attached,
+                               "message": format!("session {id} would not render")})
+                    } else {
+                        serde_json::json!({"type": "generate_batch_prefill_session_done",
+                               "session_id": id, "logical_position": 8})
+                    }
                 })
                 .collect())
         }
@@ -3400,6 +3488,105 @@ mod tests {
             events(&mut rx).as_slice(),
             [BatchEvent::Error(FailKind::Unavailable, _)]
         ));
+    }
+
+    // One session the worker could not prefill fails alone, with its reason; the
+    // rest of the batch decodes, and the failed one is released with it.
+    #[tokio::test]
+    async fn one_bad_session_fails_only_itself() {
+        let state = crate::state::AppState::new(hipfire_config::HipfireConfig::default());
+        let (mut parked, mut fit_cap, mut index) = (Vec::new(), usize::MAX, PrefixIndex::default());
+        let (a, mut rx_a) = pending("a");
+        let (b, mut rx_b) = pending("b");
+        let mut engine = FakeEngine::new();
+        engine.failing = vec!["b"];
+        let engine = run_text_batch(
+            &state,
+            engine,
+            vec![a, b],
+            64,
+            4,
+            &mut index,
+            &mut parked,
+            &mut fit_cap,
+        )
+        .await
+        .unwrap();
+        assert!(matches!(
+            events(&mut rx_a).last(),
+            Some(BatchEvent::Done(_))
+        ));
+        match events(&mut rx_b).as_slice() {
+            [BatchEvent::Error(FailKind::Server, m)] => {
+                assert!(m.contains("session b would not render"), "{m}")
+            }
+            other => panic!("expected b's own error, got {other:?}"),
+        }
+        assert!(engine.released.iter().any(|id| id == "b"));
+    }
+
+    // A session whose cached prefix will not attach goes again without it (the
+    // checkpoint forgotten and released) instead of failing.
+    #[tokio::test]
+    async fn a_session_whose_checkpoint_will_not_attach_is_prefilled_without_it() {
+        let mut engine = FakeEngine::new();
+        engine.attach_fails = true;
+        let entry = PrefixEntry {
+            worker: "w".to_string(),
+            prefix_hash: serde_json::json!({"algorithm": "x", "value": "h", "prefix_len": 4}),
+            prefix_len: 4,
+            checkpoint_id: "ck-1".to_string(),
+            hits: 0,
+            batch: 0,
+            mint_at: None,
+        };
+        let mut index = PrefixIndex::default();
+        index.insert(entry.clone());
+        let mut reuse = HashMap::from([("a".to_string(), PrefixReuse::Attach(entry))]);
+        let specs = [spec("a"), spec("b")];
+        let events = prefill_budgeted(
+            &mut engine,
+            "batch",
+            "w",
+            &specs,
+            &mut reuse,
+            &HashMap::new(),
+            0,
+            &mut index,
+        )
+        .await
+        .unwrap();
+        assert_eq!(engine.prefills, 2, "one retry, for the session that failed");
+        let retried = &engine.prefill_requests[1]["sessions"];
+        assert_eq!(retried.as_array().unwrap().len(), 1);
+        assert!(retried[0]["state_handle"]["runtime_state_handle"].is_null());
+        assert!(prefill_session_errors(&events).is_empty(), "{events:?}");
+        let done: Vec<&str> = events
+            .iter()
+            .filter(|e| e["type"] == "generate_batch_prefill_session_done")
+            .filter_map(|e| e["session_id"].as_str())
+            .collect();
+        assert_eq!(done.len(), 2);
+        assert!(engine.released.iter().any(|id| id == "ck-1"));
+        assert!(reuse.is_empty());
+    }
+
+    // A prompt that fills the context is refused with its length, and leaves the
+    // batch; the others stay.
+    #[test]
+    fn an_overlong_prompt_is_refused_with_its_length() {
+        let (tx_a, mut rx_a) = mpsc::unbounded_channel();
+        let (tx_b, mut rx_b) = mpsc::unbounded_channel();
+        let mut txs = HashMap::from([("a".to_string(), tx_a), ("b".to_string(), tx_b)]);
+        reject_overlong(&vec![("a".to_string(), 40_000)], Some(32_768), &mut txs);
+        assert!(!txs.contains_key("a") && txs.contains_key("b"));
+        match events(&mut rx_a).as_slice() {
+            [BatchEvent::Error(FailKind::ContextLength, m)] => {
+                assert!(m.contains("40000") && m.contains("32768"), "{m}")
+            }
+            other => panic!("expected a context-length error, got {other:?}"),
+        }
+        assert!(events(&mut rx_b).is_empty());
     }
 }
 

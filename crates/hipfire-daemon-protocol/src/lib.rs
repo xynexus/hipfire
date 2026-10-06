@@ -534,6 +534,12 @@ pub enum DaemonResponse {
         #[serde(flatten)]
         payload: serde_json::Map<String, serde_json::Value>,
     },
+    /// One session of a batch prefill failed (`session_id`, `message`,
+    /// `attached`: the checkpoint it was forking, if any); the rest went on.
+    GenerateBatchPrefillSessionError {
+        #[serde(flatten)]
+        payload: serde_json::Map<String, serde_json::Value>,
+    },
     GenerateBatchPrefillDone {
         #[serde(flatten)]
         payload: serde_json::Map<String, serde_json::Value>,
@@ -956,6 +962,16 @@ mod tests {
                     matches!(
                         response,
                         DaemonResponse::GenerateBatchPrefillSessionDone { .. }
+                    )
+                },
+            ),
+            (
+                json!({"type": "generate_batch_prefill_session_error", "id": "p", "session_id": "s",
+                       "message": "m"}),
+                |response| {
+                    matches!(
+                        response,
+                        DaemonResponse::GenerateBatchPrefillSessionError { .. }
                     )
                 },
             ),
