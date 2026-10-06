@@ -37,6 +37,9 @@ use hipfire_scheduler::{
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct ChatRequest {
+    /// The caller's `X-Request-Id`, set by the handler (never read from the body).
+    #[serde(skip)]
+    pub request_id: Option<String>,
     pub model: Option<String>,
     pub messages: Vec<ChatMessage>,
     #[serde(default)]
@@ -78,7 +81,22 @@ pub struct ChatMessage {
 pub async fn post_chat_completions(
     State(state): State<SharedState>,
     accounting: Option<Extension<crate::accounting::RequestAccounting>>,
-    Json(body): Json<ChatRequest>,
+    headers: axum::http::HeaderMap,
+    Json(mut body): Json<ChatRequest>,
+) -> Response {
+    let request_id = request_id_or_new(caller_request_id(&headers).as_deref());
+    body.request_id = Some(request_id.clone());
+    let mut response = post_chat_completions_inner(state, accounting, body).await;
+    if let Ok(v) = axum::http::HeaderValue::from_str(&request_id) {
+        response.headers_mut().insert("x-request-id", v);
+    }
+    response
+}
+
+async fn post_chat_completions_inner(
+    state: SharedState,
+    accounting: Option<Extension<crate::accounting::RequestAccounting>>,
+    body: ChatRequest,
 ) -> Response {
     let accounting = accounting.map(|Extension(accounting)| accounting);
     let owner = accounting
@@ -1228,6 +1246,28 @@ fn openai_nonstream_usage_json(done: &hipfire_generate::DoneEvent) -> Value {
     })
 }
 
+/// The caller's `X-Request-Id`, when it is a plausible id (1..=96 of
+/// `[A-Za-z0-9._:/-]`); anything else is ignored rather than echoed into logs.
+pub(crate) fn caller_request_id(headers: &axum::http::HeaderMap) -> Option<String> {
+    let v = headers.get("x-request-id")?.to_str().ok()?.trim();
+    let ok = !v.is_empty()
+        && v.len() <= 96
+        && v.bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"._:/-".contains(&b));
+    ok.then(|| v.to_string())
+}
+
+/// This request's id: the caller's `X-Request-Id` plus a short unique suffix (the id
+/// names the daemon session, so two requests reusing one must not collide), else a
+/// fresh UUID. One id end to end: the caller's log line, hipfire's batch-runner
+/// session lines, and the response id all carry it.
+pub(crate) fn request_id_or_new(caller: Option<&str>) -> String {
+    match caller {
+        Some(id) => format!("{id}-{}", &Uuid::new_v4().simple().to_string()[..8]),
+        None => Uuid::new_v4().to_string(),
+    }
+}
+
 fn done_extra_u64(done: &hipfire_generate::DoneEvent, key: &str) -> Option<u64> {
     done.extra.get(key).and_then(Value::as_u64)
 }
@@ -2065,7 +2105,10 @@ async fn execute_blocking_chat_cancellable<F>(
 where
     F: FnMut() -> bool,
 {
-    let req_id = Uuid::new_v4().to_string();
+    let req_id = body
+        .request_id
+        .clone()
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
     let created = now_unix_seconds();
 
     let model_arg = {
@@ -2267,6 +2310,12 @@ where
         // legacy path does when the daemon hands it none.
         let (final_text, tool_calls) =
             parse_inline_tool_calls(&final_text, &req_id, body.tools.as_ref());
+        // The prompt length and how much of it a cached prefix covered, as the
+        // usage builders read them; usage used to report no cache hits on this path.
+        let extra = ["prompt_tokens", "cached_tokens"]
+            .into_iter()
+            .filter_map(|k| done_json.get(k).map(|v| (k.to_string(), v.clone())))
+            .collect();
         let done = hipfire_generate::DoneEvent {
             id: req_id.clone(),
             tokens: token_count,
@@ -2278,7 +2327,7 @@ where
             ttft_ms: None,
             finish_reason: Some(finish_reason),
             response_id: None,
-            extra: std::collections::HashMap::new(),
+            extra,
         };
         return Ok(Some(BlockingChatResult {
             req_id,
@@ -2594,7 +2643,10 @@ async fn stream_chat(
     let (tx, mut rx) = mpsc::channel::<Result<Event, Infallible>>(64);
 
     tokio::spawn(async move {
-        let req_id = Uuid::new_v4().to_string();
+        let req_id = body
+            .request_id
+            .clone()
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         let created = now_unix_seconds();
 
         let model_arg = {
@@ -3473,6 +3525,33 @@ mod tests {
         assert_eq!(body["truncation"]["suggested_max_tokens"], 4096);
     }
 
+    // A caller's X-Request-Id is taken when it is a plausible id and always gets a
+    // unique suffix -- it names a daemon session, so two requests reusing one must not
+    // collide; anything else is ignored rather than echoed into logs.
+    #[test]
+    fn a_caller_request_id_is_validated_and_made_unique() {
+        let headers = |v: &str| {
+            let mut h = axum::http::HeaderMap::new();
+            h.insert("x-request-id", v.parse().unwrap());
+            h
+        };
+        assert_eq!(
+            caller_request_id(&headers("plan-3/7:2")).as_deref(),
+            Some("plan-3/7:2")
+        );
+        assert_eq!(caller_request_id(&headers("has space")), None);
+        assert_eq!(caller_request_id(&headers(&"x".repeat(97))), None);
+        assert_eq!(caller_request_id(&axum::http::HeaderMap::new()), None);
+        let (a, b) = (
+            request_id_or_new(Some("p/1")),
+            request_id_or_new(Some("p/1")),
+        );
+        assert!(
+            a.starts_with("p/1-") && b.starts_with("p/1-") && a != b,
+            "{a} {b}"
+        );
+    }
+
     #[test]
     fn chat_usage_includes_cache_details_from_daemon_extras() {
         let done = hipfire_generate::DoneEvent {
@@ -3614,6 +3693,7 @@ mod tests {
         let state = crate::state::AppState::new(HipfireConfig::default());
 
         let bad_stop = ChatRequest {
+            request_id: None,
             model: Some("qwen3.5-0.8b-mq4".to_string()),
             messages: vec![ChatMessage {
                 role: "user".to_string(),
@@ -3630,6 +3710,7 @@ mod tests {
         assert_eq!(body["error"]["type"], "invalid_request_error");
 
         let bad_image = ChatRequest {
+            request_id: None,
             model: Some("qwen3.5-0.8b-mq4".to_string()),
             messages: vec![ChatMessage {
                 role: "user".to_string(),
@@ -3650,6 +3731,7 @@ mod tests {
             .contains("remote image URLs"));
 
         let missing_model = ChatRequest {
+            request_id: None,
             model: Some("__definitely_missing_hipfire_model__".to_string()),
             messages: vec![ChatMessage {
                 role: "user".to_string(),

@@ -3353,6 +3353,7 @@ fn sd_request_to_chat_request(
     };
 
     ChatRequest {
+        request_id: None,
         model: sd_requested_model(body),
         messages: vec![ChatMessage {
             role: "user".to_string(),

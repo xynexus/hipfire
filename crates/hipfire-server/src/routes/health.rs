@@ -95,6 +95,17 @@ async fn assemble_health_json(state: &SharedState) -> Value {
     let batch_telemetry = state.batch_telemetry.lock().await.clone();
     let batch_pending = state.batch_inbox.lock().await.len();
     let work_snapshot = state.work_scheduler.lock().await.snapshot();
+    // How long the oldest request in each band has waited -- starvation shows here
+    // while it happens, not after.
+    let now = crate::batch_runner::now_ms();
+    let oldest_queued = {
+        let sched = state.work_scheduler.lock().await;
+        json!({
+            "realtime": sched.longest_wait_ms(now, |w| w.priority < 64),
+            "default": sched.longest_wait_ms(now, |w| (64..255).contains(&w.priority)),
+            "opportunistic": sched.longest_wait_ms(now, |w| w.priority == 255),
+        })
+    };
     // The daemon's own scheduler counters. Deliberately a separate block from the
     // `prefill_batch` / `decode_batch` / `state_cache` views below: those describe
     // SERVER-side batching, which still lives here, so back-filling them with
@@ -176,6 +187,8 @@ async fn assemble_health_json(state: &SharedState) -> Value {
             "active_gpu_slots": work_snapshot.active_resources.gpu_slots,
         }),
         "prefill_batch": prefill_batch,
+        "workers_live": workers_live_json(state, now),
+        "oldest_queued_age_ms": oldest_queued,
         "decode_batch": if batch_enabled {
             batch_telemetry.decode_health_json()
         } else {
@@ -540,4 +553,23 @@ mod tests {
         )
         .unwrap();
     }
+}
+
+/// Per-worker gauges the batch runner keeps current mid-cycle, with the running
+/// cycle's age.
+fn workers_live_json(state: &crate::state::SharedState, now: u64) -> serde_json::Value {
+    let gauges = state
+        .worker_gauges
+        .lock()
+        .map(|g| g.clone())
+        .unwrap_or_default();
+    let map: serde_json::Map<String, serde_json::Value> = gauges
+        .into_iter()
+        .map(|(worker, g)| {
+            let mut v = serde_json::to_value(&g).unwrap_or_default();
+            v["cycle_age_ms"] = json!(g.cycle_started_ms.map(|t| now.saturating_sub(t)));
+            (worker, v)
+        })
+        .collect();
+    serde_json::Value::Object(map)
 }
