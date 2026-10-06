@@ -1470,24 +1470,35 @@ impl KvCacheRowsSnapshot {
 
 impl DeltaNetSnapshot {
     /// Allocate backup buffers matching `state`'s shapes.
+    ///
+    /// A failed allocation frees the buffers already made: the snapshot has no `Drop`
+    /// (freeing needs the GPU), so returning early used to leak them.
     pub fn new_for(gpu: &mut Gpu, state: &DeltaNetState) -> HipResult<Self> {
-        let mut s_matrix_bufs = Vec::with_capacity(state.s_matrices.len());
+        let mut snap = Self {
+            s_matrix_bufs: Vec::with_capacity(state.s_matrices.len()),
+            s_scale_bufs: Vec::with_capacity(state.s_scales.len()),
+            conv_state_bufs: Vec::with_capacity(state.conv_states.len()),
+        };
+        match snap.alloc_like(gpu, state) {
+            Ok(()) => Ok(snap),
+            Err(e) => {
+                snap.free_gpu(gpu);
+                Err(e)
+            }
+        }
+    }
+
+    fn alloc_like(&mut self, gpu: &mut Gpu, state: &DeltaNetState) -> HipResult<()> {
         for t in &state.s_matrices {
-            s_matrix_bufs.push(gpu.hip.malloc(t.buf.size())?);
+            self.s_matrix_bufs.push(gpu.hip.malloc(t.buf.size())?);
         }
-        let mut s_scale_bufs = Vec::with_capacity(state.s_scales.len());
         for t in &state.s_scales {
-            s_scale_bufs.push(gpu.hip.malloc(t.buf.size())?);
+            self.s_scale_bufs.push(gpu.hip.malloc(t.buf.size())?);
         }
-        let mut conv_state_bufs = Vec::with_capacity(state.conv_states.len());
         for t in &state.conv_states {
-            conv_state_bufs.push(gpu.hip.malloc(t.buf.size())?);
+            self.conv_state_bufs.push(gpu.hip.malloc(t.buf.size())?);
         }
-        Ok(Self {
-            s_matrix_bufs,
-            s_scale_bufs,
-            conv_state_bufs,
-        })
+        Ok(())
     }
 
     /// Copy live state → backup.

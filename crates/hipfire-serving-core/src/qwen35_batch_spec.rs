@@ -380,18 +380,38 @@ fn step(
     }
 
     // 2. Snapshot the DeltaNet state of every session that may reject.
+    // Drafting is optional: a session whose snapshot cannot be made (memory pressure)
+    // decodes this step without drafts instead of failing the batch -- whose early
+    // return also leaked every snapshot already made.
     let mut snapshots: Vec<Option<DeltaNetSnapshot>> = Vec::with_capacity(states.len());
-    for ((_, state), plan) in states.iter().zip(&plans) {
+    for ((_, state), plan) in states.iter().zip(plans.iter_mut()) {
         if plan.drafts.is_empty() {
             snapshots.push(None);
             continue;
         }
         let dn = qwen35_dn(state);
-        let mut snap = DeltaNetSnapshot::new_for(gpu, dn)
-            .map_err(|e| format!("speculative decode: DeltaNet snapshot alloc: {e:?}"))?;
-        snap.save_from(dn, gpu)
-            .map_err(|e| format!("speculative decode: DeltaNet snapshot: {e:?}"))?;
-        snapshots.push(Some(snap));
+        let snap = match DeltaNetSnapshot::new_for(gpu, dn) {
+            Ok(mut snap) => match snap.save_from(dn, gpu) {
+                Ok(()) => Some(snap),
+                Err(e) => {
+                    tracing::warn!(
+                        "speculative decode: DeltaNet snapshot failed ({e:?}); not drafting"
+                    );
+                    snap.free_gpu(gpu);
+                    None
+                }
+            },
+            Err(e) => {
+                tracing::warn!(
+                    "speculative decode: DeltaNet snapshot alloc failed ({e:?}); not drafting"
+                );
+                None
+            }
+        };
+        if snap.is_none() {
+            plan.drafts.clear();
+        }
+        snapshots.push(snap);
     }
 
     // 3. One fused forward over every session's feed + drafts.
@@ -401,7 +421,14 @@ fn step(
         .collect();
     let lens: Vec<usize> = row_tokens.iter().map(Vec::len).collect();
     let total_rows: usize = lens.iter().sum();
-    crate::qwen35_decode::qwen35_ensure_decode_prefill_batch_scratch(m, gpu, total_rows)?;
+    if let Err(e) =
+        crate::qwen35_decode::qwen35_ensure_decode_prefill_batch_scratch(m, gpu, total_rows)
+    {
+        for snap in snapshots.into_iter().flatten() {
+            snap.free_gpu(gpu);
+        }
+        return Err(e);
+    }
     // No drafts anywhere: nothing to verify, so take the ordinary forward, which
     // writes each session's `logits` itself — for a lone session the per-token
     // decode kernels, which beat a one-row batch forward (measured: +35% wall on
