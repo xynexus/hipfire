@@ -1641,9 +1641,11 @@ impl KvCache {
     ///
     /// Shared are only the pages wholly inside what `sealed` makes immutable: V rows
     /// below it, and K records of the 128-token blocks it completes. Neither side
-    /// writes there again — positions only ever advance, and a fork starts at
-    /// `sealed`. The page straddling that point is copied, since both sides will
-    /// write its remainder; the recent window (the open block) is copied whole.
+    /// may write there again: both hold `sealed` as their `SequenceState::
+    /// shared_floor`, and a rewind below it (a reset, a re-prefill from 0) first
+    /// re-homes the cache into private pages (`SequenceState::rewind_kv_to`).
+    /// The page straddling that point is copied, since both sides will write its
+    /// remainder; the recent window (the open block) is copied whole.
     pub fn fork_paged(&self, gpu: &mut Gpu, sealed: usize, physical_cap: usize) -> HipResult<Self> {
         assert!(
             sealed <= self.physical_cap,

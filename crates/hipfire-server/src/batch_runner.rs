@@ -298,6 +298,8 @@ pub struct BatchTelemetry {
     /// Times a running image yielded at a sampler-step boundary and was
     /// restarted from seed (Phase 5.2).
     pub image_preemptions: u64,
+    /// The prefix cache's counters, as of the last cycle.
+    pub prefix: PrefixStats,
 }
 
 /// The generic seam the runner groups by: two requests may share one fused
@@ -463,6 +465,20 @@ impl PrefixEntry {
 pub struct PrefixIndex {
     entries: Vec<PrefixEntry>,
     batches: u64,
+    pub stats: PrefixStats,
+}
+
+/// How the prefix cache is doing, for `/health`: lookups that found a
+/// checkpoint, the checkpoints evicted and demoted, and how much of the
+/// prompts prefilled came from a cached prefix.
+#[derive(Clone, Copy, Debug, Default, serde::Serialize)]
+pub struct PrefixStats {
+    pub lookups: u64,
+    pub hits: u64,
+    pub evictions: u64,
+    pub demotions: u64,
+    pub tokens_reused: u64,
+    pub tokens_prefilled: u64,
 }
 
 /// Checkpoints held for reuse, per server. Each is a resident daemon session — on
@@ -486,6 +502,7 @@ impl PrefixIndex {
         worker: &str,
         candidates: &[serde_json::Value],
     ) -> Option<PrefixEntry> {
+        self.stats.lookups += 1;
         let best = candidates
             .iter()
             .filter_map(|c| {
@@ -495,6 +512,7 @@ impl PrefixIndex {
                     .position(|e| e.worker == worker && e.hash_value() == value)
             })
             .max_by_key(|&i| self.entries[i].prefix_len)?;
+        self.stats.hits += 1;
         let mut entry = self.entries.remove(best);
         entry.hits += 1;
         self.entries.push(entry.clone());
@@ -543,8 +561,27 @@ impl PrefixIndex {
                 .position(|e| e.worker == worker)
                 .expect("this worker has entries");
             evicted.push(self.entries.remove(victim).checkpoint_id);
+            self.stats.evictions += 1;
         }
         evicted
+    }
+
+    /// `checkpoint_id` was attached by a chain that has since minted a deeper
+    /// checkpoint, which the chain's next step attaches instead. Unless another
+    /// chain attached it too (the shared system turn), move it to the cold end:
+    /// it stays usable, and a lookup brings it back. A lookup used to leave it
+    /// hot beside the chain's new tail, so each chain held two of the 16 slots,
+    /// and past 8 concurrent chains every step re-prefilled its conversation.
+    pub fn supersede(&mut self, checkpoint_id: &str) {
+        if let Some(i) = self
+            .entries
+            .iter()
+            .position(|e| e.checkpoint_id == checkpoint_id && e.hits <= 1)
+        {
+            let entry = self.entries.remove(i);
+            self.entries.insert(0, entry);
+            self.stats.demotions += 1;
+        }
     }
 
     /// Forget a checkpoint (the daemon no longer has it, or it failed to attach).
@@ -892,7 +929,7 @@ async fn prefill_budgeted(
             .await;
         let e = match result {
             Ok(call_events) => {
-                record_prefix_checkpoints(engine, worker, &call_events, index).await;
+                record_prefix_checkpoints(engine, worker, &call_events, reuse, index).await;
                 // A session whose checkpoint would not attach goes again without
                 // it, as the whole call used to; any other session error stands.
                 let failed = prefill_session_errors(&call_events);
@@ -1089,15 +1126,31 @@ async fn record_prefix_checkpoints(
     engine: &mut impl CycleEngine,
     worker: &str,
     events: &[serde_json::Value],
+    reuse: &HashMap<String, PrefixReuse>,
     index: &mut PrefixIndex,
 ) {
     let mut release = Vec::new();
     index.batches += 1;
     let batch = index.batches;
     for ev in events {
+        if ev["type"] == "generate_batch_prefill_session_done" {
+            index.stats.tokens_reused += ev["cached_prefix_tokens"].as_u64().unwrap_or(0);
+            index.stats.tokens_prefilled += ev["prefill_tokens"].as_u64().unwrap_or(0);
+        }
         let Some(checkpoints) = ev["state_handle"]["prefix_checkpoints"].as_array() else {
             continue;
         };
+        let deepest = checkpoints
+            .iter()
+            .filter_map(|c| c["prefix_len"].as_u64())
+            .max()
+            .unwrap_or(0) as usize;
+        let attached = ev["session_id"]
+            .as_str()
+            .and_then(|id| match reuse.get(id) {
+                Some(PrefixReuse::Attach(entry)) => Some(entry),
+                _ => None,
+            });
         // Longest first: the shortest (most shared) boundary ends up most recent.
         let mut checkpoints: Vec<&serde_json::Value> = checkpoints.iter().collect();
         checkpoints.sort_by_key(|c| std::cmp::Reverse(c["prefix_len"].as_u64().unwrap_or(0)));
@@ -1115,6 +1168,9 @@ async fn record_prefix_checkpoints(
                 batch,
                 mint_at: None,
             }));
+        }
+        if let Some(entry) = attached.filter(|e| deepest > e.prefix_len) {
+            index.supersede(&entry.checkpoint_id);
         }
     }
     if !release.is_empty() {
@@ -1279,6 +1335,7 @@ impl BatchTelemetry {
             "resident_decode_sessions": self.resident_decode_sessions,
             "pending_requests": self.pending_requests,
             "selected_batch_size": self.selected_batch_size,
+            "prefix_cache": self.prefix,
         })
     }
 }
@@ -2611,6 +2668,8 @@ async fn run_batch_cycle(
                 }
 
                 let mut tel = state.batch_telemetry.lock().await;
+
+                tel.prefix = prefix_index.stats;
                 tel.preemptions += 1;
                 tel.last_chunk_count = last_chunk_count;
                 tel.last_chunk_size = last_chunk_size;
@@ -2640,6 +2699,8 @@ async fn run_batch_cycle(
         .await;
 
     let mut tel = state.batch_telemetry.lock().await;
+
+    tel.prefix = prefix_index.stats;
     tel.total_batches += 1;
     if last_backend.as_deref() == Some("serial_reference") {
         tel.serial_batches += 1;
@@ -2914,6 +2975,50 @@ mod tests {
         assert!(index
             .lookup("w", &[serde_json::json!({"value": "step-0"})])
             .is_none());
+    }
+
+    #[test]
+    fn twelve_tool_loops_keep_their_tails_on_a_sixteen_slot_index() {
+        // Each step attaches the chain's previous tail and mints the next. A
+        // lookup used to leave the attached tail hot beside the new one, two slots
+        // a chain, so past 8 chains the tails evicted each other. `supersede` makes
+        // the dead one the coldest; the shared system turn, attached by every
+        // chain, stays hot.
+        let mut index = PrefixIndex::default();
+        let mk = |hash: String, len: usize| PrefixEntry {
+            worker: "w".into(),
+            prefix_hash: serde_json::json!({"value": hash, "prefix_len": len}),
+            prefix_len: len,
+            checkpoint_id: format!("ck-{hash}"),
+            hits: 0,
+            batch: 0,
+            mint_at: None,
+        };
+        let chains = 12;
+        assert!(chains > prefix_cache_max() / 2 && chains < prefix_cache_max());
+        index.insert(mk("system".into(), 50));
+        for step in 0..10 {
+            for chain in 0..chains {
+                let attached = if step == 0 {
+                    index.lookup("w", &[serde_json::json!({"value": "system"})])
+                } else {
+                    let prev = format!("c{chain}-s{}", step - 1);
+                    let hit = index.lookup("w", &[serde_json::json!({"value": prev})]);
+                    assert!(
+                        hit.is_some(),
+                        "chain {chain} lost its step-{} tail",
+                        step - 1
+                    );
+                    hit
+                };
+                index.insert(mk(format!("c{chain}-s{step}"), 100 * (step + 1) + chain));
+                index.supersede(&attached.unwrap().checkpoint_id);
+            }
+        }
+        let hit = index.lookup("w", &[serde_json::json!({"value": "system"})]);
+        assert!(hit.is_some(), "the shared system turn was evicted");
+        assert_eq!(index.stats.hits, index.stats.lookups);
+        assert!(index.stats.demotions > 0);
     }
 
     #[test]

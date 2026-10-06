@@ -107,7 +107,12 @@ pub struct ResidentWorkerLedgerEntry {
     pub model_path: String,
     pub residency_mode: ResidencyMode,
     pub resource_usage: ResourceUsage,
+    /// Recency: higher is more recent. The stalest goes first.
     pub last_used_seq: u64,
+    /// Running or holding work (a decode cycle, parked requests): counted
+    /// toward the cap, never unloaded to make room. Unloading it mid-cycle
+    /// failed the work it held.
+    pub busy: bool,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -237,7 +242,11 @@ pub fn plan_model_residency(
     let mut current = ledger_usage(resident_workers);
     let mut unload = Vec::new();
     // Least-recently-used first, and the same order serves both rules below.
-    let mut victims = resident_workers.to_vec();
+    let mut victims: Vec<ResidentWorkerLedgerEntry> = resident_workers
+        .iter()
+        .filter(|worker| !worker.busy)
+        .cloned()
+        .collect();
     victims.sort_by_key(|worker| worker.last_used_seq);
     let mut victims = victims.into_iter();
 
@@ -2741,8 +2750,19 @@ mod tests {
                     vram_bytes: 10,
                 },
                 last_used_seq: *seq,
+                busy: false,
             })
             .collect()
+    }
+
+    // The stalest idle worker makes room; a busy one is counted but kept, even
+    // when it is the stalest.
+    #[test]
+    fn residency_unloads_the_stalest_idle_worker() {
+        let mut workers = ledger(&[("busy-old", 1), ("idle-mid", 2), ("idle-new", 3)]);
+        workers[0].busy = true;
+        let plan = plan_model_residency(NO_BYTE_BUDGET, count_capped_request(3), &workers).unwrap();
+        assert_eq!(plan.unload_worker_key_ids, vec!["idle-mid"]);
     }
 
     fn count_capped_request(max_resident_workers: u32) -> ModelResidencyRequest {
@@ -2870,6 +2890,7 @@ mod tests {
                     vram_bytes: 500,
                 },
                 last_used_seq: 1,
+                busy: false,
             },
             ResidentWorkerLedgerEntry {
                 worker_key_id: "newer".to_string(),
@@ -2880,6 +2901,7 @@ mod tests {
                     vram_bytes: 300,
                 },
                 last_used_seq: 2,
+                busy: false,
             },
         ];
         let request = ModelResidencyRequest {

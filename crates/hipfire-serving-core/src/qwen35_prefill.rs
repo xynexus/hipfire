@@ -109,6 +109,13 @@ pub fn qwen35_prefill_active_session(
     tokens: &[u32],
     replay_as_generated_suffix: bool,
 ) -> Result<usize, String> {
+    debug_assert!(
+        m.active
+            .sequence_state
+            .as_ref()
+            .is_none_or(|s| m.active.cursor.seq_pos >= s.shared_floor),
+        "prefill would write KV below the floor it shares with a fork (rewind_kv_to first)"
+    );
     if tokens.is_empty() {
         return Ok(0);
     }
@@ -772,6 +779,7 @@ pub fn emit_qwen35_owned_prefill_checkpoint(
     let group = hipfire_runtime::kv::KvCache::KVARN_GROUP;
     let cap = source.cursor.seq_pos.max(1).div_ceil(group) * group;
     let checkpoint = Qwen35RequestSessionState::fork_from_capped(gpu, source, Some(cap))?;
+    source.mark_shared_through();
     sessions.insert(checkpoint_id.clone(), checkpoint);
     Ok(checkpoint_id)
 }

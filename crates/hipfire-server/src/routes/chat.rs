@@ -563,7 +563,16 @@ pub(crate) async fn ensure_model_loaded(
             clear_loaded_model_state_for_failed_daemon(state).await;
         }
     }
-    if let Some(loaded) = state.loaded_models.lock().await.get(&model_str).cloned() {
+    let used = state
+        .loaded_models
+        .lock()
+        .await
+        .get_mut(&model_str)
+        .map(|loaded| {
+            loaded.last_used = crate::state::next_use_stamp();
+            loaded.clone()
+        });
+    if let Some(loaded) = used {
         if loaded.max_seq >= params.max_seq {
             return Ok(LoadedModelContext {
                 model_path: model_str,
@@ -627,6 +636,7 @@ pub(crate) async fn ensure_model_loaded(
                         arch: arch.clone(),
                         batch_prefill_capable,
                         has_draft_model,
+                        last_used: crate::state::next_use_stamp(),
                     },
                 )
                 .await;
@@ -681,6 +691,7 @@ pub(crate) async fn ensure_model_loaded(
             arch: arch.clone(),
             batch_prefill_capable,
             has_draft_model,
+            last_used: crate::state::next_use_stamp(),
         },
     )
     .await;
@@ -831,14 +842,28 @@ async fn resident_workers_for_planning(state: &SharedState) -> Vec<ResidentWorke
             None => None,
         }
     };
+    // Workers the batch runner has a cycle or parked requests on.
+    let busy: std::collections::HashSet<String> = state
+        .worker_gauges
+        .lock()
+        .map(|g| {
+            g.iter()
+                .filter(|(_, g)| g.active > 0 || g.parked > 0)
+                .map(|(worker, _)| worker.clone())
+                .collect()
+        })
+        .unwrap_or_default();
     daemon_status
         .as_ref()
-        .and_then(|status| resident_workers_from_daemon_resource_status(status, &loaded_models))
-        .unwrap_or_else(|| resident_workers_from_loaded_models(&loaded_models))
+        .and_then(|status| {
+            resident_workers_from_daemon_resource_status(status, &loaded_models, &busy)
+        })
+        .unwrap_or_else(|| resident_workers_from_loaded_models(&loaded_models, &busy))
 }
 
 fn resident_workers_from_loaded_models(
     loaded_models: &HashMap<String, LoadedModelState>,
+    busy: &std::collections::HashSet<String>,
 ) -> Vec<ResidentWorkerLedgerEntry> {
     loaded_models
         .iter()
@@ -851,7 +876,11 @@ fn resident_workers_from_loaded_models(
                     system_memory_bytes: 0,
                     vram_bytes: model_file_bytes(path),
                 },
-                last_used_seq: u64::from(loaded.max_seq),
+                last_used_seq: loaded.last_used,
+                busy: loaded
+                    .worker_key_id
+                    .as_deref()
+                    .is_some_and(|w| busy.contains(w)),
             })
         })
         .collect()
@@ -860,6 +889,7 @@ fn resident_workers_from_loaded_models(
 fn resident_workers_from_daemon_resource_status(
     status: &Value,
     loaded_models: &HashMap<String, LoadedModelState>,
+    busy: &std::collections::HashSet<String>,
 ) -> Option<Vec<ResidentWorkerLedgerEntry>> {
     let workers = status.get("workers")?.as_array()?;
     let loaded_by_worker = loaded_models
@@ -867,7 +897,7 @@ fn resident_workers_from_daemon_resource_status(
         .filter_map(|(path, loaded)| {
             Some((
                 loaded.worker_key_id.as_deref()?.to_string(),
-                (path.clone(), u64::from(loaded.max_seq)),
+                (path.clone(), loaded.last_used),
             ))
         })
         .collect::<HashMap<_, _>>();
@@ -892,6 +922,7 @@ fn resident_workers_from_daemon_resource_status(
             .and_then(Value::as_str)
             .and_then(ResidencyMode::parse)
             .unwrap_or(ResidencyMode::Full);
+        let is_busy = busy.contains(&worker_key_id);
         resident.push(ResidentWorkerLedgerEntry {
             worker_key_id,
             model_path,
@@ -906,6 +937,7 @@ fn resident_workers_from_daemon_resource_status(
                     .and_then(Value::as_u64)
                     .unwrap_or(0),
             },
+            busy: is_busy,
             last_used_seq: fallback_seq,
         });
     }
@@ -4384,6 +4416,7 @@ mod tests {
                 arch: None,
                 batch_prefill_capable: None,
                 has_draft_model: false,
+                last_used: 1,
             },
         );
 
@@ -4408,6 +4441,7 @@ mod tests {
                 arch: None,
                 batch_prefill_capable: None,
                 has_draft_model: false,
+                last_used: 7,
             },
         );
         let status = json!({
@@ -4421,8 +4455,9 @@ mod tests {
             }]
         });
 
+        let busy = std::collections::HashSet::from(["worker-old".to_string()]);
         let workers =
-            resident_workers_from_daemon_resource_status(&status, &loaded_models).unwrap();
+            resident_workers_from_daemon_resource_status(&status, &loaded_models, &busy).unwrap();
 
         assert_eq!(workers.len(), 1);
         assert_eq!(workers[0].worker_key_id, "worker-old");
@@ -4435,7 +4470,9 @@ mod tests {
                 vram_bytes: 256,
             }
         );
-        assert_eq!(workers[0].last_used_seq, 4096);
+        // Recency is when it was last used, not its context length.
+        assert_eq!(workers[0].last_used_seq, 7);
+        assert!(workers[0].busy);
     }
 
     #[test]
@@ -4458,15 +4495,17 @@ mod tests {
                 arch: None,
                 batch_prefill_capable: None,
                 has_draft_model: false,
+                last_used: 9,
             },
         );
 
-        let workers = resident_workers_from_loaded_models(&loaded_models);
+        let workers = resident_workers_from_loaded_models(&loaded_models, &Default::default());
 
         assert_eq!(workers.len(), 1);
         assert_eq!(workers[0].worker_key_id, "worker-resident");
         assert_eq!(workers[0].resource_usage.vram_bytes, 321);
-        assert_eq!(workers[0].last_used_seq, 2048);
+        assert_eq!(workers[0].last_used_seq, 9);
+        assert!(!workers[0].busy);
         let _ = std::fs::remove_dir_all(&root);
     }
 
