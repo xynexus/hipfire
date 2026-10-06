@@ -658,7 +658,7 @@ async fn stream_responses(
             return;
         }
 
-        let gen_req = {
+        let (gen_req, think_filter) = {
             let cfg = state.config.lock().await;
             // Per-model overrides (thinking, reasoning_effort) apply here as on the
             // chat route; the global config alone ignored them on this path.
@@ -671,26 +671,30 @@ async fn stream_responses(
                 body.presence_penalty,
                 body.frequency_penalty,
             );
-            generate_request_from_chat(
-                req_id.clone(),
-                &chat_messages,
-                GenerationSamplingPolicy::from_defaults(
-                    cfg.temperature,
-                    cfg.top_p,
-                    cfg.repeat_penalty,
-                    cfg.max_tokens,
-                    body.temperature,
-                    body.top_p,
-                    body.top_k,
-                    body.repeat_penalty,
-                    Some(request_max_tokens),
+            let think_filter = ThinkStreamFilter::for_controls(&controls);
+            (
+                generate_request_from_chat(
+                    req_id.clone(),
+                    &chat_messages,
+                    GenerationSamplingPolicy::from_defaults(
+                        cfg.temperature,
+                        cfg.top_p,
+                        cfg.repeat_penalty,
+                        cfg.max_tokens,
+                        body.temperature,
+                        body.top_p,
+                        body.top_k,
+                        body.repeat_penalty,
+                        Some(request_max_tokens),
+                    ),
+                    loaded.worker_key_id,
+                    normalize_tools(body.tools.clone()),
+                    None,
+                    stop,
+                    image_base64,
+                    controls,
                 ),
-                loaded.worker_key_id,
-                normalize_tools(body.tools.clone()),
-                None,
-                stop,
-                image_base64,
-                controls,
+                think_filter,
             )
         };
 
@@ -740,7 +744,7 @@ async fn stream_responses(
         // The template opens `<think>` in the generation prompt, so the stream starts
         // mid-reasoning and no opening marker ever arrives — default() would misread
         // the whole reasoning block as answer text.
-        let mut think_filter = ThinkStreamFilter::started_in_think();
+        let mut think_filter = think_filter;
         let mut reasoning_text = String::new();
         // Captured before the move so a client disconnect can cooperatively
         // cancel this exact request in the worker (SIGUSR1 + drain).
@@ -789,7 +793,13 @@ async fn stream_responses(
                     );
                 }
                 // Already split by the stream filter — reasoning went out on its own
-                // event, so there is nothing left to strip here.
+                // event. What is left gets the cleanup a non-streamed reply gets: a
+                // stray turn header the model picked as a near-tie (`<|im_start|>
+                // assistant` ahead of the answer, or `<|im_start|>user` after it)
+                // was streamed, and then returned as the answer and stored as the
+                // assistant turn. The deltas already sent cannot be taken back; the
+                // `done` events, which a client takes as the answer, can.
+                let output_text = crate::routes::chat::clean_reply_text(&output_text);
                 let mut stored = messages;
                 stored.push(Message {
                     role: Role::Assistant,
