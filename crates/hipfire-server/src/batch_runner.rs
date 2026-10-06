@@ -337,6 +337,9 @@ pub struct SessionSpec {
     pub max_think_tokens: u32,
     /// Total tokens this request may still generate.
     pub max_tokens: usize,
+    /// Run alone: no other session shares its prefill or decode, so its answer does
+    /// not depend on what else the server is doing (`ChatRequest::deterministic`).
+    pub solo: bool,
     /// The request's tool declarations, rendered into the chat template by the
     /// daemon. Without them the model never learns a tool exists and answers in
     /// prose, or invents a call nothing will parse.
@@ -1030,6 +1033,19 @@ fn prefix_cache_enabled() -> bool {
 }
 
 /// A request's terminal payload: why it stopped, and its usage in tokens.
+/// The scheduler key and batch cap for a text request. Requests batch only with
+/// others under the same key: normally the worker, so everything on a model can
+/// share a cycle; a solo request gets a key of its own and a cap of one, so its
+/// lease is a singleton and no cycle admits it beside others (or others beside it --
+/// `run_batch_cycle` checks that too).
+pub(crate) fn text_microbatch(worker: &str, request_id: &str, solo: bool) -> (String, usize) {
+    if solo {
+        (format!("{worker}#solo:{request_id}"), 1)
+    } else {
+        (worker.to_string(), batch_max())
+    }
+}
+
 /// One worker's live state, for `/health`. The cycle-end telemetry is all `/health`
 /// had, and a cycle can last a whole swarm turn: mid-cycle it read zero sessions while
 /// a batch ran, so the precursors of starvation and memory pressure were invisible
@@ -2325,8 +2341,13 @@ async fn run_batch_cycle(
                 active.len()
             );
         }
+        // A solo session runs alone to the end: nothing joins its cycle.
+        let solo = active
+            .iter()
+            .any(|id| specs_by_id.get(id).is_some_and(|s| s.solo));
         if midcycle_admit_enabled()
             && !admission_closed
+            && !solo
             && !active.is_empty()
             && !state.engine_wanted()
         {
@@ -2552,7 +2573,56 @@ mod tests {
             max_think_tokens: 0,
             max_tokens: 16,
             tools: None,
+            solo: false,
         }
+    }
+
+    // A solo (deterministic) request runs alone: its lease is a singleton between
+    // two same-worker requests, and a cycle running those two cannot take it in.
+    #[test]
+    fn a_solo_request_never_shares_a_batch() {
+        use hipfire_scheduler::{
+            ContinuousWorkScheduler, WorkloadClass, WorkloadResources, WorkloadSpec,
+        };
+        assert_eq!(
+            text_microbatch("w1", "r9", true),
+            ("w1#solo:r9".to_string(), 1)
+        );
+        assert_eq!(
+            text_microbatch("w1", "r9", false),
+            ("w1".to_string(), batch_max())
+        );
+        let capacity = WorkloadResources {
+            system_memory_bytes: 64_000,
+            vram_bytes: 24_000,
+            gpu_slots: 4,
+            npu_slots: 1,
+            cpu_threads: 16,
+        };
+        let mut sched = ContinuousWorkScheduler::new(capacity, 32, 0);
+        for (id, solo) in [("a", false), ("s", true), ("b", false)] {
+            let (key, cap) = text_microbatch("w1", id, solo);
+            sched
+                .enqueue(WorkloadSpec::microbatchable(
+                    id,
+                    WorkloadClass::TokenPrefill,
+                    64,
+                    0,
+                    WorkloadResources::default(),
+                    key,
+                    cap,
+                ))
+                .unwrap();
+        }
+        // Mid-cycle admission for a worker's cycle never takes the solo request.
+        let joined = sched.take_microbatch_compatible(WorkloadClass::TokenPrefill, "w1", 255, 8);
+        let ids: Vec<&str> = joined.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, ["a", "b"]);
+        let lease = sched
+            .next_batch(0)
+            .expect("the solo request is still queued");
+        let ids: Vec<&str> = lease.workloads.iter().map(|w| w.id.as_str()).collect();
+        assert_eq!(ids, ["s"], "a solo lease holds the solo request only");
     }
 
     // The built requests must be accepted by the daemon's own validators —
