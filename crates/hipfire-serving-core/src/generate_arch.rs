@@ -1894,7 +1894,8 @@ pub fn generate_llama(
         // `emit_filter_action`), and EOS/terminator + max_tokens stop conditions.
         let mut emitted: Vec<u32> = Vec::new();
         let mut streamed: Vec<u32> = Vec::new();
-        let mut filter = chat_output_filter_from_profile(chat_profile.as_ref(), &[]);
+        let mut filter =
+            chat_output_filter_from_profile(chat_profile.as_ref(), &[], m.tokenizer.as_ref());
         let mut bytes_fed = 0usize;
         let mut generated = 0usize;
         let mut position = prompt_tokens.len();

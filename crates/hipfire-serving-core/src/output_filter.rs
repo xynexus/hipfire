@@ -126,12 +126,21 @@ pub fn gpu_block_attractor_token(
 /// filter buffer a partial stop token rather than leaking it before the match
 /// completes.
 pub fn chat_output_filter(m: &LoadedModel, request_stop_sequences: &[String]) -> EosFilter {
-    chat_output_filter_from_profile(m.chat_template_profile.as_ref(), request_stop_sequences)
+    chat_output_filter_from_profile(
+        m.chat_template_profile.as_ref(),
+        request_stop_sequences,
+        m.tokenizer.as_ref(),
+    )
 }
 
+/// The turn-suffix stops above, less any that `tokenizer` ends generation on by
+/// id (the decode loops check `is_terminator`). Matched as bytes, those also
+/// fired on a reply that QUOTES the suffix -- a file holding `<|im_end|>` --
+/// and ended the turn mid-call. Request stop sequences stay byte matches.
 pub fn chat_output_filter_from_profile(
     chat_template_profile: Option<&prompt_frame::ChatTemplateProfile>,
     request_stop_sequences: &[String],
+    tokenizer: Option<&hipfire_model::tokenizer::Tokenizer>,
 ) -> EosFilter {
     let (mut stop_at, mut holdback_prefixes) = chat_template_profile
         .map(|profile| {
@@ -150,6 +159,16 @@ pub fn chat_output_filter_from_profile(
         })
         .filter(|(stop_at, _)| !stop_at.is_empty())
         .unwrap_or_else(|| (vec![b"<|im_end|>".to_vec()], vec![b"<|im_end|>".to_vec()]));
+    if let Some(tokenizer) = tokenizer {
+        let by_id = |bytes: &Vec<u8>| {
+            std::str::from_utf8(bytes)
+                .ok()
+                .and_then(|s| tokenizer.special_token_id(s.trim_end()))
+                .is_some_and(|id| tokenizer.is_terminator(id))
+        };
+        stop_at.retain(|s| !by_id(s));
+        holdback_prefixes.retain(|s| !by_id(s));
+    }
 
     for stop in request_stop_sequences {
         if stop.is_empty() {
@@ -210,10 +229,38 @@ mod output_filter_tests {
         assert_eq!(stops[1].len(), 64);
     }
 
+    // The turn suffix the decode loop stops on by id is not also a byte stop: a
+    // reply quoting `<|im_end|>` (a file it writes) runs on; a request stop
+    // sequence still ends it.
+    #[test]
+    fn a_quoted_turn_suffix_does_not_stop_the_reply() {
+        let tok = hipfire_model::tokenizer::Tokenizer::from_gguf_meta_json(&serde_json::json!({
+            "tokenizer.ggml.tokens": ["<unk>", "<|im_end|>", "a"],
+            "tokenizer.ggml.merges": Vec::<String>::new(),
+            "tokenizer.ggml.model": "llama",
+            "tokenizer.ggml.eos_token_id": 1,
+        }))
+        .unwrap();
+        let stops = vec!["END".to_string()];
+        let mut filter = chat_output_filter_from_profile(None, &stops, Some(&tok));
+        match filter.observe(b"x<|im_end|>y END z") {
+            FilterAction::StopEmit(bytes) => {
+                assert_eq!(std::str::from_utf8(&bytes).unwrap(), "x<|im_end|>y ");
+            }
+            other => panic!("expected the request stop, got {other:?}"),
+        }
+        // Without the tokenizer the bytes still stop it, as before.
+        let mut filter = chat_output_filter_from_profile(None, &stops, None);
+        assert!(matches!(
+            filter.observe(b"x<|im_end|>y END z"),
+            FilterAction::StopEmit(ref b) if b == b"x"
+        ));
+    }
+
     #[test]
     fn request_stop_sequence_stops_filter_output() {
         let stops = vec!["END".to_string()];
-        let mut filter = chat_output_filter_from_profile(None, &stops);
+        let mut filter = chat_output_filter_from_profile(None, &stops, None);
         match filter.observe(b"hello END hidden") {
             FilterAction::StopEmit(bytes) => {
                 assert_eq!(std::str::from_utf8(&bytes).unwrap(), "hello ");

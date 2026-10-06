@@ -973,12 +973,15 @@ pub fn qwen35_logits_debug_summary(
 
 /// Sample/select the next token for one session from its decode logits and
 /// package the per-session [`Qwen35DecodeTokenOutcome`] (token + stop state).
+/// `history` is the session's tokens before this one: a terminator inside an
+/// open `<tool_call>` is the call's text, not a stop.
 pub fn qwen35_decode_token_outcome(
     m: &LoadedModel,
     gpu: &mut hipfire_rdna::Gpu,
     logits: &hipfire_rdna::GpuTensor,
     max_tokens_remaining: usize,
     im_end_token: Option<u32>,
+    history: &[u32],
 ) -> Result<Qwen35DecodeTokenOutcome, String> {
     let config = m
         .q35_config
@@ -991,13 +994,15 @@ pub fn qwen35_decode_token_outcome(
     let token = gpu
         .argmax_f32(logits, config.vocab_size)
         .map_err(|e| format!("qwen35 decode argmax: {e:?}"))?;
-    let is_terminator =
-        token == config.eos_token || im_end_token == Some(token) || tokenizer.is_terminator(token);
+    let is_terminator = (token == config.eos_token
+        || im_end_token == Some(token)
+        || tokenizer.is_terminator(token))
+        && !tokenizer.tool_call_open(history.iter().copied());
     let stop = is_terminator || max_tokens_remaining <= 1;
     let text = if is_terminator {
         String::new()
     } else {
-        tokenizer.decode(&[token])
+        tokenizer.decode_marked(history, &[token])
     };
     Ok(Qwen35DecodeTokenOutcome {
         token,
@@ -1046,6 +1051,7 @@ pub fn qwen35_decode_step_serial_reference(
             &scratch.logits,
             session.max_tokens_remaining,
             im_end_token,
+            &state.cursor.conversation_tokens,
         )?;
         state.cursor.conversation_tokens.push(outcome.token);
         {
@@ -1261,6 +1267,7 @@ pub fn qwen35_decode_step_fused_grouped_moe_native_chunk(
                 &state.logits,
                 session.max_tokens_remaining,
                 im_end_token,
+                &state.cursor.conversation_tokens,
             )?);
         }
         let mut oracle_states = if qwen35_decode_internal_parity_enabled() {
@@ -1362,6 +1369,7 @@ pub fn qwen35_decode_step_fused_grouped_moe_native_chunk(
                     &oracle_state.logits,
                     session.max_tokens_remaining,
                     im_end_token,
+                    &fused_state.cursor.conversation_tokens,
                 )?;
                 if oracle_outcome.token != outcome.token {
                     return Err(format!(
@@ -1545,6 +1553,7 @@ pub fn qwen35_decode_step_fused_dense_native_chunk(
                 &state.logits,
                 session.max_tokens_remaining,
                 im_end_token,
+                &state.cursor.conversation_tokens,
             )?);
         }
         let mut oracle_states = if qwen35_decode_internal_parity_enabled() {
@@ -1644,6 +1653,7 @@ pub fn qwen35_decode_step_fused_dense_native_chunk(
                     &oracle_state.logits,
                     session.max_tokens_remaining,
                     im_end_token,
+                    &fused_state.cursor.conversation_tokens,
                 )?;
                 if oracle_outcome.token != outcome.token {
                     return Err(format!(
@@ -1745,6 +1755,7 @@ pub fn qwen35_decode_step_fused_dense_native_singleton(
             &state.logits,
             session.max_tokens_remaining,
             im_end_token,
+            &state.cursor.conversation_tokens,
         )?;
         state.cursor.conversation_tokens.push(outcome.token);
         {

@@ -890,8 +890,11 @@ pub fn generate_dflash(
     // quirks (Gemma 4 marker holdback, strip-think, byte-level stop_at);
     // see crates/engine/src/eos_filter.rs.
     let mut bytes_fed_to_filter = 0usize;
-    let mut filter =
-        chat_output_filter_from_profile(chat_template_profile.as_ref(), request_stop_sequences);
+    let mut filter = chat_output_filter_from_profile(
+        chat_template_profile.as_ref(),
+        request_stop_sequences,
+        m.tokenizer.as_ref(),
+    );
     let mut position = prompt_tokens.len();
     let mut seed_token = first_token;
     let mut spec_metrics = SpecMetrics::new(df.block_size);
@@ -1810,8 +1813,11 @@ pub fn generate_multi(
     let mut generated = 0usize;
     let mut streamed_tokens: Vec<u32> = Vec::new();
     let mut bytes_fed_to_filter = 0usize;
-    let mut filter =
-        chat_output_filter_from_profile(chat_template_profile.as_ref(), request_stop_sequences);
+    let mut filter = chat_output_filter_from_profile(
+        chat_template_profile.as_ref(),
+        request_stop_sequences,
+        m.tokenizer.as_ref(),
+    );
     let mut alert_fired = false;
     let mut think_count: usize = 0;
     let mut prev_in_think: bool = false;
@@ -5004,8 +5010,11 @@ pub fn generate_start(
         // future arch quirks (Gemma 4 marker holdback, strip-think,
         // byte-level stop_at); see crates/engine/src/eos_filter.rs.
         let mut bytes_fed_to_filter = 0usize;
-        let mut filter =
-            chat_output_filter_from_profile(chat_template_profile.as_ref(), request_stop_sequences);
+        let mut filter = chat_output_filter_from_profile(
+            chat_template_profile.as_ref(),
+            request_stop_sequences,
+            m.tokenizer.as_ref(),
+        );
 
         for _ in 0..max_tokens {
             generated += 1;

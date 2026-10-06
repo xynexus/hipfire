@@ -161,6 +161,9 @@ struct SessionPlan {
     /// Tokens emitted this step so far (the fresh token, when `feed` is it).
     emitted: Vec<u32>,
     stop: bool,
+    /// The step stopped at a terminator: the last emitted token, which is the
+    /// only one that can be (a stop truncates there).
+    term_stop: bool,
     remaining: usize,
 }
 
@@ -330,12 +333,14 @@ fn step(
             let token = fresh_tokens
                 .next()
                 .ok_or("qwen35 decode argmax: missing a session's token")?;
-            let stop = is_terminator(config, tokenizer, im_end_token, token) || remaining <= 1;
+            let term_stop = is_terminator(config, tokenizer, im_end_token, token)
+                && !tokenizer.tool_call_open(state.cursor.conversation_tokens.iter().copied());
             SessionPlan {
                 feed: vec![token],
                 drafts: Vec::new(),
                 emitted: vec![token],
-                stop,
+                stop: term_stop || remaining <= 1,
+                term_stop,
                 remaining,
             }
         } else {
@@ -345,6 +350,7 @@ fn step(
                 drafts: Vec::new(),
                 emitted: Vec::new(),
                 stop: false,
+                term_stop: false,
                 remaining,
             }
         };
@@ -556,6 +562,22 @@ fn step(
     for (s, (((session, state), mut plan), snap)) in
         states.iter_mut().zip(plans).zip(snapshots).enumerate()
     {
+        // What came before this step's emitted tokens, for marking quoted
+        // markup in their text (`decode_marked`): the history, plus the pending
+        // run it feeds, which was emitted last step.
+        let mark_history: Vec<u32> = {
+            let conv = &state.cursor.conversation_tokens;
+            let fed: &[u32] = if plan.emitted.is_empty() {
+                &plan.feed
+            } else {
+                &[]
+            };
+            conv[conv.len().saturating_sub(32)..]
+                .iter()
+                .chain(fed)
+                .copied()
+                .collect()
+        };
         let (a, bonus) = match &verified {
             Some((argmax, _)) if !plan.drafts.is_empty() => {
                 accept(&plan.drafts, |i| argmax[row_index[s][i]], plan.feed.len())
@@ -572,15 +594,25 @@ fn step(
         if rejected {
             fresh.push(bonus);
         }
-        // Stop at a terminator or the token budget, whichever comes first.
+        // Stop at a terminator or the token budget, whichever comes first. A
+        // terminator inside an open `<tool_call>` is the call's text.
+        let mut open = tokenizer.tool_call_open(
+            state
+                .cursor
+                .conversation_tokens
+                .iter()
+                .chain(&plan.feed)
+                .copied(),
+        );
         for (i, &t) in fresh.iter().enumerate() {
-            if plan.emitted.len() + i + 1 >= plan.remaining
-                || is_terminator(config, tokenizer, im_end_token, t)
-            {
+            let term_stop = !open && is_terminator(config, tokenizer, im_end_token, t);
+            if plan.emitted.len() + i + 1 >= plan.remaining || term_stop {
                 fresh.truncate(i + 1);
                 plan.stop = true;
+                plan.term_stop = term_stop;
                 break;
             }
+            open = tokenizer.tool_call_open_step(open, t);
         }
         if plan.emitted.len() >= plan.remaining {
             plan.stop = true;
@@ -620,18 +652,8 @@ fn step(
         }
         plan.emitted.extend_from_slice(&fresh);
 
-        let by_length = plan.stop
-            && plan.emitted.len() >= plan.remaining
-            && !plan
-                .emitted
-                .last()
-                .is_some_and(|&t| is_terminator(config, tokenizer, im_end_token, t));
-        let text: Vec<u32> = plan
-            .emitted
-            .iter()
-            .copied()
-            .filter(|&t| !is_terminator(config, tokenizer, im_end_token, t))
-            .collect();
+        let by_length = plan.stop && plan.emitted.len() >= plan.remaining && !plan.term_stop;
+        let text = &plan.emitted[..plan.emitted.len() - usize::from(plan.term_stop)];
         let logical_position =
             state.cursor.seq_pos + state.kv_cache().compact_offset + pendings[s].len();
         lines.push(serde_json::json!({
@@ -642,7 +664,7 @@ fn step(
             "runtime_state_handle": session.session_id,
             "token": plan.emitted.first(),
             "tokens": plan.emitted,
-            "text": tokenizer.decode(&text),
+            "text": tokenizer.decode_marked(&mark_history, text),
             "stop": plan.stop,
             "finish_reason": if !plan.stop { serde_json::Value::Null }
                 else if by_length { "length".into() } else { "stop".into() },

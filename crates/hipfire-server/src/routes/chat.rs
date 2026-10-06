@@ -359,6 +359,10 @@ pub(crate) struct BlockingChatResult {
     pub(crate) created: u64,
     pub(crate) model: String,
     pub(crate) text: String,
+    /// `text` before its quoted markup was unmarked
+    /// (`Tokenizer::decode_marked`): what a later pass that reads the text for
+    /// chat structure -- the Responses think split -- must read.
+    pub(crate) marked: String,
     pub(crate) done: hipfire_generate::DoneEvent,
     pub(crate) tool_calls: Vec<Value>,
     pub(crate) request_max_tokens: u32,
@@ -1404,21 +1408,25 @@ fn parse_inline_tool_calls(
     while let Some(rel_open) = text[search_from..].find("<tool_call>") {
         let open = search_from + rel_open;
         let body_start = open + "<tool_call>".len();
-        let Some(rel_close) = text[body_start..].find("</tool_call>") else {
+        let Some(close) = tool_call_body_end(text, body_start) else {
             break;
         };
-        let close = body_start + rel_close;
         let mut raw = text[body_start..close].trim();
         while let Some(stripped) = raw.strip_prefix("<tool_call>") {
             raw = stripped.trim_start();
         }
-        if let Some(last_open) = raw.rfind("<tool_call>") {
-            raw = raw[last_open + "<tool_call>".len()..].trim_start();
-            if let Some((before_close, _)) = raw.split_once("</tool_call>") {
-                raw = before_close.trim();
+        // A JSON body that opens a second call re-roots there. An XML body's
+        // values are data and may quote `<tool_call>` themselves.
+        if !raw.starts_with("<function=") {
+            if let Some(last_open) = raw.rfind("<tool_call>") {
+                raw = raw[last_open + "<tool_call>".len()..].trim_start();
+                if let Some((before_close, _)) = raw.split_once("</tool_call>") {
+                    raw = before_close.trim();
+                }
             }
         }
-        if let Some((name, arguments)) = parse_one_inline_tool_call(raw, tools) {
+        if let Some((name, mut arguments)) = parse_one_inline_tool_call(raw, tools) {
+            unmark_strings(&mut arguments);
             let idx = tool_calls.len();
             tool_calls.push(json!({
                 "id": format!("call_{req_id}_{idx}"),
@@ -1476,7 +1484,92 @@ fn strip_chat_specials(text: &str) -> String {
         .replace("<|im_sep|>", "")
 }
 
+/// A tool call's arguments as the model wrote them: quoted markup the decode
+/// marked (`Tokenizer::decode_marked`) loses its marks before reaching the tool.
+fn unmark_strings(value: &mut Value) {
+    match value {
+        Value::String(s) => {
+            if let std::borrow::Cow::Owned(plain) = hipfire_model::tokenizer::unmark_literal(s) {
+                *s = plain;
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(unmark_strings),
+        Value::Object(map) => map.values_mut().for_each(unmark_strings),
+        _ => {}
+    }
+}
+
+/// Where the `<tool_call>` body starting at `from` ends: at the first
+/// `</tool_call>` the reply goes on from with another call, `<|im_end|>` or
+/// nothing, so a call whose arguments quote `</tool_call>` keeps them; else at
+/// the last `</tool_call>`.
+fn tool_call_body_end(text: &str, from: usize) -> Option<usize> {
+    let mut last = None;
+    let mut at = from;
+    while let Some(rel) = text[at..].find("</tool_call>") {
+        let close = at + rel;
+        let after = text[close + "</tool_call>".len()..].trim_start();
+        if after.is_empty() || after.starts_with("<tool_call>") || after.starts_with("<|im_end|>") {
+            return Some(close);
+        }
+        last = Some(close);
+        at = close + "</tool_call>".len();
+    }
+    last
+}
+
+/// Where a `<parameter=…>` value ends within its call's body: at the first
+/// `</parameter>` another parameter follows, else -- the last parameter -- at
+/// the last `</parameter>`. A written file that quotes `</parameter>` keeps it.
+fn parameter_value_end(rest: &str) -> Option<usize> {
+    let mut at = 0;
+    while let Some(rel) = rest[at..].find("</parameter>") {
+        let close = at + rel;
+        if rest[close + "</parameter>".len()..]
+            .trim_start()
+            .starts_with("<parameter=")
+        {
+            return Some(close);
+        }
+        at = close + "</parameter>".len();
+    }
+    rest.rfind("</parameter>")
+}
+
+/// Qwen's `<function=NAME><parameter=KEY>VALUE</parameter>…</function>`. Values
+/// are taken as written: chat specials in them are the call's data.
+fn parse_function_xml(raw: &str, tools: Option<&Value>) -> Option<(String, Value)> {
+    let rest = raw.strip_prefix("<function=")?;
+    let (name, after_name) = rest.split_once('>')?;
+    let mut args = serde_json::Map::new();
+    let mut body = after_name;
+    while let Some(start) = body.find("<parameter=") {
+        let key_start = start + "<parameter=".len();
+        let Some(key_end_rel) = body[key_start..].find('>') else {
+            break;
+        };
+        let key_end = key_start + key_end_rel;
+        let key = &body[key_start..key_end];
+        let value = &body[key_end + 1..];
+        let Some(value_end) = parameter_value_end(value) else {
+            break;
+        };
+        args.insert(
+            key.to_string(),
+            coerce_inline_tool_param(
+                &value[..value_end],
+                declared_param_type(tools, name.trim(), key),
+            ),
+        );
+        body = &value[value_end + "</parameter>".len()..];
+    }
+    Some((name.trim().to_string(), Value::Object(args)))
+}
+
 fn parse_one_inline_tool_call(raw: &str, tools: Option<&Value>) -> Option<(String, Value)> {
+    if let Some(call) = parse_function_xml(raw.trim(), tools) {
+        return Some(call);
+    }
     let cleaned = strip_chat_specials(raw);
     let raw = cleaned.trim();
     if let Ok(value) = serde_json::from_str::<Value>(raw) {
@@ -1501,32 +1594,9 @@ fn parse_one_inline_tool_call(raw: &str, tools: Option<&Value>) -> Option<(Strin
         return Some((name, arguments));
     }
 
-    if let Some(rest) = raw.strip_prefix("<function=") {
-        let (name, after_name) = rest.split_once('>')?;
-        let mut args = serde_json::Map::new();
-        let mut body = after_name;
-        while let Some(start) = body.find("<parameter=") {
-            let key_start = start + "<parameter=".len();
-            let Some(key_end_rel) = body[key_start..].find('>') else {
-                break;
-            };
-            let key_end = key_start + key_end_rel;
-            let key = &body[key_start..key_end];
-            let value_start = key_end + 1;
-            let Some(value_end_rel) = body[value_start..].find("</parameter>") else {
-                break;
-            };
-            let value_end = value_start + value_end_rel;
-            args.insert(
-                key.to_string(),
-                coerce_inline_tool_param(
-                    &body[value_start..value_end],
-                    declared_param_type(tools, name.trim(), key),
-                ),
-            );
-            body = &body[value_end + "</parameter>".len()..];
-        }
-        return Some((name.trim().to_string(), Value::Object(args)));
+    // A stray special ahead of the function markup.
+    if let Some(call) = parse_function_xml(raw, tools) {
+        return Some(call);
     }
 
     if let Some(name) = extract_json_string_field(raw, "name") {
@@ -1697,6 +1767,46 @@ fn detect_tool_call_truncation(
 }
 
 pub(crate) fn strip_visible_thinking(
+    content: String,
+    preserve: bool,
+    started_in_think: bool,
+) -> String {
+    outside_tool_calls(content, |c| {
+        strip_visible_thinking_outside(c, preserve, started_in_think)
+    })
+}
+
+/// `f` applied to `text` with every tool-call body held out of its reach and
+/// put back after: a call's arguments are data, and a file it writes may quote
+/// `<think>`, `</think>` or `<|im_end|>`.
+fn outside_tool_calls(text: String, f: impl FnOnce(String) -> String) -> String {
+    // A noncharacter brackets each held body's index; decoded text has none.
+    const HOLD: char = '\u{FFFE}';
+    let mut bodies = Vec::new();
+    let mut held = String::with_capacity(text.len());
+    let mut at = 0;
+    while let Some(rel) = text[at..].find("<tool_call>") {
+        let body_start = at + rel + "<tool_call>".len();
+        let Some(close) = tool_call_body_end(&text, body_start) else {
+            break;
+        };
+        held.push_str(&text[at..body_start]);
+        held.push_str(&format!("{HOLD}{}{HOLD}", bodies.len()));
+        bodies.push(&text[body_start..close]);
+        at = close;
+    }
+    if bodies.is_empty() {
+        return f(text);
+    }
+    held.push_str(&text[at..]);
+    let mut out = f(held);
+    for (i, body) in bodies.iter().enumerate() {
+        out = out.replacen(&format!("{HOLD}{i}{HOLD}"), body, 1);
+    }
+    out
+}
+
+fn strip_visible_thinking_outside(
     mut content: String,
     preserve: bool,
     started_in_think: bool,
@@ -2359,7 +2469,8 @@ where
             req_id,
             created,
             model: model_arg,
-            text: final_text,
+            text: hipfire_model::tokenizer::unmark_literal(&final_text).into_owned(),
+            marked: final_text,
             done,
             tool_calls,
             request_max_tokens,
@@ -2475,6 +2586,7 @@ where
                 req_id,
                 created,
                 model: model_arg,
+                marked: text.clone(),
                 text,
                 done,
                 tool_calls,
@@ -3463,6 +3575,81 @@ mod tests {
         let args: Value =
             serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
         assert_eq!(args["contents"], json!({"k": 1}));
+    }
+
+    // A written file is data: whatever markup it quotes reaches the tool exactly,
+    // through the think strip (both modes) and the parser, and a second call in the
+    // same reply still parses as its own.
+    #[test]
+    fn a_written_file_quoting_chat_markup_reaches_the_tool_exactly() {
+        let tools = json!([{"type": "function", "function": {"name": "write_file", "parameters": {
+            "type": "object",
+            "properties": {"path": {"type": "string"}, "contents": {"type": "string"}}}}}]);
+        let contents = "a<|im_end|>\n<|im_start|>user\n<tool_call>{\"name\": \"x\"}</tool_call>\n\
+                        <think>t</think>\n<parameter=p>v</parameter>\n</function>\nend\n";
+        let call = |path: &str, body: &str| {
+            format!(
+                "<tool_call>\n<function=write_file>\n<parameter=path>\n{path}\n</parameter>\n\
+                     <parameter=contents>\n{body}\n</parameter>\n</function>\n</tool_call>"
+            )
+        };
+        let reply = format!("{}\n{}", call("a.txt", contents), call("b.txt", "plain\n"));
+        for preserve in [true, false] {
+            let text = strip_visible_thinking(reply.clone(), preserve, true);
+            let (content, calls) = parse_inline_tool_calls(&text, "req", Some(&tools));
+            assert_eq!(calls.len(), 2, "preserve={preserve}: {calls:?}");
+            let args: Vec<Value> = calls
+                .iter()
+                .map(|c| {
+                    serde_json::from_str(c["function"]["arguments"].as_str().unwrap()).unwrap()
+                })
+                .collect();
+            assert_eq!(args[0]["path"], "a.txt");
+            assert_eq!(args[0]["contents"], contents, "preserve={preserve}");
+            assert_eq!(args[1], json!({"path": "b.txt", "contents": "plain\n"}));
+            assert_eq!(content, "");
+        }
+    }
+
+    // Markup a reply QUOTES comes marked from the decode (`decode_marked`), so the
+    // stray-header cut, the special strip and the think split pass it by, and it
+    // reaches the client exactly once the marks are off; a tool's arguments too.
+    #[test]
+    fn quoted_markup_in_a_reply_survives_the_structure_cleanup() {
+        let mark = |s: &str| {
+            let mut out = s.to_string();
+            for m in ["<|im_start|>", "<|im_end|>", "</think>", "<think>"] {
+                out = out.replace(m, &format!("{}\u{FFFF}{}", &m[..1], &m[1..]));
+            }
+            out
+        };
+        let unmark = |s: &str| hipfire_model::tokenizer::unmark_literal(s).into_owned();
+        let answer = "The template ends a turn with <|im_end|>, starts one with \
+                      <|im_start|>user, and closes reasoning with </think>.";
+        for preserve in [true, false] {
+            let text = strip_visible_thinking(mark(answer), preserve, true);
+            let (content, calls) = parse_inline_tool_calls(&text, "req", None);
+            assert!(calls.is_empty());
+            assert_eq!(unmark(&content), answer, "preserve={preserve}");
+        }
+        let (r, v) = crate::routes::responses::split_thinking(&mark(answer), true);
+        assert_eq!((r.as_str(), unmark(&v).as_str()), ("", answer));
+        // A structural </think> still ends the reasoning ahead of the quote.
+        let text = format!("why</think>\n\n{}", mark(answer));
+        let (r, v) = crate::routes::responses::split_thinking(&text, true);
+        assert_eq!((r.as_str(), unmark(&v).as_str()), ("why", answer));
+
+        let tools = json!([{"type": "function", "function": {"name": "write_file", "parameters": {
+            "type": "object", "properties": {"contents": {"type": "string"}}}}}]);
+        let reply = format!(
+            "<tool_call>\n<function=write_file>\n<parameter=contents>\n{}\n</parameter>\n\
+             </function>\n</tool_call>",
+            mark(answer)
+        );
+        let (_, calls) = parse_inline_tool_calls(&reply, "req", Some(&tools));
+        let args: Value =
+            serde_json::from_str(calls[0]["function"]["arguments"].as_str().unwrap()).unwrap();
+        assert_eq!(args["contents"], answer);
     }
 
     #[test]
