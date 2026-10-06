@@ -363,6 +363,9 @@ fn report_config_diagnostics(config: &LoadedConfig) {
 
 pub async fn serve_loaded(config: LoadedConfig) -> anyhow::Result<()> {
     report_config_diagnostics(&config);
+    if let Some(why) = config.unreadable() {
+        anyhow::bail!("config unusable ({why}); refusing to serve on defaults -- fix the file or move it aside");
+    }
     let auth_policy =
         api_auth::validate_api_auth_config(&config.config).map_err(anyhow::Error::msg)?;
     let auth_mode = config.config.api_auth_mode;

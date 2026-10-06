@@ -2099,6 +2099,7 @@ dependencies = [
  "anyhow",
  "dirs",
  "futures",
+ "hipfire-build-info",
  "hipfire-daemon-protocol",
  "hipfire-env",
  "hipfire-generate",
