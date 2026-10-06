@@ -106,6 +106,7 @@ pub fn generate_mtp(
             template,
             system: system_prompt,
             user: prompt,
+            reasoning_effort: hipfire_prompt::template_reasoning_effort(max_think_tokens),
             enable_thinking: max_think_tokens != 1,
             bos_token: None,
         };
@@ -545,6 +546,7 @@ pub fn generate_dflash(
             template,
             system: system_prompt,
             user: prompt,
+            reasoning_effort: hipfire_prompt::template_reasoning_effort(max_think_tokens),
             enable_thinking: max_think_tokens != 1,
             bos_token: None,
         };
@@ -1612,6 +1614,7 @@ pub fn generate_multi(
             template,
             system: system_prompt,
             user: prompt,
+            reasoning_effort: hipfire_prompt::template_reasoning_effort(max_think_tokens),
             enable_thinking: max_think_tokens != 1,
             bos_token: None,
         };
@@ -4509,6 +4512,7 @@ pub fn generate_start(
             template,
             system: system_prompt,
             user: prompt,
+            reasoning_effort: hipfire_prompt::template_reasoning_effort(max_think_tokens),
             enable_thinking: max_think_tokens != 1,
             bos_token: None,
         };

@@ -312,6 +312,7 @@ pub fn qwen35_materialize_batch_prefill_prompt(
             template,
             system: system_prompt,
             user: prompt,
+            reasoning_effort: hipfire_prompt::template_reasoning_effort(session.max_think_tokens),
             enable_thinking: session.max_think_tokens != 1,
             bos_token: None,
         };

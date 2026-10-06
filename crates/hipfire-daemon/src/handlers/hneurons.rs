@@ -180,6 +180,7 @@ pub(crate) fn cett_capture(daemon_state: &mut DaemonState, msg: &serde_json::Val
             template: tmpl,
             system: (!system.is_empty()).then_some(system.as_str()),
             user: &user,
+            reasoning_effort: None,
             enable_thinking: false,
             bos_token: None,
         };

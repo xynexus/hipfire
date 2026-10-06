@@ -734,7 +734,7 @@ mod renamed_env_e2e {
     /// the operator what to write instead.
     #[test]
     fn legacy_env_applies_and_warns() {
-        // Serialized against other env-touching tests by running in one test fn.
+        let _env = crate::TEST_ENV.lock().unwrap_or_else(|e| e.into_inner());
         std::env::set_var("HIPFIRE_DFLASH_BLOCK", "8");
         let resolved = crate::resolve_typed_config_document(&serde_json::json!({}), None);
         std::env::remove_var("HIPFIRE_DFLASH_BLOCK");

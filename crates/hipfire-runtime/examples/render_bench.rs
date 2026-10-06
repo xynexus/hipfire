@@ -131,6 +131,7 @@ fn main() {
         template: &template,
         system: Some(system),
         user,
+        reasoning_effort: None,
         enable_thinking: true,
         bos_token: None,
     };

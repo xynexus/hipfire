@@ -93,6 +93,7 @@ pub fn generate_registered_backend(
             template,
             system: system_prompt,
             user: prompt,
+            reasoning_effort: hipfire_prompt::template_reasoning_effort(max_think_tokens),
             enable_thinking: max_think_tokens > 0,
             bos_token,
         };
@@ -1339,6 +1340,7 @@ pub fn generate_nemotron(
                 template,
                 system: system_prompt,
                 user: prompt,
+                reasoning_effort: hipfire_prompt::template_reasoning_effort(max_think_tokens),
                 enable_thinking: max_think_tokens != 1,
                 bos_token: None,
             };
@@ -1518,6 +1520,7 @@ pub fn generate_zaya(
                 template,
                 system: system_prompt,
                 user: prompt,
+                reasoning_effort: hipfire_prompt::template_reasoning_effort(max_think_tokens),
                 enable_thinking: max_think_tokens != 1,
                 bos_token: None,
             };
@@ -1772,6 +1775,7 @@ pub fn generate_llama(
                 template,
                 system: system_prompt,
                 user: prompt,
+                reasoning_effort: hipfire_prompt::template_reasoning_effort(max_think_tokens),
                 enable_thinking: max_think_tokens != 1,
                 bos_token: None,
             };
@@ -2161,6 +2165,7 @@ pub fn generate_minimax(
                 template,
                 system: system_prompt,
                 user: prompt,
+                reasoning_effort: hipfire_prompt::template_reasoning_effort(max_think_tokens),
                 enable_thinking: max_think_tokens != 1,
                 bos_token: None,
             };
@@ -2456,6 +2461,7 @@ pub fn generate_lfm2moe(
                 template,
                 system: system_prompt,
                 user: prompt,
+                reasoning_effort: hipfire_prompt::template_reasoning_effort(max_think_tokens),
                 enable_thinking: max_think_tokens != 1,
                 bos_token: None,
             };
@@ -2807,6 +2813,7 @@ fn generate_lfm2moe_dflash(
                 template,
                 system: system_prompt,
                 user: prompt,
+                reasoning_effort: hipfire_prompt::template_reasoning_effort(max_think_tokens),
                 enable_thinking: max_think_tokens != 1,
                 bos_token: None,
             };
@@ -3256,6 +3263,7 @@ pub fn framed_qwen35_prompt(
         template,
         system,
         user,
+        reasoning_effort: None,
         enable_thinking: true,
         bos_token: None,
     }

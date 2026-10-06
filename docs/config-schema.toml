@@ -799,6 +799,17 @@ restart_impact = "none"
 env = ["HIPFIRE_QWEN35_PAGED_EXPERTS"]
 
 [[field]]
+key = "reasoning_effort"
+type = "enum(none|minimal|low|medium|high|xhigh)"
+requirement = "optional"
+scopes = ["global", "model", "request"]
+mutability = "request_only"
+owner = "hipfire-config"
+description = "Effort (and so the thinking budget) a request runs at when it names none and leaves thinking on. Unset: unbudgeted, and a template that reads `reasoning_effort` uses its own default -- Qwen3.8-27B's is `xhigh`. Set per model."
+secret = false
+restart_impact = "none"
+
+[[field]]
 key = "repeat_penalty"
 type = "f64"
 requirement = "optional"

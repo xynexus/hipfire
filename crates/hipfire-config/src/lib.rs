@@ -507,6 +507,11 @@ pub struct HipfireConfig {
     pub mtp_k: u32,
     #[serde(default = "default_thinking")]
     pub thinking: String,
+    /// Effort a request runs at when it names none and leaves thinking on (`none`,
+    /// `minimal`, `low`, `medium`, `high`, `xhigh`). Unset: no budget unless the
+    /// request asks for one. Set per model in `model_overrides`.
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
     #[serde(default = "default_gpu_slab_load")]
     pub gpu_slab_load: String,
     /// Render prompts through the model's Jinja chat template rather than the
@@ -718,6 +723,7 @@ impl Default for HipfireConfig {
             mtp_mode: default_mtp_mode(),
             mtp_k: default_mtp_k(),
             thinking: default_thinking(),
+            reasoning_effort: None,
             gpu_slab_load: default_gpu_slab_load(),
             jinja_chat: default_jinja_chat(),
             chat_template_file: None,
@@ -1434,6 +1440,12 @@ pub fn config_value_map(config: &HipfireConfig) -> BTreeMap<String, Value> {
         .unwrap_or_default()
 }
 
+/// Tests that set process env, or assert a resolve reported nothing, hold this:
+/// the env layer reads the live environment, so one test's `HIPFIRE_DFLASH_BLOCK`
+/// surfaced as a rename warning in another's "an untouched config must be silent".
+#[cfg(test)]
+pub(crate) static TEST_ENV: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1561,6 +1573,7 @@ mod tests {
 
     #[test]
     fn schema_defaults_materialize_to_typed_defaults() {
+        let _env = crate::TEST_ENV.lock().unwrap_or_else(|e| e.into_inner());
         let resolved = resolve_typed_config_document(&serde_json::json!({}), None);
 
         assert!(resolved.diagnostics.is_empty());
@@ -1998,6 +2011,7 @@ mod tests {
 
     #[test]
     fn a_deprecated_kv_mode_is_reported_before_the_loader_refuses_it() {
+        let _env = crate::TEST_ENV.lock().unwrap_or_else(|e| e.into_inner());
         // Issue #386: `q8` passed the enum, the server reported healthy, and the
         // loader's refusal was the first anyone heard of it.
         for mode in ["q8", "asym2", "asym3", "asym4"] {
@@ -2029,6 +2043,7 @@ mod tests {
 
     #[test]
     fn a_compiled_default_is_never_reported() {
+        let _env = crate::TEST_ENV.lock().unwrap_or_else(|e| e.into_inner());
         let resolved = resolve_typed_config_document(&serde_json::json!({}), None);
         assert!(
             resolved.diagnostics.is_empty(),
