@@ -652,6 +652,17 @@ impl Gpu {
                     block_stride,
                 );
             }
+            // The wave64 GEMM applies the overlay itself from XT: the separate
+            // pass re-read and re-wrote all of Y, 17% of a cold 13K-token 27B
+            // prefill (12% of an attached 7.8K step). XT has to exist first, so
+            // the hoist check moves ahead of the GEMM on this path.
+            // HIPFIRE_OQ_FUSED_OVERLAY=0 restores the separate pass.
+            let fused = use_w64
+                && std::env::var("HIPFIRE_OQ_FUSED_OVERLAY").as_deref() != Ok("0")
+                && std::env::var("HIPFIRE_OQ_COMPACT_NO_CORRECT").as_deref() != Ok("1");
+            if fused {
+                self.ensure_oq_xt(xq, xs, &xt, &xst, n, k, ng)?;
+            }
             if use_w64 {
                 // The wave64 kernel consumes fragment-interleaved nibble pairs,
                 // not int8. The permutation is done ONCE per activation, beside
@@ -663,7 +674,20 @@ impl Gpu {
                     shape: vec![n * k],
                     dtype: DType::Raw,
                 };
-                self.gemm_oq_compact_iu4x2_w64(w_blocks, &xilv, xs, y, m, k, n, block_stride)?;
+                self.gemm_oq_compact_iu4x2_w64_xt(
+                    w_blocks,
+                    &xilv,
+                    xs,
+                    y,
+                    m,
+                    k,
+                    n,
+                    block_stride,
+                    fused.then_some(&xt),
+                )?;
+                if fused {
+                    return Ok(());
+                }
             } else {
                 self.gemm_oq_compact_iu4x2_wmma(w_blocks, xq, xs, y, m, k, n, group, block_stride)?;
             }
@@ -674,28 +698,7 @@ impl Gpu {
             if std::env::var("HIPFIRE_OQ_COMPACT_NO_CORRECT").as_deref() == Ok("1") {
                 return Ok(());
             }
-            // Skip when the hoisted quantize already built XT for THIS
-            // activation. Keyed on the generation counter plus ng: a group other
-            // than 256 gives XsT a different layout, and the hoisted path only
-            // ever emits ng = k/256.
-            let hoisted = self.oq_xt_gen == self.oq_act_gen
-                && self.oq_xt_ng == ng
-                && self.oq_xt_n == n
-                && std::env::var("HIPFIRE_OQ_XT_HOIST").as_deref() != Ok("0");
-            if !hoisted {
-                // The hoisted quantize is supposed to have built XT for this
-                // activation already; a miss means we redo the transpose, which
-                // the trace prices at 3.50% of GPU time (3072 calls) — 10x the
-                // per-call cost of the interleave beside it. Name the reason.
-                crate::kernel_trace::record_fallback(
-                    "oq compact: XT hoist MISS -> redundant x8 transpose",
-                    &format!(
-                        "xt_gen={} act_gen={} xt_ng={} ng={} xt_n={} n={}",
-                        self.oq_xt_gen, self.oq_act_gen, self.oq_xt_ng, ng, self.oq_xt_n, n
-                    ),
-                );
-                self.oq_compact_x8_transpose(xq, xs, &xt, &xst, n, k, ng)?;
-            }
+            self.ensure_oq_xt(xq, xs, &xt, &xst, n, k, ng)?;
             // ACCUMULATES into y, so it must follow the GEMM on the same Y.
             return self.oq_compact_overlay_correct_t(
                 w_blocks,
@@ -710,6 +713,42 @@ impl Gpu {
             );
         }
         self.gemm_oq_compact_grouped_wmma(w_blocks, xq, xs, y, m, k, n, group, block_stride)
+    }
+
+    /// Make XT/XsT (the K-major int8 activation and scales the overlay reads)
+    /// hold THIS activation: skipped when the hoisted quantize already built them,
+    /// keyed on the generation counter plus ng and n -- a group other than 256
+    /// gives XsT a different layout, and the hoisted path only emits ng = k/256.
+    #[allow(clippy::too_many_arguments)]
+    fn ensure_oq_xt(
+        &mut self,
+        xq: &GpuTensor,
+        xs: &GpuTensor,
+        xt: &GpuTensor,
+        xst: &GpuTensor,
+        n: usize,
+        k: usize,
+        ng: usize,
+    ) -> HipResult<()> {
+        let hoisted = self.oq_xt_gen == self.oq_act_gen
+            && self.oq_xt_ng == ng
+            && self.oq_xt_n == n
+            && std::env::var("HIPFIRE_OQ_XT_HOIST").as_deref() != Ok("0");
+        if hoisted {
+            return Ok(());
+        }
+        // The hoisted quantize is supposed to have built XT for this activation
+        // already; a miss means we redo the transpose, which the trace prices at
+        // 3.50% of GPU time (3072 calls) — 10x the per-call cost of the
+        // interleave beside it. Name the reason.
+        crate::kernel_trace::record_fallback(
+            "oq compact: XT hoist MISS -> redundant x8 transpose",
+            &format!(
+                "xt_gen={} act_gen={} xt_ng={} ng={} xt_n={} n={}",
+                self.oq_xt_gen, self.oq_act_gen, self.oq_xt_ng, ng, self.oq_xt_n, n
+            ),
+        );
+        self.oq_compact_x8_transpose(xq, xs, xt, xst, n, k, ng)
     }
 
     pub fn gemm_oq_compact_act_batched(
@@ -1740,6 +1779,26 @@ impl Gpu {
         batch_size: usize,
         block_stride: usize,
     ) -> HipResult<()> {
+        self.gemm_oq_compact_iu4x2_w64_xt(
+            w_blocks, x_i8, x_scales, y_f32, m, k, batch_size, block_stride, None,
+        )
+    }
+
+    /// [`Self::gemm_oq_compact_iu4x2_w64`], applying the sparse overlay from `xt`
+    /// (the K-major int8 activation, `[K, B]`) when given; see the kernel.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_oq_compact_iu4x2_w64_xt(
+        &mut self,
+        w_blocks: &GpuTensor,
+        x_i8: &GpuTensor,
+        x_scales: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        block_stride: usize,
+        xt: Option<&GpuTensor>,
+    ) -> HipResult<()> {
         self.bind_thread()?;
         assert_eq!(
             k % 256,
@@ -1779,6 +1838,7 @@ impl Gpu {
                     k,
                     batch_size,
                     block_stride,
+                    xt,
                     (wm, wn, wmt, wnt),
                 );
             }
@@ -1872,6 +1932,7 @@ impl Gpu {
             k,
             batch_size,
             block_stride,
+            xt,
             (warps_m, warps_n, w_mt, w_nt),
         )
     }
@@ -1888,9 +1949,11 @@ impl Gpu {
         k: usize,
         batch_size: usize,
         block_stride: usize,
+        xt: Option<&GpuTensor>,
         (warps_m, warps_n, w_mt, w_nt): (usize, usize, usize, usize),
     ) -> HipResult<()> {
         let wp = w_blocks.buf.as_ptr();
+        let xtp = xt.map_or(std::ptr::null_mut(), |t| t.buf.as_ptr());
         let xp = x_i8.buf.as_ptr();
         let xsp = x_scales.buf.as_ptr();
         let yp = y_f32.buf.as_ptr();
@@ -1905,6 +1968,7 @@ impl Gpu {
             &mut ki as *mut _ as *mut c_void,
             &mut bi as *mut _ as *mut c_void,
             &mut si as *mut _ as *mut c_void,
+            &xtp as *const _ as *mut c_void,
         ];
         // Must match BM / BN / BLOCK in the kernel (its WARPS_M/N, WMt, WNt).
         let bm = warps_m * w_mt * 16;

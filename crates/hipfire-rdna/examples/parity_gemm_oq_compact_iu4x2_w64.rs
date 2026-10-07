@@ -11,8 +11,9 @@
 //! (unsigned int4). The kernel recombines in i32 before any f32 scaling, so the
 //! only error against the oracle is f32 rounding of the per-group rescale.
 //!
-//! Bulk term only — the sparse weight overlay is a separate pass, as for the
-//! 1-pass twin.
+//! The bulk term alone, and then -- with the K-major activation `XT` passed
+//! (`gemm_oq_compact_iu4x2_w64_xt`) -- bulk plus the sparse overlay, which the
+//! kernel folds into its i32 accumulator: also exact against the oracle.
 //!
 //!   cargo run --release -p hipfire-rdna --example parity_gemm_oq_compact_iu4x2
 
@@ -149,6 +150,27 @@ fn main() {
             }
         }
 
+        // Bulk plus the overlay: each entry adds val * x[idx] (the bulk nibble
+        // under it was zeroed above), on the same per-group scales.
+        let mut want_ov = want.clone();
+        let hdr = 2 + group / 2;
+        for row in 0..m {
+            for g in 0..ng {
+                let off = (row * ng + g) * stride;
+                let sw = f16_to_f32(u16::from_le_bytes([blocks[off], blocks[off + 1]]));
+                for s in 0..n_out {
+                    let idx = blocks[off + hdr + 2 * s] as usize;
+                    let val = blocks[off + hdr + 2 * s + 1] as i8 as i32;
+                    for bb in 0..b {
+                        let t = val * x8[bb * k + g * group + idx] as i32;
+                        want_ov[bb * m + row] += t as f32 * sw * xs[bb * ng + g];
+                    }
+                }
+            }
+        }
+        // XT: the K-major activation, [K, B], one int8 per byte.
+        let xt: Vec<u8> = (0..k * b).map(|i| x8[(i % b) * k + i / b] as u8).collect();
+
         let dev = split_planes(&blocks, nblk, stride, group);
         let wb = gpu.upload_raw(&dev, &[dev.len()]).expect("w");
         let x8b = gpu.upload_raw(&x8u, &[x8u.len()]).expect("x8");
@@ -157,6 +179,11 @@ fn main() {
         gpu.gemm_oq_compact_iu4x2_w64(&wb, &x8b, &xsb, &yb, m, k, b, stride)
             .expect("launch");
         let got = gpu.download_f32(&yb).expect("dl");
+        let xtb = gpu.upload_raw(&xt, &[xt.len()]).expect("xt");
+        let yb2 = gpu.alloc_tensor(&[b * m], DType::F32).expect("y2");
+        gpu.gemm_oq_compact_iu4x2_w64_xt(&wb, &x8b, &xsb, &yb2, m, k, b, stride, Some(&xtb))
+            .expect("launch xt");
+        let got_ov = gpu.download_f32(&yb2).expect("dl2");
 
         let mut max_abs = 0f32;
         let mut max_ref = 0f32;
@@ -165,15 +192,21 @@ fn main() {
             max_ref = max_ref.max(want[i].abs());
         }
         let worst = max_abs / max_ref.max(1e-30);
-        let ok = worst < 1e-5;
+        let (mut ov_abs, mut ov_ref) = (0f32, 0f32);
+        for i in 0..b * m {
+            ov_abs = ov_abs.max((got_ov[i] - want_ov[i]).abs());
+            ov_ref = ov_ref.max(want_ov[i].abs());
+        }
+        let worst_ov = ov_abs / ov_ref.max(1e-30);
+        let ok = worst < 1e-5 && worst_ov < 1e-5;
         if !ok {
             fail += 1;
         }
         println!(
-            "  {m:>5} {k:>6} {b:>4} {n_out:>6} {group:>4}    {worst:>8.2e}   {}",
+            "  {m:>5} {k:>6} {b:>4} {n_out:>6} {group:>4}    {worst:>8.2e}  +overlay {worst_ov:>8.2e}   {}",
             if ok { "PASS" } else { "FAIL" }
         );
-        for t in [wb, x8b, xsb, yb] {
+        for t in [wb, x8b, xsb, yb, xtb, yb2] {
             let _ = gpu.free_tensor(t);
         }
     }

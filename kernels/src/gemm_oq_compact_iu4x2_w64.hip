@@ -28,7 +28,13 @@
 //        same byte volume as pre-split planes and costs a few VALU ops.
 //   Xs : [B, K/G] f32     Y : [B, M] f32
 //
-// Does NOT apply the sparse overlay; that is a separate pass, as for both twins.
+// The sparse overlay is applied here when `XT` is given (the K-major int8
+// activation the hoisted quantize already builds): at each group fold every
+// lane adds its rows' overlay entries, val * XT[k][col], into the low-digit i32
+// accumulator before the radix-16 recombination -- exact, since the bulk nibble
+// under an entry is zeroed and XT holds the same int8 values the GEMM consumed.
+// With XT null it is skipped, and the separate pass applies it instead; that
+// pass re-read and re-wrote all of Y, 17% of a cold 13K-token 27B prefill.
 // Requires K % 256 == 0 (Oq4G256 guarantees it).
 // Quant-basis contract: input activation `x` must already be rotated into the
 // weights' quantization basis by the dispatch caller (rotate_x_*); a raw `x`
@@ -78,7 +84,7 @@ __device__ __forceinline__ uint32_t oqx2w64_pack4(uint32_t t) {
 __launch_bounds__(BLOCK) extern "C" __global__ void gemm_oq_compact_iu4x2_w64(
     const uint8_t* __restrict__ W, const int8_t* __restrict__ X,
     const float* __restrict__ Xs, float* __restrict__ Y,
-    int M, int K, int B, int block_stride) {
+    int M, int K, int B, int block_stride, const int8_t* __restrict__ XT) {
     // X held INTERLEAVED in LDS exactly as it is in DRAM: per row, each 16-K step
     // is 8 bytes of hi nibbles then 8 of lo. Same bytes as separate Xhs+Xls
     // planes (BK/2 + BK/2 == BK), but staging becomes a pure copy and ONE i32x4
@@ -120,11 +126,16 @@ __launch_bounds__(BLOCK) extern "C" __global__ void gemm_oq_compact_iu4x2_w64(
             facc[i][j] = (f32x4){0.f, 0.f, 0.f, 0.f};
         }
     const i32x4 zero4 = (i32x4){0, 0, 0, 0};
+    // The group's first OQ_PF overlay entries per row, prefetched two strips
+    // before the fold that uses them (see the fold).
+#define OQ_PF 3
+    uint32_t ovp[WMt][4][OQ_PF];
 
     // Scale pointers hoisted: the row/col indices vary only in the group, so a
     // 64-bit multiply per (group, tile) becomes one per tile for the kernel.
     const uint8_t* swp[WMt][4];
     const float* sxp[WNt];
+    int xcol[WNt];  // this lane's clamped activation column per N-tile, for XT
 #pragma unroll
     for (int i = 0; i < WMt; i++)
 #pragma unroll
@@ -139,6 +150,7 @@ __launch_bounds__(BLOCK) extern "C" __global__ void gemm_oq_compact_iu4x2_w64(
         const int c0 = bn + wn * WNt * 16 + j * 16 + lane;
         const int cs = (c0 < B) ? c0 : (B - 1);
         sxp[j] = Xs + (long long)cs * n_groups;
+        xcol[j] = cs;
     }
 
 #ifdef A_GROUP_LINE
@@ -190,6 +202,24 @@ __launch_bounds__(BLOCK) extern "C" __global__ void gemm_oq_compact_iu4x2_w64(
     for (int k = 0; k < nstrip; k++) {
         int buf = k & 1;
         const bool seed = (k % STRIPS_PER_GROUP) == 0;
+        // Issue this group's overlay-entry loads now, two strips before the fold:
+        // independent of everything in flight, so the WMMA work of the last two
+        // strips covers their latency. At the fold they were a chain -- entry,
+        // then the activation it names -- per row, and the fused kernel ran
+        // slower than the separate pass it replaced.
+        if (XT != nullptr && (k % STRIPS_PER_GROUP) == STRIPS_PER_GROUP - 2) {
+            const int n_ov = (side_stride - 2) >> 1;
+            const int g_off = (k / STRIPS_PER_GROUP) * side_stride;
+#pragma unroll
+            for (int i = 0; i < WMt; i++)
+#pragma unroll
+                for (int g = 0; g < 4; g++)
+#pragma unroll
+                    for (int e = 0; e < OQ_PF; e++)
+                        ovp[i][g][e] = (e < n_ov)
+                            ? (uint32_t)*(const uint16_t*)(swp[i][g] + g_off + 2 + 2 * e)
+                            : 0u;
+        }
         if (k + 1 < nstrip) { LOADG(k + 1); }
 #pragma unroll
         // Every LDS read below is 128-bit at the ISA, both operands. X gets there
@@ -233,6 +263,36 @@ __launch_bounds__(BLOCK) extern "C" __global__ void gemm_oq_compact_iu4x2_w64(
         if ((k + 1) % STRIPS_PER_GROUP == 0) {
             const int grp = k / STRIPS_PER_GROUP;
             const int g_off = grp * side_stride;
+            if (XT != nullptr) {
+                // Overlay entries follow the f16 scale: n_ov (u8 idx, i8 val) pairs.
+                // The first OQ_PF are in registers already; every gather below is
+                // independent, so they issue back to back. A zero entry (past
+                // n_ov) gathers row grp*256 and adds 0.
+                const int n_ov = (side_stride - 2) >> 1;
+                const int8_t* xg = XT + (long long)grp * 256 * B;
+#pragma unroll
+                for (int i = 0; i < WMt; i++)
+#pragma unroll
+                    for (int g = 0; g < 4; g++) {
+#pragma unroll
+                        for (int e = 0; e < OQ_PF; e++) {
+                            const int idx = (int)(ovp[i][g][e] & 0xffu);
+                            const int val = (int)(int8_t)(ovp[i][g][e] >> 8);
+                            const int8_t* xt = xg + (long long)idx * B;
+#pragma unroll
+                            for (int j = 0; j < WNt; j++) accl[i][j][g] += val * (int)xt[xcol[j]];
+                        }
+                        // Past OQ_PF entries (none at oq4.25): straight from memory.
+                        const uint8_t* sb = swp[i][g] + g_off;
+                        for (int e = OQ_PF; e < n_ov; e++) {
+                            const int idx = sb[2 + 2 * e];
+                            const int val = (int)(int8_t)sb[3 + 2 * e];
+                            const int8_t* xt = xg + (long long)idx * B;
+#pragma unroll
+                            for (int j = 0; j < WNt; j++) accl[i][j][g] += val * (int)xt[xcol[j]];
+                        }
+                    }
+            }
             float sw[WMt][4];
 #pragma unroll
             for (int i = 0; i < WMt; i++)
