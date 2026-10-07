@@ -300,6 +300,56 @@ fn main() {
         .filter(|(a, b)| a.to_bits() != b.to_bits())
         .count();
 
+    // ── arm 4: int8-activation grouped GEMM on the integer matrix cores ─────
+    let y_q = gpu.alloc_tensor(&[m_total * m], DType::F32).unwrap();
+    let rows = batch * K_TOP;
+    gpu.gemm_oq_compact_moe_grouped_iu8(
+        &ptr_t,
+        &tiles_t,
+        &sorted_t,
+        &x_t,
+        &y_q,
+        m,
+        k,
+        1,
+        m_total,
+        rows,
+        block_stride,
+    )
+    .unwrap();
+    gpu.device_synchronize().unwrap();
+    let yq_raw = gpu.download_f32(&y_q).unwrap();
+    let mut y_iu8 = vec![0f32; batch * K_TOP * m];
+    for flat in 0..batch * K_TOP {
+        let s = slot_of_flat[flat];
+        y_iu8[flat * m..flat * m + m].copy_from_slice(&yq_raw[s * m..s * m + m]);
+    }
+    // Its oracle runs on the activations it actually saw -- the int8 rows and
+    // per-group scales left in its scratch -- so the integer path must match to
+    // f32 rounding, and anything more is an addressing or layout defect.
+    let xq: Vec<i8> = gpu
+        .download_raw(gpu.moe_xq_scratch.as_ref().unwrap(), rows * k)
+        .unwrap()
+        .into_iter()
+        .map(|b| b as i8)
+        .collect();
+    let xs_all = gpu
+        .download_f32(gpu.moe_xs_scratch.as_ref().unwrap())
+        .unwrap();
+    let ngr = k / GROUP;
+    let mut oracle_q = vec![0f32; rows * m];
+    for s in 0..rows {
+        let e = topk[s] as usize;
+        for row in 0..m {
+            let mut acc = 0f64;
+            for j in 0..k {
+                let xv = xq[s * k + j] as f64 * xs_all[s * ngr + j / GROUP] as f64;
+                acc += logical[e][row * k + j] as f64 * xv;
+            }
+            oracle_q[s * m + row] = acc as f32;
+        }
+    }
+
     // ── timing: does hoisting the weight read out of the slot loop pay? ─────
     let iters = 50;
     let t_gemv = {
@@ -335,9 +385,57 @@ fn main() {
         gpu.device_synchronize().unwrap();
         t0.elapsed().as_secs_f64() * 1e3 / iters as f64
     };
+    let t_wmma = {
+        gpu.device_synchronize().unwrap();
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            gpu.gemm_oq_compact_moe_grouped_wmma(
+                &ptr_t,
+                &tiles_t,
+                &sorted_t,
+                &x_t,
+                &y_g,
+                m,
+                k,
+                1,
+                m_total,
+                batch * K_TOP,
+                block_stride,
+            )
+            .unwrap();
+        }
+        gpu.device_synchronize().unwrap();
+        t0.elapsed().as_secs_f64() * 1e3 / iters as f64
+    };
+    let t_iu8 = {
+        gpu.device_synchronize().unwrap();
+        let t0 = std::time::Instant::now();
+        for _ in 0..iters {
+            gpu.gemm_oq_compact_moe_grouped_iu8(
+                &ptr_t,
+                &tiles_t,
+                &sorted_t,
+                &x_t,
+                &y_q,
+                m,
+                k,
+                1,
+                m_total,
+                rows,
+                block_stride,
+            )
+            .unwrap();
+        }
+        gpu.device_synchronize().unwrap();
+        t0.elapsed().as_secs_f64() * 1e3 / iters as f64
+    };
     println!(
-        "  timing: gemv {t_gemv:.3} ms   f32-grouped {t_f32:.3} ms   speedup {:.2}x",
-        t_gemv / t_f32.max(1e-9)
+        "  timing: gemv {t_gemv:.3} ms   f32-grouped {t_f32:.3} ms   wmma-grouped {t_wmma:.3} ms   \
+         iu8-grouped {t_iu8:.3} ms (quantize included)\n          f32 vs gemv {:.2}x, wmma vs f32 \
+         {:.2}x, iu8 vs f32 {:.2}x",
+        t_gemv / t_f32.max(1e-9),
+        t_f32 / t_wmma.max(1e-9),
+        t_f32 / t_iu8.max(1e-9)
     );
 
     // ── verdict ─────────────────────────────────────────────────────────────
@@ -369,7 +467,13 @@ fn main() {
     if !wmma_checked {
         println!("  (wmma arm not held to the floor: it reads 4 overlay records, n_out={n_out})");
     }
-    let ok = (!wmma_checked || (e_grp < 5e-3 && cross < 5e-3)) && exact == 0;
+    let e_iu8_q = max_rel(&oracle_q, &y_iu8);
+    let e_iu8 = max_rel(&oracle, &y_iu8);
+    println!("  iu8grp vs its oracle: {e_iu8_q:.3e}   (same int8 activations: integer path)");
+    println!("  iu8grp vs oracle    : {e_iu8:.3e}   (the int8 activation gap)");
+    // The integer path is exact; what is left is f32 accumulation order.
+    let iu8_ok = e_iu8_q < 1e-4;
+    let ok = (!wmma_checked || (e_grp < 5e-3 && cross < 5e-3)) && exact == 0 && iu8_ok;
     println!(
         "{}",
         if ok && wmma_checked {
@@ -377,7 +481,7 @@ fn main() {
         } else if ok {
             "PASS — f32 arm BIT-EXACT vs the decode GEMV"
         } else {
-            "FAIL — see which arm: wmma above the f16 floor, or f32 arm not bit-exact"
+            "FAIL — see which arm: wmma above the f16 floor, f32 arm not bit-exact, or iu8 off its oracle"
         }
     );
     if !ok {

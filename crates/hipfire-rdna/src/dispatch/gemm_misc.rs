@@ -635,6 +635,108 @@ impl Gpu {
         )
     }
 
+    /// Grouped compact-MoE GEMM on the integer matrix cores (W4A8): `x_src`'s
+    /// `x_src_rows` f32 rows are quantized to int8 per 256-group into owned
+    /// scratch, then `gemm_oq_compact_iu4x2_moe_grouped` runs the dense iu4x2
+    /// inner loop per 16-slot expert tile, overlay applied in i32. Same
+    /// arguments as [`Self::gemm_oq_compact_moe_grouped_wmma`].
+    ///
+    /// Not bit-exact with the decode GEMV, as the f32 kernel is: activations are
+    /// int8, as in the dense prefill GEMMs. Path 2 runs only at >= 64 rows, so
+    /// DFlash verify (B <= 16) never reaches it.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_oq_compact_moe_grouped_iu8(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        x_src: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        x_src_rows: usize,
+        block_stride: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert_eq!(
+            k % 256,
+            0,
+            "gemm_oq_compact_moe_grouped_iu8: K % 256 != 0 (K={k})"
+        );
+        let (need_q, need_s) = (x_src_rows * k, x_src_rows * (k / 256));
+        if self
+            .moe_xq_scratch
+            .as_ref()
+            .map_or(true, |t| t.numel() < need_q)
+        {
+            if let Some(old) = self.moe_xq_scratch.take() {
+                let _ = self.free_tensor(old);
+            }
+            self.moe_xq_scratch = Some(self.alloc_tensor(&[need_q], DType::Raw)?);
+        }
+        if self
+            .moe_xs_scratch
+            .as_ref()
+            .map_or(true, |t| t.numel() < need_s)
+        {
+            if let Some(old) = self.moe_xs_scratch.take() {
+                let _ = self.free_tensor(old);
+            }
+            self.moe_xs_scratch = Some(self.alloc_tensor(&[need_s], DType::F32)?);
+        }
+        let xq = GpuTensor {
+            buf: unsafe { self.moe_xq_scratch.as_ref().unwrap().buf.alias() },
+            shape: vec![need_q],
+            dtype: DType::Raw,
+        };
+        let xs = GpuTensor {
+            buf: unsafe { self.moe_xs_scratch.as_ref().unwrap().buf.alias() },
+            shape: vec![need_s],
+            dtype: DType::F32,
+        };
+        self.quantize_act_oq8(x_src, &xq, &xs, x_src_rows, k, 256)?;
+        let kernel_name = "gemm_oq_compact_iu4x2_moe_grouped";
+        self.ensure_kernel(
+            kernel_name,
+            kernels::GEMM_OQ_COMPACT_IU4X2_MOE_GROUPED_SRC,
+            kernel_name,
+        )?;
+        let expert_ptr = expert_weight_ptrs.buf.as_ptr();
+        let tile_ptr = expert_tile_ids.buf.as_ptr();
+        let sorted_ptr = sorted_slot_index.buf.as_ptr();
+        let xq_ptr = xq.buf.as_ptr();
+        let xs_ptr = xs.buf.as_ptr();
+        let y_ptr = y_grouped.buf.as_ptr();
+        let m_value = m as i32;
+        let k_value = k as i32;
+        let row_div_value = x_row_div as i32;
+        let total_value = m_total as i32;
+        let stride_value = block_stride as i32;
+        // Must match OQMG_MW: waves per workgroup, 16 weight rows each.
+        const MW: usize = 8;
+        self.launch_kernargs(
+            kernel_name,
+            [m.div_ceil(16 * MW) as u32, m_total.div_ceil(16) as u32, 1],
+            [(32 * MW) as u32, 1, 1],
+            0,
+            &kernargs![
+                ptr expert_ptr,
+                ptr tile_ptr,
+                ptr sorted_ptr,
+                ptr xq_ptr,
+                ptr xs_ptr,
+                ptr y_ptr,
+                i32 m_value,
+                i32 k_value,
+                i32 row_div_value,
+                i32 total_value,
+                i32 stride_value
+            ],
+        )
+    }
+
     pub fn gemm_oq_compact_moe_grouped_wmma(
         &mut self,
         expert_weight_ptrs: &GpuTensor,
