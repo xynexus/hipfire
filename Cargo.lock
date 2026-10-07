@@ -2611,6 +2611,7 @@ dependencies = [
  "hipfire-mixer",
  "hipfire-model",
  "hipfire-npu",
+ "hipfire-primitives",
  "hipfire-prompt",
  "hipfire-rdna",
  "hipfire-runtime",

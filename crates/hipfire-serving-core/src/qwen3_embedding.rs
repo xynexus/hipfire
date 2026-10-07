@@ -514,11 +514,14 @@ fn load_token_embeddings_bf16(hfq: &HfqFile, config: &LlamaConfig) -> Result<Vec
     // The embed table is BF16 here by construction, and `--bf16-codec` defaults to
     // `huff` with gather-shaped tensors steered to LUT3 — so this table is stored
     // compressed in any recent artifact and MUST be read through the decoding
-    // accessor. `tensor_data` would return None and report it as absent.
-    let (info, data) = hfq
-        .tensor_data_cow("model.embed_tokens.weight")
-        .ok_or_else(|| "Qwen3 embedding artifact has no model.embed_tokens.weight".to_string())?;
-    let data = data.as_ref();
+    // accessor. `tensor_data` would return None and report it as absent, and
+    // `tensor_data_cow` decodes Huffman but leaves a LUT3 head tensor (embed_tokens)
+    // packed for the kernels that read it in place -- a freshly quantized artifact
+    // then failed to load at qt=49. `tensor_data_logical` decodes both.
+    let name = "model.embed_tokens.weight";
+    let info = hfq
+        .find_tensor_info(name)
+        .ok_or_else(|| format!("Qwen3 embedding artifact has no {name}"))?;
     if info.shape != [config.vocab_size as u32, config.dim as u32] {
         return Err(format!(
             "Qwen3 embedding table shape {:?} does not match [{}, {}]",
@@ -531,8 +534,17 @@ fn load_token_embeddings_bf16(hfq: &HfqFile, config: &LlamaConfig) -> Result<Vec
     {
         return Err("Qwen3 embedding table must not carry an AWQ activation sidecar".into());
     }
+    let (quant_type, data) = hfq.tensor_data_logical(name).map_err(|e| match e {
+        hipfire_runtime::hfq::LogicalReadError::Missing => {
+            format!("Qwen3 embedding artifact has no {name}")
+        }
+        hipfire_runtime::hfq::LogicalReadError::Decode(qt) => {
+            format!("Qwen3 embedding table {name}: recoded data (qt={qt}) failed to decode")
+        }
+    })?;
+    let data = data.as_slice();
     let mut result = Vec::with_capacity(config.vocab_size * config.dim);
-    match info.quant_type {
+    match quant_type {
         16 => result.extend(
             data.chunks_exact(2)
                 .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]])),
@@ -646,12 +658,66 @@ mod tests {
             "hipfire-qwen3-embedding-state-{}",
             std::process::id()
         ));
-        std::fs::create_dir_all(&root).unwrap();
+        let (hfq, config, metadata) =
+            tiny_embedding_package(&root, oq8("model.embed_tokens.weight", 2, 256));
+        let state = Qwen3EmbeddingState::load(&hfq, config, metadata).unwrap();
+
+        assert_eq!(&state.encoder_weight_blob[..8], ENCODER_BLOB_MAGIC);
+        assert_eq!(
+            u32::from_le_bytes(state.encoder_weight_blob[12..16].try_into().unwrap()),
+            12
+        );
+        assert_eq!(state.token_embeddings_bf16.len(), 2 * 256);
+        assert!(hfq.find_tensor_info("lm_head.weight").is_none());
+
+        drop(state);
+        drop(hfq);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    // The quantizer stores this table LUT3-coded by default (`--bf16-codec huff`
+    // steers gather-shaped tensors to LUT3), and the HFQ reader keeps a LUT3 head
+    // tensor packed: the loader must decode it, not refuse qt=49.
+    #[test]
+    fn a_lut3_coded_embedding_table_loads_as_its_bf16_values() {
+        let root = std::env::temp_dir().join(format!(
+            "hipfire-qwen3-embedding-lut3-{}",
+            std::process::id()
+        ));
+        let table: Vec<u16> = (0..2 * 256)
+            .map(|i| f32_to_bf16((i as f32 - 256.0) / 64.0))
+            .collect();
+        let bytes: Vec<u8> = table.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let packed = HfqMemTensor {
+            name: "model.embed_tokens.weight".into(),
+            quant_type: 49,
+            shape: vec![2, 256],
+            group_size: 0,
+            data: hipfire_primitives::bf16_lut3::encode(&bytes),
+        };
+        let (hfq, config, metadata) = tiny_embedding_package(&root, packed);
+        assert_eq!(
+            hfq.find_tensor_info("model.embed_tokens.weight")
+                .unwrap()
+                .quant_type,
+            49,
+            "the reader keeps the head table packed"
+        );
+        let state = Qwen3EmbeddingState::load(&hfq, config, metadata).unwrap();
+        assert_eq!(state.token_embeddings_bf16, table);
+        drop(state);
+        drop(hfq);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    /// A one-layer, two-token Qwen3 embedding package with `embed` as its table.
+    fn tiny_embedding_package(
+        root: &std::path::Path,
+        embed: HfqMemTensor,
+    ) -> (HfqFile, LlamaConfig, EmbeddingMetadata) {
+        std::fs::create_dir_all(root).unwrap();
         let path = root.join("Qwen3-Embedding-0.6B--npu.oq8+.hfq");
-        let mut tensors = vec![
-            oq8("model.embed_tokens.weight", 2, 256),
-            bf16("model.norm.weight", vec![256]),
-        ];
+        let mut tensors = vec![embed, bf16("model.norm.weight", vec![256])];
         let prefix = "model.layers.0";
         tensors.extend([
             bf16(format!("{prefix}.input_layernorm.weight"), vec![256]),
@@ -710,18 +776,6 @@ mod tests {
         let metadata = EmbeddingMetadata::from_hfq_metadata_json(&hfq.metadata_json)
             .unwrap()
             .unwrap();
-        let state = Qwen3EmbeddingState::load(&hfq, config, metadata).unwrap();
-
-        assert_eq!(&state.encoder_weight_blob[..8], ENCODER_BLOB_MAGIC);
-        assert_eq!(
-            u32::from_le_bytes(state.encoder_weight_blob[12..16].try_into().unwrap()),
-            12
-        );
-        assert_eq!(state.token_embeddings_bf16.len(), 2 * 256);
-        assert!(hfq.find_tensor_info("lm_head.weight").is_none());
-
-        drop(state);
-        drop(hfq);
-        std::fs::remove_dir_all(root).unwrap();
+        (hfq, config, metadata)
     }
 }
