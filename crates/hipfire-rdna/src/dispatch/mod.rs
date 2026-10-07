@@ -610,6 +610,11 @@ pub struct Gpu {
     pub oq4_xs_batch: Option<GpuTensor>, // per-group f32 activation scales, N*K/256
     pub oq4_ytmp_batch: Option<GpuTensor>, // f32 residual GEMM scratch, M*N
     pub oq8_xq_batch: Option<GpuTensor>, // int8 activation, N*K bytes (oq8 W8A8)
+    // Int8 activation + per-group scales for the grouped compact-MoE iu4x2 GEMM,
+    // owned apart from the oq8 batch scratch so the dense projections' shared
+    // quantize pass is never overwritten by a routed-expert one.
+    pub moe_xq_scratch: Option<GpuTensor>,
+    pub moe_xs_scratch: Option<GpuTensor>,
     pub oq8_xs_batch: Option<GpuTensor>, // per-group f32 activation scales, N*K/256
     pub oq8_ytmp_batch: Option<GpuTensor>, // f32 residual GEMM scratch, M*N
     pub oq_xt_batch: Option<GpuTensor>,  // K-major int8 activation, N*K (iu4x2 overlay pass)
@@ -1088,6 +1093,8 @@ impl Gpu {
             oq4_xs_batch: None,
             oq4_ytmp_batch: None,
             oq8_xq_batch: None,
+            moe_xq_scratch: None,
+            moe_xs_scratch: None,
             oq8_xs_batch: None,
             oq8_ytmp_batch: None,
             oq_xt_batch: None,

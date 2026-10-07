@@ -1541,6 +1541,12 @@ pub const GEMM_OQ_COMPACT_MOE_GROUPED_WMMA_SRC: &str =
 pub const GEMM_OQ_COMPACT_MOE_GROUPED_F32_SRC: &str =
     include_str!("../../../kernels/src/gemm_oq_compact_moe_grouped_f32.hip");
 
+/// Grouped compact-MoE GEMM on the integer matrix cores (W4A8): the dense
+/// iu4x2 inner loop per 16-slot expert tile, overlay applied in i32.
+/// See `kernels/src/gemm_oq_compact_iu4x2_moe_grouped.hip`.
+pub const GEMM_OQ_COMPACT_IU4X2_MOE_GROUPED_SRC: &str =
+    include_str!("../../../kernels/src/gemm_oq_compact_iu4x2_moe_grouped.hip");
+
 /// gfx12 (RDNA4) sister of GEMM_HFQ4G256_MOE_GROUPED_WMMA_K2_SRC. Same
 /// dispatch contract; differs in WMMA intrinsic (_gfx12), operand
 /// width (half8_t vs half16_t), and K-lane split (K split across 2

@@ -365,18 +365,22 @@ fn main() {
             .map(|(i, v)| format!("L{i}={v:.1e}"))
             .collect();
         println!("  per-layer head: {}", head.join(" "));
-        // The GEMM itself is bit-exact (parity_gemm_oq_compact_moe_grouped), so
-        // anything here is the surrounding pipeline: scatter/unscatter and the
-        // down combine's summation order. Order-of-summation over k_top experts
-        // is legitimate and lands near f32 epsilon; a layout or indexing fault
-        // does not.
-        let ok = nonfinite == 0 && worst < 1e-4;
+        // The grouped compact GEMM is W4A8 (int8 activations,
+        // gemm_oq_compact_iu4x2_moe_grouped), as the dense prefill projections
+        // are, so it is no longer bit-exact against the f32 indexed path; its
+        // integer arithmetic is checked exactly by parity_gemm_oq_compact_moe_grouped.
+        // What this bounds is the pipeline around it: the grouped path may move
+        // the hidden states no further than batched prefill already moves them
+        // from per-token in this same run (`worst_all`). A scatter/unscatter or
+        // indexing fault lands far outside that.
+        let ceiling = worst_all.max(1e-4);
+        let ok = nonfinite == 0 && worst <= ceiling;
         println!(
-            "  {}",
+            "  {} (ceiling {ceiling:.3e}: batched vs per-token, this run)",
             if ok {
-                "PASS — consistent with summation order in the down combine"
+                "PASS — within the batched path's own divergence"
             } else {
-                "FAIL — too large for reordering: suspect scatter/unscatter or indexing"
+                "FAIL — beyond the batched path's own divergence: suspect scatter/unscatter or indexing"
             }
         );
     }
