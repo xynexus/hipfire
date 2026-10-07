@@ -949,7 +949,12 @@ async fn prefill_budgeted(
                 if !retry.is_empty() {
                     let mut handles: Vec<String> = Vec::new();
                     for s in &retry {
-                        if let Some(PrefixReuse::Attach(entry)) = reuse.remove(&s.id) {
+                        // It goes again minting, not with no plan: a plan-less session
+                        // checkpoints nothing, so a tool loop's next step -- which
+                        // would have attached at this one's end -- prefilled in full.
+                        if let Some(PrefixReuse::Attach(entry)) =
+                            reuse.insert(s.id.clone(), PrefixReuse::Mint)
+                        {
                             tracing::warn!(
                                 "session {}: cached prefix {} would not attach ({}); retrying \
                                  without it",
@@ -1002,7 +1007,7 @@ async fn prefill_budgeted(
             if let Some(PrefixReuse::Attach(entry)) = reuse.get(&s.id) {
                 if dropping.contains(&entry.checkpoint_id) {
                     index.forget(&entry.checkpoint_id);
-                    reuse.remove(&s.id);
+                    reuse.insert(s.id.clone(), PrefixReuse::Mint);
                 }
             }
         }
@@ -1069,7 +1074,10 @@ async fn prefill_with_prefix_reuse(
             });
         }
         if round + 1 == MAX_ROUNDS {
-            deferred.clear();
+            // Out of rounds to wait for a sibling's checkpoint: mint their own.
+            for id in deferred.drain(..) {
+                reuse.insert(id, PrefixReuse::Mint);
+            }
         }
         let (now, later): (Vec<SessionSpec>, Vec<SessionSpec>) =
             pending.into_iter().partition(|s| !deferred.contains(&s.id));
@@ -3665,6 +3673,8 @@ mod tests {
         let retried = &engine.prefill_requests[1]["sessions"];
         assert_eq!(retried.as_array().unwrap().len(), 1);
         assert!(retried[0]["state_handle"]["runtime_state_handle"].is_null());
+        // ...and still checkpoints its boundaries, for its conversation's next step.
+        assert_eq!(retried[0]["params"]["semantic_boundary_checkpoints"], true);
         assert!(prefill_session_errors(&events).is_empty(), "{events:?}");
         let done: Vec<&str> = events
             .iter()
@@ -3673,7 +3683,7 @@ mod tests {
             .collect();
         assert_eq!(done.len(), 2);
         assert!(engine.released.iter().any(|id| id == "ck-1"));
-        assert!(reuse.is_empty());
+        assert!(matches!(reuse.get("a"), Some(PrefixReuse::Mint)));
     }
 
     // A prompt that fills the context is refused with its length, and leaves the
