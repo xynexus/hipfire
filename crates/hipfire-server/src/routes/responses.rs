@@ -545,6 +545,22 @@ fn response_json(
     if truncated {
         response["incomplete_details"] = json!({ "reason": "max_output_tokens" });
     }
+    // The same `timings` chat completions carry (a hipfire extension; OpenAI clients
+    // ignore it): a client profiling its own requests -- Corrode's per-call
+    // telemetry -- had token counts and nothing about where a request's time went.
+    let timings: serde_json::Map<String, Value> = [
+        ("ttft_ms", done.ttft_ms),
+        ("decode_tok_s", done.decode_tok_s),
+        ("tok_s", done.tok_s),
+        ("prefill_ms", done.prefill_ms),
+        ("prefill_tok_s", done.prefill_tok_s),
+    ]
+    .into_iter()
+    .filter_map(|(k, v)| v.map(|v| (k.to_string(), json!(v))))
+    .collect();
+    if !timings.is_empty() {
+        response["timings"] = Value::Object(timings);
+    }
     response
 }
 
@@ -1704,6 +1720,21 @@ mod tests {
             extra: Default::default(),
         };
         let body = response_json("resp_1", "qwen", "hi", "", &done, &[]);
+        assert!(
+            body.get("timings").is_none(),
+            "no timings known, none reported"
+        );
+        let timed = hipfire_generate::DoneEvent {
+            ttft_ms: Some(231.0),
+            decode_tok_s: Some(42.7),
+            ..done.clone()
+        };
+        let t = &response_json("resp_1", "qwen", "hi", "", &timed, &[])["timings"];
+        assert_eq!(
+            (t["ttft_ms"].as_f64(), t["decode_tok_s"].as_f64()),
+            (Some(231.0), Some(42.7))
+        );
+        assert!(t.get("prefill_ms").is_none());
         assert_eq!(body["id"], "resp_1");
         assert_eq!(body["object"], "response");
         assert_eq!(body["output_text"], "hi");
