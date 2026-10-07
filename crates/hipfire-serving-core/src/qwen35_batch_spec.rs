@@ -139,12 +139,8 @@ pub fn flush_spec_pending(
         crate::qwen35_prefill::qwen35_prefill_owned_session_serial_segment(
             gpu, weights, config, scratch, &mut state, &pending,
         )?;
-        gpu.memcpy_dtod_auto(
-            &state.logits.buf,
-            &scratch.logits.buf,
-            scratch.logits.buf.size(),
-        )
-        .map_err(|e| format!("flush pending speculative tokens: logits copy: {e:?}"))
+        crate::session::copy_logits(gpu, &state.logits, &scratch.logits)
+            .map_err(|e| format!("flush pending speculative tokens: logits copy: {e:?}"))
     })();
     m.q35_registry
         .sessions
@@ -492,12 +488,8 @@ fn step(
                 )
                 .map_err(|e| format!("qwen35 decode advance: {e:?}"))?;
             }
-            gpu.memcpy_dtod_auto(
-                &state.logits.buf,
-                &scratch.logits.buf,
-                scratch.logits.buf.size(),
-            )
-            .map_err(|e| format!("qwen35 decode logits copy: {e:?}"))?;
+            crate::session::copy_logits(gpu, &state.logits, &scratch.logits)
+                .map_err(|e| format!("qwen35 decode logits copy: {e:?}"))?;
             return Ok(None);
         }
         let mut rows: Vec<qwen35::DensePrefillSessionBatchRow<'_>> = states
