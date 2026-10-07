@@ -2456,13 +2456,18 @@ where
         let mut text = String::new();
         let mut finish_reason = "stop".to_string();
         let mut done_json = Value::Null;
+        let admitted = std::time::Instant::now();
+        let mut first_token: Option<std::time::Instant> = None;
         loop {
             if should_cancel() {
                 state.batch_inbox.lock().await.remove(&req_id);
                 return Ok(None);
             }
             match rx.recv().await {
-                Some(crate::batch_runner::BatchEvent::Token(t)) => text.push_str(&t),
+                Some(crate::batch_runner::BatchEvent::Token(t)) => {
+                    first_token.get_or_insert_with(std::time::Instant::now);
+                    text.push_str(&t)
+                }
                 Some(crate::batch_runner::BatchEvent::Done(done)) => {
                     finish_reason = done
                         .get("finish_reason")
@@ -2499,15 +2504,20 @@ where
             .into_iter()
             .filter_map(|k| done_json.get(k).map(|v| (k.to_string(), v.clone())))
             .collect();
+        let (tok_s, decode_tok_s, ttft_ms) = batched_timings(
+            first_token.map(|f| f.duration_since(admitted)),
+            admitted.elapsed(),
+            token_count,
+        );
         let done = hipfire_generate::DoneEvent {
             id: req_id.clone(),
             tokens: token_count,
-            tok_s: None,
+            tok_s,
             prefill_tokens: prompt_tokens,
             prefill_ms: None,
             prefill_tok_s: None,
-            decode_tok_s: None,
-            ttft_ms: None,
+            decode_tok_s,
+            ttft_ms,
             finish_reason: Some(finish_reason),
             response_id: None,
             extra,
@@ -3223,9 +3233,56 @@ fn sse_error(msg: &str) -> Event {
     Event::default().data(serde_json::to_string(&json!({"error": {"message": msg}})).unwrap())
 }
 
+/// `(tok_s, decode_tok_s, ttft_ms)` for a request the batch runner served, measured at
+/// the route: it sees each token arrive, and the runner reports none of the three --
+/// so a non-streamed request's `timings` carried token counts only. Time to first
+/// token runs from admission, so it includes any wait for a batch slot, as a client
+/// sees it; decode is first token to done. No prefill rate: prefill is fused across
+/// the batch's sessions, so one request's share of it is not measured.
+fn batched_timings(
+    to_first_token: Option<std::time::Duration>,
+    total: std::time::Duration,
+    tokens: u32,
+) -> (Option<f64>, Option<f64>, Option<f64>) {
+    let secs = |d: std::time::Duration| d.as_secs_f64();
+    let tok_s = (secs(total) > 0.0).then(|| tokens as f64 / secs(total));
+    let ttft_ms = to_first_token.map(|d| secs(d) * 1000.0);
+    let decode = to_first_token
+        .map(|d| total.saturating_sub(d))
+        .filter(|d| tokens > 1 && secs(*d) > 0.0)
+        .map(|d| (tokens - 1) as f64 / secs(d));
+    (tok_s, decode, ttft_ms)
+}
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A non-streamed batched request reports rates and time to first token.
+    #[test]
+    fn batched_timings_come_from_token_arrival() {
+        use std::time::Duration;
+        let (tok_s, decode, ttft) = batched_timings(
+            Some(Duration::from_millis(500)),
+            Duration::from_millis(2500),
+            41,
+        );
+        assert_eq!(ttft, Some(500.0));
+        assert!((tok_s.unwrap() - 41.0 / 2.5).abs() < 1e-9);
+        assert!(
+            (decode.unwrap() - 40.0 / 2.0).abs() < 1e-9,
+            "40 tokens after the first, in 2 s"
+        );
+        // No token at all: nothing to time but the whole request.
+        assert_eq!(
+            batched_timings(None, Duration::from_secs(1), 0),
+            (Some(0.0), None, None)
+        );
+        // One token: no decode interval to rate.
+        assert_eq!(
+            batched_timings(Some(Duration::from_secs(1)), Duration::from_secs(1), 1).1,
+            None
+        );
+    }
     use hipfire_prompt::Role;
 
     #[test]
