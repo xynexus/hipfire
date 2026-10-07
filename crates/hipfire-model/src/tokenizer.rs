@@ -190,6 +190,78 @@ pub fn unmark_literal(text: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+/// The special-token ids an HF `TemplateProcessing` post-processor puts before and
+/// after a single sequence (`single: [<special>.., $A, <special>..]`), read from a
+/// `tokenizer.json` -- `(vec![], vec![])` when it has none. [`Tokenizer::encode`]
+/// never applies a post-processor (a chat prompt is framed by its template), so a
+/// caller that feeds the model one raw sequence the way HF's `tokenizer(text)` does
+/// -- an embedding input -- frames it with these. Qwen3-Embedding appends
+/// `<|endoftext|>` and pools that last token: fed without it, every vector was off
+/// the model's own (cosine 0.44-0.64).
+pub fn single_sequence_frame(tokenizer_json: &str) -> (Vec<u32>, Vec<u32>) {
+    let Ok(tok) = serde_json::from_str::<serde_json::Value>(tokenizer_json) else {
+        return Default::default();
+    };
+    let pp = &tok["post_processor"];
+    let template = if pp["type"] == "TemplateProcessing" {
+        Some(pp)
+    } else {
+        pp["processors"]
+            .as_array()
+            .and_then(|ps| ps.iter().find(|p| p["type"] == "TemplateProcessing"))
+    };
+    let Some(t) = template else {
+        return Default::default();
+    };
+    let (mut before, mut after, mut seen) = (Vec::new(), Vec::new(), false);
+    for item in t["single"].as_array().into_iter().flatten() {
+        if item.get("Sequence").is_some() {
+            seen = true;
+            continue;
+        }
+        let Some(name) = item["SpecialToken"]["id"].as_str() else {
+            continue;
+        };
+        let ids = t["special_tokens"][name]["ids"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|v| v.as_u64())
+            .map(|v| v as u32);
+        if seen {
+            after.extend(ids)
+        } else {
+            before.extend(ids)
+        }
+    }
+    (before, after)
+}
+
+#[cfg(test)]
+mod single_sequence_frame_tests {
+    use super::single_sequence_frame;
+
+    #[test]
+    fn reads_the_template_around_a_single_sequence() {
+        // Qwen3-Embedding's: a Sequence wrapping ByteLevel and the template.
+        let qwen3 = r#"{"post_processor":{"type":"Sequence","processors":[
+            {"type":"ByteLevel","add_prefix_space":false},
+            {"type":"TemplateProcessing",
+             "single":[{"Sequence":{"id":"A","type_id":0}},{"SpecialToken":{"id":"<|endoftext|>","type_id":0}}],
+             "special_tokens":{"<|endoftext|>":{"id":"<|endoftext|>","ids":[151643],"tokens":["<|endoftext|>"]}}}]}}"#;
+        assert_eq!(single_sequence_frame(qwen3), (vec![], vec![151643]));
+        let bos_eos = r#"{"post_processor":{"type":"TemplateProcessing",
+            "single":[{"SpecialToken":{"id":"<bos>","type_id":0}},{"Sequence":{"id":"A","type_id":0}},{"SpecialToken":{"id":"<eos>","type_id":0}}],
+            "special_tokens":{"<bos>":{"ids":[2]},"<eos>":{"ids":[1]}}}}"#;
+        assert_eq!(single_sequence_frame(bos_eos), (vec![2], vec![1]));
+        assert_eq!(
+            single_sequence_frame(r#"{"post_processor":null}"#),
+            (vec![], vec![])
+        );
+        assert_eq!(single_sequence_frame("not json"), (vec![], vec![]));
+    }
+}
+
 pub struct Tokenizer {
     /// Token ID → string
     vocab: Vec<String>,

@@ -193,11 +193,11 @@ fn qwen3_embedding_encode_prefixed(
     let tokenized = texts
         .iter()
         .map(|text| {
-            if prefix.is_empty() {
+            state.frame_input(if prefix.is_empty() {
                 tokenizer.encode(text)
             } else {
                 tokenizer.encode(&format!("{prefix}{text}"))
-            }
+            })
         })
         .collect::<Vec<_>>();
     let dimensions = dims.unwrap_or(state.metadata.output.native_dimensions);
