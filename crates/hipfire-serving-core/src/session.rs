@@ -48,6 +48,21 @@ use crate::memory::{
 };
 use crate::model::{LoadedModel, ResidentSession};
 
+/// Copy one logits row between a saved session and the active scratch: the
+/// tensor's own size, not its buffer's. The pool hands back any free buffer at
+/// least as large as asked, so two `[vocab]` rows can sit in buffers of different
+/// sizes, and copying the scratch buffer's capacity read past a fresh snapshot's
+/// end. A worker's first prefill after `hipfire start` panicked on it: a small
+/// model's freed buffers had left an oversized block for the 27B's scratch logits.
+pub(crate) fn copy_logits(
+    gpu: &hipfire_rdna::Gpu,
+    dst: &hipfire_rdna::GpuTensor,
+    src: &hipfire_rdna::GpuTensor,
+) -> hipfire_rdna::HipResult<()> {
+    debug_assert_eq!((&dst.shape, dst.dtype), (&src.shape, src.dtype));
+    gpu.memcpy_dtod_auto(&dst.buf, &src.buf, src.byte_size())
+}
+
 /// Synthetic session id used by the legacy single-session `generate` path (the
 /// pre-multi-session code that didn't supply its own session id).
 pub const QWEN35_LEGACY_SESSION_ID: &str = "__legacy_generate__";
@@ -422,9 +437,7 @@ impl Qwen35RequestSessionState {
         // On success `logits` is moved into `Self` and freed via the eviction
         // path; free it here on the memcpy-error branch (the only path between the
         // alloc and the move) so a failed snapshot copy doesn't strand it.
-        if let Err(e) =
-            gpu.memcpy_dtod_auto(&logits.buf, &scratch.logits.buf, scratch.logits.buf.size())
-        {
+        if let Err(e) = copy_logits(gpu, &logits, &scratch.logits) {
             let _ = gpu.free_tensor(logits);
             return Err(format!("save qwen35 session logits snapshot: {e:?}"));
         }
@@ -454,12 +467,8 @@ impl Qwen35RequestSessionState {
     ) -> Result<(), String> {
         let allocation_epoch = self.allocation_epoch;
         if let Some(scratch) = m.q35_scratch.as_ref() {
-            gpu.memcpy_dtod_auto(
-                &scratch.logits.buf,
-                &self.logits.buf,
-                scratch.logits.buf.size(),
-            )
-            .map_err(|e| format!("restore qwen35 session logits snapshot: {e:?}"))?;
+            copy_logits(gpu, &scratch.logits, &self.logits)
+                .map_err(|e| format!("restore qwen35 session logits snapshot: {e:?}"))?;
         }
         // Free the snapshot. `GpuTensor` has no `Drop`, so letting `self.logits`
         // fall out of scope orphaned the allocation — ~970 KiB per call at a
@@ -3094,6 +3103,32 @@ impl SessionServingBackend for LoadedModel {
 
 #[cfg(test)]
 mod eviction_tests {
+    // A logits row the pool put in a larger buffer copies into and out of an
+    // exact-size snapshot: the copy is the row, not the buffer. Copying the larger
+    // buffer's capacity read past the snapshot -- the first-prefill panic.
+    #[test]
+    #[ignore = "needs a GPU"]
+    fn a_logits_row_copies_whatever_buffer_the_pool_gave_it() {
+        use hipfire_rdna::{DType, Gpu};
+        let mut gpu = Gpu::init().expect("Gpu::init");
+        const VOCAB: usize = 248_320;
+        // Leave a larger free buffer in the bucket a [VOCAB] F32 row falls in.
+        let roomy = gpu.alloc_tensor(&[VOCAB + 10_000], DType::F32).unwrap();
+        gpu.free_tensor(roomy).unwrap();
+        let scratch = gpu.alloc_tensor(&[VOCAB], DType::F32).unwrap();
+        let snapshot = gpu.alloc_tensor(&[VOCAB], DType::F32).unwrap();
+        assert!(
+            scratch.buf.size() > snapshot.buf.size(),
+            "precondition: the scratch got the roomier pooled buffer ({} vs {})",
+            scratch.buf.size(),
+            snapshot.buf.size()
+        );
+        super::copy_logits(&gpu, &snapshot, &scratch).expect("save");
+        super::copy_logits(&gpu, &scratch, &snapshot).expect("restore");
+        gpu.free_tensor(scratch).unwrap();
+        gpu.free_tensor(snapshot).unwrap();
+    }
+
     use super::{
         eviction_victims, qwen35_eviction_victims, LFM2_LEGACY_SESSION_ID, QWEN35_LEGACY_SESSION_ID,
     };

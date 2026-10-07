@@ -1088,12 +1088,8 @@ pub fn qwen35_decode_step_serial_reference(
                 scratch,
             )
             .map_err(|e| format!("qwen35 decode forward_scratch: {e:?}"))?;
-            gpu.memcpy_dtod_auto(
-                &state.logits.buf,
-                &scratch.logits.buf,
-                scratch.logits.buf.size(),
-            )
-            .map_err(|e| format!("save qwen35 decode logits snapshot: {e:?}"))?;
+            crate::session::copy_logits(gpu, &state.logits, &scratch.logits)
+                .map_err(|e| format!("save qwen35 decode logits snapshot: {e:?}"))?;
         }
         state.cursor.seq_pos += 1;
         let new_logical_position = state.cursor.seq_pos + state.kv_cache().compact_offset;
@@ -1410,14 +1406,9 @@ pub fn qwen35_decode_step_fused_grouped_moe_native_chunk(
                 .map_err(|e| {
                     format!("qwen35 grouped-MoE decode internal serial parity advance: {e:?}")
                 })?;
-                gpu.memcpy_dtod_auto(
-                    &oracle_state.logits.buf,
-                    &scratch.logits.buf,
-                    scratch.logits.buf.size(),
-                )
-                .map_err(|e| {
-                    format!("save qwen35 grouped-MoE decode internal parity logits: {e:?}")
-                })?;
+                crate::session::copy_logits(gpu, &oracle_state.logits, &scratch.logits).map_err(
+                    |e| format!("save qwen35 grouped-MoE decode internal parity logits: {e:?}"),
+                )?;
                 oracle_state.cursor.seq_pos += 1;
                 let fused_next = gpu
                     .argmax_f32(&fused_state.logits, config.vocab_size)
@@ -1694,12 +1685,8 @@ pub fn qwen35_decode_step_fused_dense_native_chunk(
                     scratch,
                 )
                 .map_err(|e| format!("qwen35 decode internal serial parity advance: {e:?}"))?;
-                gpu.memcpy_dtod_auto(
-                    &oracle_state.logits.buf,
-                    &scratch.logits.buf,
-                    scratch.logits.buf.size(),
-                )
-                .map_err(|e| format!("save qwen35 decode internal parity logits: {e:?}"))?;
+                crate::session::copy_logits(gpu, &oracle_state.logits, &scratch.logits)
+                    .map_err(|e| format!("save qwen35 decode internal parity logits: {e:?}"))?;
                 oracle_state.cursor.seq_pos += 1;
                 let fused_next = gpu
                     .argmax_f32(&fused_state.logits, config.vocab_size)
@@ -1797,12 +1784,8 @@ pub fn qwen35_decode_step_fused_dense_native_singleton(
                 scratch,
             )
             .map_err(|e| format!("qwen35 fused dense native singleton decode advance: {e:?}"))?;
-            gpu.memcpy_dtod_auto(
-                &state.logits.buf,
-                &scratch.logits.buf,
-                scratch.logits.buf.size(),
-            )
-            .map_err(|e| format!("save qwen35 native singleton logits snapshot: {e:?}"))?;
+            crate::session::copy_logits(gpu, &state.logits, &scratch.logits)
+                .map_err(|e| format!("save qwen35 native singleton logits snapshot: {e:?}"))?;
         }
         state.cursor.seq_pos += 1;
         let new_logical_position = state.cursor.seq_pos + state.kv_cache().compact_offset;
