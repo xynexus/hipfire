@@ -67,7 +67,7 @@ client side of it (`connect`, `attach_or_spawn`, `shared_daemon_listening`,
     vision) spawn a private one. While serve holds the worker that fails on the
     `daemon.pid` flock and is reported as a failed row.
 
-Still open: on the batched path, a non-streamed request's `timings` carry
-token counts only. The batch runner's `DoneEvent` sets the rates and TTFT to
-`None`. The tools stream to avoid it; a client that does not stream gets no
-throughput numbers.
+Since closed (2026-10-07): a non-streamed request on the batched path used to get
+token counts only in `timings`. The route now measures `tok_s`, `decode_tok_s` and
+`ttft_ms` from token arrival (`batched_timings`); there is still no per-request
+prefill rate, since prefill is fused across the batch.
