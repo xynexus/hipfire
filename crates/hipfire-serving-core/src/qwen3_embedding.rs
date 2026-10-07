@@ -30,11 +30,27 @@ type ResidentExecutor = (
 pub struct Qwen3EmbeddingState {
     pub config: LlamaConfig,
     pub metadata: EmbeddingMetadata,
+    /// Special tokens the model's tokenizer puts around one input (its
+    /// post-processor's single-sequence template): `<|endoftext|>` after, here.
+    input_frame: (Vec<u32>, Vec<u32>),
     token_embeddings_bf16: Vec<u16>,
     encoder_weight_blob: Vec<u8>,
     image_cache_root: PathBuf,
     #[cfg(target_os = "linux")]
     executor: RefCell<Option<ResidentExecutor>>,
+}
+
+impl Qwen3EmbeddingState {
+    /// One tokenized input as the model was trained to see it: `ids` inside its
+    /// tokenizer's single-sequence template (see
+    /// [`hipfire_model::tokenizer::single_sequence_frame`]).
+    pub fn frame_input(&self, ids: Vec<u32>) -> Vec<u32> {
+        let (before, after) = &self.input_frame;
+        if before.is_empty() && after.is_empty() {
+            return ids;
+        }
+        [before.as_slice(), &ids, after.as_slice()].concat()
+    }
 }
 
 #[derive(Debug)]
@@ -103,6 +119,14 @@ impl Qwen3EmbeddingState {
                     .into(),
             );
         }
+        let input_frame = serde_json::from_str::<serde_json::Value>(&hfq.metadata_json)
+            .ok()
+            .and_then(|root| {
+                root.get("tokenizer")
+                    .and_then(serde_json::Value::as_str)
+                    .map(hipfire_model::tokenizer::single_sequence_frame)
+            })
+            .unwrap_or_default();
         let token_embeddings_bf16 = load_token_embeddings_bf16(hfq, &config)?;
         let encoder_weight_blob = build_qwen3_encoder_weight_blob(hfq, &config)?;
         let image_cache_root = std::env::var_os("HIPFIRE_NPU_IMAGE_CACHE")
@@ -119,6 +143,7 @@ impl Qwen3EmbeddingState {
         Ok(Self {
             config,
             metadata,
+            input_frame,
             token_embeddings_bf16,
             encoder_weight_blob,
             image_cache_root,
@@ -669,6 +694,8 @@ mod tests {
         );
         assert_eq!(state.token_embeddings_bf16.len(), 2 * 256);
         assert!(hfq.find_tensor_info("lm_head.weight").is_none());
+        // Inputs get the tokenizer's template: the model pools the <|endoftext|>.
+        assert_eq!(state.frame_input(vec![7, 8]), vec![7, 8, 151643]);
 
         drop(state);
         drop(hfq);
@@ -735,7 +762,13 @@ mod tests {
             oq8(format!("{prefix}.mlp.up_proj.weight"), 256, 256),
             oq8(format!("{prefix}.mlp.down_proj.weight"), 256, 256),
         ]);
+        // Only the post-processor matters here: Qwen3-Embedding's appends <|endoftext|>.
+        let tokenizer = json!({"post_processor": {"type": "TemplateProcessing",
+            "single": [{"Sequence": {"id": "A", "type_id": 0}},
+                       {"SpecialToken": {"id": "<|endoftext|>", "type_id": 0}}],
+            "special_tokens": {"<|endoftext|>": {"ids": [151643]}}}});
         let metadata = json!({
+            "tokenizer": tokenizer.to_string(),
             "quant_format": "oq8+",
             "config": {
                 "model_type": "qwen3",
