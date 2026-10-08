@@ -21,7 +21,7 @@
 // Otherwise it uses `positions[global_bid] + 1` (legacy causal). The tile
 // kernel's bias is already baked into the partials, so reduce only needs
 // to know how many tiles to combine.
-template <int DPT>
+template <int DPT, bool FIXED = false>
 __device__ __forceinline__ void asym_reduce_body(
     const float* __restrict__ partials,        // [sub_batch × n_heads × max_tiles × stride]
     float* __restrict__ out,                   // [sub_batch × n_heads × head_dim]
@@ -62,7 +62,10 @@ __device__ __forceinline__ void asym_reduce_body(
     // refuse any other head_dim rather than corrupting silently; see
     // Gpu::require_head_dim_256 and
     // docs/bugs/2026-08-30-batched-flash-tile-head-dim-256.md.
-    const int dpt = head_dim / 32;
+    // FIXED: head_dim == 32*DPT at compile time, so the per-dim loops unroll into
+    // registers instead of indexing g[] through v_movrel, and the tile loop can
+    // keep several tiles' loads in flight (it is a serial walk per head).
+    const int dpt = FIXED ? DPT : head_dim / 32;
     const int d_base = tid * dpt;
 
     // Pass 1: global max
@@ -79,12 +82,14 @@ __device__ __forceinline__ void asym_reduce_body(
     #pragma unroll
     for (int i = 0; i < DPT; i++) g[i] = 0.0f;
 
+    #pragma unroll 4
     for (int tile = 0; tile < n_tiles; tile++) {
         const float* p = my_partials + tile * stride;
         float tile_max = p[0];
         float tile_sum = p[1];
         if (tile_sum <= 0.0f) continue;
         float corr = expf(tile_max - global_max);
+        #pragma unroll
         for (int i = 0; i < dpt; i++)
             g[i] += p[2 + d_base + i] * corr;
         global_sum += tile_sum * corr;
@@ -94,6 +99,7 @@ __device__ __forceinline__ void asym_reduce_body(
 
     const int q_dim = n_heads * head_dim;
     float* my_out = out + local_bid * q_dim + h * head_dim;
+    #pragma unroll
     for (int i = 0; i < dpt; i++)
         my_out[d_base + i] = g[i] * inv_sum;
 }
@@ -104,8 +110,12 @@ __global__ void attention_flash_asym_reduce_batched(
     const float* __restrict__ partials, float* __restrict__ out,
     const int* __restrict__ positions, int n_heads, int head_dim, int tile_size,
     int max_tiles, int batch_offset, int block_start, int block_cols) {
-    asym_reduce_body<8>(partials, out, positions, n_heads, head_dim, tile_size,
-                        max_tiles, batch_offset, block_start, block_cols);
+    if (head_dim == 256)
+        asym_reduce_body<8, true>(partials, out, positions, n_heads, head_dim, tile_size,
+                                  max_tiles, batch_offset, block_start, block_cols);
+    else
+        asym_reduce_body<8>(partials, out, positions, n_heads, head_dim, tile_size,
+                            max_tiles, batch_offset, block_start, block_cols);
 }
 
 // head_dim 512: DPT=16 (gemma4 global layers).

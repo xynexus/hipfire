@@ -104,7 +104,26 @@ fn main() {
     ] {
         // Every KVarN K width: the kernel compiles one variant per width.
         for bits in [4usize, 2, 8] {
-            all_pass &= run_case(&mut gpu, nfb, tail, rows, bits);
+            if !skip(nfb, tail, rows, bits, (6, 2)) {
+                all_pass &= run_case(&mut gpu, nfb, tail, rows, bits, (6, 2));
+            }
+        }
+    }
+    // Decode / verify widths at the served query groups -- Qwen3.8-27B (24 over 4,
+    // G=6) and Qwen3.6-35B-A3B (16 over 2, G=8) -- where the tile path runs.
+    for &heads in &[(24usize, 4usize), (16, 2)] {
+        for &(nfb, tail, rows) in &[
+            (104usize, 77usize, 1usize),
+            (104, 77, 2),
+            (8, 0, 1),
+            (3, 20, 1),
+            (30, 128, 4),
+        ] {
+            for bits in [4usize, 8, 2] {
+                if !skip(nfb, tail, rows, bits, heads) {
+                    all_pass &= run_case(&mut gpu, nfb, tail, rows, bits, heads);
+                }
+            }
         }
     }
     if !all_pass {
@@ -113,16 +132,21 @@ fn main() {
     println!("ALL PASS");
 }
 
+/// PARITY_ONLY="nfb,tail,rows,bits,n_heads,n_kv_heads" runs that one case.
+fn skip(nfb: usize, tail: usize, rows: usize, bits: usize, heads: (usize, usize)) -> bool {
+    std::env::var("PARITY_ONLY")
+        .is_ok_and(|v| v != format!("{nfb},{tail},{rows},{bits},{},{}", heads.0, heads.1))
+}
+
 fn run_case(
     gpu: &mut Gpu,
     n_full_blocks: usize,
     tail_len: usize,
     rows: usize,
     bits: usize,
+    (n_heads, n_kv_heads): (usize, usize),
 ) -> bool {
     let head_dim = 256usize;
-    let n_heads = 6usize;
-    let n_kv_heads = 2usize;
     let group = 128usize;
     let kv_dim = n_kv_heads * head_dim;
     let n_full = n_full_blocks * group;
@@ -343,14 +367,61 @@ fn run_case(
             .zip(&ref_out)
             .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()))
     };
+    // PARITY_BENCH=1: warm timing of the tile path, 30 back-to-back calls into a
+    // preallocated output -- how the decode loop runs it, unlike the single cold
+    // call above.
+    if std::env::var("PARITY_BENCH").is_ok() && rows < 32 {
+        let out = gpu.zeros(&[rows * q_dim], DType::F32).unwrap();
+        std::env::set_var("HIPFIRE_KVARN_PREFILL_WMMA", "0");
+        let call = |gpu: &mut Gpu| {
+            gpu.attention_flash_kvarn_batched_masked(
+                &qd,
+                &rd,
+                &wd,
+                &vd,
+                &out,
+                &posd,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_seq,
+                seq_len,
+                rows,
+                &partials,
+                None,
+                0,
+                0,
+                n_full_blocks,
+                record_bytes,
+                bits,
+            )
+            .unwrap();
+        };
+        for _ in 0..5 {
+            call(gpu);
+        }
+        gpu.device_synchronize().unwrap();
+        let t = std::time::Instant::now();
+        for _ in 0..30 {
+            call(gpu);
+        }
+        gpu.device_synchronize().unwrap();
+        println!(
+            "    bench G={} rows={rows} seq={seq_len} bits={bits}: tile {:7.1} us",
+            n_heads / n_kv_heads,
+            t.elapsed().as_secs_f64() * 1e6 / 30.0
+        );
+    }
     let (e_old, e_new) = (err(&old), err(&new));
     let ref_max = ref_out.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-    let nan = new.iter().any(|v| !v.is_finite());
+    let nan = new.iter().chain(&old).any(|v| !v.is_finite());
     // f16 Q/K/V/P in the WMMA path vs f32 in the old one: allow a few f16 ulps of
     // the output scale.
-    let pass = !nan && e_new < 4e-3 && e_new <= ref_max * 2e-2;
+    // The tile path is f32 throughout: it must stay at f32 accuracy.
+    let pass = !nan && e_new < 4e-3 && e_new <= ref_max * 2e-2 && e_old <= ref_max * 1e-3;
     println!(
-        "  bits={bits} n_full={n_full_blocks} tail={tail_len} rows={rows} seq={seq_len}: old-vs-host={e_old:.2e} wmma-vs-host={e_new:.2e} (|ref|max {ref_max:.3}) -> {}",
+        "  G={} bits={bits} n_full={n_full_blocks} tail={tail_len} rows={rows} seq={seq_len}: old-vs-host={e_old:.2e} wmma-vs-host={e_new:.2e} (|ref|max {ref_max:.3}) -> {}",
+        n_heads / n_kv_heads,
         if pass { "PASS" } else { "FAIL" }
     );
     pass

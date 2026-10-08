@@ -81,7 +81,7 @@ __device__ __forceinline__ float wave32_max_dpp(float v) {
     return fmaxf(v, __builtin_bit_cast(float, s_));
 }
 
-template <int MAXDPT, int NW>
+template <int MAXDPT, int NW, int KB = 0>
 __device__ __forceinline__ void kvarn_tile_body(
     const float* __restrict__ q,               // [sub_batch × n_heads × head_dim]
     const uint8_t* __restrict__ records,       // block-tiled KVarN K records
@@ -114,7 +114,12 @@ __device__ __forceinline__ void kvarn_tile_body(
     const int nthr = 32 * NW;
     // dims-per-thread: 32-thread block covers head_dim (128 -> 4, 256 -> 8). This
     // (not a hardcoded 8) is what makes the kernel correct for head_dim != 256.
-    const int dpt = head_dim / 32;
+    // KB != 0: head_dim == 32*MAXDPT and bits == KB are compile-time, so every
+    // per-dim / per-token loop below unrolls into registers. With them runtime
+    // the loops stayed rolled and `part[tt]`/`mq[i]` were indexed through
+    // v_movrel -- the kernel sat ~5x off its byte floor at decode.
+    if (KB != 0) bits = KB;
+    const int dpt = (KB != 0) ? MAXDPT : head_dim / 32;
     const int cpb = 8 / bits;                  // K codes per byte
     // `bits` is a RUNTIME parameter, so `idx / cpb` and `idx % cpb` compiled to a
     // real integer divide — 8 x `v_rcp_iflag_f32` plus fixups — PER ELEMENT in the
@@ -155,6 +160,7 @@ __device__ __forceinline__ void kvarn_tile_body(
     const float* q_head = q + local_bid * q_dim + h * head_dim;
     const int d0 = lane * dpt;
     float mq[MAXDPT];                          // dpt <= MAXDPT (head_dim <= 32*MAXDPT)
+    #pragma unroll
     for (int i = 0; i < dpt; i++) mq[i] = q_head[d0 + i];
 
     // ── Phase A: Q·K with inline KVarN dequant (records) or f32 window. ──
@@ -185,6 +191,7 @@ __device__ __forceinline__ void kvarn_tile_body(
         // reduction, so the shuffle sums the per-lane C_local terms for free.
         float qa[MAXDPT];
         float c_local = 0.0f;
+        #pragma unroll
         for (int i = 0; i < dpt; i++) {
             const float sa_i = __half2float(scale_abs[d0 + i]);
             const float za_i = __half2float(zp_abs[d0 + i]);
@@ -209,9 +216,12 @@ __device__ __forceinline__ void kvarn_tile_body(
         // idx = (d0+i)*group + t_base with group a multiple of TPW and t_base a
         // multiple of TPW makes idx a multiple of TPW, so idx>>cpb_shift is
         // 4-byte aligned — the load is always legal.
-        const int TPW = 32 / bits;                    // codes per dword: 8 at bits=4
+        const int TPW = (KB != 0) ? 32 / KB : 32 / bits;   // codes per dword: 8 at bits=4
         for (int t_base = wv * TPW; t_base < tile_len; t_base += NW * TPW) {
-            const int nt = min(TPW, tile_len - t_base);
+            // The compile-time body always scores a whole dword of tokens (the
+            // records hold the full block); a row whose causal end falls inside
+            // this block just leaves the scores past it unwritten below.
+            const int nt = (KB != 0) ? TPW : min(TPW, tile_len - t_base);
             // WORST-CASE sized: TPW = 32/bits is 16 at bits=2, and `nt` below can
             // reach it, so `part[8]` overran by 8 floats on every 2-bit tile.
             // The old comment ("TPW <= 8 for bits >= 4") stated the precondition
@@ -222,17 +232,20 @@ __device__ __forceinline__ void kvarn_tile_body(
             float part[16];                           // TPW = 32/bits, 16 at bits=2
             #pragma unroll
             for (int tt = 0; tt < 16; tt++) part[tt] = c_local;
+            #pragma unroll
             for (int i = 0; i < dpt; i++) {
                 const int idx = (d0 + i) * group + t_base;
                 const uint32_t w4 = *(const uint32_t*)(rec + (idx >> cpb_shift));
                 const float qai = qa[i];
+                #pragma unroll
                 for (int tt = 0; tt < nt; tt++)
                     part[tt] += (float)((w4 >> (tt * bits)) & codemask) * qai;
             }
+            #pragma unroll
             for (int tt = 0; tt < nt; tt++) {
                 float partial = part[tt] * __half2float(s_col[t_base + tt]);
                 partial = wave32_sum_dpp(partial);
-                if (lane == 0) {
+                if (lane == 0 && t_base + tt < tile_len) {
                     const int t = tile_start + t_base + tt;
                     float s = partial * scale_attn;
                     if (tree_mode && t >= block_start)
@@ -341,6 +354,7 @@ __device__ __forceinline__ void kvarn_tile_body(
         const unsigned char* vbh = v_cache + (size_t)t * v_row_stride + vh_off;
         const float wvs = w * (float)*((const _Float16*)vbh);
         const signed char* vq = (const signed char*)(vbh + 2 + bj0);
+        #pragma unroll
         for (int i = 0; i < dpt; i++) {
             out_vec[i] += wvs * (float)vq[i];
         }
@@ -378,10 +392,18 @@ extern "C" __launch_bounds__(32 * KVARN_NW, 1) __global__ void attention_flash_k
     int max_seq, float scale_attn, int tile_size, int max_tiles, int batch_offset,
     int block_start, int block_cols, int n_full_blocks, int rec_bytes, int bits,
     int window_f16) {
-    kvarn_tile_body<8, KVARN_NW>(q, records, window, v_cache, partials, positions, tree_bias,
-                       n_heads, n_kv_heads, head_dim, max_seq, scale_attn, tile_size,
-                       max_tiles, batch_offset, block_start, block_cols, n_full_blocks,
-                       rec_bytes, bits, window_f16);
+#define KVARN_TILE_ARGS q, records, window, v_cache, partials, positions, tree_bias, \
+        n_heads, n_kv_heads, head_dim, max_seq, scale_attn, tile_size, max_tiles, \
+        batch_offset, block_start, block_cols, n_full_blocks, rec_bytes, bits, window_f16
+    // Workgroup-uniform branch on kernel arguments: the served shape (kvarn4,
+    // head_dim 256) gets the compile-time body, anything else the runtime one.
+    // KB=8 measured slower than the runtime body (700 -> 1075 us at 13.4K, G=6),
+    // so 8-bit K stays runtime.
+    if (head_dim == 256 && tile_size == 128 && bits == 4)
+        kvarn_tile_body<8, KVARN_NW, 4>(KVARN_TILE_ARGS);
+    else
+        kvarn_tile_body<8, KVARN_NW>(KVARN_TILE_ARGS);
+#undef KVARN_TILE_ARGS
 }
 
 // head_dim == 512 (dpt == 16): gemma4 global layers. Lower min-blocks hint since
