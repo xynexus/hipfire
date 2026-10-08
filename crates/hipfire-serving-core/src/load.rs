@@ -4291,7 +4291,13 @@ fn load_dflash_state_source(
             draft_config.num_extract(),
             draft_config.hidden,
             ctx_capacity + draft_config.block_size,
-            hipfire_arch_qwen35::qwen35::PREFILL_MAX_BATCH.max(draft_config.block_size),
+            std::env::var("HIPFIRE_PREFILL_MAX_BATCH")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or_else(|| {
+                    hipfire_arch_qwen35::qwen35::default_prefill_max_batch(target_config)
+                })
+                .max(draft_config.block_size),
         )
     } else {
         HiddenStateRingBuffer::new_for_layers(
@@ -4300,7 +4306,13 @@ fn load_dflash_state_source(
             draft_config.target_layer_ids.clone(),
             draft_config.hidden,
             ctx_capacity + draft_config.block_size,
-            hipfire_arch_qwen35::qwen35::PREFILL_MAX_BATCH.max(draft_config.block_size),
+            std::env::var("HIPFIRE_PREFILL_MAX_BATCH")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or_else(|| {
+                    hipfire_arch_qwen35::qwen35::default_prefill_max_batch(target_config)
+                })
+                .max(draft_config.block_size),
         )
     }
     .map_err(|e| format!("hidden_rb: {e}"))?;

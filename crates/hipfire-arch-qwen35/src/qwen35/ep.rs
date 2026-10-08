@@ -2312,7 +2312,7 @@ pub fn forward_prefill_batch_multi_with_caps(
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&v| v >= 2)
-        .unwrap_or(PREFILL_MAX_BATCH);
+        .unwrap_or(default_prefill_max_batch(config));
 
     let force_fallback = std::env::var("HIPFIRE_PREFILL_BATCHED").ok().as_deref() == Some("0");
 
