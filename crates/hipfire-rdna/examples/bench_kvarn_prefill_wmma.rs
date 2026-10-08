@@ -9,65 +9,6 @@
 //!   cargo run --release -p hipfire-rdna --example bench_kvarn_prefill_wmma [ctx rows]
 use hipfire_rdna::{DType, Gpu};
 
-fn f16_to_f32(bits: u16) -> f32 {
-    let s = (bits >> 15) & 1;
-    let e = (bits >> 10) & 0x1f;
-    let m = bits & 0x3ff;
-    let v = if e == 0 {
-        (m as f32) * 2f32.powi(-24)
-    } else if e == 31 {
-        if m == 0 {
-            f32::INFINITY
-        } else {
-            f32::NAN
-        }
-    } else {
-        (1.0 + m as f32 / 1024.0) * 2f32.powi(e as i32 - 15)
-    };
-    if s == 1 {
-        -v
-    } else {
-        v
-    }
-}
-
-fn f32_to_f16(x: f32) -> u16 {
-    let bits = x.to_bits();
-    let sign = ((bits >> 16) & 0x8000) as u16;
-    let mut exp = ((bits >> 23) & 0xff) as i32 - 127 + 15;
-    let mant = bits & 0x7f_ffff;
-    if exp >= 0x1f {
-        return sign | 0x7c00;
-    }
-    if exp <= 0 {
-        if exp < -10 {
-            return sign;
-        }
-        let mant = mant | 0x80_0000;
-        let shift = (14 - exp) as u32;
-        let mut h = (mant >> shift) as u16;
-        if (mant >> (shift - 1)) & 1 == 1 {
-            let sticky = mant & ((1 << (shift - 1)) - 1);
-            if sticky != 0 || (h & 1) == 1 {
-                h += 1;
-            }
-        }
-        return sign | h;
-    }
-    let mut h_mant = (mant >> 13) as u16;
-    if (mant >> 12) & 1 == 1 {
-        let sticky = mant & 0xfff;
-        if sticky != 0 || (h_mant & 1) == 1 {
-            h_mant += 1;
-            if h_mant == 0x400 {
-                h_mant = 0;
-                exp += 1;
-            }
-        }
-    }
-    sign | ((exp as u16) << 10) | h_mant
-}
-
 fn lcg(seed: u32, n: usize) -> Vec<f32> {
     let mut s = seed.max(1);
     let mut u = || {
@@ -102,7 +43,6 @@ fn main() {
     let q_dim = n_heads * head_dim;
     let n_full_blocks = ctx / group;
     let n_full = n_full_blocks * group;
-    let tail = ctx - n_full;
     let tile_elems = head_dim * group;
     let record_bytes = tile_elems.div_ceil(2) + head_dim * 2 * 2 + group * 2;
     let rec_buf_bytes = (n_full_blocks.max(1) * n_kv_heads * record_bytes).next_multiple_of(4);
