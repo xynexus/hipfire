@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Copyright (c) 2026 hipfire contributors
 // hipfire — see LICENSE and NOTICE in the project root.
-//! `gemm_q8_0_batched` at decode widths (5..64 rows, the row-split kernel) must be
-//! BIT-IDENTICAL to the same rows run four at a time (the one-wave-per-row
+//! `gemm_q8_0_batched` at 2..64 rows (the row-split kernel) must be
+//! BIT-IDENTICAL to the same rows run one at a time (the one-wave-per-row
 //! kernel), at the Qwen3.6-35B-A3B MoE router (256x2048) and shared-expert gate
 //! (1x2048) shapes. Also prints warm timings.
 //!
@@ -39,15 +39,16 @@ fn main() {
         let a = gpu
             .upload_raw(&q8_weights(m, k), &[m * k / 32 * 34])
             .unwrap();
-        for &n in &[5usize, 8, 13, 16, 32, 33, 64] {
+        for &n in &[2usize, 3, 4, 5, 8, 13, 16, 32, 33, 64] {
             let x: Vec<f32> = lcg(3 + n as u32, n * k);
             // F32, not raw: sub_offset counts elements of the tensor's dtype.
             let xd = gpu.upload_f32(&x, &[n * k]).unwrap();
             let y_new = gpu.zeros(&[n * m], DType::F32).unwrap();
             let y_ref = gpu.zeros(&[n * m], DType::F32).unwrap();
             gpu.gemm_q8_0_batched(&a, &xd, &y_new, m, k, n).unwrap();
-            for off in (0..n).step_by(4) {
-                let take = (n - off).min(4);
+            // Reference: one row per call -- the one-wave-per-row kernel.
+            for off in 0..n {
+                let take = 1;
                 let xs = xd.sub_offset(off * k, take * k);
                 let ys = y_ref.sub_offset(off * m, take * m);
                 gpu.gemm_q8_0_batched(&a, &xs, &ys, m, k, take).unwrap();
@@ -87,11 +88,16 @@ fn main() {
                 gpu.device_synchronize().unwrap();
                 t.elapsed().as_secs_f64() * 1e6 / 50.0
             };
-            let (t_new, t_old4) = (time(&mut gpu, n), time(&mut gpu, 4));
+            let (t_new, t_old1) = (time(&mut gpu, n), time(&mut gpu, 1));
             println!(
-                "  M={m} K={k} n={n}: {bad} bit mismatches of {}  row-split {t_new:7.1} us  (4-row calls {t_old4:7.1} us)",
+                "  M={m} K={k} n={n}: {bad} bit mismatches of {}  row-split {t_new:7.1} us  (1-row calls {t_old1:7.1} us)",
                 yn.len()
             );
+            // FNV-1a of the batched output, to compare builds of the kernel.
+            let hash = yn.iter().fold(0xcbf29ce484222325u64, |h, v| {
+                (h ^ v.to_bits() as u64).wrapping_mul(0x100000001b3)
+            });
+            println!("    output hash {hash:016x}");
             ok &= bad == 0;
         }
     }
