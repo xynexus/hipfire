@@ -62,6 +62,50 @@ pub(crate) fn oq4_act_bits(site: &str) -> Option<String> {
 /// except for atomicAdd nondeterminism in the routed-down accumulation
 /// (same as the single-token indexed kernel it replaces).
 #[allow(clippy::too_many_arguments)]
+/// Rows at which a SINGLE session's batched MoE (prefill chunks, DFlash verify)
+/// takes the grouped path 2.
+///
+/// Grouped MoE amortizes an expert's weight read across the tokens routed to it,
+/// but for Opus dtypes it first has to expand activations into [N x K_TOP x dim]
+/// so each slot gets its OWN expert's AWQ scale (see the OqCompact arm and
+/// b86eb4397). That expansion is O(N x K_TOP), so it only pays once N is large
+/// enough for the weight reuse to outrun it. Measured end-to-end on
+/// Qwen3.5-35B-A3B--oq4.25++, prefill tok/s, indexed vs grouped:
+///
+///     N=31    193.29 -> 179.89   -7%   grouped LOSES
+///     N=115   249.71 -> 288.93  +16%
+///     N=459   250.75 -> 327.92  +31%
+///     N=1720  248.20 -> 325.47  +31%
+///     N=3445  238.78 -> 309.48  +30%
+///
+/// Crossover is between 31 and 115. 64 sits above it with margin and well clear
+/// of DFlash verify, which runs B <= 16 -- and verify must stay on the indexed
+/// path anyway: at B=8 the grouped path measured 56.20 -> 45.95 tok/s. Both paths
+/// are bit-exact to each other (MoE path-2 gate reads 0.000e0 on every layer), so
+/// this threshold is purely a speed choice and cannot change output.
+pub(crate) const MOE_GROUPED_MIN_BATCH: usize = 64;
+
+/// Rows at which a MULTI-SESSION batch (batched decode, one row per session plus
+/// its n-gram drafts) takes the grouped path 2. Its tokens come from different
+/// sessions, so the step's distinct experts number far fewer than rows x 8 and
+/// the indexed GEMV re-reads each shared expert once per token.
+///
+/// NUMERICS: path 2's compact arm is W4A8 (`gemm_oq_compact_moe_grouped_iu8`,
+/// activations int8 per 256-group), as prefill and >= 64-row batches already
+/// run; below this threshold decode stays W4A16 on the indexed GEMV. The f32
+/// grouped kernel (bit-exact against the GEMV) does not help at these widths:
+/// it saves only the weight bytes while every row still re-reads each slot's
+/// f32 activations -- 0.50-0.74x the GEMV at 1-2 tokens per expert, and B=16
+/// decode measured 133-136 against the GEMV's 148 tok/s. Measured on
+/// Qwen3.6-35B-A3B--oq4.25++, aggregate tok/s at threshold 64 -> 8 (two rounds):
+///
+///     B=4  short  101-103 -> 102   B=16 short  148-150 -> 160-164  +9%
+///     B=8  short  139     -> 136   B=32 short  172-174 -> 214-215  +24%
+///     B=8  deep   107     -> 111
+///
+/// The crossover sits between 8 and 16 rows; 16 keeps B=8 on the indexed path.
+pub(crate) const MOE_GROUPED_MIN_BATCH_SESSIONS: usize = 16;
+
 pub(crate) fn prefill_moe_ffn_body_batched(
     gpu: &mut Gpu,
     pager: Option<&RefCell<hipfire_runtime::weight_pager::WeightPager>>,
@@ -70,6 +114,9 @@ pub(crate) fn prefill_moe_ffn_body_batched(
     config: &Qwen35Config,
     pbs: &PrefillBatchScratch,
     n: usize,
+    // Rows at which the routed experts take the grouped path 2:
+    // MOE_GROUPED_MIN_BATCH or MOE_GROUPED_MIN_BATCH_SESSIONS.
+    grouped_min_rows: usize,
     layer_idx: usize,
     ctx: &DispatchCtx,
     // EP (Ship 6 substrate-EP prefill): when `Some`, the routed combine writes
@@ -861,27 +908,6 @@ pub(crate) fn prefill_moe_ffn_body_batched(
             std::env::var("HIPFIRE_MOE_GROUPED_GEMM").ok().as_deref(),
         )
     });
-    // BATCH THRESHOLD. Grouped MoE amortizes an expert's weight read across the
-    // tokens routed to it, but for Opus dtypes it first has to expand
-    // activations into [N x K_TOP x dim] so each slot gets its OWN expert's AWQ
-    // scale (see the OqCompact arm below and b86eb4397). That expansion is
-    // O(N x K_TOP), so it only pays once N is large enough for the weight reuse
-    // to outrun it. Measured end-to-end on Qwen3.5-35B-A3B--oq4.25++, prefill
-    // tok/s, indexed vs grouped:
-    //
-    //     N=31    193.29 -> 179.89   -7%   grouped LOSES
-    //     N=115   249.71 -> 288.93  +16%
-    //     N=459   250.75 -> 327.92  +31%
-    //     N=1720  248.20 -> 325.47  +31%
-    //     N=3445  238.78 -> 309.48  +30%
-    //
-    // Crossover is between 31 and 115. 64 sits above it with margin and well
-    // clear of DFlash verify, which runs B <= 16 -- and verify must stay on the
-    // indexed path anyway: at B=8 the grouped path measured 56.20 -> 45.95
-    // tok/s. Both paths are bit-exact to each other (MoE path-2 gate reads
-    // 0.000e0 on every layer), so this threshold is purely a speed choice and
-    // cannot change output.
-    const MOE_GROUPED_MIN_BATCH: usize = 64;
     // Oq4G256 is declared grouped-GEMM-supported for the MIXED routing profile,
     // which dispatches through the indexed-block W4A16 grouped kernel. Path 2 has
     // no arm for a UNIFORM Oq4G256 profile — the design says those "can still use
@@ -901,7 +927,7 @@ pub(crate) fn prefill_moe_ffn_body_batched(
     // path-1 parity is unverified. This only picks the arm once admitted.
     let uniform_oq4_belongs_on_path1 =
         dtypes.expert_gate_up == DType::Oq4G256 && !dtypes.routed_profile.is_mixed();
-    let path2_eligible = n >= MOE_GROUPED_MIN_BATCH
+    let path2_eligible = n >= grouped_min_rows
         && !uniform_oq4_belongs_on_path1
         && moe_grouped_gemm_path2_eligible_for_dtype(
             dtypes.expert_gate_up,
@@ -3154,6 +3180,7 @@ pub(crate) fn forward_prefill_chunk(
                     config,
                     pbs,
                     n,
+                    MOE_GROUPED_MIN_BATCH,
                     layer_idx,
                     &ctx,
                     routed_out,
@@ -3229,6 +3256,7 @@ pub(crate) fn forward_prefill_chunk(
                     config,
                     pbs,
                     n,
+                    MOE_GROUPED_MIN_BATCH,
                     layer_idx,
                     &ctx,
                     routed_out,
