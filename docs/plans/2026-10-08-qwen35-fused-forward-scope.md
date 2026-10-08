@@ -123,8 +123,51 @@ per-row tile path that does neither is 15% / 27% of decode at 13.3K (see above).
   the direct answer to ZAYA's flat result -- its serial phases idled the GPU. In the
   counter-scheduled persistent kernel it costs nothing structural: two microbatches
   in flight just means there is always a bandwidth item ready. Microbatch size is a
-  tunable (split evenly, or by expert-union size); B=1 decode has none to split, so
-  there the overlap must come from cross-layer prefetch instead.
+  tunable set from the expert-union curve (see "MoE: large batches" below): it
+  re-reads experts, so it pays at small and moderate B and not at large B; B=1 has
+  nothing to split, so there the overlap must come from cross-layer prefetch.
+
+## MoE: large batches are where the A3B pays, and microbatching has a price
+
+A3B decode-step byte floor by batch width (dense weights shared; experts = the
+union the step's tokens route to; DeltaNet state ~0.1 GB and, at 13.3K, KVarN
+~0.11 GB per session per step; 248.5 GB/s):
+
+| B | experts/layer | step GB (short) | aggregate floor | per-session floor | aggregate floor @13.3K |
+|---|---|---|---|---|---|
+| 1 | 8 | 1.66 | 149 tok/s | 149 | 140 |
+| 8 | 57 | 5.67 | 351 | 44 | 305 |
+| 32 | 163 | 15.1 | 525 | 16 | 429 |
+| 64 | 222 | 22.3 | 713 | 11 | 547 |
+| 128 | 252 | 30.6 | 1,038 | 8 | 719 |
+| 256 | 256 | 43.7 | 1,455 | 6 | 896 |
+
+What it says:
+
+- **Per-token cost falls ~5x from B=1 to B=64** once the expert union saturates
+  (~B=64-128): past that, extra tokens add no expert bytes. The 27B's curve is flatter
+  at the top (575 tok/s floor at B=64) and its per-token cost is ~8x the A3B's at B=1.
+  Concurrency pays most on the MoE.
+- **At large B the limit moves to per-session traffic.** At B=64, 13.3K: experts
+  14.9 GB, DeltaNet state ~6.4 GB, KVarN ~7 GB of 29 GB. DeltaNet state precision and
+  KVarN attention efficiency become first-order for large-batch MoE.
+- **Latency and throughput trade directly** (44 tok/s per session at B=8, 11 at B=64).
+  Which work gets the wide steps is serving policy: realtime work in small steps,
+  opportunistic batch-filling work (speculative review, exploration) in large ones.
+  A batch-filler is NOT free at depth -- each added session costs ~0.2 GB/step
+  (~0.8 ms) in state + KV even once experts are saturated.
+- **Microbatching re-reads experts.** Splitting B into m microbatches reads
+  m x union(B/m) experts instead of union(B): x1.09 at B=8, x1.12 at B=16, x1.47 at
+  B=64 (2 microbatches). It pays where phases are narrow and idle the GPU (small and
+  moderate B) and costs where they are already wide (large B, where norms, router,
+  top-k and per-session attention fill the GPU on their own). So m is a function of B
+  chosen from this curve: 2 at B <= ~16, 1 at large B -- not a constant.
+- **Kernel consequence.** Past B ~ 32 the decode MoE should be expert-grouped (sort
+  rows by expert, one item per distinct expert), i.e. the prefill grouped MoE GEMM at
+  1-16 rows per expert (B x 8 / union: 2.3 at B=64, 8 at B=256). Today's decode kernels
+  work per (row, expert) pair and the wide multicol stops at 16 rows; there is no hard
+  cap on decode batch width in serving (`qwen35_decode_batch_max_chunk_size` defaults
+  to the session count), so the kernels, not the scheduler, are the limit.
 
 ## Architecture
 
@@ -197,7 +240,7 @@ first.
 | 0 | Untraced decode accounting: per-op bytes and time per token, both models, B = 1/4/8, short and 13.3K context, A3B expert-union size per step | the baseline every later number is judged against | -- | a per-op table per (B, context) | -- |
 | K0 | GQA-shared KVarN attention for verify / multi-row decode: one workgroup per (session, KV head, context slice) over all query heads and that session's rows, B sessions per launch, each record tile dequantized once (extend `attention_kvarn_routed_batched_gqa*` to causal multi-row, or route verify to the WMMA kernel per KV head) | redundant KV reads | at 13.3K: 27B ~-8 ms/token (~-10%), A3B ~-3.5 ms/token (~-12%); more at depth | parity vs tile path, all verify widths, tree bias | < 5% at 13.3K |
 | V | Device-side DFlash accept loop | host round trips | A3B -10% decode time, 27B -3% | bit-identical tokens vs host loop; tok/s gain | < 5% on A3B |
-| D1 | Persistent kernel for ONE A3B MoE layer (DeltaNetMoe), counters + idle-prefetch, expert-grouped items, two microbatches | bubbles, tiny kernels, cross-op streaming, expert reuse, serial-phase overlap | layer at >= 70% of its byte floor at B = 1, 4, 8, with and without microbatching (today ~36-41% whole-model) | per-layer parity (cos 1.0); bytes moved / layer time at each B | < 1.3x over today's 6 super-ops at every B (ZAYA-style flat) |
+| D1 | Persistent kernel for ONE A3B MoE layer (DeltaNetMoe), counters + idle-prefetch, expert-grouped items, m microbatches | bubbles, tiny kernels, cross-op streaming, expert reuse, serial-phase overlap | layer at >= 70% of its byte floor at B = 1, 8, 32, 64, m in {1, 2} (today ~36-41% whole-model) | per-layer parity (cos 1.0); bytes moved / layer time at each B | < 1.3x over today's 6 super-ops at every B (ZAYA-style flat) |
 | D2 | All four layer programs, whole decode step, B in 1..16 | the rest of D | A3B 57.7 -> ~100 tok/s; 27B 14.5 -> ~16 | greedy text identical; DFlash acceptance unchanged | A3B < 80 tok/s |
 | P1 | gate/up silu epilogue + pre-GEMM fused quantize (current format) | activation round trips | 27B prefill -3..5% | parity; served A/B | < 2% |
 | P2 | A3B K=2048 dense GEMM on the w64 structure | GEMM efficiency | A3B prefill -8..12% (26% share) | kernel bench vs `iu4x2_wmma` | < 1.2x kernel |
