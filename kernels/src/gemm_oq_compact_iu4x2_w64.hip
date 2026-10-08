@@ -89,6 +89,23 @@ __launch_bounds__(BLOCK) extern "C" __global__ void gemm_oq_compact_iu4x2_w64(
     // to 80 B (20 dwords, gcd(20,64)=4) spreads them over all 16.
 #define XPAD 16
     __shared__ __align__(16) uint8_t As[2][BM * (BK / 2)], Xi[2][BN * (BK + XPAD)];
+#ifdef OV_FOLD
+    // SPARSE OVERLAY AT THE GROUP FOLD (n_ov = 3 only: 8-byte side records).
+    //
+    // The overlay adds val * x[idx] for 3 (idx, val) per (row, group), idx
+    // anywhere in the group's 256. Both earlier fusions lost because only one
+    // 64-wide strip is resident, so the lookup went to global memory. Here each
+    // strip is also de-interleaved back to raw int8 into Xg as it is staged, so
+    // at the fold the whole group sits in LDS and the correction is three LDS
+    // byte reads and MACs per accumulator element, added in i32 before the
+    // scale -- what gemm_oq_compact_iu4x2_moe_grouped does. No XT transpose, no
+    // separate pass, Y written once.
+    //
+    // Row stride 272 = 256 + 16: 16 B aligned for the b128 stores, and 68 dwords,
+    // so the 16 lanes reading one idx across 16 columns hit 16 distinct banks.
+#define GSTR 272
+    __shared__ __align__(16) int8_t Xg[BN * GSTR];
+#endif
     // SWIZZLE: N is the FAST grid axis, M the slow one. With M fast, the whole
     // 47 MB weight set is swept once per N-block -- 4 sweeps at B=512 against a
     // 32 MB MALL that cannot hold one, so every sweep is a fresh DRAM read.
@@ -179,8 +196,27 @@ __launch_bounds__(BLOCK) extern "C" __global__ void gemm_oq_compact_iu4x2_w64(
         int q = threadIdx.x + l * BLOCK, row = q / XCPR, ch = q % XCPR; \
         int r = bn + row < B ? bn + row : B - 1; \
         rX[l] = *(const i32x4*)((const uint8_t*)X + (long long)r * xst + (ks) * BK + ch * 16); }
+#ifdef OV_FOLD
+    // A chunk is one 16-K step: 8 bytes of hi digits then 8 of lo, digit pair j
+    // of each byte covering x[2j] (low nibble) and x[2j+1] (high nibble).
+    // Rebuild the 16 raw int8 values: even ones take both low nibbles, odd ones
+    // both high nibbles, then interleave.
+#define STSG(ks) \
+    _Pragma("unroll") for (int l = 0; l < NXv; l++) { int q = threadIdx.x + l * BLOCK; \
+        int row = q / XCPR, ch = q % XCPR; i32x4 raw; \
+        _Pragma("unroll") for (int h = 0; h < 2; h++) { \
+            uint32_t H = (uint32_t)rX[l][h], L = (uint32_t)rX[l][2 + h]; \
+            uint32_t E = ((H << 4) & 0xf0f0f0f0u) | (L & 0x0f0f0f0fu); \
+            uint32_t O = (H & 0xf0f0f0f0u) | ((L >> 4) & 0x0f0f0f0fu); \
+            raw[2 * h] = (int)__builtin_amdgcn_perm(O, E, 0x05010400u); \
+            raw[2 * h + 1] = (int)__builtin_amdgcn_perm(O, E, 0x07030602u); } \
+        *(i32x4*)(Xg + row * GSTR + ((ks) % STRIPS_PER_GROUP) * BK + ch * 16) = raw; }
+#else
+#define STSG(ks)
+#endif
 #define STS(ks) \
     STSA((ks) & 1, ks) \
+    STSG(ks) \
     _Pragma("unroll") for (int l = 0; l < NXv; l++) { int q = threadIdx.x + l * BLOCK; \
         int row = q / XCPR, ch = q % XCPR; \
         *(i32x4*)(Xi[(ks) & 1] + row * (BK + XPAD) + ch * 16) = rX[l]; }
@@ -234,24 +270,53 @@ __launch_bounds__(BLOCK) extern "C" __global__ void gemm_oq_compact_iu4x2_w64(
             const int grp = k / STRIPS_PER_GROUP;
             const int g_off = grp * side_stride;
             float sw[WMt][4];
+#ifdef OV_FOLD
+            // The whole 8-byte side record: the scale the fold always read, plus
+            // the row's three (idx, val) overlay entries.
+            int oidx[WMt][4][3], oval[WMt][4][3];
+#pragma unroll
+            for (int i = 0; i < WMt; i++)
+#pragma unroll
+                for (int g = 0; g < 4; g++) {
+                    const uint2 rec = *(const uint2*)(swp[i][g] + g_off);
+                    sw[i][g] = (float)__builtin_bit_cast(_Float16, (uint16_t)(rec.x & 0xffff));
+                    oidx[i][g][0] = (rec.x >> 16) & 0xff; oval[i][g][0] = (int)(int8_t)(rec.x >> 24);
+                    oidx[i][g][1] = rec.y & 0xff;         oval[i][g][1] = (int)(int8_t)(rec.y >> 8);
+                    oidx[i][g][2] = (rec.y >> 16) & 0xff; oval[i][g][2] = (int)(int8_t)(rec.y >> 24);
+                }
+#else
 #pragma unroll
             for (int i = 0; i < WMt; i++)
 #pragma unroll
                 for (int g = 0; g < 4; g++)
                     sw[i][g] = (float)(*(const _Float16*)(swp[i][g] + g_off));
+#endif
 #pragma unroll
             for (int j = 0; j < WNt; j++) {
                 const float sx = sxp[j][grp];
+#ifdef OV_FOLD
+                const int8_t* xg = Xg + (wn * WNt * 16 + j * 16 + lane) * GSTR;
+#endif
 #pragma unroll
                 for (int i = 0; i < WMt; i++) {
 #pragma unroll
                     for (int g = 0; g < 4; g++) {
                         // Exact radix-16 recombination in i32 before the scale.
-                        const int v = 16 * acch[i][j][g] + accl[i][j][g];
+                        int v = 16 * acch[i][j][g] + accl[i][j][g];
+#ifdef OV_FOLD
+                        v += oval[i][g][0] * (int)xg[oidx[i][g][0]]
+                           + oval[i][g][1] * (int)xg[oidx[i][g][1]]
+                           + oval[i][g][2] * (int)xg[oidx[i][g][2]];
+#endif
                         facc[i][j][g] += (float)v * sw[i][g] * sx;
                     }
                 }
             }
+#ifdef OV_FOLD
+            // The next STS overwrites Xg with the next group's first strip; every
+            // wave must be done reading this group first.
+            __syncthreads();
+#endif
         }
         if (k + 1 < nstrip) { STS(k + 1); }
         __syncthreads();

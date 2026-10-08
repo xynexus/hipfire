@@ -652,6 +652,32 @@ impl Gpu {
                     block_stride,
                 );
             }
+            // n_ov = 3 at prefill widths: the overlay is added at the GEMM's group
+            // fold from LDS, so neither the XT transpose nor the separate pass
+            // runs. HIPFIRE_OQ_OV_FOLD=0 keeps GEMM + `_tr3`.
+            if use_w64
+                && n > 64
+                && block_stride == 136
+                && w64_tile_override().is_none()
+                && std::env::var("HIPFIRE_OQ_OV_FOLD").as_deref() != Ok("0")
+                && std::env::var("HIPFIRE_OQ_COMPACT_NO_CORRECT").as_deref() != Ok("1")
+            {
+                let xilv = GpuTensor {
+                    buf: unsafe { self.oq_xilv_batch.as_ref().unwrap().buf.alias() },
+                    shape: vec![n * k],
+                    dtype: DType::Raw,
+                };
+                return self.gemm_oq_compact_iu4x2_w64_fold(
+                    w_blocks,
+                    &xilv,
+                    xs,
+                    y,
+                    m,
+                    k,
+                    n,
+                    block_stride,
+                );
+            }
             if use_w64 {
                 // The wave64 kernel consumes fragment-interleaved nibble pairs,
                 // not int8. The permutation is done ONCE per activation, beside
@@ -1896,6 +1922,62 @@ impl Gpu {
             batch_size,
             block_stride,
             (warps_m, warps_n, w_mt, w_nt),
+        )
+    }
+
+    /// [`Self::gemm_oq_compact_iu4x2_w64`] with the n_ov = 3 sparse overlay added
+    /// at each group fold from an LDS copy of the whole group (`OV_FOLD`): Y comes
+    /// out corrected and no transpose or separate pass is needed. Prefill widths
+    /// only (B > 64: the m128 and default tiles). The overlay is summed in i32
+    /// before the scale, so this is exact where the separate pass rounds its own
+    /// f32 sum: equal to it within float rounding, not bit for bit.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_oq_compact_iu4x2_w64_fold(
+        &mut self,
+        w_blocks: &GpuTensor,
+        x_i8: &GpuTensor,
+        x_scales: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        block_stride: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(k % 256 == 0 && batch_size > 64 && block_stride == 136);
+        // Same tile choice as the unfused GEMM at these widths.
+        let wide_m =
+            batch_size >= 384 && std::env::var("HIPFIRE_OQ_W64_WIDE").as_deref() != Ok("0");
+        let (func_name, tile) = if wide_m {
+            (
+                "gemm_oq_compact_iu4x2_w64_m128_fold",
+                (4usize, 1usize, 2usize, 4usize),
+            )
+        } else {
+            ("gemm_oq_compact_iu4x2_w64_fold", (2, 2, 2, 4))
+        };
+        if !self.functions.contains_key(func_name) {
+            let (wm, wn, wmt, wnt) = tile;
+            let src = format!(
+                "#define OV_FOLD 1\n#define WARPS_M {wm}\n#define WARPS_N {wn}\n#define WMt {wmt}\n#define WNt {wnt}\n{}",
+                kernels::GEMM_OQ_COMPACT_IU4X2_W64_SRC.replace(
+                    "void gemm_oq_compact_iu4x2_w64(",
+                    &format!("void {func_name}(")
+                )
+            );
+            self.ensure_kernel(func_name, &src, func_name)?;
+        }
+        self.launch_iu4x2_w64(
+            func_name,
+            w_blocks,
+            x_i8,
+            x_scales,
+            y_f32,
+            m,
+            k,
+            batch_size,
+            block_stride,
+            tile,
         )
     }
 
