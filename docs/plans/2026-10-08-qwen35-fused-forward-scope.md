@@ -83,6 +83,49 @@ plus the activation bytes it stops writing; the rest of prefill's gap to halogen
 (22.9 s vs 38.3 s cold on the 27B) is GEMM format and attention, which have their
 own plans (overlay-free NF4 format, `study/nf4-codebook-format`; attention at depth).
 
+## The three dimensions every kernel must cover
+
+A kernel tuned for one session at short context is tuned for the wrong workload:
+Corrode runs many tasks at once, at 13-21K context, DFlash on. Every kernel and
+work item below is specified -- and benchmarked -- across all three.
+
+**1. Batch: B sessions x R rows per session.** Rows are DFlash verify positions
+(2-16) or a prefill chunk; sessions are concurrent requests. Weights are shared by
+all B x R rows; KV, DeltaNet state and positions are per session. Aggregate decode,
+measured today against each model's byte floor:
+
+| | B=1 | B=4 | B=8 |
+|---|---|---|---|
+| 27B measured / floor | 14.5 / 17.9 (81%) | 47 / ~66 (71%) | 80 / ~122 (66%) |
+| A3B measured / floor | 57.7 / ~147 (39%) | 102 / ~280 (36%) | 141 / ~340 (41%) |
+
+(27B floor: shared weights + per-session DeltaNet state. A3B floor: shared dense
+weights + the UNION of the experts the B tokens route to + per-session state.)
+The dense model loses efficiency as B grows (state traffic, per-session attention);
+the MoE model never had it.
+
+**2. KVarN.** Append, 128-token block flush, and attention over 4-bit K records +
+f32 window + Q8 V, at every (B, R): each record tile dequantized once per session
+and shared by all of that session's rows and all query heads of the KV group. The
+per-row tile path that does neither is 15% / 27% of decode at 13.3K (see above).
+
+**3. MoE: expert grouping and microbatching.**
+- *Grouping.* A token picks 8 of 256 experts, so at B tokens a layer touches the
+  union -- ~30 experts at B=4, ~57 at B=8, ~101 at B=16 -- and expert bytes per step
+  grow ~4x / ~7x / ~12x over one token. Each distinct expert's weights must be read
+  ONCE per step for every row routed to it (sort rows by expert, one item per
+  expert), not once per (row, expert) pair: -11% expert bytes at B=8, -21% at B=16.
+  The batch scheduler can also bias toward fewer distinct experts per step only by
+  choosing WHICH requests share a step -- a serving-policy lever, out of kernel scope.
+- *Microbatching.* Split each step's rows into two microbatches offset by one phase:
+  while microbatch A runs its serial parts (norms, router, top-k, attention, the
+  DeltaNet recurrence), microbatch B streams expert weights, and vice versa. That is
+  the direct answer to ZAYA's flat result -- its serial phases idled the GPU. In the
+  counter-scheduled persistent kernel it costs nothing structural: two microbatches
+  in flight just means there is always a bandwidth item ready. Microbatch size is a
+  tunable (split evenly, or by expert-union size); B=1 decode has none to split, so
+  there the overlap must come from cross-layer prefetch instead.
+
 ## Architecture
 
 One description covers both models: the four `LayerProgram`s in
@@ -151,10 +194,10 @@ first.
 
 | # | work | buys | expected | exit | kill |
 |---|---|---|---|---|---|
-| 0 | Untraced decode accounting: per-op bytes and time per token, both models, B = 1/4/8 | the baseline every later number is judged against | -- | a per-op table | -- |
-| K0 | GQA-shared KVarN attention for verify / multi-row decode: one workgroup per (KV head, context slice) over all query heads and rows, each record tile dequantized once (extend `attention_kvarn_routed_batched_gqa*` to causal multi-row, or route verify to the WMMA kernel per KV head) | redundant KV reads | at 13.3K: 27B ~-8 ms/token (~-10%), A3B ~-3.5 ms/token (~-12%); more at depth | parity vs tile path, all verify widths, tree bias | < 5% at 13.3K |
+| 0 | Untraced decode accounting: per-op bytes and time per token, both models, B = 1/4/8, short and 13.3K context, A3B expert-union size per step | the baseline every later number is judged against | -- | a per-op table per (B, context) | -- |
+| K0 | GQA-shared KVarN attention for verify / multi-row decode: one workgroup per (session, KV head, context slice) over all query heads and that session's rows, B sessions per launch, each record tile dequantized once (extend `attention_kvarn_routed_batched_gqa*` to causal multi-row, or route verify to the WMMA kernel per KV head) | redundant KV reads | at 13.3K: 27B ~-8 ms/token (~-10%), A3B ~-3.5 ms/token (~-12%); more at depth | parity vs tile path, all verify widths, tree bias | < 5% at 13.3K |
 | V | Device-side DFlash accept loop | host round trips | A3B -10% decode time, 27B -3% | bit-identical tokens vs host loop; tok/s gain | < 5% on A3B |
-| D1 | Persistent kernel for ONE A3B MoE layer (DeltaNetMoe), counters + idle-prefetch | bubbles, tiny kernels, cross-op streaming | layer at >= 70% of its byte floor (today ~39% whole-model) | per-layer parity (cos 1.0); layer time | layer < 1.3x faster than today's 6 super-ops (ZAYA-style flat) |
+| D1 | Persistent kernel for ONE A3B MoE layer (DeltaNetMoe), counters + idle-prefetch, expert-grouped items, two microbatches | bubbles, tiny kernels, cross-op streaming, expert reuse, serial-phase overlap | layer at >= 70% of its byte floor at B = 1, 4, 8, with and without microbatching (today ~36-41% whole-model) | per-layer parity (cos 1.0); bytes moved / layer time at each B | < 1.3x over today's 6 super-ops at every B (ZAYA-style flat) |
 | D2 | All four layer programs, whole decode step, B in 1..16 | the rest of D | A3B 57.7 -> ~100 tok/s; 27B 14.5 -> ~16 | greedy text identical; DFlash acceptance unchanged | A3B < 80 tok/s |
 | P1 | gate/up silu epilogue + pre-GEMM fused quantize (current format) | activation round trips | 27B prefill -3..5% | parity; served A/B | < 2% |
 | P2 | A3B K=2048 dense GEMM on the w64 structure | GEMM efficiency | A3B prefill -8..12% (26% share) | kernel bench vs `iu4x2_wmma` | < 1.2x kernel |
