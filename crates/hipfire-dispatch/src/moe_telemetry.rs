@@ -93,7 +93,42 @@ pub fn take_moe_router_histogram() -> Option<MoeRouterHistogram> {
     MOE_ROUTER_HISTOGRAM.with(|hist| hist.borrow_mut().take())
 }
 
+/// `HIPFIRE_MOE_ROUTE_DUMP=<path>`: append every routed token's top-k to `path` as
+/// raw little-endian records -- `u16 layer, u16 k, k x u16 expert, k x f32 weight` --
+/// for offline routing analysis (weight by rank, expert unions at a batch width, drop
+/// rules). Setting it turns the recording path on by itself; the histogram need not be.
+fn route_dump() -> Option<&'static std::sync::Mutex<std::fs::File>> {
+    static DUMP: std::sync::OnceLock<Option<std::sync::Mutex<std::fs::File>>> =
+        std::sync::OnceLock::new();
+    DUMP.get_or_init(|| {
+        let path = std::env::var_os("HIPFIRE_MOE_ROUTE_DUMP")?;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+            .ok()
+            .map(std::sync::Mutex::new)
+    })
+    .as_ref()
+}
+
 pub fn record_moe_router_selection(layer_idx: usize, indices: &[usize], weights: &[f32]) {
+    if let Some(file) = route_dump() {
+        use std::io::Write;
+        let k = indices.len().min(weights.len());
+        let mut rec = Vec::with_capacity(4 + 6 * k);
+        rec.extend_from_slice(&(layer_idx as u16).to_le_bytes());
+        rec.extend_from_slice(&(k as u16).to_le_bytes());
+        for &e in &indices[..k] {
+            rec.extend_from_slice(&(e.min(u16::MAX as usize) as u16).to_le_bytes());
+        }
+        for &w in &weights[..k] {
+            rec.extend_from_slice(&w.to_le_bytes());
+        }
+        if let Ok(mut f) = file.lock() {
+            let _ = f.write_all(&rec);
+        }
+    }
     MOE_ROUTER_HISTOGRAM.with(|hist| {
         let mut hist = hist.borrow_mut();
         let Some(hist) = hist.as_mut() else {
@@ -144,7 +179,7 @@ pub fn record_moe_router_selection(layer_idx: usize, indices: &[usize], weights:
 }
 
 pub fn moe_router_histogram_active() -> bool {
-    MOE_ROUTER_HISTOGRAM.with(|hist| hist.borrow().is_some())
+    route_dump().is_some() || MOE_ROUTER_HISTOGRAM.with(|hist| hist.borrow().is_some())
 }
 
 pub fn router_index_i32_to_usize(idx: i32) -> usize {
