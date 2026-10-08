@@ -2167,12 +2167,9 @@ fn draft_ffn_layer(
     conv_geom: Option<(usize, usize)>,
     graph_safe: bool,
 ) -> HipResult<()> {
-    if graph_safe {
-        gpu.memcpy_dtod_auto(&scratch.residual_ffn.buf, &scratch.x.buf, (b * h) * 4)?;
-    } else {
-        gpu.hip
-            .memcpy_dtod(&scratch.residual_ffn.buf, &scratch.x.buf, (b * h) * 4)?;
-    }
+    // Stream-ordered when a stream is active (graph capture or a spec step),
+    // blocking otherwise.
+    gpu.memcpy_dtod_auto(&scratch.residual_ffn.buf, &scratch.x.buf, (b * h) * 4)?;
 
     gpu.rmsnorm_batched(&scratch.x, &layer.ffn_norm, &scratch.x_norm, b, h, eps)?;
     // DFlash2 `mlp_conv.prepare` — between post_attention_layernorm and the MLP.
@@ -2548,8 +2545,13 @@ pub fn draft_forward_opts(
         let layer = &weights.layers[li];
 
         // Residual.
-        gpu.hip
-            .memcpy_dtod(&scratch.residual_attn.buf, &scratch.x.buf, (b * h) * 4)?;
+        gpu.memcpy_dtod_at_auto(
+            &scratch.residual_attn.buf,
+            0,
+            &scratch.x.buf,
+            0,
+            (b * h) * 4,
+        )?;
 
         // attn_norm.
         gpu.rmsnorm_batched(&scratch.x, &layer.attn_norm, &scratch.x_norm, b, h, eps)?;
@@ -2696,9 +2698,10 @@ pub fn draft_forward_opts(
         // above); the noise tail still needs k_norm applied below.
         let ctx_bytes = (l * kvd) * 4;
         let noise_bytes = (b * kvd) * 4;
-        gpu.hip
-            .memcpy_dtod_at(&scratch.k_cat.buf, 0, &k_cache_layer.buf, 0, ctx_bytes)?;
-        gpu.hip.memcpy_dtod_at(
+        // Stream-ordered (the active stream during a spec step): blocking
+        // hipMemcpy here cost a host round trip per copy, four per layer.
+        gpu.memcpy_dtod_at_auto(&scratch.k_cat.buf, 0, &k_cache_layer.buf, 0, ctx_bytes)?;
+        gpu.memcpy_dtod_at_auto(
             &scratch.k_cat.buf,
             ctx_bytes,
             &scratch.k_noise.buf,
@@ -2706,9 +2709,8 @@ pub fn draft_forward_opts(
             noise_bytes,
         )?;
         dflash_subphase_sync(gpu, dbg, li, "k_cat_copy")?;
-        gpu.hip
-            .memcpy_dtod_at(&scratch.v_cat.buf, 0, &v_cache_layer.buf, 0, ctx_bytes)?;
-        gpu.hip.memcpy_dtod_at(
+        gpu.memcpy_dtod_at_auto(&scratch.v_cat.buf, 0, &v_cache_layer.buf, 0, ctx_bytes)?;
+        gpu.memcpy_dtod_at_auto(
             &scratch.v_cat.buf,
             ctx_bytes,
             &scratch.v_noise.buf,

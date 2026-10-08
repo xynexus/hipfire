@@ -1501,16 +1501,22 @@ impl DeltaNetSnapshot {
         Ok(())
     }
 
-    /// Copy live state → backup.
+    /// Copy live state → backup, ordered on the active stream when there is one.
+    ///
+    /// These were blocking `hipMemcpy`s -- three per DeltaNet layer, 90 a DFlash
+    /// cycle on the 27B -- each draining the GPU and costing a host round trip
+    /// (~4.3 ms/token, see `spec_step_dflash`). Stream-ordered they keep the same
+    /// order against the kernels around them, and a later null-stream download
+    /// still waits for them.
     pub fn save_from(&mut self, state: &DeltaNetState, gpu: &mut Gpu) -> HipResult<()> {
         for (dst, src) in self.s_matrix_bufs.iter().zip(state.s_matrices.iter()) {
-            gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size())?;
+            gpu.memcpy_dtod_at_auto(dst, 0, &src.buf, 0, src.buf.size())?;
         }
         for (dst, src) in self.s_scale_bufs.iter().zip(state.s_scales.iter()) {
-            gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size())?;
+            gpu.memcpy_dtod_at_auto(dst, 0, &src.buf, 0, src.buf.size())?;
         }
         for (dst, src) in self.conv_state_bufs.iter().zip(state.conv_states.iter()) {
-            gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size())?;
+            gpu.memcpy_dtod_at_auto(dst, 0, &src.buf, 0, src.buf.size())?;
         }
         Ok(())
     }
@@ -1540,16 +1546,17 @@ impl DeltaNetSnapshot {
         Ok(())
     }
 
-    /// Copy backup → live state (rewinds the recurrent state to the snapshot point).
+    /// Copy backup → live state (rewinds the recurrent state to the snapshot
+    /// point), ordered on the active stream when there is one (see `save_from`).
     pub fn restore_to(&self, state: &mut DeltaNetState, gpu: &mut Gpu) -> HipResult<()> {
         for (src, dst) in self.s_matrix_bufs.iter().zip(state.s_matrices.iter()) {
-            gpu.hip.memcpy_dtod(&dst.buf, src, src.size())?;
+            gpu.memcpy_dtod_at_auto(&dst.buf, 0, src, 0, src.size())?;
         }
         for (src, dst) in self.s_scale_bufs.iter().zip(state.s_scales.iter()) {
-            gpu.hip.memcpy_dtod(&dst.buf, src, src.size())?;
+            gpu.memcpy_dtod_at_auto(&dst.buf, 0, src, 0, src.size())?;
         }
         for (src, dst) in self.conv_state_bufs.iter().zip(state.conv_states.iter()) {
-            gpu.hip.memcpy_dtod(&dst.buf, src, src.size())?;
+            gpu.memcpy_dtod_at_auto(&dst.buf, 0, src, 0, src.size())?;
         }
         Ok(())
     }
@@ -6062,26 +6069,20 @@ impl HiddenStateRingBuffer {
     /// compute destination offsets, which would be baked wrong in a replayed
     /// graph.
     ///
-    /// When `gpu.active_stream` is Some, we first sync the stream (so the
-    /// captured forward's staging writes are complete) then use sync D2D
-    /// for the scatter. This matches the existing sync-memcpy semantics the
-    /// rest of the engine relies on for ordering with null-stream consumers
-    /// (e.g. the draft forward's D2H of hidden rows after this commit).
+    /// The copies are ordered on `gpu.active_stream` when there is one, after
+    /// the forward that wrote the staging rows -- no host wait. This used to
+    /// synchronize the stream and copy with blocking `hipMemcpy` for ordering
+    /// with null-stream consumers (e.g. a later D2H of hidden rows); the legacy
+    /// null stream already waits for the blocking active stream, so that order
+    /// holds without stalling the host before the lm_head is even enqueued.
     pub fn commit_staging_to_ring(&mut self, gpu: &mut Gpu, n: usize) -> HipResult<()> {
         let row_bytes = self.hidden_dim * 4;
         let head = self.head;
         let max_pos = self.max_positions;
 
-        // If running under an explicit stream (graph capture path), wait
-        // for the captured writes to complete before the scatter so we
-        // don't read uninitialized staging.
-        if let Some(stream) = gpu.active_stream.as_ref() {
-            gpu.hip.stream_synchronize(stream)?;
-        }
-
         for ei in 0..self.layer_bufs.len() {
             if head + n <= max_pos {
-                gpu.hip.memcpy_dtod_at(
+                gpu.memcpy_dtod_at_auto(
                     &self.layer_bufs[ei].buf,
                     head * row_bytes,
                     &self.staging_bufs[ei].buf,
@@ -6090,14 +6091,14 @@ impl HiddenStateRingBuffer {
                 )?;
             } else {
                 let first = max_pos - head;
-                gpu.hip.memcpy_dtod_at(
+                gpu.memcpy_dtod_at_auto(
                     &self.layer_bufs[ei].buf,
                     head * row_bytes,
                     &self.staging_bufs[ei].buf,
                     0,
                     first * row_bytes,
                 )?;
-                gpu.hip.memcpy_dtod_at(
+                gpu.memcpy_dtod_at_auto(
                     &self.layer_bufs[ei].buf,
                     0,
                     &self.staging_bufs[ei].buf,
@@ -7197,8 +7198,9 @@ fn verify_dflash_block_inner(
 /// Vec<f32> + `draft_forward`'s upload for the common ctx_slice=None path.
 /// Eliminates 5 blocking D2H sync points per spec step (one per extract
 /// layer) and the follow-on per-cycle H2D upload; remains about 80 small
-/// async D2D enqueues per cycle (ne × n_rows ≤ 5 × 16), which the stream
-/// dispatcher handles in ~200 µs of CPU time with zero cross-device waits.
+/// D2D copies per cycle (ne × n_rows ≤ 5 × 16), ordered on the active stream
+/// when there is one. (They were described as async but issued as blocking
+/// `hipMemcpy`, each a host round trip.)
 pub fn scatter_hidden_block_to_interleaved(
     gpu: &Gpu,
     hidden_rb: &HiddenStateRingBuffer,
@@ -7230,7 +7232,7 @@ pub fn scatter_hidden_block_to_interleaved(
         for ext in 0..num_extract {
             let src_offset_bytes = slot * row_bytes;
             let dst_offset_bytes = dst_row_base_bytes + ext * row_bytes;
-            gpu.hip.memcpy_dtod_at(
+            gpu.memcpy_dtod_at_auto(
                 &dst.buf,
                 dst_offset_bytes,
                 &hidden_rb.layer_bufs[ext].buf,
