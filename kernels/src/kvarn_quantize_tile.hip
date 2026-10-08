@@ -134,7 +134,14 @@ extern "C" __global__ void kvarn_quantize_tile(
         for (int s = nth / 2; s > 0; s >>= 1) { if (tid < s) red[tid] = fmaxf(red[tid], red[tid + s]); __syncthreads(); }
         float row_max = red[0]; __syncthreads();
         float imb = col_max / fmaxf(col_min, 1e-8f) + row_max / fmaxf(row_min, 1e-8f);
-        if (imb < best_imb_s) {
+        // Every thread must compare against the SAME best_imb_s before any of
+        // them lowers it. Without this barrier thread 0 could store imb first; a
+        // lagging wave then read imb < imb == false, skipped copying its rows'
+        // scales into blr/blc, and quantized them with an older iteration's --
+        // 3-4% of identical 256x128 tiles came out different from the rest.
+        const bool better = imb < best_imb_s;
+        __syncthreads();
+        if (better) {
             if (tid == 0) best_imb_s = imb;
             for (int c = tid; c < c_dim; c += nth) blc[c] = lc[c];
             for (int r = tid; r < r_dim; r += nth) blr[r] = lr[r];

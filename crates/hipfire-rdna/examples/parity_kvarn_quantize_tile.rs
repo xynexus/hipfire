@@ -119,6 +119,30 @@ fn run_bits(gpu: &mut Gpu, tile: &[f32], r: usize, c: usize, bits: usize) -> (f6
     (cs, cs_gpu_deq, max_deq_err)
 }
 
+/// Quantize `copies` identical tiles in one launch: every record must come out
+/// byte-identical. The best-scales snapshot once raced (a lagging wave read
+/// `best_imb_s` after thread 0 had already lowered it, skipped copying its rows'
+/// scales, and quantized them with an older iteration's) -- about one tile in a
+/// few hundred, so it takes many copies to see. Returns the differing records.
+fn differing_records(gpu: &mut Gpu, tile: &[f32], r: usize, c: usize, bits: usize) -> usize {
+    let copies = 1024;
+    let n = r * c;
+    let record_bytes = n.div_ceil(8 / bits) + r * 2 * 2 + c * 2;
+    let bytes: Vec<u8> = (0..copies)
+        .flat_map(|_| tile.iter().flat_map(|v| v.to_le_bytes()))
+        .collect();
+    let td = gpu.upload_raw(&bytes, &[copies * n]).unwrap();
+    let rd = gpu
+        .upload_raw(&vec![0u8; copies * record_bytes], &[copies * record_bytes])
+        .unwrap();
+    gpu.kvarn_quantize_tile(&td, &rd, copies, r, c, record_bytes, bits)
+        .unwrap();
+    gpu.device_synchronize().unwrap();
+    let rec = gpu.download_raw(&rd, copies * record_bytes).unwrap();
+    let first = &rec[..record_bytes];
+    rec.chunks(record_bytes).filter(|x| *x != first).count()
+}
+
 fn main() {
     let mut a = std::env::args().skip(1);
     let r: usize = a.next().and_then(|s| s.parse().ok()).unwrap_or(128);
@@ -171,6 +195,18 @@ fn main() {
             if pass { "PASS" } else { "FAIL" }
         );
         prev_cs = cs;
+    }
+    // Determinism at the served record shape (head_dim 256 x GROUP 128): the
+    // K-cache flush must not depend on wave timing.
+    let (dr, dc) = (256, 128);
+    let dbase = lcg_normal(11, dr * dc);
+    let dtile: Vec<f32> = (0..dr * dc)
+        .map(|i| dbase[i] * 0.05 * 40f32.powf((i / dc) as f32 / dr as f32))
+        .collect();
+    for _ in 0..4 {
+        let bad = differing_records(&mut gpu, &dtile, dr, dc, 4);
+        println!("  determinism r={dr} c={dc} bits=4: {bad} of 1024 copies differ");
+        all_pass &= bad == 0;
     }
     println!(
         "parity_kvarn_quantize_tile r={r} c={c} on {} (naive-4bit={cs_naive:.5}) -> {}",
