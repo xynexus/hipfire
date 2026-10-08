@@ -95,6 +95,12 @@ fn main() {
         (3, 0, 64),                 // attached tail ending on a block boundary
         (4, 90, 130),               // attached tail spanning records + window
         (1, 5, 33),                 // short, partial workgroup
+        // A continuation's chunk that starts mid-block opens with a short segment
+        // attended while its block is still f32: rows end the window.
+        (8, 128, 22),   // short head segment, window just filled
+        (3, 20, 1),     // single row
+        (2, 45, 7),     // a few rows, partial window
+        (104, 128, 22), // the 27B's 13.3K-prefix head segment
     ] {
         // Every KVarN K width: the kernel compiles one variant per width.
         for bits in [4usize, 2, 8] {
@@ -121,7 +127,7 @@ fn run_case(
     let kv_dim = n_kv_heads * head_dim;
     let n_full = n_full_blocks * group;
     let seq_len = n_full + tail_len;
-    let max_seq = 1024usize;
+    let max_seq = seq_len.next_multiple_of(group).max(1024);
     let blocks_per_head = head_dim / 32;
     let v_row_stride = n_kv_heads * blocks_per_head * 34;
     let tile_elems = head_dim * group;
@@ -280,9 +286,31 @@ fn run_case(
     let partials = gpu
         .zeros(&[rows * n_heads * max_tiles * (2 + head_dim)], DType::F32)
         .unwrap();
+    // The WMMA arm calls the kernel directly: routing by row count would send a
+    // short segment (< 32 rows) to the tile path, and a prefill chunk's short
+    // head segment now takes this kernel whatever its own width.
     let run = |gpu: &mut Gpu, wmma: bool| {
-        std::env::set_var("HIPFIRE_KVARN_PREFILL_WMMA", if wmma { "1" } else { "0" });
+        std::env::set_var("HIPFIRE_KVARN_PREFILL_WMMA", "0");
         let out = gpu.zeros(&[rows * q_dim], DType::F32).unwrap();
+        if wmma {
+            gpu.attention_prefill_kvarn_wmma(
+                &qd,
+                &rd,
+                &wd,
+                &vd,
+                &out,
+                &posd,
+                n_heads,
+                n_kv_heads,
+                rows,
+                n_full_blocks,
+                record_bytes,
+                bits,
+            )
+            .unwrap();
+            gpu.device_synchronize().unwrap();
+            return gpu.download_f32(&out).unwrap();
+        }
         gpu.attention_flash_kvarn_batched_masked(
             &qd,
             &rd,

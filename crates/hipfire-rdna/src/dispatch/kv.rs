@@ -1789,6 +1789,14 @@ impl Gpu {
         }
 
         let q_row = n_heads * head_dim;
+        // The kernel is chosen by the CHUNK's width, not the segment's. A chunk
+        // that starts mid-block (every chunk of a continuation whose prefix is
+        // not a multiple of 128 tokens) opens with a short segment -- 22 rows on
+        // the 27B's 13.3K prefix -- and by its own width that fell to the per-row
+        // tile path, which re-dequantizes every K/V tile for every row: 6.9 s of
+        // a 32.5 s 7.8K-token step at 13-21K depth, more than the WMMA kernel
+        // spent on the other 256 rows of each chunk.
+        let wmma = self.kvarn_prefill_wmma_ok(head_dim, n, bits);
         let mut written = 0usize;
         while written < n {
             let t = start_pos + written;
@@ -1810,27 +1818,34 @@ impl Gpu {
             let q_view = fa_q.sub_offset(written * q_row, take * q_row);
             let out_view = out.sub_offset(written * q_row, take * q_row);
             let pos_view = positions.sub_offset(written, take);
-            self.attention_flash_kvarn_batched_masked(
-                &q_view,
-                records,
-                window,
-                v_cache,
-                &out_view,
-                &pos_view,
-                n_heads,
-                n_kv_heads,
-                head_dim,
-                physical_cap,
-                t + take,
-                take,
-                flash_partials,
-                None,
-                block_start,
-                block_cols,
-                block,
-                rec_bytes,
-                bits,
-            )?;
+            if wmma {
+                self.attention_prefill_kvarn_wmma(
+                    &q_view, records, window, v_cache, &out_view, &pos_view, n_heads, n_kv_heads,
+                    take, block, rec_bytes, bits,
+                )?;
+            } else {
+                self.attention_flash_kvarn_batched_masked(
+                    &q_view,
+                    records,
+                    window,
+                    v_cache,
+                    &out_view,
+                    &pos_view,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    physical_cap,
+                    t + take,
+                    take,
+                    flash_partials,
+                    None,
+                    block_start,
+                    block_cols,
+                    block,
+                    rec_bytes,
+                    bits,
+                )?;
+            }
             if slot + take == GROUP {
                 // Block complete in the window -> gather + variance-norm pack into
                 // records[block]. AFTER the attend above, never before.

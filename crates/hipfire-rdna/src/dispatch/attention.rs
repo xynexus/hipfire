@@ -1657,6 +1657,15 @@ impl Gpu {
         ))
     }
 
+    /// Whether a KVarN prefill of `rows` rows takes the query-tiled WMMA kernel.
+    pub(crate) fn kvarn_prefill_wmma_ok(&self, head_dim: usize, rows: usize, bits: usize) -> bool {
+        head_dim == 256
+            && rows >= KVARN_PREFILL_WMMA_MIN_ROWS
+            && matches!(bits, 2 | 4 | 8)
+            && self.arch_caps.has_wmma_w32()
+            && kvarn_prefill_wmma_enabled()
+    }
+
     /// Batched flash attention for Q8_0 KV cache.
     ///
     /// This is the no-LDS-cap replacement for the old per-position
@@ -1794,13 +1803,7 @@ impl Gpu {
         // query-tiled WMMA kernel: this tile+reduce path runs the decode kernel
         // once per ROW, re-dequantizing every K/V tile per row (42% of a cold
         // 8.3K-token 27B prefill). `HIPFIRE_KVARN_PREFILL_WMMA=0` keeps this path.
-        if tree_bias.is_none()
-            && head_dim == 256
-            && batch_size >= KVARN_PREFILL_WMMA_MIN_ROWS
-            && matches!(bits, 2 | 4 | 8)
-            && self.arch_caps.has_wmma_w32()
-            && kvarn_prefill_wmma_enabled()
-        {
+        if tree_bias.is_none() && self.kvarn_prefill_wmma_ok(head_dim, batch_size, bits) {
             return self.attention_prefill_kvarn_wmma(
                 q,
                 records,
