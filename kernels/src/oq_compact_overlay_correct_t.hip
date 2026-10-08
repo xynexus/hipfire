@@ -295,6 +295,103 @@ __launch_bounds__(256) extern "C" __global__ void oq_compact_overlay_correct_tr(
 }
 
 // ---------------------------------------------------------------------------
+// N_OV = 3 TWIN OF `_tr`, TABLES IN SGPRS.
+//
+// Counters over a 27B prefill (cold 13.3K + 7.8K attached): `_tr` issued 953 G
+// VALU instructions against the GEMM's 505 G yet ran at ~35% of VALU issue, and
+// its DRAM traffic was only the Y read-modify-write. It was waiting, not
+// computing. The table is wave-uniform (the row is), but `n_ov` is a runtime
+// value, so LLVM loaded it per lane with a VMEM load, built every gather address
+// with a 64-bit VALU mad, and walked the entries two at a time: table load ->
+// wait -> address -> gather -> wait, twice per (row, group).
+//
+// Here the entry count is fixed, so one row's 8-byte side record ([f16 scale]
+// [idx val] x 3) is a single scalar load, idx/val land in SGPRs, a gather's
+// address is an SGPR base plus the lane's b offset, and a group's 3 x RPW gathers
+// are in flight together. Same lane mapping, same integer sums, same float
+// expression in the same group order as `_tr`: bit-identical
+// (parity_oq_overlay_tr compares the two hashes).
+#define OQCO3_RPW (OQCO_ROWS / 8)
+
+__launch_bounds__(256) extern "C" __global__ void oq_compact_overlay_correct_tr3(
+    const uint8_t* __restrict__ W,
+    const int8_t*  __restrict__ XT,
+    const float*   __restrict__ XsT,
+    float*         __restrict__ Y,
+    int M, int K, int B
+) {
+    __shared__ float acc_s[OQCO_ROWS][OQCO_BB + 1];
+
+    const int wid  = __builtin_amdgcn_readfirstlane(threadIdx.x >> 5);
+    const int lane = threadIdx.x & 31;
+    const int row0 = blockIdx.x * OQCO_ROWS;
+    const int rl0  = wid * OQCO3_RPW;
+    const int b0   = blockIdx.y * OQCO_BB + (lane << 2);
+
+    const int n_groups = K >> 8;
+    // Side records follow the nibble plane: [M][n_groups] x 8 B at n_ov = 3.
+    const uint2* __restrict__ side =
+        reinterpret_cast<const uint2*>(W + (long long)M * n_groups * 128);
+
+    float acc[OQCO3_RPW][4];
+    #pragma unroll
+    for (int r = 0; r < OQCO3_RPW; ++r)
+        #pragma unroll
+        for (int t = 0; t < 4; ++t) acc[r][t] = 0.f;
+
+    if (b0 < B) {
+        for (int g = 0; g < n_groups; ++g) {
+            const float* xsg = XsT + (long long)g * B + b0;
+            float xs[4];
+            #pragma unroll
+            for (int t = 0; t < 4; ++t) xs[t] = xsg[t];
+            const int kbase = g << 8;
+            #pragma unroll
+            for (int r = 0; r < OQCO3_RPW; ++r) {
+                // Clamped, not broken out of: a row past M computes a copy of
+                // row M-1 that the drain never stores, and the four rows' loads
+                // stay free to issue together.
+                const int row = min(row0 + rl0 + r, M - 1);
+                const uint2 rec = side[(long long)row * n_groups + g];
+                const float sw = (float)__builtin_bit_cast(_Float16, (uint16_t)(rec.x & 0xffff));
+                const int idx[3] = {(int)((rec.x >> 16) & 0xff), (int)(rec.y & 0xff),
+                                    (int)((rec.y >> 16) & 0xff)};
+                const int val[3] = {(int)(int8_t)(rec.x >> 24), (int)(int8_t)(rec.y >> 8),
+                                    (int)(int8_t)(rec.y >> 24)};
+                uint32_t xw[3];
+                #pragma unroll
+                for (int e = 0; e < 3; ++e)
+                    // Scalar row base + 32-bit lane offset: an SGPR-based gather.
+                    xw[e] = *(const uint32_t*)(XT + (long long)(kbase + idx[e]) * B
+                                               + (uint32_t)b0);
+                int isum[4] = {0, 0, 0, 0};
+                #pragma unroll
+                for (int e = 0; e < 3; ++e)
+                    #pragma unroll
+                    for (int t = 0; t < 4; ++t)
+                        isum[t] += val[e] * (int)(int8_t)((xw[e] >> (t * 8)) & 0xff);
+                #pragma unroll
+                for (int t = 0; t < 4; ++t)
+                    acc[r][t] += (float)isum[t] * sw * xs[t];
+            }
+        }
+    }
+    #pragma unroll
+    for (int r = 0; r < OQCO3_RPW; ++r)
+        #pragma unroll
+        for (int t = 0; t < 4; ++t) acc_s[rl0 + r][(lane << 2) + t] = acc[r][t];
+    __syncthreads();
+
+    for (int i = threadIdx.x; i < OQCO_ROWS * OQCO_BB; i += 256) {
+        const int rr = i & (OQCO_ROWS - 1);
+        const int bl = i / OQCO_ROWS;
+        const int row = row0 + rr;
+        const int b = blockIdx.y * OQCO_BB + bl;
+        if (row < M && b < B) Y[(long long)b * M + row] += acc_s[rr][bl];
+    }
+}
+
+// ---------------------------------------------------------------------------
 // SMALL-B ROW-COALESCED VARIANT.
 //
 // `_tr` maps a wave's 32 lanes across 128 b (4 per lane) and walks its rows one

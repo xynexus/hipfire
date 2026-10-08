@@ -22,20 +22,37 @@ use hipfire_rdna::{DType, Gpu, OQ_OVERLAY_SLACK};
 fn main() {
     let mut gpu = Gpu::init().unwrap();
     let mut ok = true;
-    for pass in ["tr", "t"] {
-        if pass == "t" {
-            std::env::set_var("HIPFIRE_OQ_OVERLAY_ROWC", "0");
+    let mut tr3_hashes = Vec::new();
+    // "tr3" is what a 4.25-bit model takes (n_ov = 3); "tr" is the generic kernel
+    // it must reproduce bit for bit.
+    for pass in ["tr3", "tr", "t"] {
+        match pass {
+            "tr" => std::env::set_var("HIPFIRE_OQ_OVERLAY_TR3", "0"),
+            "t" => std::env::set_var("HIPFIRE_OQ_OVERLAY_ROWC", "0"),
+            _ => {}
         }
         println!("-- {pass}");
-        for &(m, k, b) in &[
+        for (i, &(m, k, b)) in [
             (200usize, 1024usize, 65usize),
             (128, 2048, 100),
             (77, 1024, 257),
             (300, 512, 513),
             (5120, 6144, 78),
             (6144, 6144, 30),
-        ] {
-            ok &= case(&mut gpu, m, k, b);
+        ]
+        .iter()
+        .enumerate()
+        {
+            let (pass_ok, hash) = case(&mut gpu, m, k, b);
+            ok &= pass_ok;
+            match pass {
+                "tr3" => tr3_hashes.push(hash),
+                "tr" if tr3_hashes[i] != hash => {
+                    println!("   tr3 hash {:016x} differs from tr", tr3_hashes[i]);
+                    ok = false;
+                }
+                _ => {}
+            }
         }
     }
     if !ok {
@@ -52,7 +69,7 @@ fn f16_bits(n: u32) -> u16 {
     (exp << 10) | mant
 }
 
-fn case(gpu: &mut Gpu, m: usize, k: usize, b: usize) -> bool {
+fn case(gpu: &mut Gpu, m: usize, k: usize, b: usize) -> (bool, u64) {
     let group = 256usize;
     let n_groups = k / group;
     let nib_bytes = group / 2;
@@ -156,5 +173,5 @@ fn case(gpu: &mut Gpu, m: usize, k: usize, b: usize) -> bool {
         if refused { "" } else { " TOOK AN UNPADDED XT" },
         if pass { "PASS" } else { "FAIL" }
     );
-    pass
+    (pass, hash)
 }
