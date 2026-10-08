@@ -96,7 +96,10 @@ fn main() {
         (4, 90, 130),               // attached tail spanning records + window
         (1, 5, 33),                 // short, partial workgroup
     ] {
-        all_pass &= run_case(&mut gpu, nfb, tail, rows);
+        // Every KVarN K width: the kernel compiles one variant per width.
+        for bits in [4usize, 2, 8] {
+            all_pass &= run_case(&mut gpu, nfb, tail, rows, bits);
+        }
     }
     if !all_pass {
         std::process::exit(1);
@@ -104,7 +107,13 @@ fn main() {
     println!("ALL PASS");
 }
 
-fn run_case(gpu: &mut Gpu, n_full_blocks: usize, tail_len: usize, rows: usize) -> bool {
+fn run_case(
+    gpu: &mut Gpu,
+    n_full_blocks: usize,
+    tail_len: usize,
+    rows: usize,
+    bits: usize,
+) -> bool {
     let head_dim = 256usize;
     let n_heads = 6usize;
     let n_kv_heads = 2usize;
@@ -116,7 +125,7 @@ fn run_case(gpu: &mut Gpu, n_full_blocks: usize, tail_len: usize, rows: usize) -
     let blocks_per_head = head_dim / 32;
     let v_row_stride = n_kv_heads * blocks_per_head * 34;
     let tile_elems = head_dim * group;
-    let record_bytes = tile_elems.div_ceil(2) + head_dim * 2 * 2 + group * 2;
+    let record_bytes = (tile_elems * bits).div_ceil(8) + head_dim * 2 * 2 + group * 2;
 
     let kbase = lcg(11, n_full.max(1) * kv_dim);
     let mut k = vec![0.0f32; n_full * kv_dim];
@@ -147,7 +156,7 @@ fn run_case(gpu: &mut Gpu, n_full_blocks: usize, tail_len: usize, rows: usize) -
             .unwrap();
         gpu.kvarn_gather_k_tiles(&kd, &td, n_full_blocks, n_kv_heads, head_dim, group)
             .unwrap();
-        gpu.kvarn_quantize_tile(&td, &rd, n_tiles, head_dim, group, record_bytes, 4)
+        gpu.kvarn_quantize_tile(&td, &rd, n_tiles, head_dim, group, record_bytes, bits)
             .unwrap();
     }
     let recs = gpu.download_raw(&rd, rec_buf_bytes).unwrap();
@@ -190,7 +199,7 @@ fn run_case(gpu: &mut Gpu, n_full_blocks: usize, tail_len: usize, rows: usize) -
     }
     let vd = gpu.upload_raw(&v_cache, &[max_seq * v_row_stride]).unwrap();
 
-    let qbytes = tile_elems.div_ceil(2);
+    let qbytes = (tile_elems * bits).div_ceil(8);
     let (off_scale, off_zp) = (qbytes, qbytes + head_dim * 2);
     let off_scol = off_zp + head_dim * 2;
     let mut k_host = vec![0.0f32; seq_len * kv_dim];
@@ -202,8 +211,9 @@ fn run_case(gpu: &mut Gpu, n_full_blocks: usize, tail_len: usize, rows: usize) -
                 let (sa, za) = (rd16(off_scale + ch * 2), rd16(off_zp + ch * 2));
                 for c in 0..group {
                     let gi = ch * group + c;
-                    let byte = rec[gi >> 1];
-                    let q = if gi & 1 == 0 { byte & 0xf } else { byte >> 4 } as f32;
+                    let per = 8 / bits;
+                    let byte = rec[gi / per];
+                    let q = ((byte as u32 >> ((gi % per) * bits)) & ((1u32 << bits) - 1)) as f32;
                     k_host[(b * group + c) * kv_dim + kvh * head_dim + ch] =
                         (q * sa + za) * rd16(off_scol + c * 2);
                 }
@@ -292,7 +302,7 @@ fn run_case(gpu: &mut Gpu, n_full_blocks: usize, tail_len: usize, rows: usize) -
             0,
             n_full_blocks,
             record_bytes,
-            4,
+            bits,
         )
         .unwrap();
         gpu.device_synchronize().unwrap();
@@ -312,7 +322,7 @@ fn run_case(gpu: &mut Gpu, n_full_blocks: usize, tail_len: usize, rows: usize) -
     // the output scale.
     let pass = !nan && e_new < 4e-3 && e_new <= ref_max * 2e-2;
     println!(
-        "  n_full={n_full_blocks} tail={tail_len} rows={rows} seq={seq_len}: old-vs-host={e_old:.2e} wmma-vs-host={e_new:.2e} (|ref|max {ref_max:.3}) -> {}",
+        "  bits={bits} n_full={n_full_blocks} tail={tail_len} rows={rows} seq={seq_len}: old-vs-host={e_old:.2e} wmma-vs-host={e_new:.2e} (|ref|max {ref_max:.3}) -> {}",
         if pass { "PASS" } else { "FAIL" }
     );
     pass
