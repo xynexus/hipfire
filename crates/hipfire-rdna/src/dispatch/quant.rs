@@ -652,6 +652,58 @@ impl Gpu {
                     block_stride,
                 );
             }
+            // XT before the GEMM: the fused epilogue reads it, as does the
+            // separate pass. Skip when the hoisted quantize already built XT for THIS
+            // activation. Keyed on the generation counter plus ng: a group other
+            // than 256 gives XsT a different layout, and the hoisted path only
+            // ever emits ng = k/256.
+            let no_correct = std::env::var("HIPFIRE_OQ_COMPACT_NO_CORRECT").as_deref() == Ok("1");
+            let hoisted = self.oq_xt_gen == self.oq_act_gen
+                && self.oq_xt_ng == ng
+                && self.oq_xt_n == n
+                && std::env::var("HIPFIRE_OQ_XT_HOIST").as_deref() != Ok("0");
+            if !hoisted && !no_correct {
+                // The hoisted quantize is supposed to have built XT for this
+                // activation already; a miss means we redo the transpose, which
+                // the trace prices at 3.50% of GPU time (3072 calls) — 10x the
+                // per-call cost of the interleave beside it. Name the reason.
+                crate::kernel_trace::record_fallback(
+                    "oq compact: XT hoist MISS -> redundant x8 transpose",
+                    &format!(
+                        "xt_gen={} act_gen={} xt_ng={} ng={} xt_n={} n={}",
+                        self.oq_xt_gen, self.oq_act_gen, self.oq_xt_ng, ng, self.oq_xt_n, n
+                    ),
+                );
+                self.oq_compact_x8_transpose(xq, xs, &xt, &xst, n, k, ng)?;
+            }
+            // n_ov = 3 at prefill widths: the overlay is summed in the w64 GEMM's
+            // epilogue, so Y is written once and no separate pass follows.
+            // HIPFIRE_OQ_OV_EPI=0 keeps GEMM + `_tr3`.
+            let ov_epi = use_w64
+                && n > 64
+                && block_stride == 136
+                && w64_tile_override().is_none()
+                && std::env::var("HIPFIRE_OQ_OV_EPI").as_deref() != Ok("0")
+                && !no_correct;
+            if ov_epi {
+                let xilv = GpuTensor {
+                    buf: unsafe { self.oq_xilv_batch.as_ref().unwrap().buf.alias() },
+                    shape: vec![n * k],
+                    dtype: DType::Raw,
+                };
+                return self.gemm_oq_compact_iu4x2_w64_epi(
+                    w_blocks,
+                    &xilv,
+                    xs,
+                    y,
+                    m,
+                    k,
+                    n,
+                    block_stride,
+                    &xt,
+                    &xst,
+                );
+            }
             if use_w64 {
                 // The wave64 kernel consumes fragment-interleaved nibble pairs,
                 // not int8. The permutation is done ONCE per activation, beside
@@ -671,30 +723,8 @@ impl Gpu {
             // the GEMM's uncorrected speed can be measured directly. Output is
             // NUMERICALLY WRONG (the sparse overlay is simply not applied); this
             // exists to bound what any correction scheme is competing against.
-            if std::env::var("HIPFIRE_OQ_COMPACT_NO_CORRECT").as_deref() == Ok("1") {
+            if no_correct {
                 return Ok(());
-            }
-            // Skip when the hoisted quantize already built XT for THIS
-            // activation. Keyed on the generation counter plus ng: a group other
-            // than 256 gives XsT a different layout, and the hoisted path only
-            // ever emits ng = k/256.
-            let hoisted = self.oq_xt_gen == self.oq_act_gen
-                && self.oq_xt_ng == ng
-                && self.oq_xt_n == n
-                && std::env::var("HIPFIRE_OQ_XT_HOIST").as_deref() != Ok("0");
-            if !hoisted {
-                // The hoisted quantize is supposed to have built XT for this
-                // activation already; a miss means we redo the transpose, which
-                // the trace prices at 3.50% of GPU time (3072 calls) — 10x the
-                // per-call cost of the interleave beside it. Name the reason.
-                crate::kernel_trace::record_fallback(
-                    "oq compact: XT hoist MISS -> redundant x8 transpose",
-                    &format!(
-                        "xt_gen={} act_gen={} xt_ng={} ng={} xt_n={} n={}",
-                        self.oq_xt_gen, self.oq_act_gen, self.oq_xt_ng, ng, self.oq_xt_n, n
-                    ),
-                );
-                self.oq_compact_x8_transpose(xq, xs, &xt, &xst, n, k, ng)?;
             }
             // ACCUMULATES into y, so it must follow the GEMM on the same Y.
             return self.oq_compact_overlay_correct_t(
@@ -1803,6 +1833,7 @@ impl Gpu {
                     batch_size,
                     block_stride,
                     (wm, wn, wmt, wnt),
+                    None,
                 );
             }
         }
@@ -1896,6 +1927,66 @@ impl Gpu {
             batch_size,
             block_stride,
             (warps_m, warps_n, w_mt, w_nt),
+            None,
+        )
+    }
+
+    /// [`Self::gemm_oq_compact_iu4x2_w64`] with the n_ov = 3 sparse overlay summed
+    /// in its epilogue (`OV_EPI`): Y comes out corrected, written once, and no
+    /// separate overlay pass follows. Prefill widths only (B > 64: the m128 and
+    /// default tiles); `xt`/`xst` are the K-major activation and scales the
+    /// overlay pass would have read.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_oq_compact_iu4x2_w64_epi(
+        &mut self,
+        w_blocks: &GpuTensor,
+        x_i8: &GpuTensor,
+        x_scales: &GpuTensor,
+        y_f32: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+        block_stride: usize,
+        xt: &GpuTensor,
+        xst: &GpuTensor,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(k % 256 == 0 && batch_size > 64 && block_stride == 136);
+        overlay_inputs_check(xt, xst, k, batch_size, 256)?;
+        // Same tile choice as the unfused GEMM at these widths.
+        let wide_m =
+            batch_size >= 384 && std::env::var("HIPFIRE_OQ_W64_WIDE").as_deref() != Ok("0");
+        let (func_name, tile) = if wide_m {
+            (
+                "gemm_oq_compact_iu4x2_w64_m128_epi",
+                (4usize, 1usize, 2usize, 4usize),
+            )
+        } else {
+            ("gemm_oq_compact_iu4x2_w64_epi", (2, 2, 2, 4))
+        };
+        if !self.functions.contains_key(func_name) {
+            let (wm, wn, wmt, wnt) = tile;
+            let src = format!(
+                "#define OV_EPI 1\n#define WARPS_M {wm}\n#define WARPS_N {wn}\n#define WMt {wmt}\n#define WNt {wnt}\n{}",
+                kernels::GEMM_OQ_COMPACT_IU4X2_W64_SRC.replace(
+                    "void gemm_oq_compact_iu4x2_w64(",
+                    &format!("void {func_name}(")
+                )
+            );
+            self.ensure_kernel(func_name, &src, func_name)?;
+        }
+        self.launch_iu4x2_w64(
+            func_name,
+            w_blocks,
+            x_i8,
+            x_scales,
+            y_f32,
+            m,
+            k,
+            batch_size,
+            block_stride,
+            tile,
+            Some((xt, xst)),
         )
     }
 
@@ -1912,6 +2003,7 @@ impl Gpu {
         batch_size: usize,
         block_stride: usize,
         (warps_m, warps_n, w_mt, w_nt): (usize, usize, usize, usize),
+        ov: Option<(&GpuTensor, &GpuTensor)>,
     ) -> HipResult<()> {
         let wp = w_blocks.buf.as_ptr();
         let xp = x_i8.buf.as_ptr();
@@ -1919,6 +2011,9 @@ impl Gpu {
         let yp = y_f32.buf.as_ptr();
         let (mut mi, mut ki, mut bi) = (m as i32, k as i32, batch_size as i32);
         let mut si = block_stride as i32;
+        let (xtp, xstp) = ov.map_or((std::ptr::null_mut(), std::ptr::null_mut()), |(xt, xst)| {
+            (xt.buf.as_ptr(), xst.buf.as_ptr())
+        });
         let mut params: Vec<*mut c_void> = vec![
             &wp as *const _ as *mut c_void,
             &xp as *const _ as *mut c_void,
@@ -1929,6 +2024,10 @@ impl Gpu {
             &mut bi as *mut _ as *mut c_void,
             &mut si as *mut _ as *mut c_void,
         ];
+        if ov.is_some() {
+            params.push(&xtp as *const _ as *mut c_void);
+            params.push(&xstp as *const _ as *mut c_void);
+        }
         // Must match BM / BN / BLOCK in the kernel (its WARPS_M/N, WMt, WNt).
         let bm = warps_m * w_mt * 16;
         let bn = warps_n * w_nt * 16;

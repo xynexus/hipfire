@@ -78,7 +78,11 @@ __device__ __forceinline__ uint32_t oqx2w64_pack4(uint32_t t) {
 __launch_bounds__(BLOCK) extern "C" __global__ void gemm_oq_compact_iu4x2_w64(
     const uint8_t* __restrict__ W, const int8_t* __restrict__ X,
     const float* __restrict__ Xs, float* __restrict__ Y,
-    int M, int K, int B, int block_stride) {
+    int M, int K, int B, int block_stride
+#ifdef OV_EPI
+    , const int8_t* __restrict__ XT, const float* __restrict__ XsT
+#endif
+    ) {
     // X held INTERLEAVED in LDS exactly as it is in DRAM: per row, each 16-K step
     // is 8 bytes of hi nibbles then 8 of lo. Same bytes as separate Xhs+Xls
     // planes (BK/2 + BK/2 == BK), but staging becomes a pure copy and ONE i32x4
@@ -260,6 +264,100 @@ __launch_bounds__(BLOCK) extern "C" __global__ void gemm_oq_compact_iu4x2_w64(
 #undef LOADA
 #undef STSA
 #undef STS
+#ifdef OV_EPI
+    // SPARSE OVERLAY IN THE EPILOGUE (n_ov = 3 only: 8-byte side records).
+    //
+    // The separate pass (`oq_compact_overlay_correct_tr3`) re-reads and rewrites
+    // all of Y in f32 and runs alone. Here the workgroup finishes its own tile:
+    // the K-strip LDS is free once the loop ends, so the tile goes through it in
+    // OVR-row slabs -- GEMM result in, the slab's overlay sum added with the same
+    // lane mapping and arithmetic as `_tr3` (a row is wave-uniform, its side record
+    // one scalar load, a gather an SGPR row base plus the lane's b), then one
+    // row-coalesced store. Y is written once, and the gathers overlap other
+    // workgroups' WMMA instead of running as their own kernel.
+    //
+    // Bit-identical to GEMM + `_tr3`: there Y = facc, then Y += acc with acc
+    // summed over groups in order; here T = facc, then T += the same acc.
+    constexpr int OVR = 32;                 // rows per slab
+    constexpr int TS = BN + 1;              // +1: a 0-mod-64 stride is a 32-way conflict
+    constexpr int NW = BLOCK / 64;
+    constexpr int RPW = OVR / NW;           // slab rows per wave
+    constexpr int BPL = BN / 64;            // b per lane
+    static_assert(BLOCK == 256 && (BN == 64 || BN == 128) && BM % OVR == 0,
+                  "OV_EPI: m128 / default tiles only");
+    static_assert(OVR * TS * 4 <= 2 * BN * (BK + XPAD), "OV_EPI slab must fit in Xi");
+    float* T = reinterpret_cast<float*>(&Xi[0][0]);
+    const uint2* __restrict__ side8 = reinterpret_cast<const uint2*>(W + side_base);
+    const int wv = __builtin_amdgcn_readfirstlane((int)(threadIdx.x >> 6));
+    const int bl0 = wtid * BPL;
+    const int b0 = bn + bl0;
+    for (int c = 0; c < BM / OVR; c++) {
+        __syncthreads();
+#pragma unroll
+        for (int i = 0; i < WMt; i++)
+#pragma unroll
+            for (int j = 0; j < WNt; j++)
+#pragma unroll
+                for (int g = 0; g < 4; g++) {
+                    const int rl = wm * WMt * 16 + i * 16 + 4 * g + (wtid >> 4);
+                    if (rl / OVR == c)
+                        T[(rl % OVR) * TS + wn * WNt * 16 + j * 16 + lane] = facc[i][j][g];
+                }
+        float acc[RPW][BPL];
+#pragma unroll
+        for (int r = 0; r < RPW; r++)
+#pragma unroll
+            for (int t = 0; t < BPL; t++) acc[r][t] = 0.f;
+        if (b0 < B) {
+            for (int g = 0; g < n_groups; g++) {
+                float xs[BPL];
+#pragma unroll
+                for (int t = 0; t < BPL; t++) xs[t] = XsT[(long long)g * B + b0 + t];
+                const int kbase = g << 8;
+#pragma unroll
+                for (int r = 0; r < RPW; r++) {
+                    const int row = min(bm + c * OVR + wv * RPW + r, M - 1);
+                    const uint2 rec = side8[(long long)row * n_groups + g];
+                    const float sw = (float)__builtin_bit_cast(_Float16, (uint16_t)(rec.x & 0xffff));
+                    const int idx[3] = {(int)((rec.x >> 16) & 0xff), (int)(rec.y & 0xff),
+                                        (int)((rec.y >> 16) & 0xff)};
+                    const int val[3] = {(int)(int8_t)(rec.x >> 24), (int)(int8_t)(rec.y >> 8),
+                                        (int)(int8_t)(rec.y >> 24)};
+                    uint32_t xw[3];
+#pragma unroll
+                    for (int e = 0; e < 3; e++) {
+                        const uint8_t* xr = (const uint8_t*)XT + (long long)(kbase + idx[e]) * B
+                                          + (uint32_t)b0;
+                        xw[e] = (BPL == 2) ? (uint32_t)*(const uint16_t*)xr : (uint32_t)*xr;
+                    }
+                    int isum[BPL];
+#pragma unroll
+                    for (int t = 0; t < BPL; t++) isum[t] = 0;
+#pragma unroll
+                    for (int e = 0; e < 3; e++)
+#pragma unroll
+                        for (int t = 0; t < BPL; t++)
+                            isum[t] += val[e] * (int)(int8_t)((xw[e] >> (t * 8)) & 0xff);
+#pragma unroll
+                    for (int t = 0; t < BPL; t++)
+                        acc[r][t] += (float)isum[t] * sw * xs[t];
+                }
+            }
+        }
+        __syncthreads();
+#pragma unroll
+        for (int r = 0; r < RPW; r++)
+#pragma unroll
+            for (int t = 0; t < BPL; t++) T[(wv * RPW + r) * TS + bl0 + t] += acc[r][t];
+        __syncthreads();
+        // Row-coalesced: consecutive threads store consecutive rows of one b.
+        for (int i = threadIdx.x; i < OVR * BN; i += BLOCK) {
+            const int rr = i % OVR, bl = i / OVR;
+            const int row = bm + c * OVR + rr, b = bn + bl;
+            if (row < M && b < B) Y[(long long)b * M + row] = T[rr * TS + bl];
+        }
+    }
+#else
 #pragma unroll
     for (int i = 0; i < WMt; i++)
 #pragma unroll
@@ -272,4 +370,5 @@ __launch_bounds__(BLOCK) extern "C" __global__ void gemm_oq_compact_iu4x2_w64(
                 if (r < M) Y[(long long)oc * M + r] = facc[i][j][g];
             }
         }
+#endif
 }
