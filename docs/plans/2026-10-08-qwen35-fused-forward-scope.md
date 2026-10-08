@@ -203,6 +203,17 @@ What it says:
   whose profiles overlap into the same step (affinity batching: ~25-30% fewer expert
   reads at B = 32-64 against a mixed step), still bounded by bands and the age limits
   that keep any session from waiting.
+- **Cold seeding needs no keyword lookup -- the router classifies.** Code vs prose
+  from the routing of the first token is 98-100% right over all layers, 100% from two
+  (leave-one-out over the six domains). A session's own histogram covers only 4% of
+  its later routing after 16 tokens and 20% after 64, while a cluster prior covers 29%
+  from the first token; blending the prior into the histogram at weight N/256 tracks
+  the better of the two (29 -> 31 -> 33 -> 38% at N = 16 / 64 / 256 / 1,024). So: pick
+  the cluster prior (code, natural language) from the first routed tokens, blend, and
+  let the session's own profile take over. A session that attaches a cached prefix
+  starts from the histogram recorded when that prefix was minted -- Corrode's tasks
+  share a context prefix, so most start warm. Priors are 256 counts x 40 layers per
+  cluster, built from the persistent `moe_quality` counters split by cluster.
 - **Dropping a lone low-weight expert does not pay** (measured, see "Already measured").
   Because routing is flat, a lone (token, expert) under 0.05 weight is rare: ~1% of
   expert reads saved at B = 8-64. At 0.08 it saves 7-14% but strips ~5% of the mix
