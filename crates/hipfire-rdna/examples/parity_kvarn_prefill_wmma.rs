@@ -104,7 +104,27 @@ fn main() {
     ] {
         // Every KVarN K width: the kernel compiles one variant per width.
         for bits in [4usize, 2, 8] {
-            all_pass &= run_case(&mut gpu, nfb, tail, rows, bits);
+            if !skip(nfb, tail, rows, bits, (6, 2)) {
+                all_pass &= run_case(&mut gpu, nfb, tail, rows, bits, (6, 2));
+            }
+        }
+    }
+    // Decode / verify widths at the served query groups -- Qwen3.8-27B (24 over 4,
+    // G=6) and Qwen3.6-35B-A3B (16 over 2, G=8) -- where the tile path runs and the
+    // GQA tile kernel takes it (bits 4/8; bits 2 stays on the per-head kernel).
+    for &heads in &[(24usize, 4usize), (16, 2)] {
+        for &(nfb, tail, rows) in &[
+            (104usize, 77usize, 1usize),
+            (104, 77, 2),
+            (8, 0, 1),
+            (3, 20, 1),
+            (30, 128, 4),
+        ] {
+            for bits in [4usize, 8, 2] {
+                if !skip(nfb, tail, rows, bits, heads) {
+                    all_pass &= run_case(&mut gpu, nfb, tail, rows, bits, heads);
+                }
+            }
         }
     }
     if !all_pass {
@@ -113,16 +133,21 @@ fn main() {
     println!("ALL PASS");
 }
 
+/// PARITY_ONLY="nfb,tail,rows,bits,n_heads,n_kv_heads" runs that one case.
+fn skip(nfb: usize, tail: usize, rows: usize, bits: usize, heads: (usize, usize)) -> bool {
+    std::env::var("PARITY_ONLY")
+        .is_ok_and(|v| v != format!("{nfb},{tail},{rows},{bits},{},{}", heads.0, heads.1))
+}
+
 fn run_case(
     gpu: &mut Gpu,
     n_full_blocks: usize,
     tail_len: usize,
     rows: usize,
     bits: usize,
+    (n_heads, n_kv_heads): (usize, usize),
 ) -> bool {
     let head_dim = 256usize;
-    let n_heads = 6usize;
-    let n_kv_heads = 2usize;
     let group = 128usize;
     let kv_dim = n_kv_heads * head_dim;
     let n_full = n_full_blocks * group;
@@ -289,10 +314,13 @@ fn run_case(
     // The WMMA arm calls the kernel directly: routing by row count would send a
     // short segment (< 32 rows) to the tile path, and a prefill chunk's short
     // head segment now takes this kernel whatever its own width.
-    let run = |gpu: &mut Gpu, wmma: bool| {
+    // mode 0: per-head tile kernel; 1: GQA tile kernel (both via the tile
+    // dispatch, WMMA off); 2: the WMMA kernel directly.
+    let run = |gpu: &mut Gpu, mode: u8| {
         std::env::set_var("HIPFIRE_KVARN_PREFILL_WMMA", "0");
+        std::env::set_var("HIPFIRE_KVARN_TILE_GQA", if mode == 1 { "1" } else { "0" });
         let out = gpu.zeros(&[rows * q_dim], DType::F32).unwrap();
-        if wmma {
+        if mode == 2 {
             gpu.attention_prefill_kvarn_wmma(
                 &qd,
                 &rd,
@@ -336,21 +364,77 @@ fn run_case(
         gpu.device_synchronize().unwrap();
         gpu.download_f32(&out).unwrap()
     };
-    let old = run(gpu, false);
-    let new = run(gpu, true);
+    let old = run(gpu, 0);
+    let gqa = run(gpu, 1);
+    let new = run(gpu, 2);
     let err = |x: &[f32]| {
         x.iter()
             .zip(&ref_out)
             .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()))
     };
-    let (e_old, e_new) = (err(&old), err(&new));
+    // PARITY_BENCH=1: warm timing of the two tile arms, 30 back-to-back calls each
+    // into a preallocated output -- how the decode loop runs them, unlike the
+    // single cold calls above.
+    if std::env::var("PARITY_BENCH").is_ok() && rows < 32 {
+        let out = gpu.zeros(&[rows * q_dim], DType::F32).unwrap();
+        let time_arm = |gpu: &mut Gpu, gqa_on: bool| {
+            std::env::set_var("HIPFIRE_KVARN_PREFILL_WMMA", "0");
+            std::env::set_var("HIPFIRE_KVARN_TILE_GQA", if gqa_on { "1" } else { "0" });
+            let call = |gpu: &mut Gpu| {
+                gpu.attention_flash_kvarn_batched_masked(
+                    &qd,
+                    &rd,
+                    &wd,
+                    &vd,
+                    &out,
+                    &posd,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    max_seq,
+                    seq_len,
+                    rows,
+                    &partials,
+                    None,
+                    0,
+                    0,
+                    n_full_blocks,
+                    record_bytes,
+                    bits,
+                )
+                .unwrap();
+            };
+            for _ in 0..5 {
+                call(gpu);
+            }
+            gpu.device_synchronize().unwrap();
+            let t = std::time::Instant::now();
+            for _ in 0..30 {
+                call(gpu);
+            }
+            gpu.device_synchronize().unwrap();
+            t.elapsed().as_secs_f64() * 1e6 / 30.0
+        };
+        let (t_tile, t_gqa) = (time_arm(gpu, false), time_arm(gpu, true));
+        println!(
+            "    bench G={} rows={rows} seq={seq_len} bits={bits}: tile {t_tile:7.1} us  gqa {t_gqa:7.1} us  ({:.2}x)",
+            n_heads / n_kv_heads,
+            t_tile / t_gqa
+        );
+    }
+    let (e_old, e_gqa, e_new) = (err(&old), err(&gqa), err(&new));
     let ref_max = ref_out.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-    let nan = new.iter().any(|v| !v.is_finite());
+    let nan = new.iter().chain(&gqa).any(|v| !v.is_finite());
     // f16 Q/K/V/P in the WMMA path vs f32 in the old one: allow a few f16 ulps of
-    // the output scale.
-    let pass = !nan && e_new < 4e-3 && e_new <= ref_max * 2e-2;
+    // the output scale. The GQA tile kernel is f32 like the per-head one: it must
+    // land at that kernel's error, give or take summation order.
+    let pass = !nan
+        && e_new < 4e-3
+        && e_new <= ref_max * 2e-2
+        && e_gqa <= (4.0 * e_old).max(ref_max * 1e-4);
     println!(
-        "  bits={bits} n_full={n_full_blocks} tail={tail_len} rows={rows} seq={seq_len}: old-vs-host={e_old:.2e} wmma-vs-host={e_new:.2e} (|ref|max {ref_max:.3}) -> {}",
+        "  G={} bits={bits} n_full={n_full_blocks} tail={tail_len} rows={rows} seq={seq_len}: tile={e_old:.2e} gqa={e_gqa:.2e} wmma={e_new:.2e} vs host (|ref|max {ref_max:.3}) -> {}",
+        n_heads / n_kv_heads,
         if pass { "PASS" } else { "FAIL" }
     );
     pass

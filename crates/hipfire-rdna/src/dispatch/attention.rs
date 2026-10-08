@@ -1855,10 +1855,62 @@ impl Gpu {
         )?;
         let q_dim = n_heads * head_dim;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
+        // One workgroup per (KV head, tile, row) for the whole query group: each K
+        // record dword and V row is read once instead of once per query head.
+        // Same partials, same reduce. HIPFIRE_KVARN_TILE_GQA=0 keeps the per-head
+        // tile kernel.
+        let gqa = n_heads / n_kv_heads.max(1);
+        let gqa_kernel = (tree_bias.is_none()
+            && head_dim == 256
+            && matches!(bits, 4 | 8)
+            && n_heads % n_kv_heads.max(1) == 0
+            && (2..=8).contains(&gqa)
+            && std::env::var("HIPFIRE_KVARN_TILE_GQA").as_deref() != Ok("0"))
+        .then(|| format!("attention_flash_kvarn_tile_gqa{gqa}"));
+        if let Some(name) = &gqa_kernel {
+            self.ensure_kernel(
+                "attention_flash_kvarn_tile_gqa",
+                kernels::ATTENTION_FLASH_KVARN_TILE_GQA_SRC,
+                name,
+            )?;
+        }
         let mut offset = 0usize;
         while offset < batch_size {
             let chunk = (batch_size - offset).min(sub_batch);
-            {
+            if let Some(name) = &gqa_kernel {
+                let q_ptr =
+                    unsafe { (q.buf.as_ptr() as *mut u8).add(offset * q_dim * 4) as *mut c_void };
+                let (rec_ptr, win_ptr, v_ptr) = (
+                    records.buf.as_ptr(),
+                    window.buf.as_ptr(),
+                    v_cache.buf.as_ptr(),
+                );
+                let (p_ptr, pos_ptr) = (partials.buf.as_ptr(), positions.buf.as_ptr());
+                let win_f16 = i32::from(window.dtype == crate::DType::F16);
+                let (nh, nkv, ts, mt, bo) = (
+                    n_heads as i32,
+                    n_kv_heads as i32,
+                    TILE_SIZE as i32,
+                    max_tiles as i32,
+                    offset as i32,
+                );
+                let (nfb, rb, bt) = (n_full_blocks as i32, rec_bytes as i32, bits as i32);
+                // Must match KVARN_GQA_NW and the kernel's LDS carve-up:
+                // [G][TILE] scores | [G][NW] wave slots | [NW][head_dim] V sums.
+                const NW: usize = 4;
+                let lds = (gqa * TILE_SIZE + gqa * NW + NW * head_dim) * 4;
+                self.launch_kernargs(
+                    name,
+                    [n_kv_heads as u32, max_tiles as u32, chunk as u32],
+                    [(32 * NW) as u32, 1, 1],
+                    lds as u32,
+                    &kernargs![
+                        ptr q_ptr, ptr rec_ptr, ptr win_ptr, ptr v_ptr, ptr p_ptr, ptr pos_ptr,
+                        i32 nh, i32 nkv, f32 scale, i32 ts, i32 mt, i32 bo, i32 nfb, i32 rb, i32 bt,
+                        i32 win_f16
+                    ],
+                )?;
+            } else {
                 let q_ptr =
                     unsafe { (q.buf.as_ptr() as *mut u8).add(offset * q_dim * 4) as *mut c_void };
                 let rec_ptr = records.buf.as_ptr();
