@@ -129,39 +129,57 @@ per-row tile path that does neither is 15% / 27% of decode at 13.3K (see above).
 
 ## MoE: large batches are where the A3B pays, and microbatching has a price
 
-A3B decode-step byte floor by batch width (dense weights shared; experts = the
-union the step's tokens route to; DeltaNet state ~0.1 GB and, at 13.3K, KVarN
-~0.11 GB per session per step; 248.5 GB/s):
+A3B decode-step byte floor by batch width. Dense weights are shared; experts are
+the union the step's tokens route to, MEASURED with `HIPFIRE_MOE_ROUTE_DUMP` on
+21K tokens of Rust source (B tokens sampled far apart, standing in for B sessions);
+DeltaNet state ~0.1 GB and, at 13.3K, KVarN ~0.11 GB per session per step; 248.5 GB/s:
 
-| B | experts/layer | step GB (short) | aggregate floor | per-session floor | aggregate floor @13.3K |
+| B | union: uniform / measured | step GB (short) | aggregate floor | per-session floor | aggregate @13.3K |
 |---|---|---|---|---|---|
-| 1 | 8 | 1.66 | 149 tok/s | 149 | 140 |
-| 8 | 57 | 5.67 | 351 | 44 | 305 |
-| 32 | 163 | 15.1 | 525 | 16 | 429 |
-| 64 | 222 | 22.3 | 713 | 11 | 547 |
-| 128 | 252 | 30.6 | 1,038 | 8 | 719 |
-| 256 | 256 | 43.7 | 1,455 | 6 | 896 |
+| 1 | 8 / 8 | 1.66 | 149 tok/s | 149 | 140 |
+| 8 | 57 / 46 | 4.90 | 405 | 51 | 345 |
+| 32 | 163 / 111 | 11.7 | 683 | 21 | 528 |
+| 64 | 222 / 146 | 17.2 | 925 | 15 | 663 |
+| 128 | 252 / 184 | 26.1 | 1,218 | 10 | 800 |
+
+Routing is skewed: ~119 of 256 experts are effectively in use per layer (layer 0:
+~203) and the 16 hottest take ~40% of slots, so unions grow well under the uniform
+estimate; one session's adjacent tokens share even more (37 at B=8, 116 at B=64).
+And routing is FLAT across the top 8: renormalized weight by rank averages 0.236,
+0.164, 0.132, 0.113, 0.100, 0.091, 0.085, 0.080 -- the 8th expert carries 8% of a
+token's mix, under 0.05 for only 4% of token-layers.
 
 What it says:
 
-- **Per-token cost falls ~5x from B=1 to B=64** once the expert union saturates
-  (~B=64-128): past that, extra tokens add no expert bytes. The 27B's curve is flatter
-  at the top (575 tok/s floor at B=64) and its per-token cost is ~8x the A3B's at B=1.
-  Concurrency pays most on the MoE.
-- **At large B the limit moves to per-session traffic.** At B=64, 13.3K: experts
-  14.9 GB, DeltaNet state ~6.4 GB, KVarN ~7 GB of 29 GB. DeltaNet state precision and
-  KVarN attention efficiency become first-order for large-batch MoE.
-- **Latency and throughput trade directly** (44 tok/s per session at B=8, 11 at B=64).
+- **Per-token cost falls ~6x from B=1 to B=64.** Concurrency pays most on the MoE;
+  the 27B's floor is 575 tok/s at B=64 and its per-token cost ~8x the A3B's at B=1.
+- **At large B per-session traffic is the majority.** At B=64, 13.3K: experts 9.6 GB,
+  DeltaNet state ~6.4 GB, KVarN ~7 GB of ~23 GB. DeltaNet state precision and KVarN
+  attention efficiency become first-order for large-batch MoE.
+- **Latency and throughput trade directly** (51 tok/s per session at B=8, 15 at B=64).
   Which work gets the wide steps is serving policy: realtime work in small steps,
   opportunistic batch-filling work (speculative review, exploration) in large ones.
   A batch-filler is NOT free at depth -- each added session costs ~0.2 GB/step
-  (~0.8 ms) in state + KV even once experts are saturated.
+  (~0.8 ms) in state + KV even where its experts are already being read.
 - **Microbatching re-reads experts.** Splitting B into m microbatches reads
-  m x union(B/m) experts instead of union(B): x1.09 at B=8, x1.12 at B=16, x1.47 at
-  B=64 (2 microbatches). It pays where phases are narrow and idle the GPU (small and
-  moderate B) and costs where they are already wide (large B, where norms, router,
-  top-k and per-session attention fill the GPU on their own). So m is a function of B
-  chosen from this curve: 2 at B <= ~16, 1 at large B -- not a constant.
+  m x union(B/m) instead of union(B); with the measured unions, two microbatches cost
+  x1.17 at B=8, x1.26 at B=16, x1.52 at B=64. It pays where phases are narrow and idle
+  the GPU and costs where they are already wide, so m is a function of B: 2 at small
+  B, 1 at large B -- not a constant.
+- **Per-expert queues, largest first, with aging.** The MoE stage keeps a queue per
+  (layer, expert); items run largest queue first -- the hot experts, multi-row and
+  WMMA-friendly -- and lone-token items fill the gaps between them. Within a lockstep
+  step the order changes overlap and latency, not bytes: the union is fixed by
+  routing. Bytes move only by (a) more tokens at the same layer at the same time
+  (wider steps) or (b) deferrable opportunistic tokens waiting at a queue for an
+  expert being read for realtime tokens anyway, released by an age deadline so a lone
+  token never starves. (b) is limited: a token needs all 8 of its experts at every
+  layer before it can move on, so waiting stalls its whole session; with the skew a
+  hot expert is usually free and a cold one rarely is.
+- **Dropping a lone low-weight expert does not pay** (measured, see "Already measured").
+  Because routing is flat, a lone (token, expert) under 0.05 weight is rare: ~1% of
+  expert reads saved at B = 8-64. At 0.08 it saves 7-14% but strips ~5% of the mix
+  from ~40% of tokens (up to 36% from one), a model change, not an approximation.
 - **Kernel consequence.** Past B ~ 32 the decode MoE should be expert-grouped (sort
   rows by expert, one item per distinct expert), i.e. the prefill grouped MoE GEMM at
   1-16 rows per expert (B x 8 / union: 2.3 at B=64, 8 at B=256). Today's decode kernels
@@ -187,8 +205,14 @@ for those programs, not a new model description.
 - **Prefetch window = the MALL.** An A3B layer is ~18 MB of dense weights + ~13 MB
   of routed experts, about the 32 MB MALL: the dense part of layer L+1 (DeltaNet /
   attention projections, shared expert, router) can be in flight while layer L's
-  serial phases run. Routed experts cannot be prefetched before their router runs;
-  they start the moment top-k lands.
+  serial phases run. Routed experts cannot be known before their router runs, but
+  popularity is skewed and stable: the 8 hottest experts of a layer (~13 MB) cover
+  ~26% of its slots, the 12 hottest (~20 MB) ~33%, the 16 hottest ~39% -- measured
+  out of sample (hot set from one half of the tokens, hit rate on the other) -- so
+  prefetching layer L+1's hottest experts alongside its dense part turns a guess into
+  a MALL hit for about a third of the routed reads -- the
+  overlap B=1 can still get when there is no batch to microbatch. Everything else
+  starts the moment top-k lands.
 - **Small ops become work items, not kernels**: rmsnorm + rotate, qk-prep, conv1d,
   the gated norm, top-k + renorm, silu-mul, adds. Each runs on the few workgroups it
   needs while the rest stream weights -- the inversion of ZAYA's single-block phases.
@@ -240,7 +264,7 @@ first.
 | 0 | Untraced decode accounting: per-op bytes and time per token, both models, B = 1/4/8, short and 13.3K context, A3B expert-union size per step | the baseline every later number is judged against | -- | a per-op table per (B, context) | -- |
 | K0 | GQA-shared KVarN attention for verify / multi-row decode: one workgroup per (session, KV head, context slice) over all query heads and that session's rows, B sessions per launch, each record tile dequantized once (extend `attention_kvarn_routed_batched_gqa*` to causal multi-row, or route verify to the WMMA kernel per KV head) | redundant KV reads | at 13.3K: 27B ~-8 ms/token (~-10%), A3B ~-3.5 ms/token (~-12%); more at depth | parity vs tile path, all verify widths, tree bias | < 5% at 13.3K |
 | V | Device-side DFlash accept loop | host round trips | A3B -10% decode time, 27B -3% | bit-identical tokens vs host loop; tok/s gain | < 5% on A3B |
-| D1 | Persistent kernel for ONE A3B MoE layer (DeltaNetMoe), counters + idle-prefetch, expert-grouped items, m microbatches | bubbles, tiny kernels, cross-op streaming, expert reuse, serial-phase overlap | layer at >= 70% of its byte floor at B = 1, 8, 32, 64, m in {1, 2} (today ~36-41% whole-model) | per-layer parity (cos 1.0); bytes moved / layer time at each B | < 1.3x over today's 6 super-ops at every B (ZAYA-style flat) |
+| D1 | Persistent kernel for ONE A3B MoE layer (DeltaNetMoe), counters + idle-prefetch (dense + hottest experts of the next layer), per-expert queues largest-first with aging, m microbatches | bubbles, tiny kernels, cross-op streaming, expert reuse, serial-phase overlap | layer at >= 70% of its byte floor at B = 1, 8, 32, 64, m in {1, 2} (today ~36-41% whole-model) | per-layer parity (cos 1.0); bytes moved / layer time at each B | < 1.3x over today's 6 super-ops at every B (ZAYA-style flat) |
 | D2 | All four layer programs, whole decode step, B in 1..16 | the rest of D | A3B 57.7 -> ~100 tok/s; 27B 14.5 -> ~16 | greedy text identical; DFlash acceptance unchanged | A3B < 80 tok/s |
 | P1 | gate/up silu epilogue + pre-GEMM fused quantize (current format) | activation round trips | 27B prefill -3..5% | parity; served A/B | < 2% |
 | P2 | A3B K=2048 dense GEMM on the w64 structure | GEMM efficiency | A3B prefill -8..12% (26% share) | kernel bench vs `iu4x2_wmma` | < 1.2x kernel |
@@ -280,3 +304,5 @@ hardware for the second time and the plan reduces to V + P.
 | ZAYA coop decode megakernel (grid.sync) | launches -77%, tok/s +3% |
 | overlay fused into the GEMM: K-loop, epilogue, group fold | all three slower (parked branches) |
 | hipGraph for decode | ~0 (ZAYA EXP-12/15) |
+| drop a lone low-weight routed expert (A3B) | ~1% of expert reads at weight < 0.05; routing is flat (rank-8 mean 0.080) |
+| run unrouted tokens through an expert to fill its queue | no benefit: a non-selected expert's weight is 0 after top-k; computing it is waste, adding it changes the model |
