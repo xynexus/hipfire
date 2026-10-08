@@ -927,12 +927,6 @@ impl Gpu {
             batch_size <= 64,
             "gemm_q8_0_batched: batch_size {batch_size} exceeds kernel MAX_BATCH=64"
         );
-        self.ensure_kernel(
-            "gemm_q8_0_batched",
-            kernels::GEMM_Q8_0_BATCHED_SRC,
-            "gemm_q8_0_batched",
-        )?;
-
         let a_ptr = a_raw.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
         let y_ptr = y.buf.as_ptr();
@@ -940,6 +934,28 @@ impl Gpu {
         let k_val = k as i32;
         let bs_val = batch_size as i32;
 
+        // Several rows: spread them over waves (bit-identical, see the kernel).
+        // One wave per output row walking every row in turn made the A3B's MoE
+        // router and shared-expert gate ~230 us each per layer at 32 rows.
+        if batch_size > 4 {
+            self.ensure_kernel(
+                "gemm_q8_0_batched",
+                kernels::GEMM_Q8_0_BATCHED_SRC,
+                "gemm_q8_0_batched_rows",
+            )?;
+            return self.launch_kernargs(
+                "gemm_q8_0_batched_rows",
+                [m as u32, batch_size.div_ceil(32) as u32, 1],
+                [256, 1, 1],
+                0,
+                &kernargs![ptr a_ptr, ptr x_ptr, ptr y_ptr, i32 m_val, i32 k_val, i32 bs_val],
+            );
+        }
+        self.ensure_kernel(
+            "gemm_q8_0_batched",
+            kernels::GEMM_Q8_0_BATCHED_SRC,
+            "gemm_q8_0_batched",
+        )?;
         self.launch_kernargs(
             "gemm_q8_0_batched",
             [m as u32, 1, 1],
