@@ -936,8 +936,10 @@ impl Gpu {
 
         // Several rows: spread them over waves (bit-identical, see the kernel).
         // One wave per output row walking every row in turn made the A3B's MoE
-        // router and shared-expert gate ~230 us each per layer at 32 rows.
-        if batch_size > 4 {
+        // router and shared-expert gate ~230 us each per layer at 32 rows -- and
+        // still ~40-50 us at the 2-4 rows of a decode step carrying n-gram
+        // drafts, where the row-split kernel takes 18-29 us.
+        if batch_size > 1 {
             self.ensure_kernel(
                 "gemm_q8_0_batched",
                 kernels::GEMM_Q8_0_BATCHED_SRC,
