@@ -42,6 +42,15 @@ fn main() {
         ("wo", 5120, 4096, 256),
         ("gate/up B=128", 17408, 5120, 128),
         ("gate/up B=512", 17408, 5120, 512),
+        // Qwen3.6-35B-A3B dense projections (hidden 2048): DeltaNet qkvz and
+        // out_proj, full-attention qkv (gated q) and o_proj, shared expert.
+        ("a3b qkvz", 12288, 2048, 512),
+        ("a3b fa qkv", 9216, 2048, 512),
+        ("a3b out/o", 2048, 4096, 512),
+        ("a3b sh gate/up", 1024, 2048, 512),
+        ("a3b qkvz B=256", 12288, 2048, 256),
+        ("a3b out/o B=256", 2048, 4096, 256),
+        ("27b wo B=512", 5120, 4096, 512),
     ] {
         let ng = k / GROUP;
         let nblk = m * ng;

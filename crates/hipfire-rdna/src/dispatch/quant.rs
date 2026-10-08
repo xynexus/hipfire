@@ -604,15 +604,15 @@ impl Gpu {
             return self.gemv_oq_compact_multicol(w_blocks, xq, xs, y, m, k, n, block_stride);
         }
         if std::env::var("HIPFIRE_OQ_COMPACT_IU4X2").as_deref() != Ok("0") {
-            // Wave64 twin, where it actually wins. Benched at the 27B shapes vs
-            // the wave32 two-pass: gate/up 1.26x, B=512 1.26x, B=128 1.47x,
-            // down 1.05x, qkv 1.05x -- but wo (K=4096) 0.75x. The wave64 recipe
-            // is N-heavy, and the second i32 accumulator set forces WNt=4 rather
-            // than the 1-pass twin's 8, which is why this lands at 1.26x and not
-            // the 1.56x the 1-pass sees. Route on K: the small-K shape loses.
-            let use_w64 = group == 256
-                && k >= 5120
-                && std::env::var("HIPFIRE_OQ_COMPACT_W64").as_deref() != Ok("0");
+            // Wave64 twin. It was gated to K >= 5120 when the 27B's wo (K=4096)
+            // measured 0.75x the wave32 two-pass; re-benched since
+            // (bench_oq_compact_iu4, GEMM only) it wins at every shape: 27B
+            // gate/up 1.62x, down 1.34x, qkv 1.26x, wo 1.01x (B=256) / 1.28x
+            // (B=512); Qwen3.6-35B-A3B qkvz 2.28x (B=512) / 3.09x (B=256),
+            // full-attention qkv 2.37x, out/o 1.23-1.26x, shared gate/up 1.27x.
+            // A3B prefill 16.9 -> 14.7 s cold (13.3K), 11.6 -> 10.3 s attached.
+            let use_w64 =
+                group == 256 && std::env::var("HIPFIRE_OQ_COMPACT_W64").as_deref() != Ok("0");
             let xt = GpuTensor {
                 buf: unsafe { self.oq_xt_batch.as_ref().unwrap().buf.alias() },
                 shape: vec![n * k],
