@@ -1953,8 +1953,26 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         assert!(n_heads % n_kv_heads == 0);
-        const KERNEL: &str = "attention_prefill_kvarn_wmma";
-        self.ensure_kernel(KERNEL, kernels::ATTENTION_PREFILL_KVARN_WMMA_SRC, KERNEL)?;
+        // KV_BITS is compiled in (it sizes the kernel's prefetch registers): 4 is
+        // the kernel as written, 2 and 8 are renamed variants.
+        let kernel: &str = match bits {
+            4 => "attention_prefill_kvarn_wmma",
+            2 => "attention_prefill_kvarn_wmma_b2",
+            8 => "attention_prefill_kvarn_wmma_b8",
+            other => panic!("attention_prefill_kvarn_wmma: KVarN bits {other} unsupported"),
+        };
+        if bits == 4 {
+            self.ensure_kernel(kernel, kernels::ATTENTION_PREFILL_KVARN_WMMA_SRC, kernel)?;
+        } else if !self.functions.contains_key(kernel) {
+            let src = format!(
+                "#define KV_BITS {bits}\n{}",
+                kernels::ATTENTION_PREFILL_KVARN_WMMA_SRC.replace(
+                    "void attention_prefill_kvarn_wmma(",
+                    &format!("void {kernel}(")
+                )
+            );
+            self.ensure_kernel(kernel, &src, kernel)?;
+        }
         const HD: usize = 256;
         // Q_lds 64x264 + K_lds 16x264 + V_T 256x24 + P 4x16x24 halfs, + maxpos.
         let lds = (64 * 264 + 16 * 264 + 256 * 24 + 4 * 16 * 24) * 2 + 16;
@@ -1971,7 +1989,7 @@ impl Gpu {
         let (b, nh, nkv) = (batch_size as i32, n_heads as i32, n_kv_heads as i32);
         let (nfb, rb, bt) = (n_full_blocks as i32, rec_bytes as i32, bits as i32);
         self.launch_kernargs(
-            KERNEL,
+            kernel,
             [n_heads as u32, batch_size.div_ceil(64) as u32, 1],
             [128, 1, 1],
             lds as u32,

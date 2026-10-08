@@ -42,6 +42,9 @@
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float __attribute__((ext_vector_type(8))) float8_t;
 
+#ifndef KV_BITS
+#define KV_BITS 4
+#endif
 namespace {
 constexpr int HD = 256;       // head_dim
 constexpr int MQ = 64;        // query rows per workgroup (4 waves x 16)
@@ -136,10 +139,15 @@ extern "C" __launch_bounds__(128, 1) __global__ void attention_prefill_kvarn_wmm
     for (int dc = 0; dc < HD / 16; dc++) O[dc] = (float8_t){0, 0, 0, 0, 0, 0, 0, 0};
 
     // KVarN record geometry.
-    const int cpb_shift = (bits == 8) ? 0 : ((bits == 4) ? 1 : 2);  // log2(8/bits)
-    const int codemask = (1 << bits) - 1;
-    const int tpw = 32 / bits;                    // codes per dword
-    const int wpd = NT / tpw;                     // dwords per dim per sub-tile (>= 1)
+    // K precision is a compile-time constant (KV_BITS; the dispatcher builds one
+    // variant per width) so the prefetch registers below are sized exactly: sized
+    // for the widest case at runtime they took the kernel to 256 VGPRs and 69
+    // spilled, slower than no prefetch at all.
+    (void)bits;
+    constexpr int cpb_shift = (KV_BITS == 8) ? 0 : ((KV_BITS == 4) ? 1 : 2);  // log2(8/bits)
+    constexpr int codemask = (1 << KV_BITS) - 1;
+    constexpr int tpw = 32 / KV_BITS;             // codes per dword
+    constexpr int wpd = NT / tpw;                 // dwords per dim per sub-tile (>= 1)
     const int off_scale = (HD * GROUP) >> cpb_shift;
     const int off_zp = off_scale + HD * 2;
     const int off_scol = off_zp + HD * 2;
@@ -147,28 +155,82 @@ extern "C" __launch_bounds__(128, 1) __global__ void attention_prefill_kvarn_wmm
     const int bph = HD / 32;
     const int v_row_stride = n_kv_heads * bph * 34;
 
+    // ── Software pipeline: sub-tile kt+NT's raw K/V is loaded into registers
+    // while sub-tile kt computes, so the global latency -- measured at about
+    // half the staging time when it sat in front of every sub-tile -- overlaps
+    // the WMMA work instead. A thread's K items are always the same channels d
+    // and the same token offset w (128 is a multiple of wpd), so a sub-tile's
+    // raw K is KMAX code words, their channels' scale/zero-point and the tpw
+    // per-token scales; its V item is one 34-byte Q8_0 block. The window tail
+    // (the last partial block) is loaded where it is used, as before.
+    // K: a thread owns DPT CONSECUTIVE channels d0.. at token offset w, so each
+    // token's DPT values leave in one vector LDS store (8 B at 4 bits) instead of
+    // DPT scattered 2-byte ones. V: a thread owns two tokens x 16 dims, so each
+    // dim's pair leaves as one 4-byte store into the dim-major V_T.
+    constexpr int DPT = HD * wpd / 128;           // K channels per thread: 4 / 2 / 8
+    typedef _Float16 __attribute__((ext_vector_type(DPT))) hvec_t;
+    const int k_w = tid % wpd;
+    const int k_d0 = (tid / wpd) * DPT;
+    // Packed: the halves ride two to a register (vector loads), not one each --
+    // unpacked they held the kernel at 256 VGPRs with spills.
+    typedef _Float16 __attribute__((ext_vector_type(tpw))) scvec_t;
+    uint32_t pk_word[DPT];
+    hvec_t pk_sa, pk_za;
+    scvec_t pk_sc;
+    const int v_hh = tid & 1;                     // which 16 dims of the block
+    const int v_b = (tid >> 1) & (bph - 1);       // 32-dim Q8_0 block
+    const int v_tp = tid >> 4;                    // token pair (2*v_tp, 2*v_tp+1)
+    uint32_t pv[2][4];                            // per token: 16 int8, 4 to a register
+    uint16_t pv_s[2];                             // per token: the block's f16 scale
+    bool pv_live[2] = {false, false};
+    auto prefetch = [&](int kt_n) {
+        const int blk_n = kt_n / GROUP;
+        if (kt_n < kv_len && blk_n < n_full_blocks) {
+            const uint8_t* rec = records + (size_t)(blk_n * n_kv_heads + kv_h) * rec_bytes;
+            const _Float16* scale_abs = (const _Float16*)(rec + off_scale);
+            const _Float16* zp_abs = (const _Float16*)(rec + off_zp);
+            const _Float16* s_col = (const _Float16*)(rec + off_scol);
+            const int t_in = kt_n - blk_n * GROUP;
+            const int t0 = t_in + k_w * tpw;
+#pragma unroll
+            for (int n = 0; n < DPT; n++)
+                pk_word[n] = *(const uint32_t*)(rec + (((k_d0 + n) * GROUP + t0) >> cpb_shift));
+            pk_sa = *(const hvec_t*)(scale_abs + k_d0);
+            pk_za = *(const hvec_t*)(zp_abs + k_d0);
+            pk_sc = *(const scvec_t*)(s_col + t0);
+        }
+#pragma unroll
+        for (int u = 0; u < 2; u++) {
+            const int tok = kt_n + 2 * v_tp + u;
+            pv_live[u] = tok < kv_len;
+            if (pv_live[u]) {
+                const uint16_t* base = (const uint16_t*)(
+                    v_cache + (size_t)tok * v_row_stride + (size_t)(kv_h * bph + v_b) * 34);
+                pv_s[u] = base[0];
+                // 2-byte aligned (34-byte blocks), so 16-bit loads, paired up.
+#pragma unroll
+                for (int e = 0; e < 4; e++)
+                    pv[u][e] = (uint32_t)base[1 + v_hh * 8 + 2 * e]
+                             | ((uint32_t)base[2 + v_hh * 8 + 2 * e] << 16);
+            }
+        }
+    };
+    prefetch(0);
+
     for (int kt = 0; kt < kv_len; kt += NT) {
         // ── Stage K (token-major f16) ──
         const int blk = kt / GROUP;               // NT divides GROUP: one block
         if (blk < n_full_blocks) {
-            const uint8_t* rec = records + (size_t)(blk * n_kv_heads + kv_h) * rec_bytes;
-            const __half* scale_abs = (const __half*)(rec + off_scale);
-            const __half* zp_abs = (const __half*)(rec + off_zp);
-            const __half* s_col = (const __half*)(rec + off_scol);
-            const int t_in = kt - blk * GROUP;
-            for (int i = tid; i < HD * wpd; i += 128) {
-                const int d = i / wpd;
-                const int w = i - d * wpd;
-                const int t0 = t_in + w * tpw;    // token within the block
-                const int idx = d * GROUP + t0;   // multiple of tpw: dword aligned
-                const uint32_t word = *(const uint32_t*)(rec + (idx >> cpb_shift));
-                const float sa = __half2float(scale_abs[d]);
-                const float za = __half2float(zp_abs[d]);
-                for (int tt = 0; tt < tpw; tt++) {
-                    const float code = (float)((word >> (tt * bits)) & codemask);
-                    const float val = (code * sa + za) * __half2float(s_col[t0 + tt]);
-                    K_lds[(w * tpw + tt) * KS + d] = (_Float16)val;
+#pragma unroll
+            for (int tt = 0; tt < tpw; tt++) {
+                const float sc = (float)pk_sc[tt];
+                hvec_t v;
+#pragma unroll
+                for (int n = 0; n < DPT; n++) {
+                    const float code = (float)((pk_word[n] >> (tt * KV_BITS)) & codemask);
+                    v[n] = (_Float16)((code * (float)pk_sa[n] + (float)pk_za[n]) * sc);
                 }
+                *(hvec_t*)(K_lds + (k_w * tpw + tt) * KS + k_d0) = v;
             }
         } else {
             const int win_base = n_full_blocks * GROUP;
@@ -185,23 +247,24 @@ extern "C" __launch_bounds__(128, 1) __global__ void attention_prefill_kvarn_wmm
                 K_lds[t * KS + d] = (_Float16)v;
             }
         }
-        // ── Stage V (Q8_0 -> f16, dim-major) ──
-        for (int i = tid; i < NT * bph; i += 128) {
-            const int t = i / bph;
-            const int b = i - t * bph;
-            const int tok = kt + t;
-            if (tok < kv_len) {
-                const unsigned char* base =
-                    v_cache + (size_t)tok * v_row_stride + (size_t)(kv_h * bph + b) * 34;
-                const float s = (float)*(const _Float16*)base;
-                const signed char* vq = (const signed char*)(base + 2);
+        // ── Stage V (Q8_0 -> f16, dim-major), from the prefetched block ──
+        {
+            const float s0 = pv_live[0] ? (float)__builtin_bit_cast(_Float16, pv_s[0]) : 0.0f;
+            const float s1 = pv_live[1] ? (float)__builtin_bit_cast(_Float16, pv_s[1]) : 0.0f;
+            _Float16* vt = V_T + (v_b * 32 + v_hh * 16) * VS + 2 * v_tp;
 #pragma unroll
-                for (int e = 0; e < 32; e++) V_T[(b * 32 + e) * VS + t] = (_Float16)(s * (float)vq[e]);
-            } else {
-#pragma unroll
-                for (int e = 0; e < 32; e++) V_T[(b * 32 + e) * VS + t] = (_Float16)0.0f;
+            for (int e = 0; e < 16; e++) {
+                const signed char q0 = (signed char)(pv[0][e >> 2] >> (8 * (e & 3)));
+                const signed char q1 = (signed char)(pv[1][e >> 2] >> (8 * (e & 3)));
+                typedef _Float16 __attribute__((ext_vector_type(2))) h2_t;
+                // A dead token's scale is 0, so its column is written as 0 (q is
+                // whatever the register held; 0 * finite stays 0 -- and the
+                // buffer is never loaded for it, so q is a stale finite byte).
+                *(h2_t*)(vt + e * VS) = (h2_t){(_Float16)(s0 * (float)q0), (_Float16)(s1 * (float)q1)};
             }
         }
+        // The next sub-tile's loads go out now; they land during this one's math.
+        prefetch(kt + NT);
         __syncthreads();
 
         // ── S = Q K^T for this wave's 16 rows x NT tokens ──
@@ -242,10 +305,19 @@ extern "C" __launch_bounds__(128, 1) __global__ void attention_prefill_kvarn_wmm
         half16_t pa;
 #pragma unroll
         for (int j = 0; j < 16; j++) pa[j] = prow[half * PS + j];
+        // alpha is exactly 1 for a row whose running max did not move -- the
+        // common case once it settles -- and then O needs no rescale.
+        bool rescale = false;
+#pragma unroll
+        for (int j = 0; j < 8; j++) rescale |= (alpha[j] != 1.0f);
+        if (rescale) {
+#pragma unroll
+            for (int dc = 0; dc < HD / 16; dc++)
+#pragma unroll
+                for (int j = 0; j < 8; j++) O[dc][j] *= alpha[j];
+        }
 #pragma unroll
         for (int dc = 0; dc < HD / 16; dc++) {
-#pragma unroll
-            for (int j = 0; j < 8; j++) O[dc][j] *= alpha[j];
             half16_t vb;
             const _Float16* vrow = V_T + (dc * 16 + half) * VS;
 #pragma unroll
