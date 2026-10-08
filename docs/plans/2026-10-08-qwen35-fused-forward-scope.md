@@ -149,6 +149,23 @@ And routing is FLAT across the top 8: renormalized weight by rank averages 0.236
 0.164, 0.132, 0.113, 0.100, 0.091, 0.085, 0.080 -- the 8th expert carries 8% of a
 token's mix, under 0.05 for only 4% of token-layers.
 
+**It changes with subject matter -- which is why the daemon takes per-session router
+histograms.** Six domains through the same A3B session (Rust GUI = egui source, Rust
+systems = CAE, Python GUI = tkinter, and model-written English / Russian / Chinese
+prose):
+
+- **Code and prose use near-disjoint experts.** Jaccard of the top-16 per layer:
+  code vs prose **0.01**; within code 0.42-0.50; within prose 0.35-0.43 (Russian and
+  English prose overlap as much as Rust GUI and Rust systems code do).
+- **A session's own profile predicts it best.** Top-12 per layer, share of the
+  session's later routed slots: own session 29-33% (code), 43-50% (prose); another
+  domain in the same cluster 22-32%; across clusters 2-3%; one pooled per-model hot set
+  18-25%. Per-session beats per-model by 1.3-2.7x.
+- **It warms up in ~256 tokens** (25-44% coverage; 64 tokens give 11-29%) and is near
+  its ceiling by 1,024 -- prefill hands decode a warm profile on any real prompt.
+- **Mixing domains in one step costs ~25-30% more experts**: union 42 / 91 / 129 at
+  B = 8 / 32 / 64 for same-domain batches against 53 / 125 / 170 for a six-domain mix.
+
 What it says:
 
 - **Per-token cost falls ~6x from B=1 to B=64.** Concurrency pays most on the MoE;
@@ -176,6 +193,16 @@ What it says:
   token never starves. (b) is limited: a token needs all 8 of its experts at every
   layer before it can move on, so waiting stalls its whole session; with the skew a
   hot expert is usually free and a cold one rarely is.
+- **Per-session histograms drive both prefetch and step composition.** The
+  daemon's per-generation router histogram (`DaemonMoeRouterHistogramGuard`, today
+  sampled because it costs two device-to-host syncs per layer per token) becomes a
+  DEVICE-resident per-session, per-layer counter updated from the top-k indices
+  already on the GPU -- no sync -- read by the prefetch item, with a host copy
+  refreshed every few steps for the scheduler. Prefetch targets the union of the
+  step's sessions' hot experts within the MALL budget. The scheduler groups sessions
+  whose profiles overlap into the same step (affinity batching: ~25-30% fewer expert
+  reads at B = 32-64 against a mixed step), still bounded by bands and the age limits
+  that keep any session from waiting.
 - **Dropping a lone low-weight expert does not pay** (measured, see "Already measured").
   Because routing is flat, a lone (token, expert) under 0.05 weight is rare: ~1% of
   expert reads saved at B = 8-64. At 0.08 it saves 7-14% but strips ~5% of the mix
@@ -206,11 +233,12 @@ for those programs, not a new model description.
   of routed experts, about the 32 MB MALL: the dense part of layer L+1 (DeltaNet /
   attention projections, shared expert, router) can be in flight while layer L's
   serial phases run. Routed experts cannot be known before their router runs, but
-  popularity is skewed and stable: the 8 hottest experts of a layer (~13 MB) cover
-  ~26% of its slots, the 12 hottest (~20 MB) ~33%, the 16 hottest ~39% -- measured
-  out of sample (hot set from one half of the tokens, hit rate on the other) -- so
-  prefetching layer L+1's hottest experts alongside its dense part turns a guess into
-  a MALL hit for about a third of the routed reads -- the
+  popularity is skewed per session: a session's own 12 hottest experts per layer
+  (~20 MB) cover 29-33% of its later routed slots on code and 43-50% on prose
+  (measured out of sample), against 18-25% for one per-model hot set -- so
+  prefetching layer L+1's hottest experts FOR THE SESSIONS IN THE STEP (their
+  per-session histograms) alongside the dense part turns a guess into a MALL hit for
+  a third to a half of the routed reads -- the
   overlap B=1 can still get when there is no batch to microbatch. Everything else
   starts the moment top-k lands.
 - **Small ops become work items, not kernels**: rmsnorm + rotate, qk-prep, conv1d,
