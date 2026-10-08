@@ -1197,6 +1197,29 @@ impl Gpu {
         bits: usize,
         row_offset: usize,
     ) -> HipResult<()> {
+        if self.kvarn_decode_wmma_ok(head_dim, bits)
+            && n_heads % n_kv_heads.max(1) == 0
+            && n_heads / n_kv_heads.max(1) <= 16
+        {
+            return self.attention_decode_kvarn_wmma_routed(
+                window_f16,
+                q,
+                rec_ptrs,
+                win_ptrs,
+                v_ptrs,
+                out,
+                row_session_indices,
+                positions,
+                ptr_layer_stride,
+                layer_index,
+                n_heads,
+                n_kv_heads,
+                max_seq,
+                batch_size,
+                bits,
+                row_offset,
+            );
+        }
         // Chunked online softmax, one workgroup per (row, KV head). It replaced
         // a whole-context kernel (scores[ctx] in LDS, one workgroup per query
         // head) that could not launch past ~15.9K positions and, measured on
@@ -1666,6 +1689,291 @@ impl Gpu {
             && kvarn_prefill_wmma_enabled()
     }
 
+    /// WGPs on this device (RDNA's HIP multiprocessor count); 20 if the query fails.
+    fn wgp_count(&self) -> usize {
+        static WGPS: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *WGPS.get_or_init(|| {
+            self.hip
+                .get_device_attribute(
+                    crate::profiler::HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT,
+                    0,
+                )
+                .ok()
+                .filter(|&v| v > 0)
+                .map_or(20, |v| v as usize)
+        })
+    }
+
+    /// attention_decode_kvarn_wmma at K width `bits` (KV_BITS is compiled in: 4 is
+    /// the source as written, 2 and 8 are renamed variants): the single-session
+    /// entry, or the routed one.
+    fn decode_kvarn_wmma_kernel(&mut self, bits: usize, routed: bool) -> HipResult<String> {
+        let base = if routed {
+            "attention_decode_kvarn_wmma_routed"
+        } else {
+            "attention_decode_kvarn_wmma"
+        };
+        if bits == 4 {
+            let module = "attention_decode_kvarn_wmma";
+            self.ensure_kernel(module, kernels::ATTENTION_DECODE_KVARN_WMMA_SRC, base)?;
+            return Ok(base.to_string());
+        }
+        assert!(
+            matches!(bits, 2 | 8),
+            "attention_decode_kvarn_wmma: KVarN bits {bits}"
+        );
+        let func = format!("{base}_b{bits}");
+        if !self.functions.contains_key(&func) {
+            let src = format!(
+                "#define KV_BITS {bits}\n{}",
+                kernels::ATTENTION_DECODE_KVARN_WMMA_SRC
+                    .replace(
+                        "void attention_decode_kvarn_wmma(",
+                        &format!("void attention_decode_kvarn_wmma_b{bits}("),
+                    )
+                    .replace(
+                        "void attention_decode_kvarn_wmma_routed(",
+                        &format!("void attention_decode_kvarn_wmma_routed_b{bits}("),
+                    )
+            );
+            self.ensure_kernel(&format!("attention_decode_kvarn_wmma_b{bits}"), &src, &func)?;
+        }
+        Ok(func)
+    }
+
+    /// The decode WMMA kernel's LDS bytes and how many of its workgroups are
+    /// resident at once. Splits are sized to one round of these: a second,
+    /// part-filled round cost more than the splits saved (on gfx1151, 20 WGPs x 3,
+    /// 72 workgroups ran 30% slower than 60). RDNA's multiprocessor count is its
+    /// WGP count, 128 KB of LDS each. HIPFIRE_KVARN_DECODE_WGS overrides the count.
+    fn decode_kvarn_wmma_lds_slots(&self) -> (usize, usize) {
+        const HD: usize = 256;
+        // Q_lds 16x264 + K_lds 16x264 + V_T 256x24 (+4 per 16-row group) + P
+        // 4x16x24 halfs, the waves' partial S tiles (4x32x8 f32), the max position.
+        let lds =
+            (16 * (HD + 8) * 2 + HD * 24 + (HD / 16) * 4 + 4 * 16 * 24) * 2 + 4 * 32 * 8 * 4 + 16;
+        let slots = std::env::var("HIPFIRE_KVARN_DECODE_WGS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| self.wgp_count() * (128 * 1024 / lds));
+        (lds, slots)
+    }
+
+    /// Multi-session decode on the GQA WMMA kernel: each of `batch_size` rows from
+    /// `row_offset` attends its own session's caches (the pointer tables of
+    /// attention_kvarn_routed_batched), one workgroup per (KV head, context split,
+    /// row) over all G query heads, then attention_flash_asym_reduce_batched.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_decode_kvarn_wmma_routed(
+        &mut self,
+        window_f16: bool,
+        q: &GpuTensor,
+        rec_ptrs: &GpuTensor,
+        win_ptrs: &GpuTensor,
+        v_ptrs: &GpuTensor,
+        out: &GpuTensor,
+        row_session_indices: &GpuTensor,
+        positions: &GpuTensor,
+        ptr_layer_stride: usize,
+        layer_index: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        max_seq: usize,
+        batch_size: usize,
+        bits: usize,
+        row_offset: usize,
+    ) -> HipResult<()> {
+        const HD: usize = 256;
+        const GROUP: usize = 128;
+        if batch_size == 0 {
+            return Ok(());
+        }
+        let kernel = self.decode_kvarn_wmma_kernel(bits, true)?;
+        let reduce = "attention_flash_asym_reduce_batched";
+        self.ensure_kernel(
+            reduce,
+            kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC,
+            reduce,
+        )?;
+        let (lds, slots) = self.decode_kvarn_wmma_lds_slots();
+        // Rows' contexts are only known on the device: split the capacity's block
+        // count, and each workgroup divides its own row's context into that many.
+        let n_splits = (slots / (n_kv_heads * batch_size)).clamp(1, max_seq.div_ceil(16).max(1));
+        let rec_bytes = HD * GROUP / (8 / bits) + HD * 2 * 2 + GROUP * 2;
+        let partials =
+            self.alloc_tensor(&[batch_size * n_heads * n_splits * (2 + HD)], DType::F32)?;
+        let p_ptr = partials.buf.as_ptr();
+        let (q_ptr, rp, wp, vp, rsi, pos) = (
+            q.buf.as_ptr(),
+            rec_ptrs.buf.as_ptr(),
+            win_ptrs.buf.as_ptr(),
+            v_ptrs.buf.as_ptr(),
+            row_session_indices.buf.as_ptr(),
+            positions.buf.as_ptr(),
+        );
+        let (pls, li, nh, nkv, rb, wf, ro) = (
+            ptr_layer_stride as i32,
+            layer_index as i32,
+            n_heads as i32,
+            n_kv_heads as i32,
+            rec_bytes as i32,
+            i32::from(window_f16),
+            row_offset as i32,
+        );
+        let scale = 1.0f32 / (HD as f32).sqrt();
+        let launched = self.launch_kernargs(
+            &kernel,
+            [n_kv_heads as u32, n_splits as u32, batch_size as u32],
+            [128, 1, 1],
+            lds as u32,
+            &kernargs![
+                ptr q_ptr, ptr rp, ptr wp, ptr vp, ptr p_ptr, ptr rsi, ptr pos,
+                i32 pls, i32 li, i32 nh, i32 nkv, f32 scale, i32 rb, i32 wf, i32 ro
+            ],
+        );
+        // Every row has exactly n_splits partials: the reduce's fixed-length mode
+        // (block_start 0, block_cols n_splits, tile_size 1) merges them all.
+        let reduced = launched.and_then(|()| {
+            let o_ptr = unsafe {
+                (out.buf.as_ptr() as *mut u8).add(row_offset * n_heads * HD * 4) as *mut c_void
+            };
+            let (hd, mt, one, zero) = (HD as i32, n_splits as i32, 1i32, 0i32);
+            self.launch_kernargs(
+                reduce,
+                [n_heads as u32, batch_size as u32, 1],
+                [32, 1, 1],
+                0,
+                &kernargs![
+                    ptr p_ptr, ptr o_ptr, ptr pos,
+                    i32 nh, i32 hd, i32 one, i32 mt, i32 ro, i32 zero, i32 mt
+                ],
+            )
+        });
+        let _ = self.free_tensor(partials);
+        reduced
+    }
+
+    /// Whether KVarN decode / verify attention takes the GQA WMMA kernel.
+    pub(crate) fn kvarn_decode_wmma_ok(&self, head_dim: usize, bits: usize) -> bool {
+        head_dim == 256
+            && matches!(bits, 2 | 4 | 8)
+            && self.arch_caps.has_wmma_w32()
+            && !matches!(
+                std::env::var("HIPFIRE_KVARN_DECODE_WMMA").as_deref(),
+                Ok("0" | "off" | "false")
+            )
+    }
+
+    /// KVarN decode / verify attention on WMMA: `batch_size` rows of ONE session
+    /// (their own positions, or a tree bias over the block
+    /// `[block_start, block_start + block_cols)`), split over the context so the
+    /// GPU fills at batch 1, then attention_flash_asym_reduce_batched merges the
+    /// splits. See attention_decode_kvarn_wmma.hip.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_decode_kvarn_wmma(
+        &mut self,
+        q: &GpuTensor,
+        records: &GpuTensor,
+        window: &GpuTensor,
+        v_cache: &GpuTensor,
+        out: &GpuTensor,
+        positions: &GpuTensor,
+        n_heads: usize,
+        n_kv_heads: usize,
+        max_ctx_len: usize,
+        batch_size: usize,
+        partials: &GpuTensor,
+        tree_bias: Option<&GpuTensor>,
+        block_start: usize,
+        block_cols: usize,
+        n_full_blocks: usize,
+        rec_bytes: usize,
+        bits: usize,
+    ) -> HipResult<()> {
+        const HD: usize = 256;
+        let kernel = self.decode_kvarn_wmma_kernel(bits, false)?;
+        let reduce = "attention_flash_asym_reduce_batched";
+        self.ensure_kernel(
+            reduce,
+            kernels::ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC,
+            reduce,
+        )?;
+
+        let g = n_heads / n_kv_heads;
+        let q_dim = n_heads * HD;
+        let stride = 2 + HD;
+        // Splits are whole 16-token sub-tiles of a workgroup's context; `cap` is
+        // how many (row, split) partials per head the caller's buffer holds.
+        let ctx_subs = max_ctx_len.div_ceil(16).max(1);
+        let cap = (partials.numel() / (n_heads * stride)).max(1);
+        let (lds, slots) = self.decode_kvarn_wmma_lds_slots();
+        let scale = 1.0f32 / (HD as f32).sqrt();
+        let win_f16 = i32::from(window.dtype == crate::DType::F16);
+        let mut offset = 0usize;
+        while offset < batch_size {
+            let left = batch_size - offset;
+            let want = slots / (n_kv_heads * (g * left).div_ceil(16));
+            let n_splits = want.clamp(1, ctx_subs).min(cap);
+            let rows = left.min(cap / n_splits);
+            let mgroups = (g * rows).div_ceil(16);
+
+            let q_ptr =
+                unsafe { (q.buf.as_ptr() as *mut u8).add(offset * q_dim * 4) as *mut c_void };
+            let pos_ptr =
+                unsafe { (positions.buf.as_ptr() as *mut u8).add(offset * 4) as *mut c_void };
+            let bias_ptr: *mut c_void = match tree_bias {
+                Some(t) => unsafe {
+                    (t.buf.as_ptr() as *mut u8).add(offset * block_cols * 4) as *mut c_void
+                },
+                None => std::ptr::null_mut(),
+            };
+            let (rec_ptr, win_ptr, v_ptr, p_ptr) = (
+                records.buf.as_ptr(),
+                window.buf.as_ptr(),
+                v_cache.buf.as_ptr(),
+                partials.buf.as_ptr(),
+            );
+            let (r_i, nh, nkv, nfb, rb) = (
+                rows as i32,
+                n_heads as i32,
+                n_kv_heads as i32,
+                n_full_blocks as i32,
+                rec_bytes as i32,
+            );
+            let (bs, bc) = (block_start as i32, block_cols as i32);
+            self.launch_kernargs(
+                &kernel,
+                [n_kv_heads as u32, n_splits as u32, mgroups as u32],
+                [128, 1, 1],
+                lds as u32,
+                &kernargs![
+                    ptr q_ptr, ptr rec_ptr, ptr win_ptr, ptr v_ptr, ptr p_ptr, ptr pos_ptr,
+                    ptr bias_ptr, i32 r_i, i32 nh, i32 nkv, f32 scale, i32 nfb, i32 rb,
+                    i32 win_f16, i32 bs, i32 bc
+                ],
+            )?;
+            let o_ptr =
+                unsafe { (out.buf.as_ptr() as *mut u8).add(offset * q_dim * 4) as *mut c_void };
+            let pos_all = positions.buf.as_ptr();
+            // Every row has exactly n_splits partials: the reduce's fixed-length
+            // mode (block_start 0, block_cols n_splits, tile_size 1) merges them
+            // all, whatever the row's position.
+            let (hd, mt, bo, one, zero) = (HD as i32, n_splits as i32, offset as i32, 1i32, 0i32);
+            self.launch_kernargs(
+                reduce,
+                [n_heads as u32, rows as u32, 1],
+                [32, 1, 1],
+                0,
+                &kernargs![
+                    ptr p_ptr, ptr o_ptr, ptr pos_all,
+                    i32 nh, i32 hd, i32 one, i32 mt, i32 bo, i32 zero, i32 mt
+                ],
+            )?;
+            offset += rows;
+        }
+        Ok(())
+    }
+
     /// Batched flash attention for Q8_0 KV cache.
     ///
     /// This is the no-LDS-cap replacement for the old per-position
@@ -1814,6 +2122,31 @@ impl Gpu {
                 n_heads,
                 n_kv_heads,
                 batch_size,
+                n_full_blocks,
+                rec_bytes,
+                bits,
+            );
+        }
+        // Decode / verify widths: the KV head's whole query group and every row on
+        // one WMMA workgroup per context split -- each K/V sub-tile dequantized
+        // once, not once per query head and row. HIPFIRE_KVARN_DECODE_WMMA=0
+        // keeps the per-head tile path below.
+        if self.kvarn_decode_wmma_ok(head_dim, bits) && n_heads % n_kv_heads.max(1) == 0 {
+            return self.attention_decode_kvarn_wmma(
+                q,
+                records,
+                window,
+                v_cache,
+                out,
+                positions,
+                n_heads,
+                n_kv_heads,
+                max_ctx_len,
+                batch_size,
+                partials,
+                tree_bias,
+                block_start,
+                block_cols,
                 n_full_blocks,
                 rec_bytes,
                 bits,

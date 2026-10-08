@@ -2867,6 +2867,12 @@ pub const ATTENTION_FLASH_KVARN_TILE_BATCHED_SRC: &str =
 /// online softmax, no partials/reduce. See attention_prefill_kvarn_wmma.hip.
 pub const ATTENTION_PREFILL_KVARN_WMMA_SRC: &str =
     include_str!("../../../kernels/src/attention_prefill_kvarn_wmma.hip");
+/// KVarN decode / verify attention on WMMA (head_dim 256): one workgroup per (KV
+/// head, context split, 64 query rows) where the rows are the KV head's query
+/// heads x the session's rows; partials for attention_flash_asym_reduce_batched.
+/// See attention_decode_kvarn_wmma.hip.
+pub const ATTENTION_DECODE_KVARN_WMMA_SRC: &str =
+    include_str!("../../../kernels/src/attention_decode_kvarn_wmma.hip");
 pub const ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_asym_reduce_batched.hip");
 

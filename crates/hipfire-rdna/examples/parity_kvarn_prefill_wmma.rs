@@ -105,7 +105,7 @@ fn main() {
         // Every KVarN K width: the kernel compiles one variant per width.
         for bits in [4usize, 2, 8] {
             if !skip(nfb, tail, rows, bits, (6, 2)) {
-                all_pass &= run_case(&mut gpu, nfb, tail, rows, bits, (6, 2));
+                all_pass &= run_case(&mut gpu, nfb, tail, rows, bits, (6, 2), false);
             }
         }
     }
@@ -118,11 +118,20 @@ fn main() {
             (8, 0, 1),
             (3, 20, 1),
             (30, 128, 4),
+            (0, 100, 1), // short context: the window only
+            (1, 40, 1),
         ] {
             for bits in [4usize, 8, 2] {
                 if !skip(nfb, tail, rows, bits, heads) {
-                    all_pass &= run_case(&mut gpu, nfb, tail, rows, bits, heads);
+                    all_pass &= run_case(&mut gpu, nfb, tail, rows, bits, heads, false);
                 }
+            }
+        }
+        // DDTree verify: the last `rows` slots are a tree block whose rows see the
+        // prefix plus their ancestors, through an additive 0 / -inf bias.
+        for &(nfb, tail, rows) in &[(104usize, 77usize, 9usize), (30, 128, 16), (3, 20, 5)] {
+            if std::env::var("PARITY_ONLY").is_err() {
+                all_pass &= run_case(&mut gpu, nfb, tail, rows, 4, heads, true);
             }
         }
     }
@@ -145,6 +154,7 @@ fn run_case(
     rows: usize,
     bits: usize,
     (n_heads, n_kv_heads): (usize, usize),
+    tree: bool,
 ) -> bool {
     let head_dim = 256usize;
     let group = 128usize;
@@ -263,14 +273,38 @@ fn run_case(
     let q: Vec<f32> = lcg(3, rows * q_dim).iter().map(|v| v * 0.5).collect();
     let kv_group = n_heads / n_kv_heads;
     let scale_attn = 1.0f64 / (head_dim as f64).sqrt();
+    // Tree rows: slot `first + c` is visible to row r when c is r or one of its
+    // ancestors in a binary tree (parent of c is (c-1)/2); the prefix always is.
+    let ancestor = |r: usize, c: usize| {
+        let mut x = r;
+        loop {
+            if x == c {
+                return true;
+            }
+            if x == 0 {
+                return false;
+            }
+            x = (x - 1) / 2;
+        }
+    };
+    let visible = |r: usize, t: usize| {
+        if tree {
+            t < first || ancestor(r, t - first)
+        } else {
+            t <= positions[r] as usize
+        }
+    };
     let mut ref_out = vec![0.0f32; rows * q_dim];
     for r in 0..rows {
-        let len = positions[r] as usize + 1;
+        let len = seq_len;
         for h in 0..n_heads {
             let kvh = h / kv_group;
             let qv = &q[r * q_dim + h * head_dim..][..head_dim];
             let sc: Vec<f64> = (0..len)
                 .map(|t| {
+                    if !visible(r, t) {
+                        return f64::NEG_INFINITY;
+                    }
                     let kt = &k_host[t * kv_dim + kvh * head_dim..][..head_dim];
                     qv.iter()
                         .zip(kt)
@@ -310,19 +344,46 @@ fn run_case(
     let partials = gpu
         .zeros(&[rows * n_heads * max_tiles * (2 + head_dim)], DType::F32)
         .unwrap();
-    // The WMMA arm calls the kernel directly: routing by row count would send a
-    // short segment (< 32 rows) to the tile path, and a prefill chunk's short
-    // head segment now takes this kernel whatever its own width.
-    let run = |gpu: &mut Gpu, wmma: bool| {
+    let bias: Vec<f32> = (0..rows * rows)
+        .map(|i| {
+            if ancestor(i / rows, i % rows) {
+                0.0
+            } else {
+                f32::NEG_INFINITY
+            }
+        })
+        .collect();
+    let biasd = gpu
+        .upload_raw(
+            &bias
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<_>>(),
+            &[rows * rows],
+        )
+        .unwrap();
+    let (tree_bias, block_start, block_cols) = if tree {
+        (Some(&biasd), first, rows)
+    } else {
+        (None, 0, 0)
+    };
+    // mode 0: per-head tile path; 1: decode WMMA (both through the decode
+    // dispatch, prefill WMMA off); 2: the prefill WMMA kernel directly -- routing
+    // by row count would send a short segment (< 32 rows) to the decode path, and
+    // a prefill chunk's short head segment takes that kernel whatever its width.
+    let call = |gpu: &mut Gpu, mode: u8, out: &hipfire_rdna::GpuTensor| {
         std::env::set_var("HIPFIRE_KVARN_PREFILL_WMMA", "0");
-        let out = gpu.zeros(&[rows * q_dim], DType::F32).unwrap();
-        if wmma {
+        std::env::set_var(
+            "HIPFIRE_KVARN_DECODE_WMMA",
+            if mode == 1 { "1" } else { "0" },
+        );
+        if mode == 2 {
             gpu.attention_prefill_kvarn_wmma(
                 &qd,
                 &rd,
                 &wd,
                 &vd,
-                &out,
+                out,
                 &posd,
                 n_heads,
                 n_kv_heads,
@@ -332,54 +393,13 @@ fn run_case(
                 bits,
             )
             .unwrap();
-            gpu.device_synchronize().unwrap();
-            return gpu.download_f32(&out).unwrap();
-        }
-        gpu.attention_flash_kvarn_batched_masked(
-            &qd,
-            &rd,
-            &wd,
-            &vd,
-            &out,
-            &posd,
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            max_seq,
-            seq_len,
-            rows,
-            &partials,
-            None,
-            0,
-            0,
-            n_full_blocks,
-            record_bytes,
-            bits,
-        )
-        .unwrap();
-        gpu.device_synchronize().unwrap();
-        gpu.download_f32(&out).unwrap()
-    };
-    let old = run(gpu, false);
-    let new = run(gpu, true);
-    let err = |x: &[f32]| {
-        x.iter()
-            .zip(&ref_out)
-            .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()))
-    };
-    // PARITY_BENCH=1: warm timing of the tile path, 30 back-to-back calls into a
-    // preallocated output -- how the decode loop runs it, unlike the single cold
-    // call above.
-    if std::env::var("PARITY_BENCH").is_ok() && rows < 32 {
-        let out = gpu.zeros(&[rows * q_dim], DType::F32).unwrap();
-        std::env::set_var("HIPFIRE_KVARN_PREFILL_WMMA", "0");
-        let call = |gpu: &mut Gpu| {
+        } else {
             gpu.attention_flash_kvarn_batched_masked(
                 &qd,
                 &rd,
                 &wd,
                 &vd,
-                &out,
+                out,
                 &posd,
                 n_heads,
                 n_kv_heads,
@@ -388,40 +408,73 @@ fn run_case(
                 seq_len,
                 rows,
                 &partials,
-                None,
-                0,
-                0,
+                tree_bias,
+                block_start,
+                block_cols,
                 n_full_blocks,
                 record_bytes,
                 bits,
             )
             .unwrap();
-        };
-        for _ in 0..5 {
-            call(gpu);
         }
+    };
+    let run = |gpu: &mut Gpu, mode: u8| {
+        let out = gpu.zeros(&[rows * q_dim], DType::F32).unwrap();
+        call(gpu, mode, &out);
         gpu.device_synchronize().unwrap();
-        let t = std::time::Instant::now();
-        for _ in 0..30 {
-            call(gpu);
-        }
-        gpu.device_synchronize().unwrap();
-        println!(
-            "    bench G={} rows={rows} seq={seq_len} bits={bits}: tile {:7.1} us",
-            n_heads / n_kv_heads,
+        gpu.download_f32(&out).unwrap()
+    };
+    let tile = run(gpu, 0);
+    let dec = run(gpu, 1);
+    // The prefill kernel has no tree bias.
+    let pre = if tree { None } else { Some(run(gpu, 2)) };
+    let err = |x: &[f32]| {
+        x.iter()
+            .zip(&ref_out)
+            .fold(0.0f32, |m, (a, b)| m.max((a - b).abs()))
+    };
+    // PARITY_BENCH=1: warm timing of the decode arms, 30 back-to-back calls into
+    // a preallocated output -- how the decode loop runs them, unlike the single
+    // cold calls above.
+    if std::env::var("PARITY_BENCH").is_ok() && rows < 32 {
+        let out = gpu.zeros(&[rows * q_dim], DType::F32).unwrap();
+        let time = |gpu: &mut Gpu, mode: u8| {
+            for _ in 0..5 {
+                call(gpu, mode, &out);
+            }
+            gpu.device_synchronize().unwrap();
+            let t = std::time::Instant::now();
+            for _ in 0..30 {
+                call(gpu, mode, &out);
+            }
+            gpu.device_synchronize().unwrap();
             t.elapsed().as_secs_f64() * 1e6 / 30.0
+        };
+        let (t_tile, t_dec) = (time(gpu, 0), time(gpu, 1));
+        println!(
+            "    bench G={} rows={rows} seq={seq_len} bits={bits}{}: tile {t_tile:7.1} us  decode-wmma {t_dec:7.1} us  ({:.2}x)",
+            n_heads / n_kv_heads,
+            if tree { " tree" } else { "" },
+            t_tile / t_dec
         );
     }
-    let (e_old, e_new) = (err(&old), err(&new));
     let ref_max = ref_out.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-    let nan = new.iter().chain(&old).any(|v| !v.is_finite());
-    // f16 Q/K/V/P in the WMMA path vs f32 in the old one: allow a few f16 ulps of
-    // the output scale.
-    // The tile path is f32 throughout: it must stay at f32 accuracy.
-    let pass = !nan && e_new < 4e-3 && e_new <= ref_max * 2e-2 && e_old <= ref_max * 1e-3;
+    let (e_tile, e_dec) = (err(&tile), err(&dec));
+    let e_pre = pre.as_deref().map_or(0.0, err);
+    let nan = tile
+        .iter()
+        .chain(&dec)
+        .chain(pre.iter().flatten())
+        .any(|v| !v.is_finite());
+    // The tile path is f32 throughout: it must stay at f32 accuracy. The WMMA
+    // kernels stage Q/K/V/P as f16: allow a few f16 ulps of the output scale.
+    let f16_ok = |e: f32| e < 4e-3 && e <= ref_max * 2e-2;
+    let pass = !nan && e_tile <= ref_max * 1e-3 && f16_ok(e_dec) && f16_ok(e_pre);
     println!(
-        "  G={} bits={bits} n_full={n_full_blocks} tail={tail_len} rows={rows} seq={seq_len}: old-vs-host={e_old:.2e} wmma-vs-host={e_new:.2e} (|ref|max {ref_max:.3}) -> {}",
+        "  G={} bits={bits} n_full={n_full_blocks} tail={tail_len} rows={rows} seq={seq_len}{}: tile={e_tile:.2e} decode-wmma={e_dec:.2e} prefill-wmma={} vs host (|ref|max {ref_max:.3}) -> {}",
         n_heads / n_kv_heads,
+        if tree { " tree" } else { "" },
+        if tree { "-".to_string() } else { format!("{e_pre:.2e}") },
         if pass { "PASS" } else { "FAIL" }
     );
     pass
