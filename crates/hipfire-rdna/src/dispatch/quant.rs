@@ -560,6 +560,7 @@ impl Gpu {
         ng: usize,
         group: usize,
         block_stride: usize,
+        a4: bool,
     ) -> HipResult<()> {
         // SMALL BATCH -> multi-column GEMV, the same routing
         // `gemm_oq_compact_grouped_wmma` already makes and for the same reason.
@@ -616,7 +617,7 @@ impl Gpu {
                 shape: vec![n * ng],
                 dtype: DType::F32,
             };
-            if oq_compact_a4() && group == 256 && oq4_act_group() == 256 {
+            if a4 && group == 256 && oq4_act_group() == 256 {
                 // W4A4. Weights are the SAME compact 4.25-bit blocks -- only the
                 // activation narrows -- so the bits/weight floor is untouched.
                 // The bulk nibble under each overlay entry is zeroed by the
@@ -757,7 +758,19 @@ impl Gpu {
             shape: vec![n * ng],
             dtype: DType::F32,
         };
-        self.compact_batched_route(w_blocks, &xq, &xs, y, m, k, n, ng, GROUP, block_stride)
+        self.compact_batched_route(
+            w_blocks,
+            &xq,
+            &xs,
+            y,
+            m,
+            k,
+            n,
+            ng,
+            GROUP,
+            block_stride,
+            oq_compact_a4_outputs(),
+        )
     }
 
     /// Compact-resident Opus W8A8 GEMM: the [`Self::gemm_oq8_grouped_wmma`] core
@@ -2643,7 +2656,19 @@ impl Gpu {
             shape: vec![n * ng],
             dtype: DType::F32,
         };
-        self.compact_batched_route(w_blocks, &xq, &xs, y, m, k, n, ng, GROUP, block_stride)
+        self.compact_batched_route(
+            w_blocks,
+            &xq,
+            &xs,
+            y,
+            m,
+            k,
+            n,
+            ng,
+            GROUP,
+            block_stride,
+            oq_compact_a4(),
+        )
     }
 
     pub fn gemm_oq8_grouped_prequant(
@@ -3046,6 +3071,17 @@ mod tests {
 /// GEMM's fold indexes the activation scale by WEIGHT group, so a finer
 /// activation group would silently misalign the two.
 fn oq_compact_a4() -> bool {
+    matches!(
+        std::env::var("HIPFIRE_OQ_COMPACT_A4").as_deref(),
+        Ok("1") | Ok("in")
+    )
+}
+
+/// `HIPFIRE_OQ_COMPACT_A4=in`: int4 activations on the INPUT projections only --
+/// the shared-quantize `gemm_oq_compact_grouped_prequant` entry (qkv, gate/up,
+/// DeltaNet in-proj) -- while the output projections (o, down, out-proj), the
+/// activation-sensitive sites, keep int8. `=1` is every site.
+fn oq_compact_a4_outputs() -> bool {
     std::env::var("HIPFIRE_OQ_COMPACT_A4").as_deref() == Ok("1")
 }
 
