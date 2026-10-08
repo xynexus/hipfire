@@ -1147,6 +1147,29 @@ impl Gpu {
         // Must match OQCO_ROWS / OQCO_BB in the kernel.
         const ROWS: usize = 32;
         const BB: usize = 128;
+        // n_ov = 3 (the 4.25-bit format): tables in SGPRs, bit-identical.
+        // HIPFIRE_OQ_OVERLAY_TR3=0 keeps the generic kernel for A/B.
+        if group == 256
+            && block_stride == 128 + 8
+            && std::env::var("HIPFIRE_OQ_OVERLAY_TR3").as_deref() != Ok("0")
+        {
+            self.ensure_kernel(
+                "oq_compact_overlay_correct_t",
+                kernels::OQ_COMPACT_OVERLAY_CORRECT_T_SRC,
+                "oq_compact_overlay_correct_tr3",
+            )?;
+            return self.launch_kernargs(
+                "oq_compact_overlay_correct_tr3",
+                [
+                    (m as u32).div_ceil(ROWS as u32),
+                    (batch_size as u32).div_ceil(BB as u32),
+                    1,
+                ],
+                [256, 1, 1],
+                0,
+                &kernargs![ptr wp, ptr xtp, ptr xstp, ptr yp, i32 mi, i32 ki, i32 bi],
+            );
+        }
         self.launch_kernargs(
             "oq_compact_overlay_correct_tr",
             [
