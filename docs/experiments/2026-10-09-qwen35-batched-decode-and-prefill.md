@@ -60,11 +60,13 @@ A3B 14.7 / 11.5 / 10.3 / 10.2 and 10.2 / 8.1 / 7.2 / 7.2;
 
 The grouped expert GEMM costs per 16-slot tile, not per token: synthetic routing at
 M=1024 K=2048 over 256 experts takes 2.6 / 2.9 / 4.3 / 7.0 ms at 8 / 16 / 32 / 64
-slots per expert -- each extra tile re-reads all 256 experts (~200 GB/s). At chunk
-1024 an expert averages ~32 slots, two tiles. A 32-slot tile that applies each
-weight load to both halves (scatter padded to 32, a kernel variant) would bring
-that to ~one tile: est. ~1 s of the 10.3 s. Launching tile-major instead (so an
-expert's tiles hit cache) measured slower (4.3 -> 5.3 ms).
+slots per expert. It is NOT the weight reads: a workgroup that takes an expert's
+tile pair and feeds each weight load to both 16-slot column sets (bit-identical)
+measured slower at every width (3.1 / 3.5 / 5.0 / 8.1 ms), as did launching
+tile-major so an expert's tiles hit cache (4.3 -> 5.3 ms). Each tile carries fixed
+work -- staging, 32 WMMAs a group per wave, and a per-row overlay epilogue -- and
+fewer, fatter workgroups only lose parallelism. Faster needs a restructure (the
+dense GEMM's wave64 tile shape), not reuse.
 
 `kvarn_quantize_tile`: hoisting its per-element `__expf` changes nothing (same
 record hash, same 50 ms / 1024 tiles) -- it is bound by its strided passes over the
