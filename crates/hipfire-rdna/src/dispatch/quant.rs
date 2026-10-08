@@ -588,8 +588,15 @@ impl Gpu {
         // ms at 16 rows, 0.408 vs 0.396 at 18, 0.443 vs 0.401 at 20; down 0.316
         // vs 0.349 / 0.428 vs 0.370 / 0.448 vs 0.373; qkv 0.143 vs 0.134 / 0.162
         // vs 0.147 / 0.174 vs 0.147. Narrow multicol was 2.95 ms at 32 rows.
+        //
+        // Those are the 27B's K (5120 / 17408). Short rows flip it: a multicol
+        // wave walks one row's groups with B accumulators, and at K <= 4096 that
+        // walk is short enough that the tile's fixed cost loses. Measured in
+        // serving (aggregate tok/s, bound 16 -> 32 for every K): Qwen3.6-35B-A3B
+        // (K 2048/4096) B=24 170 -> 200, B=32 187 -> 197; Qwen3.8-27B (K 5120+)
+        // B=24 126 -> 100, B=32 136 -> 119. So 32 below K=4096, 16 above.
         let serving_wide = self.oq_batch_serving && (k / 256) % 4 == 0;
-        let small_n = if serving_wide { 16 } else { 32 };
+        let small_n = if serving_wide && k > 4096 { 16 } else { 32 };
         if n <= small_n
             && group == 256
             && std::env::var("HIPFIRE_OQ_COMPACT_SMALL_N").as_deref() != Ok("0")
