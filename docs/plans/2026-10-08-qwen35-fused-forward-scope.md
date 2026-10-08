@@ -40,6 +40,24 @@ can reach: tiny kernels, bubbles between them, and a host stall per DFlash round
 The 27B is already at ~81% of its floor; its upside is bounded at ~1.23x and
 realistically ~1.1x.
 
+**Those decode traces start from a 15-token prompt, which understates KVarN.** At
+Corrode's depth (decode after a 13.3K-token prompt, traced):
+
+| | 27B | A3B |
+|---|---|---|
+| decode at 13.3K, untraced rate from the run | 11.3 tok/s (88 ms; **+28%** vs short) | 35.0 tok/s (28.6 ms; **+65%** vs short) |
+| KVarN attention, share of busy | **15%** | **27%** (the A3B's largest kernel) |
+| `attention_flash_kvarn_tile_batched` | 11.4% | 17.5% |
+| `attention_kvarn_routed_batched_gqa*` | 1.8% | 5.2% |
+| ideal KV bytes per verify step (4-bit K + Q8 V) | ~0.34 GB (~1.4 ms) | ~0.11 GB (~0.4 ms) |
+| traced tile-path time per token | ~9.7 ms | ~4.1 ms |
+
+DFlash verify rows (2-16 per step) sit under `KVARN_PREFILL_WMMA_MIN_ROWS` and take
+the per-row tile path, which reads K/V once per query head and per row: ~6x (27B,
+24/4 heads) and ~8x (A3B, 16/2) redundant KV reads, plus a dequant per row. The
+cost grows linearly with context, so it is the part of decode that Corrode's long
+agent prompts feel most.
+
 Top decode kernels, A3B: `moe_gate_up_k8_indexed_batched_splitk` 17%,
 `grouped_v3_splitk` 16%, `multicol_w2` (verify) 12%, `moe_down_k8_indexed_expanded`
 12%, `grouped_v3` 8.5%, `gemm_q8_0_batched` 5.6% (router / shared-expert gate).
@@ -91,6 +109,15 @@ for those programs, not a new model description.
 - **Batch rows are a parameter.** DFlash verify (2-16 rows) and batched serving
   (up to 16 rows on the wide multicol) use the same items over B columns; batched
   decode is the throughput mode Corrode runs, and the design must not assume B=1.
+- **KVarN is three kinds of item.** (1) append: the V Q8 row write and the K row into
+  the f32 window, folded into the QKV projection item that produced them; (2) flush:
+  every 128 tokens the completed window block is gathered and quantized into a 4-bit
+  record (`kvarn_gather_k_tiles` + `kvarn_quantize_tile`), an item that runs off the
+  critical path before the block is next read; (3) attend: split-K items, one per
+  (KV head, context slice), each covering ALL query heads of its group and ALL verify
+  rows, dequantizing each record tile once, merged by a reduce item. Attend items are
+  bandwidth like weights and interleave with weight streaming; at 20K context they
+  are ~4% (27B) and ~10% (A3B) of the bytes per step.
 - **DeltaNet state** (A3B 31-63 MB, 27B 75-151 MB per token at f16/f32) stays a per-head work item
   reading and writing its own state; it is bandwidth like a weight.
 
@@ -111,6 +138,10 @@ first.
   GEMM tile -- the 2·M·B f32 intermediate (71 MB per 512-row 27B chunk) is never
   stored.
 - **o / down epilogue**: residual add in the epilogue.
+- **KVarN write in the QKV epilogue**: V rows to Q8 and K rows to the window straight
+  from the projection tile, and the 128-token block flush (gather + 4-bit quantize,
+  2.3-3% of prefill today) done by the attention kernel that already has the block's
+  K in registers when it attends the segment that completes it.
 - **MoE**: fold `moe_gate_up_unscatter` / `moe_down_combine` / `rotate_x_..._indexed`
   into the grouped GEMM's prologue/epilogue.
 - **A3B dense GEMM at K=2048**: give it the tuned w64 structure (it runs the older
@@ -121,6 +152,7 @@ first.
 | # | work | buys | expected | exit | kill |
 |---|---|---|---|---|---|
 | 0 | Untraced decode accounting: per-op bytes and time per token, both models, B = 1/4/8 | the baseline every later number is judged against | -- | a per-op table | -- |
+| K0 | GQA-shared KVarN attention for verify / multi-row decode: one workgroup per (KV head, context slice) over all query heads and rows, each record tile dequantized once (extend `attention_kvarn_routed_batched_gqa*` to causal multi-row, or route verify to the WMMA kernel per KV head) | redundant KV reads | at 13.3K: 27B ~-8 ms/token (~-10%), A3B ~-3.5 ms/token (~-12%); more at depth | parity vs tile path, all verify widths, tree bias | < 5% at 13.3K |
 | V | Device-side DFlash accept loop | host round trips | A3B -10% decode time, 27B -3% | bit-identical tokens vs host loop; tok/s gain | < 5% on A3B |
 | D1 | Persistent kernel for ONE A3B MoE layer (DeltaNetMoe), counters + idle-prefetch | bubbles, tiny kernels, cross-op streaming | layer at >= 70% of its byte floor (today ~39% whole-model) | per-layer parity (cos 1.0); layer time | layer < 1.3x faster than today's 6 super-ops (ZAYA-style flat) |
 | D2 | All four layer programs, whole decode step, B in 1..16 | the rest of D | A3B 57.7 -> ~100 tok/s; 27B 14.5 -> ~16 | greedy text identical; DFlash acceptance unchanged | A3B < 80 tok/s |
@@ -128,7 +160,8 @@ first.
 | P2 | A3B K=2048 dense GEMM on the w64 structure | GEMM efficiency | A3B prefill -8..12% (26% share) | kernel bench vs `iu4x2_wmma` | < 1.2x kernel |
 | P3 | MoE route/combine folded into the grouped GEMM | MoE glue | A3B prefill -2..3% | parity | < 2% |
 
-Order: 0, V, D1 (the decisive experiment -- it either breaks ZAYA's flat result or
+Order: 0, K0 (independent of everything else and the largest sure win at depth), V,
+D1 (the decisive experiment -- it either breaks ZAYA's flat result or
 confirms it for this hardware), then D2 or stop; P1-P3 are independent and small.
 
 ## What D1 must prove that ZAYA did not
