@@ -980,7 +980,7 @@ fn fused_grouped_moe_in_custody(
                     config.paged_experts,
                     total_tokens,
                     std::env::var("HIPFIRE_PREFILL_MAX_BATCH").ok().as_deref(),
-                    qwen35::PREFILL_MAX_BATCH,
+                    qwen35::default_prefill_max_batch(config),
                 );
                 let needs_scratch = scratch
                     .prefill_batch
@@ -1127,7 +1127,7 @@ fn fused_grouped_moe_in_custody(
             config.paged_experts,
             total_tokens,
             std::env::var("HIPFIRE_PREFILL_MAX_BATCH").ok().as_deref(),
-            qwen35::PREFILL_MAX_BATCH,
+            qwen35::default_prefill_max_batch(config),
         );
         let needs_scratch = scratch
             .prefill_batch
@@ -1523,7 +1523,7 @@ fn fused_dense_in_custody(
                         .ok()
                         .and_then(|v| v.parse::<usize>().ok())
                         .filter(|&v| v >= 2)
-                        .unwrap_or(qwen35::PREFILL_MAX_BATCH)
+                        .unwrap_or(qwen35::default_prefill_max_batch(config))
                         .max(contract.total_tokens);
                     scratch.prefill_batch = Some(
                         qwen35::PrefillBatchScratch::new_without_tree_tape(gpu, config, max_batch)
@@ -1665,7 +1665,7 @@ fn fused_dense_in_custody(
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
                 .filter(|&v| v >= 2)
-                .unwrap_or(qwen35::PREFILL_MAX_BATCH)
+                .unwrap_or(qwen35::default_prefill_max_batch(config))
                 .max(contract.total_tokens);
             scratch.prefill_batch = Some(
                 qwen35::PrefillBatchScratch::new_without_tree_tape(gpu, config, max_batch)

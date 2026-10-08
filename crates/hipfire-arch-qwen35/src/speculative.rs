@@ -5835,6 +5835,13 @@ pub struct HiddenStateRingBuffer {
 }
 
 impl HiddenStateRingBuffer {
+    /// Rows one forward chunk may stage (`staging_bufs` are `[rows x hidden_dim]`).
+    pub fn staging_rows(&self) -> usize {
+        self.staging_bufs
+            .first()
+            .map_or(usize::MAX, |t| t.numel() / self.hidden_dim.max(1))
+    }
+
     /// Allocate GPU ring buffer for `num_extract` target layers.
     ///
     /// `max_batch` sizes the staging buffers used by the graph-capture path.

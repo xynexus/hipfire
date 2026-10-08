@@ -5594,6 +5594,24 @@ impl PrefillBatchScratch {
 /// on prompt seeding of long prompts).
 pub const PREFILL_MAX_BATCH: usize = 256;
 
+/// The prefill chunk a model takes when HIPFIRE_PREFILL_MAX_BATCH is unset.
+///
+/// MoE: every chunk reads each routed expert it touches, so at 256 tokens the
+/// A3B's 256 experts saw ~8 tokens each and the grouped GEMM re-read all of
+/// them per chunk -- the MoE was 48% of prefill and weight-bound. Dense models
+/// gain little from wider chunks and lose past 512. Measured, cold 13.3K-token
+/// prompt (seconds), chunk 256 / 512 / 1024 / 2048:
+///
+///     Qwen3.6-35B-A3B  cold 14.7 / 11.5 / 10.3 / 10.2   attached 10.2 / 8.1 / 7.2 / 7.2
+///     Qwen3.8-27B      cold 37.6 / 35.9 / 37.0 / 41.5   attached 26.7 / 25.0 / 25.4 / 28.2
+pub fn default_prefill_max_batch(config: &Qwen35Config) -> usize {
+    if config.num_experts > 0 {
+        1024
+    } else {
+        512
+    }
+}
+
 /// A transient FP32 copy of the DeltaNet S state, installed for the duration of
 /// the per-token prefill fallback.
 ///
@@ -6807,7 +6825,7 @@ pub fn forward_prefill_batch_with_pbs_opts(
         .ok()
         .and_then(|s| s.parse::<usize>().ok())
         .filter(|&v| v >= MIN_BATCH)
-        .unwrap_or(PREFILL_MAX_BATCH);
+        .unwrap_or(default_prefill_max_batch(config));
 
     let n = tokens.len();
     if n == 0 {
@@ -7086,7 +7104,7 @@ pub fn forward_prefill_batch_with_pbs_opts(
             for (i, &tok) in tokens.iter().enumerate() {
                 // Same rounding positions as the batched path's chunk boundaries.
                 if let Some(sh) = dn_shadow.as_ref() {
-                    if i > 0 && i % PREFILL_MAX_BATCH == 0 {
+                    if i > 0 && i % max_batch == 0 {
                         dn_fp32_shadow_chunk_boundary(gpu, sh)?;
                     }
                 }
@@ -7190,7 +7208,12 @@ pub fn forward_prefill_batch_with_pbs_opts(
                 own_pbs.as_ref().unwrap()
             }
         };
-        let chunk_batch = pbs.max_batch;
+        // A chunk's hidden rows land in the ring's staging, which a caller may
+        // have sized for fewer rows than the scratch holds: never exceed it.
+        let chunk_batch = match hidden_rb.as_deref() {
+            Some(rb) => pbs.max_batch.min(rb.staging_rows()),
+            None => pbs.max_batch,
+        };
         let mut chunk_start = 0usize;
         while chunk_start < n {
             let chunk_end = (chunk_start + chunk_batch).min(n);

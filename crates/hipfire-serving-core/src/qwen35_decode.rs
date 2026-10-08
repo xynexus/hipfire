@@ -1489,7 +1489,7 @@ pub fn qwen35_ensure_decode_prefill_batch_scratch(
             .ok()
             .and_then(|v| v.parse::<usize>().ok())
             .filter(|&v| v >= 2)
-            .unwrap_or(qwen35::PREFILL_MAX_BATCH);
+            .unwrap_or(qwen35::default_prefill_max_batch(config));
         let max_batch = configured_max.max(min_rows);
         scratch.prefill_batch = Some(
             qwen35::PrefillBatchScratch::new_without_tree_tape(gpu, config, max_batch)

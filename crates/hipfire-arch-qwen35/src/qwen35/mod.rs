@@ -765,7 +765,7 @@ impl Qwen35Scratch {
                     .ok()
                     .and_then(|v| v.parse::<usize>().ok())
                     .filter(|&v| v >= 2)
-                    .unwrap_or(PREFILL_MAX_BATCH);
+                    .unwrap_or(default_prefill_max_batch(config));
                 s.prefill_batch = Some(PrefillBatchScratch::new(gpu, config, max_batch)?);
             }
             Ok(s)
