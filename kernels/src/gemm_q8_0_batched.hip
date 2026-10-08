@@ -70,3 +70,59 @@ extern "C" __global__ void gemm_q8_0_batched(
         }
     }
 }
+
+// The same products, batch rows spread over waves: grid [M, ceil(batch / 32)],
+// block 256 -- wave w of a workgroup takes rows (blockIdx.y*32 + 4w .. +4) of
+// output row blockIdx.x. A lane accumulates each row over the K blocks in the
+// order the kernel above does, and the cross-lane fold is the same, so the
+// result is BIT-IDENTICAL to it.
+//
+// WHY: at decode widths the kernel above is one wave per output row walking
+// every K block for every batch row in turn -- the MoE router (256 x 2048) and
+// shared-expert gate (1 x 2048) of Qwen3.6-35B-A3B took ~230 us EACH per layer
+// at 32 rows, the gate as a single wave on one CU, ~10% of the decode step.
+#define ROWS_PER_WAVE 4
+extern "C" __global__ __launch_bounds__(256) void gemm_q8_0_batched_rows(
+    const unsigned char* __restrict__ A_q8,
+    const float* __restrict__ X,
+    float* __restrict__ Y,
+    int M, int K, int batch_size
+) {
+    const int row = blockIdx.x;
+    if (row >= M) return;
+    const int tid = threadIdx.x & 31;
+    const int b0 = blockIdx.y * (8 * ROWS_PER_WAVE) + (threadIdx.x >> 5) * ROWS_PER_WAVE;
+    if (b0 >= batch_size) return;
+
+    const int blocks_per_row = K / 32;
+    const unsigned char* row_data = A_q8 + (size_t)row * blocks_per_row * 34;
+
+    float sums[ROWS_PER_WAVE];
+    #pragma unroll
+    for (int b = 0; b < ROWS_PER_WAVE; b++) sums[b] = 0.0f;
+
+    for (int bi = 0; bi < blocks_per_row; bi++) {
+        const unsigned char* block = row_data + bi * 34;
+        float d = (float)*((const _Float16*)block);
+        signed char qval = (signed char)block[2 + tid];
+        float dq = d * (float)qval;
+        const int x_off = bi * 32 + tid;
+
+        #pragma unroll
+        for (int b = 0; b < ROWS_PER_WAVE; b++) {
+            if (b0 + b < batch_size) {
+                sums[b] += dq * X[(size_t)(b0 + b) * K + x_off];
+            }
+        }
+    }
+
+    #pragma unroll
+    for (int b = 0; b < ROWS_PER_WAVE; b++) {
+        if (b0 + b < batch_size) {
+            float s = sums[b];
+            for (int offset = 16; offset > 0; offset >>= 1)
+                s += __shfl_down(s, offset);
+            if (tid == 0) Y[(size_t)(b0 + b) * M + row] = s;
+        }
+    }
+}
