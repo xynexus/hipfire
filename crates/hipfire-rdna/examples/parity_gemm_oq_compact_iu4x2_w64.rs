@@ -79,6 +79,9 @@ fn main() {
         (256, 1024, 64, 3, 256),
         (512, 5120, 128, 3, 256),
         (272, 2560, 256, 7, 256),
+        // Qwen3.6-35B-A3B-like shapes (K 2048 / 4096), which take this kernel now.
+        (1024, 2048, 512, 3, 256),
+        (2048, 4096, 256, 3, 256),
     ] {
         let ng = k / group;
         let stride = 2 + group / 2 + 2 * n_out;
