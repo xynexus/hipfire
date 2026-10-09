@@ -827,39 +827,53 @@ impl Gpu {
         // Gpu::init now, and settable from config rather than env-only.
         let wide = ng_ok && (self.flags.oq_compact_multicol_wide || self.oq_batch_serving);
         if wide {
-            let entry: &str = match batch_size {
-                1 => "gemv_oq_compact_multicol_w1",
-                2 => "gemv_oq_compact_multicol_w2",
-                3 => "gemv_oq_compact_multicol_w3",
-                4 => "gemv_oq_compact_multicol_w4",
-                5 => "gemv_oq_compact_multicol_w5",
-                6 => "gemv_oq_compact_multicol_w6",
-                7 => "gemv_oq_compact_multicol_w7",
-                8 => "gemv_oq_compact_multicol_w8",
-                9 => "gemv_oq_compact_multicol_w9",
-                10 => "gemv_oq_compact_multicol_w10",
-                11 => "gemv_oq_compact_multicol_w11",
-                12 => "gemv_oq_compact_multicol_w12",
-                13 => "gemv_oq_compact_multicol_w13",
-                14 => "gemv_oq_compact_multicol_w14",
-                15 => "gemv_oq_compact_multicol_w15",
-                16 => "gemv_oq_compact_multicol_w16",
-                17 => "gemv_oq_compact_multicol_w17",
-                18 => "gemv_oq_compact_multicol_w18",
-                19 => "gemv_oq_compact_multicol_w19",
-                20 => "gemv_oq_compact_multicol_w20",
-                21 => "gemv_oq_compact_multicol_w21",
-                22 => "gemv_oq_compact_multicol_w22",
-                23 => "gemv_oq_compact_multicol_w23",
-                24 => "gemv_oq_compact_multicol_w24",
-                25 => "gemv_oq_compact_multicol_w25",
-                26 => "gemv_oq_compact_multicol_w26",
-                27 => "gemv_oq_compact_multicol_w27",
-                28 => "gemv_oq_compact_multicol_w28",
-                29 => "gemv_oq_compact_multicol_w29",
-                30 => "gemv_oq_compact_multicol_w30",
-                31 => "gemv_oq_compact_multicol_w31",
-                _ => "gemv_oq_compact_multicol_w32",
+            // One row per wave when a call has too few waves to keep loads in
+            // flight: up to 4 columns for M <= 8192, up to 8 for M <= 2048.
+            // Cold weights, % of 233 GB/s, 3 rows -> 1 row: A3B wqkv 8192x2048
+            // B=2 55 -> 79, wz 4096x2048 B=2 43 -> 66, wo 2048x4096 B=2 31 -> 48,
+            // B=8 30 -> 42; 27B wo 5120x4096 B=2 34 -> 69. Taller matrices
+            // already have the waves and lose with it (27B gate/up 17408x5120
+            // B=4 95 -> 74), as does every 8-column shape but wo's.
+            let r1 = (batch_size <= 4 && m <= 8192) || (batch_size <= 8 && m <= 2048);
+            let r1_entry;
+            let entry: &str = if r1 {
+                r1_entry = format!("gemv_oq_compact_multicol_w{batch_size}_r1");
+                &r1_entry
+            } else {
+                match batch_size {
+                    1 => "gemv_oq_compact_multicol_w1",
+                    2 => "gemv_oq_compact_multicol_w2",
+                    3 => "gemv_oq_compact_multicol_w3",
+                    4 => "gemv_oq_compact_multicol_w4",
+                    5 => "gemv_oq_compact_multicol_w5",
+                    6 => "gemv_oq_compact_multicol_w6",
+                    7 => "gemv_oq_compact_multicol_w7",
+                    8 => "gemv_oq_compact_multicol_w8",
+                    9 => "gemv_oq_compact_multicol_w9",
+                    10 => "gemv_oq_compact_multicol_w10",
+                    11 => "gemv_oq_compact_multicol_w11",
+                    12 => "gemv_oq_compact_multicol_w12",
+                    13 => "gemv_oq_compact_multicol_w13",
+                    14 => "gemv_oq_compact_multicol_w14",
+                    15 => "gemv_oq_compact_multicol_w15",
+                    16 => "gemv_oq_compact_multicol_w16",
+                    17 => "gemv_oq_compact_multicol_w17",
+                    18 => "gemv_oq_compact_multicol_w18",
+                    19 => "gemv_oq_compact_multicol_w19",
+                    20 => "gemv_oq_compact_multicol_w20",
+                    21 => "gemv_oq_compact_multicol_w21",
+                    22 => "gemv_oq_compact_multicol_w22",
+                    23 => "gemv_oq_compact_multicol_w23",
+                    24 => "gemv_oq_compact_multicol_w24",
+                    25 => "gemv_oq_compact_multicol_w25",
+                    26 => "gemv_oq_compact_multicol_w26",
+                    27 => "gemv_oq_compact_multicol_w27",
+                    28 => "gemv_oq_compact_multicol_w28",
+                    29 => "gemv_oq_compact_multicol_w29",
+                    30 => "gemv_oq_compact_multicol_w30",
+                    31 => "gemv_oq_compact_multicol_w31",
+                    _ => "gemv_oq_compact_multicol_w32",
+                }
             };
             self.ensure_kernel(
                 "gemv_oq_compact_multicol_wide",
@@ -873,10 +887,16 @@ impl Gpu {
                 y_f32.buf.as_ptr(),
             );
             let (mi, ki, bi, bs) = (m as i32, k as i32, batch_size as i32, block_stride as i32);
-            // Mirrors OQCMW_ENTRY's RW (3 up to 16, then 1). Hardcoding 3 here
-            // would launch a third of the needed waves past B=16 and silently
-            // drop rows.
-            let rw_w: u32 = if batch_size <= 16 { 3 } else { 2 };
+            // Mirrors the entry's RW (OQCMW_ENTRY_R1: 1; OQCMW_ENTRY: 3 up to 16,
+            // then 2). Hardcoding 3 here would launch a third of the needed waves
+            // and silently drop rows.
+            let rw_w: u32 = if r1 {
+                1
+            } else if batch_size <= 16 {
+                3
+            } else {
+                2
+            };
             let grid = ((m as u32).div_ceil(rw_w * 8)).clamp(1, 2048);
             return self.launch_kernargs(
                 entry,
