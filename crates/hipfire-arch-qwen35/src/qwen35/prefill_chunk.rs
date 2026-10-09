@@ -1180,13 +1180,18 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                     // compare_prefill_hidden_paths). Expand into
                     // [N x K_TOP x dim] first, then index slots directly.
                     DType::OqCompactG256 => {
-                        let x_rot_slots =
-                            pbs.moe_x_rot_expanded_batch.as_ref().expect("moe scratch");
-                        gpu.rotate_x_mq_awq_indexed_batched(
+                        // Rotate per slot and quantize to int8 in one kernel,
+                        // straight into the GEMM's activation scratch: the f32
+                        // [N x K_TOP x dim] slot buffer between them was ~870 MB
+                        // written and read back per layer at 13.3K tokens.
+                        // Bit-identical to rotate + quantize_act_oq8.
+                        let (xq, xs) = gpu.moe_act_scratch(n * k_top, gate_up_k)?;
+                        gpu.rotate_quantize_awq_indexed_batched(
                             &pbs.x_norm_batch,
                             ffn.expert_gate_up_awq_ptrs.as_ref(),
                             topk_indices,
-                            x_rot_slots,
+                            &xq,
+                            &xs,
                             gate_up_k,
                             k_top,
                             n,
@@ -1195,18 +1200,18 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                         // this shape. Path 2 runs at >= 64 rows only, so DFlash
                         // verify -- which needs the bit-exact f32 arm -- never
                         // gets here; see gemm_oq_compact_iu4x2_moe_grouped.hip.
-                        gpu.gemm_oq_compact_moe_grouped_iu8(
+                        gpu.gemm_oq_compact_moe_grouped_iu8_prequant(
                             &ffn.expert_gate_up_ptrs,
                             tile_ids,
                             sorted,
-                            x_rot_slots,
+                            &xq,
+                            &xs,
                             y_gu_grouped,
                             2 * mi,
                             gate_up_k,
                             // rows ARE flat slots now, so no division
                             1,
                             m_total,
-                            n * k_top,
                             super::prefill_batch::oq_compact_block_stride(&ffn.experts[0].gate_up)?,
                         )?;
                     }
