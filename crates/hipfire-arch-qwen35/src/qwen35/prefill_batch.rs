@@ -4096,262 +4096,292 @@ fn forward_grouped_moe_session_batch_layers(
                 let attn_is_q8 = matches!(layer.wqkv.gpu_dtype, DType::Q8_0);
                 let attn_is_mq4 = matches!(layer.wqkv.gpu_dtype, DType::MQ4G256);
                 let attn_is_mq6 = matches!(layer.wqkv.gpu_dtype, DType::MQ6G256);
-                if attn_is_mq4 || attn_is_mq6 {
-                    fused_rmsnorm_rotate_mq_batched_for(
-                        gpu,
-                        &pbs.x_batch,
-                        &layer.attn_norm,
-                        &layer.wqkv,
-                        &pbs.x_rot_batch,
-                        dim,
-                        config.norm_eps,
-                        row_count,
-                    )?;
-                } else {
-                    gpu.rmsnorm_batched(
-                        &pbs.x_batch,
-                        &layer.attn_norm,
-                        &pbs.x_rot_batch,
-                        row_count,
-                        dim,
-                        config.norm_eps,
-                    )?;
-                }
-                capture_streamed_dense_input(
+                // D1 (HIPFIRE_D1=1): the attention half as one persistent kernel.
+                // With HIPFIRE_D1_CHECK=1 it first runs on copies of the residual
+                // stream and this layer's states, then the chain runs on the real
+                // ones and the two are compared bit for bit.
+                let d1 = d1_attn_half_covers(
                     gpu,
-                    dense_capture,
-                    capture_layer_idx,
-                    hipfire_runtime::calibration::contracts::ProjectionRole::QueryInput,
-                    &pbs.x_rot_batch,
-                    row_count,
-                    dim,
-                )?;
-                if attn_is_mq4 {
-                    gpu.gemm_qkvza_hfq4g256(
-                        &layer.wqkv.buf,
-                        &layer.wz.buf,
-                        &layer.w_beta.buf,
-                        &layer.w_alpha.buf,
-                        &pbs.x_rot_batch,
-                        &pbs.dn_qkv_batch,
-                        &pbs.dn_z_batch,
-                        &pbs.dn_beta_batch,
-                        &pbs.dn_alpha_batch,
-                        layer.wqkv.m,
-                        layer.wz.m,
-                        layer.w_beta.m,
-                        layer.w_alpha.m,
-                        layer.wqkv.k,
-                        row_count,
-                    )?;
-                } else if attn_is_mq6 {
-                    gpu.gemm_qkvza_hfq6g256(
-                        &layer.wqkv.buf,
-                        &layer.wz.buf,
-                        &layer.w_beta.buf,
-                        &layer.w_alpha.buf,
-                        &pbs.x_rot_batch,
-                        &pbs.dn_qkv_batch,
-                        &pbs.dn_z_batch,
-                        &pbs.dn_beta_batch,
-                        &pbs.dn_alpha_batch,
-                        layer.wqkv.m,
-                        layer.wz.m,
-                        layer.w_beta.m,
-                        layer.w_alpha.m,
-                        layer.wqkv.k,
-                        row_count,
-                    )?;
-                } else if attn_is_q8 && q8_wmma_arch {
-                    gpu.gemm_qkvza_q8_0_wmma(
-                        &layer.wqkv.buf,
-                        &layer.wz.buf,
-                        &layer.w_beta.buf,
-                        &layer.w_alpha.buf,
-                        &pbs.x_rot_batch,
-                        &pbs.dn_qkv_batch,
-                        &pbs.dn_z_batch,
-                        &pbs.dn_beta_batch,
-                        &pbs.dn_alpha_batch,
-                        layer.wqkv.m,
-                        layer.wz.m,
-                        layer.w_beta.m,
-                        layer.w_alpha.m,
-                        layer.wqkv.k,
-                        row_count,
-                    )?;
-                } else if attn_is_q8 {
-                    hipfire_rdna::kernel_trace::record_fallback(
-                        "qwen35 prefill_batch DN qkvza: -> 4 plain Q8 GEMMs (no WMMA)",
-                        &format!(
-                            "{:?} arch={} has_wmma=false",
-                            layer.wqkv.gpu_dtype, gpu.arch
-                        ),
-                    );
-                    gpu.gemm_q8_0_batched_chunked(
-                        &layer.wqkv.buf,
-                        &pbs.x_rot_batch,
-                        &pbs.dn_qkv_batch,
-                        layer.wqkv.m,
-                        layer.wqkv.k,
-                        row_count,
-                    )?;
-                    gpu.gemm_q8_0_batched_chunked(
-                        &layer.wz.buf,
-                        &pbs.x_rot_batch,
-                        &pbs.dn_z_batch,
-                        layer.wz.m,
-                        layer.wz.k,
-                        row_count,
-                    )?;
-                    gpu.gemm_q8_0_batched_chunked(
-                        &layer.w_beta.buf,
-                        &pbs.x_rot_batch,
-                        &pbs.dn_beta_batch,
-                        layer.w_beta.m,
-                        layer.w_beta.k,
-                        row_count,
-                    )?;
-                    gpu.gemm_q8_0_batched_chunked(
-                        &layer.w_alpha.buf,
-                        &pbs.x_rot_batch,
-                        &pbs.dn_alpha_batch,
-                        layer.w_alpha.m,
-                        layer.w_alpha.k,
-                        row_count,
-                    )?;
-                } else {
-                    dense_session_prefill_gemm_full_precision(
-                        gpu,
-                        &layer.wqkv,
-                        &pbs.x_rot_batch,
-                        &pbs.dn_qkv_batch,
-                        row_count,
-                    )?;
-                    dense_session_prefill_gemm_full_precision(
-                        gpu,
-                        &layer.wz,
-                        &pbs.x_rot_batch,
-                        &pbs.dn_z_batch,
-                        row_count,
-                    )?;
-                    dense_session_prefill_gemm_full_precision(
-                        gpu,
-                        &layer.w_beta,
-                        &pbs.x_rot_batch,
-                        &pbs.dn_beta_batch,
-                        row_count,
-                    )?;
-                    dense_session_prefill_gemm_full_precision(
-                        gpu,
-                        &layer.w_alpha,
-                        &pbs.x_rot_batch,
-                        &pbs.dn_alpha_batch,
-                        row_count,
-                    )?;
-                }
-                gpu.fused_sigmoid_alpha_gate_f32_batched(
-                    &pbs.dn_beta_batch,
-                    &pbs.dn_alpha_batch,
-                    &layer.dt_bias,
-                    &layer.a_log,
-                    n_v_heads,
-                    row_count,
-                )?;
-                dense_prefill_session_batch_conv1d_silu_split_layer(
-                    gpu,
-                    device_tables,
+                    layer,
+                    config,
                     route_shape,
-                    sessions,
-                    delta_layer_idx,
-                    &pbs.dn_q_raw_batch,
-                    &pbs.dn_k_raw_batch,
-                    &pbs.dn_v_batch,
-                    &pbs.dn_qkv_batch,
-                    &layer.conv_weight,
-                    k_dim,
-                    v_dim,
+                    dense_capture.is_none(),
+                    delta_f16,
                     row_count,
-                )?;
-                gpu.fused_qk_l2_norm_scale_f32_batched(
-                    &pbs.dn_q_raw_batch,
-                    &pbs.dn_k_raw_batch,
-                    config.linear_num_key_heads,
-                    hd,
-                    1.0 / (hd as f32).sqrt(),
-                    config.norm_eps,
-                    row_count,
-                )?;
-                if config.linear_num_key_heads < n_v_heads {
-                    let ratio = n_v_heads / config.linear_num_key_heads;
-                    gpu.repeat_interleave_qk_f32_batched(
+                );
+                let d1_shadow = if d1 && d1_check() {
+                    d1_attn_half(
+                        gpu,
+                        layer,
+                        pbs,
+                        device_tables,
+                        route_shape,
+                        sessions,
+                        delta_layer_idx,
+                        row_count,
+                        config,
+                        true,
+                    )?
+                } else {
+                    None
+                };
+                if !d1 || d1_shadow.is_some() {
+                    if attn_is_mq4 || attn_is_mq6 {
+                        fused_rmsnorm_rotate_mq_batched_for(
+                            gpu,
+                            &pbs.x_batch,
+                            &layer.attn_norm,
+                            &layer.wqkv,
+                            &pbs.x_rot_batch,
+                            dim,
+                            config.norm_eps,
+                            row_count,
+                        )?;
+                    } else {
+                        gpu.rmsnorm_batched(
+                            &pbs.x_batch,
+                            &layer.attn_norm,
+                            &pbs.x_rot_batch,
+                            row_count,
+                            dim,
+                            config.norm_eps,
+                        )?;
+                    }
+                    capture_streamed_dense_input(
+                        gpu,
+                        dense_capture,
+                        capture_layer_idx,
+                        hipfire_runtime::calibration::contracts::ProjectionRole::QueryInput,
+                        &pbs.x_rot_batch,
+                        row_count,
+                        dim,
+                    )?;
+                    if attn_is_mq4 {
+                        gpu.gemm_qkvza_hfq4g256(
+                            &layer.wqkv.buf,
+                            &layer.wz.buf,
+                            &layer.w_beta.buf,
+                            &layer.w_alpha.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.dn_qkv_batch,
+                            &pbs.dn_z_batch,
+                            &pbs.dn_beta_batch,
+                            &pbs.dn_alpha_batch,
+                            layer.wqkv.m,
+                            layer.wz.m,
+                            layer.w_beta.m,
+                            layer.w_alpha.m,
+                            layer.wqkv.k,
+                            row_count,
+                        )?;
+                    } else if attn_is_mq6 {
+                        gpu.gemm_qkvza_hfq6g256(
+                            &layer.wqkv.buf,
+                            &layer.wz.buf,
+                            &layer.w_beta.buf,
+                            &layer.w_alpha.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.dn_qkv_batch,
+                            &pbs.dn_z_batch,
+                            &pbs.dn_beta_batch,
+                            &pbs.dn_alpha_batch,
+                            layer.wqkv.m,
+                            layer.wz.m,
+                            layer.w_beta.m,
+                            layer.w_alpha.m,
+                            layer.wqkv.k,
+                            row_count,
+                        )?;
+                    } else if attn_is_q8 && q8_wmma_arch {
+                        gpu.gemm_qkvza_q8_0_wmma(
+                            &layer.wqkv.buf,
+                            &layer.wz.buf,
+                            &layer.w_beta.buf,
+                            &layer.w_alpha.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.dn_qkv_batch,
+                            &pbs.dn_z_batch,
+                            &pbs.dn_beta_batch,
+                            &pbs.dn_alpha_batch,
+                            layer.wqkv.m,
+                            layer.wz.m,
+                            layer.w_beta.m,
+                            layer.w_alpha.m,
+                            layer.wqkv.k,
+                            row_count,
+                        )?;
+                    } else if attn_is_q8 {
+                        hipfire_rdna::kernel_trace::record_fallback(
+                            "qwen35 prefill_batch DN qkvza: -> 4 plain Q8 GEMMs (no WMMA)",
+                            &format!(
+                                "{:?} arch={} has_wmma=false",
+                                layer.wqkv.gpu_dtype, gpu.arch
+                            ),
+                        );
+                        gpu.gemm_q8_0_batched_chunked(
+                            &layer.wqkv.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.dn_qkv_batch,
+                            layer.wqkv.m,
+                            layer.wqkv.k,
+                            row_count,
+                        )?;
+                        gpu.gemm_q8_0_batched_chunked(
+                            &layer.wz.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.dn_z_batch,
+                            layer.wz.m,
+                            layer.wz.k,
+                            row_count,
+                        )?;
+                        gpu.gemm_q8_0_batched_chunked(
+                            &layer.w_beta.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.dn_beta_batch,
+                            layer.w_beta.m,
+                            layer.w_beta.k,
+                            row_count,
+                        )?;
+                        gpu.gemm_q8_0_batched_chunked(
+                            &layer.w_alpha.buf,
+                            &pbs.x_rot_batch,
+                            &pbs.dn_alpha_batch,
+                            layer.w_alpha.m,
+                            layer.w_alpha.k,
+                            row_count,
+                        )?;
+                    } else {
+                        dense_session_prefill_gemm_full_precision(
+                            gpu,
+                            &layer.wqkv,
+                            &pbs.x_rot_batch,
+                            &pbs.dn_qkv_batch,
+                            row_count,
+                        )?;
+                        dense_session_prefill_gemm_full_precision(
+                            gpu,
+                            &layer.wz,
+                            &pbs.x_rot_batch,
+                            &pbs.dn_z_batch,
+                            row_count,
+                        )?;
+                        dense_session_prefill_gemm_full_precision(
+                            gpu,
+                            &layer.w_beta,
+                            &pbs.x_rot_batch,
+                            &pbs.dn_beta_batch,
+                            row_count,
+                        )?;
+                        dense_session_prefill_gemm_full_precision(
+                            gpu,
+                            &layer.w_alpha,
+                            &pbs.x_rot_batch,
+                            &pbs.dn_alpha_batch,
+                            row_count,
+                        )?;
+                    }
+                    gpu.fused_sigmoid_alpha_gate_f32_batched(
+                        &pbs.dn_beta_batch,
+                        &pbs.dn_alpha_batch,
+                        &layer.dt_bias,
+                        &layer.a_log,
+                        n_v_heads,
+                        row_count,
+                    )?;
+                    dense_prefill_session_batch_conv1d_silu_split_layer(
+                        gpu,
+                        device_tables,
+                        route_shape,
+                        sessions,
+                        delta_layer_idx,
                         &pbs.dn_q_raw_batch,
                         &pbs.dn_k_raw_batch,
-                        &pbs.dn_q_batch,
-                        &pbs.dn_k_batch,
+                        &pbs.dn_v_batch,
+                        &pbs.dn_qkv_batch,
+                        &layer.conv_weight,
+                        k_dim,
+                        v_dim,
+                        row_count,
+                    )?;
+                    gpu.fused_qk_l2_norm_scale_f32_batched(
+                        &pbs.dn_q_raw_batch,
+                        &pbs.dn_k_raw_batch,
                         config.linear_num_key_heads,
-                        ratio,
                         hd,
+                        1.0 / (hd as f32).sqrt(),
+                        config.norm_eps,
                         row_count,
                     )?;
-                } else {
-                    gpu.memcpy_dtod_auto(
-                        &pbs.dn_q_batch.buf,
-                        &pbs.dn_q_raw_batch.buf,
-                        row_count * k_dim * 4,
-                    )?;
-                    gpu.memcpy_dtod_auto(
-                        &pbs.dn_k_batch.buf,
-                        &pbs.dn_k_raw_batch.buf,
-                        row_count * k_dim * 4,
-                    )?;
-                }
-                if delta_f16 {
-                    prefill_session_batch_gated_delta_net_f16_layer(
-                        gpu,
-                        device_tables,
-                        route_shape,
-                        sessions,
-                        delta_layer_idx,
-                        &pbs.dn_q_batch,
-                        &pbs.dn_k_batch,
-                        &pbs.dn_v_batch,
-                        &pbs.dn_alpha_batch,
-                        &pbs.dn_beta_batch,
+                    if config.linear_num_key_heads < n_v_heads {
+                        let ratio = n_v_heads / config.linear_num_key_heads;
+                        gpu.repeat_interleave_qk_f32_batched(
+                            &pbs.dn_q_raw_batch,
+                            &pbs.dn_k_raw_batch,
+                            &pbs.dn_q_batch,
+                            &pbs.dn_k_batch,
+                            config.linear_num_key_heads,
+                            ratio,
+                            hd,
+                            row_count,
+                        )?;
+                    } else {
+                        gpu.memcpy_dtod_auto(
+                            &pbs.dn_q_batch.buf,
+                            &pbs.dn_q_raw_batch.buf,
+                            row_count * k_dim * 4,
+                        )?;
+                        gpu.memcpy_dtod_auto(
+                            &pbs.dn_k_batch.buf,
+                            &pbs.dn_k_raw_batch.buf,
+                            row_count * k_dim * 4,
+                        )?;
+                    }
+                    if delta_f16 {
+                        prefill_session_batch_gated_delta_net_f16_layer(
+                            gpu,
+                            device_tables,
+                            route_shape,
+                            sessions,
+                            delta_layer_idx,
+                            &pbs.dn_q_batch,
+                            &pbs.dn_k_batch,
+                            &pbs.dn_v_batch,
+                            &pbs.dn_alpha_batch,
+                            &pbs.dn_beta_batch,
+                            &pbs.dn_attn_out_batch,
+                            row_count,
+                            n_v_heads,
+                            config.linear_value_head_dim,
+                        )?;
+                    } else {
+                        dense_prefill_session_batch_gated_delta_net_f32_layer(
+                            gpu,
+                            device_tables,
+                            route_shape,
+                            sessions,
+                            delta_layer_idx,
+                            &pbs.dn_q_batch,
+                            &pbs.dn_k_batch,
+                            &pbs.dn_v_batch,
+                            &pbs.dn_alpha_batch,
+                            &pbs.dn_beta_batch,
+                            &pbs.dn_attn_out_batch,
+                            row_count,
+                            n_v_heads,
+                            config.linear_value_head_dim,
+                        )?;
+                    }
+                    gpu.gated_norm_f32_batched(
                         &pbs.dn_attn_out_batch,
-                        row_count,
+                        &pbs.dn_z_batch,
+                        &layer.norm_weight,
+                        &pbs.dn_normed_batch,
                         n_v_heads,
                         config.linear_value_head_dim,
-                    )?;
-                } else {
-                    dense_prefill_session_batch_gated_delta_net_f32_layer(
-                        gpu,
-                        device_tables,
-                        route_shape,
-                        sessions,
-                        delta_layer_idx,
-                        &pbs.dn_q_batch,
-                        &pbs.dn_k_batch,
-                        &pbs.dn_v_batch,
-                        &pbs.dn_alpha_batch,
-                        &pbs.dn_beta_batch,
-                        &pbs.dn_attn_out_batch,
+                        config.norm_eps,
                         row_count,
-                        n_v_heads,
-                        config.linear_value_head_dim,
                     )?;
-                }
-                gpu.gated_norm_f32_batched(
-                    &pbs.dn_attn_out_batch,
-                    &pbs.dn_z_batch,
-                    &layer.norm_weight,
-                    &pbs.dn_normed_batch,
-                    n_v_heads,
-                    config.linear_value_head_dim,
-                    config.norm_eps,
-                    row_count,
-                )?;
-                capture_streamed_dense_input(
+                    capture_streamed_dense_input(
                     gpu,
                     dense_capture,
                     capture_layer_idx,
@@ -4360,90 +4390,118 @@ fn forward_grouped_moe_session_batch_layers(
                     row_count,
                     n_v_heads * config.linear_value_head_dim,
                 )?;
-                if matches!(layer.wo.gpu_dtype, DType::MQ4G256) {
-                    rotate_x_mq_batched_for(
-                        gpu,
-                        &layer.wo,
-                        &pbs.dn_normed_batch,
-                        &pbs.dn_normed_rot_batch,
-                        layer.wo.k,
-                        row_count,
-                    )?;
-                    gpu.gemm_hfq4g256_residual(
-                        &layer.wo.buf,
-                        &pbs.dn_normed_rot_batch,
-                        &pbs.x_batch,
-                        layer.wo.m,
-                        layer.wo.k,
-                        row_count,
-                    )?;
-                } else if matches!(layer.wo.gpu_dtype, DType::MQ6G256) {
-                    rotate_x_mq_batched_for(
-                        gpu,
-                        &layer.wo,
-                        &pbs.dn_normed_batch,
-                        &pbs.dn_normed_rot_batch,
-                        layer.wo.k,
-                        row_count,
-                    )?;
-                    gpu.gemm_hfq6g256_residual(
-                        &layer.wo.buf,
-                        &pbs.dn_normed_rot_batch,
-                        &pbs.x_batch,
-                        layer.wo.m,
-                        layer.wo.k,
-                        row_count,
-                    )?;
-                } else if matches!(layer.wo.gpu_dtype, DType::Q8_0) && q8_wmma_arch {
-                    let x_n = pbs.x_batch.sub_offset(0, row_count * layer.wo.m);
-                    gpu.gemm_q8_0_residual_wmma(
-                        &layer.wo.buf,
-                        &pbs.dn_normed_batch,
-                        &x_n,
-                        layer.wo.m,
-                        layer.wo.k,
-                        row_count,
-                    )?;
-                } else if matches!(layer.wo.gpu_dtype, DType::Q8_0) {
-                    hipfire_rdna::kernel_trace::record_fallback(
-                        "qwen35 prefill_batch DN wo: -> plain Q8 GEMM + add (no WMMA)",
-                        &format!("{:?} arch={} has_wmma=false", layer.wo.gpu_dtype, gpu.arch),
-                    );
-                    let scratch = pbs
-                        .dn_normed_rot_batch
-                        .sub_offset(0, row_count * layer.wo.m);
-                    gpu.gemm_q8_0_batched_chunked(
-                        &layer.wo.buf,
-                        &pbs.dn_normed_batch,
-                        &scratch,
-                        layer.wo.m,
-                        layer.wo.k,
-                        row_count,
-                    )?;
-                    let x_n = pbs.x_batch.sub_offset(0, row_count * layer.wo.m);
-                    gpu.add_inplace_f32(&x_n, &scratch)?;
-                } else if matches!(
-                    layer.wo.gpu_dtype,
-                    DType::F32
-                        | DType::F16
-                        | DType::BF16
-                        | DType::Raw
-                        | DType::Oq8G256
-                        | DType::OqCompactG256
-                ) {
-                    dense_session_prefill_gemm_full_precision_residual(
-                        gpu,
-                        &layer.wo,
-                        &pbs.dn_normed_batch,
-                        &pbs.x_batch,
-                        &pbs.dn_normed_rot_batch,
-                        row_count,
-                    )?;
-                } else {
-                    return Err(hip_bridge::HipError::new(
+                    if matches!(layer.wo.gpu_dtype, DType::MQ4G256) {
+                        rotate_x_mq_batched_for(
+                            gpu,
+                            &layer.wo,
+                            &pbs.dn_normed_batch,
+                            &pbs.dn_normed_rot_batch,
+                            layer.wo.k,
+                            row_count,
+                        )?;
+                        gpu.gemm_hfq4g256_residual(
+                            &layer.wo.buf,
+                            &pbs.dn_normed_rot_batch,
+                            &pbs.x_batch,
+                            layer.wo.m,
+                            layer.wo.k,
+                            row_count,
+                        )?;
+                    } else if matches!(layer.wo.gpu_dtype, DType::MQ6G256) {
+                        rotate_x_mq_batched_for(
+                            gpu,
+                            &layer.wo,
+                            &pbs.dn_normed_batch,
+                            &pbs.dn_normed_rot_batch,
+                            layer.wo.k,
+                            row_count,
+                        )?;
+                        gpu.gemm_hfq6g256_residual(
+                            &layer.wo.buf,
+                            &pbs.dn_normed_rot_batch,
+                            &pbs.x_batch,
+                            layer.wo.m,
+                            layer.wo.k,
+                            row_count,
+                        )?;
+                    } else if matches!(layer.wo.gpu_dtype, DType::Q8_0) && q8_wmma_arch {
+                        let x_n = pbs.x_batch.sub_offset(0, row_count * layer.wo.m);
+                        gpu.gemm_q8_0_residual_wmma(
+                            &layer.wo.buf,
+                            &pbs.dn_normed_batch,
+                            &x_n,
+                            layer.wo.m,
+                            layer.wo.k,
+                            row_count,
+                        )?;
+                    } else if matches!(layer.wo.gpu_dtype, DType::Q8_0) {
+                        hipfire_rdna::kernel_trace::record_fallback(
+                            "qwen35 prefill_batch DN wo: -> plain Q8 GEMM + add (no WMMA)",
+                            &format!("{:?} arch={} has_wmma=false", layer.wo.gpu_dtype, gpu.arch),
+                        );
+                        let scratch = pbs
+                            .dn_normed_rot_batch
+                            .sub_offset(0, row_count * layer.wo.m);
+                        gpu.gemm_q8_0_batched_chunked(
+                            &layer.wo.buf,
+                            &pbs.dn_normed_batch,
+                            &scratch,
+                            layer.wo.m,
+                            layer.wo.k,
+                            row_count,
+                        )?;
+                        let x_n = pbs.x_batch.sub_offset(0, row_count * layer.wo.m);
+                        gpu.add_inplace_f32(&x_n, &scratch)?;
+                    } else if matches!(
+                        layer.wo.gpu_dtype,
+                        DType::F32
+                            | DType::F16
+                            | DType::BF16
+                            | DType::Raw
+                            | DType::Oq8G256
+                            | DType::OqCompactG256
+                    ) {
+                        dense_session_prefill_gemm_full_precision_residual(
+                            gpu,
+                            &layer.wo,
+                            &pbs.dn_normed_batch,
+                            &pbs.x_batch,
+                            &pbs.dn_normed_rot_batch,
+                            row_count,
+                        )?;
+                    } else {
+                        return Err(hip_bridge::HipError::new(
                         0,
                         "grouped MoE session fused prefix encountered an unsupported DeltaNet-MoE output weight",
                     ));
+                    }
+                }
+                if let Some(shadow) = d1_shadow {
+                    d1_compare(
+                        gpu,
+                        pbs,
+                        device_tables,
+                        route_shape,
+                        sessions,
+                        delta_layer_idx,
+                        row_count,
+                        config,
+                        layer_idx,
+                        shadow,
+                    )?;
+                } else if d1 {
+                    d1_attn_half(
+                        gpu,
+                        layer,
+                        pbs,
+                        device_tables,
+                        route_shape,
+                        sessions,
+                        delta_layer_idx,
+                        row_count,
+                        config,
+                        false,
+                    )?;
                 }
                 let ctx = DispatchCtx::new(gpu);
                 prefill_moe_ffn_body_batched(
@@ -6045,6 +6103,292 @@ pub(crate) fn oq_compact_block_stride(
 // scratch first; the rotation is allocated internally (prefill is one-shot, so
 // the small per-GEMM alloc is acceptable). MQ6G256 non-residual has no batched
 // kernel yet, so those weights fall back to serial_reference via the contract.
+fn d1_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("HIPFIRE_D1").as_deref() == Ok("1"))
+}
+
+fn d1_check() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| d1_enabled() && std::env::var("HIPFIRE_D1_CHECK").as_deref() == Ok("1"))
+}
+
+/// Whether D1 covers this layer's attention half at this batch: on, not
+/// capturing calibration inputs, f16 delta-net state, head dim 128 with fewer
+/// key heads than value heads, a 4-tap conv, one pointer-table stride, and five
+/// OqCompact projections, each with an AWQ scale and taken by the wide multicol.
+fn d1_attn_half_covers(
+    gpu: &Gpu,
+    layer: &DeltaNetMoeLayerWeights,
+    config: &Qwen35Config,
+    route_shape: DensePrefillSessionStateRouteShape,
+    not_capturing: bool,
+    delta_f16: bool,
+    n: usize,
+) -> bool {
+    let ws = [
+        &layer.wqkv,
+        &layer.wz,
+        &layer.w_beta,
+        &layer.w_alpha,
+        &layer.wo,
+    ];
+    d1_enabled()
+        && not_capturing
+        && delta_f16
+        && config.linear_key_head_dim == 128
+        && config.linear_value_head_dim == 128
+        && config.linear_num_key_heads < config.linear_num_value_heads
+        && config.linear_num_value_heads % config.linear_num_key_heads == 0
+        && config.conv_kernel_dim == 4
+        && route_shape.dn_s_layers == route_shape.dn_conv_layers
+        && ws.iter().all(|w| {
+            w.gpu_dtype == DType::OqCompactG256
+                && w.awq_scale.is_some()
+                && gpu.d1_attn_in_ok(n, w.k)
+        })
+}
+
+/// A non-owning tensor over a raw device pointer (a per-session state).
+fn d1_raw(ptr: u64, bytes: usize) -> GpuTensor {
+    GpuTensor {
+        buf: unsafe { hip_bridge::DeviceBuffer::from_raw(ptr as *mut std::ffi::c_void, bytes) },
+        shape: vec![bytes],
+        dtype: DType::Raw,
+    }
+}
+
+/// This layer's per-session delta-net state and conv ring pointers.
+fn d1_state_ptrs(
+    gpu: &Gpu,
+    device_tables: &DensePrefillSessionBatchDevicePointerTables,
+    route_shape: DensePrefillSessionStateRouteShape,
+    sessions: usize,
+    delta_layer_idx: usize,
+) -> HipResult<(Vec<u64>, Vec<u64>)> {
+    let stride = route_shape.dn_s_layers;
+    let pick = |t: &GpuTensor| -> HipResult<Vec<u64>> {
+        let b = gpu.download_raw(t, sessions * stride * 8)?;
+        Ok((0..sessions)
+            .map(|s| {
+                let o = (s * stride + delta_layer_idx) * 8;
+                u64::from_le_bytes(b[o..o + 8].try_into().unwrap())
+            })
+            .collect())
+    };
+    Ok((
+        pick(&device_tables.dn_s_ptrs)?,
+        pick(&device_tables.dn_conv_ptrs)?,
+    ))
+}
+
+fn d1_state_bytes(config: &Qwen35Config) -> (usize, usize) {
+    let hd = config.linear_value_head_dim;
+    let channels = 2 * config.linear_num_key_heads * config.linear_key_head_dim
+        + config.linear_num_value_heads * hd;
+    (
+        config.linear_num_value_heads * hd * hd * 2,
+        channels * (config.conv_kernel_dim - 1) * 4,
+    )
+}
+
+/// The bytes of everything the attention half writes, in a fixed order: the
+/// scratch rows, the residual stream `x`, then each session's state and ring.
+fn d1_outputs(
+    gpu: &Gpu,
+    pbs: &PrefillBatchScratch,
+    config: &Qwen35Config,
+    n: usize,
+    x: &GpuTensor,
+    states: (&[u64], &[u64]),
+) -> HipResult<Vec<(&'static str, Vec<u8>)>> {
+    let kd = config.linear_num_key_heads * config.linear_key_head_dim;
+    let vd = config.linear_num_value_heads * config.linear_value_head_dim;
+    let nv = config.linear_num_value_heads;
+    let rows = |t: &GpuTensor, w: usize| gpu.download_raw(t, n * w * 4);
+    let mut out = vec![
+        ("xn", rows(&pbs.x_rot_batch, config.dim)?),
+        ("qkv", rows(&pbs.dn_qkv_batch, 2 * kd + vd)?),
+        ("z", rows(&pbs.dn_z_batch, vd)?),
+        ("beta", rows(&pbs.dn_beta_batch, nv)?),
+        ("alpha", rows(&pbs.dn_alpha_batch, nv)?),
+        ("q_raw", rows(&pbs.dn_q_raw_batch, kd)?),
+        ("k_raw", rows(&pbs.dn_k_raw_batch, kd)?),
+        ("v", rows(&pbs.dn_v_batch, vd)?),
+        ("q", rows(&pbs.dn_q_batch, vd)?),
+        ("k", rows(&pbs.dn_k_batch, vd)?),
+        ("attn_out", rows(&pbs.dn_attn_out_batch, vd)?),
+        ("normed", rows(&pbs.dn_normed_batch, vd)?),
+        ("x", rows(x, config.dim)?),
+    ];
+    let (s_bytes, c_bytes) = d1_state_bytes(config);
+    for (&s, &c) in states.0.iter().zip(states.1) {
+        out.push(("S", gpu.download_raw(&d1_raw(s, s_bytes), s_bytes)?));
+        out.push(("conv", gpu.download_raw(&d1_raw(c, c_bytes), c_bytes)?));
+    }
+    Ok(out)
+}
+
+/// Runs the attention half as D1. With `shadow` it runs on copies of the
+/// residual stream and of this layer's states, and returns what it wrote for
+/// `d1_compare` to hold against the chain's run on the real ones.
+#[allow(clippy::too_many_arguments)]
+fn d1_attn_half(
+    gpu: &mut Gpu,
+    layer: &DeltaNetMoeLayerWeights,
+    pbs: &PrefillBatchScratch,
+    device_tables: &DensePrefillSessionBatchDevicePointerTables,
+    route_shape: DensePrefillSessionStateRouteShape,
+    sessions: usize,
+    delta_layer_idx: usize,
+    n: usize,
+    config: &Qwen35Config,
+    shadow: bool,
+) -> HipResult<Option<Vec<(&'static str, Vec<u8>)>>> {
+    // Shadow copies: the residual rows, each session's state and ring, and
+    // pointer tables over them (one layer, so stride 1).
+    let mut copies = Vec::new();
+    let mut shadow_ptrs = (Vec::new(), Vec::new());
+    if shadow {
+        let (s_bytes, c_bytes) = d1_state_bytes(config);
+        let (s_real, c_real) =
+            d1_state_ptrs(gpu, device_tables, route_shape, sessions, delta_layer_idx)?;
+        let x = gpu.alloc_tensor(&[n * config.dim], DType::F32)?;
+        gpu.memcpy_dtod_auto(&x.buf, &pbs.x_batch.buf, n * config.dim * 4)?;
+        copies.push(x);
+        for (&s, &c) in s_real.iter().zip(&c_real) {
+            for (src, bytes, list) in [(s, s_bytes, 0), (c, c_bytes, 1)] {
+                let t = gpu.alloc_tensor(&[bytes], DType::Raw)?;
+                gpu.memcpy_dtod_auto(&t.buf, &d1_raw(src, bytes).buf, bytes)?;
+                let p = t.buf.as_ptr() as u64;
+                if list == 0 {
+                    shadow_ptrs.0.push(p);
+                } else {
+                    shadow_ptrs.1.push(p);
+                }
+                copies.push(t);
+            }
+        }
+        let bytes = |v: &[u64]| v.iter().flat_map(|p| p.to_le_bytes()).collect::<Vec<u8>>();
+        copies.push(gpu.upload_raw(&bytes(&shadow_ptrs.0), &[sessions * 8])?);
+        copies.push(gpu.upload_raw(&bytes(&shadow_ptrs.1), &[sessions * 8])?);
+    }
+    let (x, s_tab, c_tab, stride, li) = if shadow {
+        let k = copies.len();
+        (&copies[0], &copies[k - 2], &copies[k - 1], 1, 0)
+    } else {
+        (
+            &pbs.x_batch,
+            &device_tables.dn_s_ptrs,
+            &device_tables.dn_conv_ptrs,
+            route_shape.dn_s_layers,
+            delta_layer_idx,
+        )
+    };
+    let ws = [
+        &layer.wqkv,
+        &layer.wz,
+        &layer.w_beta,
+        &layer.w_alpha,
+        &layer.wo,
+    ];
+    let ys = [
+        &pbs.dn_qkv_batch,
+        &pbs.dn_z_batch,
+        &pbs.dn_beta_batch,
+        &pbs.dn_alpha_batch,
+        x,
+    ];
+    let mut proj = Vec::with_capacity(5);
+    for (w, y) in ws.iter().zip(ys) {
+        let bs = oq_compact_block_stride(w)?;
+        proj.push((&w.buf, w.awq_scale.as_ref().unwrap(), y, w.m, w.k, bs));
+    }
+    gpu.d1_dn_moe_attn_half(&hipfire_rdna::D1AttnHalf {
+        x,
+        attn_norm: &layer.attn_norm,
+        xn: &pbs.x_rot_batch,
+        proj: [proj[0], proj[1], proj[2], proj[3], proj[4]],
+        dt_bias: &layer.dt_bias,
+        a_log: &layer.a_log,
+        conv_weight: &layer.conv_weight,
+        norm_weight: &layer.norm_weight,
+        q_raw: &pbs.dn_q_raw_batch,
+        k_raw: &pbs.dn_k_raw_batch,
+        v: &pbs.dn_v_batch,
+        q: &pbs.dn_q_batch,
+        k: &pbs.dn_k_batch,
+        attn_out: &pbs.dn_attn_out_batch,
+        normed: &pbs.dn_normed_batch,
+        conv_ptrs: c_tab,
+        s_ptrs: s_tab,
+        row_session: &device_tables.row_session_indices,
+        n,
+        n_v_heads: config.linear_num_value_heads,
+        n_k_heads: config.linear_num_key_heads,
+        sessions,
+        ptr_stride: stride,
+        layer: li,
+        eps: config.norm_eps,
+    })?;
+    if !shadow {
+        return Ok(None);
+    }
+    let out = d1_outputs(
+        gpu,
+        pbs,
+        config,
+        n,
+        &copies[0],
+        (&shadow_ptrs.0, &shadow_ptrs.1),
+    )?;
+    for t in copies {
+        gpu.free_tensor(t)?;
+    }
+    Ok(Some(out))
+}
+
+/// Holds the chain's attention half, just run on the real buffers, against
+/// D1's shadow run, and reports every buffer that differs.
+#[allow(clippy::too_many_arguments)]
+fn d1_compare(
+    gpu: &mut Gpu,
+    pbs: &PrefillBatchScratch,
+    device_tables: &DensePrefillSessionBatchDevicePointerTables,
+    route_shape: DensePrefillSessionStateRouteShape,
+    sessions: usize,
+    delta_layer_idx: usize,
+    n: usize,
+    config: &Qwen35Config,
+    layer_idx: usize,
+    shadow: Vec<(&'static str, Vec<u8>)>,
+) -> HipResult<()> {
+    let (s, c) = d1_state_ptrs(gpu, device_tables, route_shape, sessions, delta_layer_idx)?;
+    let chain = d1_outputs(gpu, pbs, config, n, &pbs.x_batch, (&s, &c))?;
+    let mut bad_bufs = 0;
+    for ((name, want), (_, got)) in chain.iter().zip(&shadow) {
+        let bad = want
+            .chunks(4)
+            .zip(got.chunks(4))
+            .filter(|(a, b)| a != b)
+            .count();
+        if bad > 0 {
+            bad_bufs += 1;
+            eprintln!(
+                "[d1-check] layer {layer_idx} n={n} {name}: {bad}/{} words differ",
+                want.len() / 4
+            );
+        }
+    }
+    if bad_bufs == 0 && layer_idx < 2 {
+        eprintln!(
+            "[d1-check] layer {layer_idx} n={n} sessions={sessions}: bit-identical ({} buffers)",
+            chain.len()
+        );
+    }
+    Ok(())
+}
+
 fn dense_session_prefill_gemm_full_precision(
     gpu: &mut Gpu,
     weight: &WeightTensor,

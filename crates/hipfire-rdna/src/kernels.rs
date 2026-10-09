@@ -3221,6 +3221,9 @@ pub const ZAYA_CCA_SRC: &str = include_str!("../../../kernels/src/zaya_cca.hip")
 /// See kernels/src/zaya_megakernel.hip and
 /// docs/plans/2026-07-24-zaya-cooperative-megakernel.md.
 pub const ZAYA_MEGAKERNEL_SRC: &str = include_str!("../../../kernels/src/zaya_megakernel.hip");
+/// D1: one Qwen3.6-35B-A3B DeltaNetMoe layer as a counter-scheduled persistent
+/// kernel; compiled per row count (`#define D1_N`). See `dispatch/d1.rs`.
+pub const D1_DN_MOE_LAYER_SRC: &str = include_str!("../../../kernels/src/d1_dn_moe_layer.hip");
 
 /// LFM2 LIV double-gated short-conv, single-token decode (runtime kernel_size).
 /// Fuses the B*x pre-gate, depthwise causal conv, C*conv_out post-gate, and the

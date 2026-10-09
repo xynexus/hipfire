@@ -553,7 +553,7 @@ impl Gpu {
     /// `compact_batched_route`, the only consumer of the decision besides
     /// `quantize_act_oq8_batched_interleaved`, which skips the activation
     /// layouts only the tiled GEMM reads.
-    fn oq_compact_multicol_takes(&self, n: usize, k: usize) -> bool {
+    pub(super) fn oq_compact_multicol_takes(&self, n: usize, k: usize) -> bool {
         let serving_wide = self.oq_batch_serving && (k / 256) % 4 == 0;
         let small_n = if serving_wide && k > 4096 { 16 } else { 32 };
         n <= small_n && std::env::var("HIPFIRE_OQ_COMPACT_SMALL_N").as_deref() != Ok("0")

@@ -201,6 +201,10 @@ macro_rules! kernargs {
 mod activation;
 mod attention;
 mod conv1d;
+#[cfg(feature = "deltanet")]
+mod d1;
+#[cfg(feature = "deltanet")]
+pub use d1::D1AttnHalf;
 mod deepseek4;
 mod embedding;
 mod fused;
@@ -591,6 +595,9 @@ pub struct Gpu {
     /// `zaya_decode_megakernel_b` / `zaya_decode_megakernel_a`.
     pub zaya_megakernel_grid: Option<u32>,
     pub zaya_megakernel_a_grid: Option<u32>,
+    /// D1 persistent-layer scratch (`d1.rs`), made on first use.
+    #[cfg(feature = "deltanet")]
+    pub d1: Option<d1::D1Scratch>,
     // Opus Quant W4A4 persistent decode scratch (B=1). Hoisted out of the
     // per-projection dispatch so the forward issues ZERO hipMalloc/hipFree inside
     // the (future) hipGraph-captured region — per-call alloc would trip
@@ -1085,6 +1092,8 @@ impl Gpu {
             mq_x_rot: None,
             zaya_megakernel_grid: None,
             zaya_megakernel_a_grid: None,
+            #[cfg(feature = "deltanet")]
+            d1: None,
             oq4_xq: None,
             oq4_xs: None,
             oq4_xr: None,

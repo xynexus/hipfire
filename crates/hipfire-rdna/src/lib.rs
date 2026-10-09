@@ -25,6 +25,8 @@ pub mod profiler;
 
 pub use compiler::KernelCompiler;
 pub use dispatch::lmhead_twostage;
+#[cfg(feature = "deltanet")]
+pub use dispatch::D1AttnHalf;
 pub use dispatch::{
     gen_fwht_signs, q8hfq_row_stride, ActivationCapture, DType, Gpu, GpuTensor, OpusNpuIoLayout,
     OwnedTensor, LLOYD_MQ4_GROUP_BYTES, MMQ_CURRENT_LAYER, OQ_OVERLAY_SLACK,

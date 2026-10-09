@@ -31,7 +31,7 @@ use std::ffi::c_void;
 /// The dither is a pure function of the value's bits and the element index — no
 /// RNG, no carried state — so a snapshot still restores exactly what it saved.
 #[cfg(feature = "deltanet")]
-fn fp16_state_dither() -> bool {
+pub(super) fn fp16_state_dither() -> bool {
     static SR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     // NOT `parse_or::<bool>`: that accepts only "true"/"false", so `=0` would
     // parse as Err and silently fall back to the default — the exact trap that
