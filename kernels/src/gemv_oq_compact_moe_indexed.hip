@@ -308,6 +308,14 @@ __device__ __forceinline__ float oqc_moe_row_dot_wide(
 // 0.3%), and expert SCATTER -- forcing the 8 routed experts to be consecutive
 // allocations, same byte volume, moved 63.5 -> 59.2 us, only 6.8%. So a
 // per-layer expert-buffer consolidation is NOT worth its blast radius.
+// Also ruled out (2026-10-09): EXPERT-MAJOR batching -- only the first pair
+// routed to an expert works, serving every pair routed there, so the expert
+// leaves DRAM once per call. Bit-identical, and slower: Qwen3.6-35B-A3B shapes,
+// 8 tokens over all 256 experts gate_up 0.336 -> 0.388 ms, down 0.248 -> 0.310;
+// even 32 tokens over a 64-expert hot set (256 pairs, 63 experts) only 1.095 ->
+// 1.008 ms. Repeat reads of a shared expert already come from the 32 MB MALL, so
+// DRAM duplication is not what these kernels wait on, and serving the pairs one
+// after another in one workgroup gives up the parallelism they do need.
 __device__ __forceinline__ float oqc_moe_row_dot_wide_slice(
     const uint8_t* __restrict__ A,
     const float* __restrict__ x,
