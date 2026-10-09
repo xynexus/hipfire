@@ -324,6 +324,44 @@ fn main() {
         let s = slot_of_flat[flat];
         y_iu8[flat * m..flat * m + m].copy_from_slice(&yq_raw[s * m..s * m + m]);
     }
+    // ── arm 4b: the same GEMM writing gate / up rows itself (unscatter fused) ─
+    // Same activations (still in the scratch), so it must equal arm 4 to the bit.
+    let (g_un, u_un) = (
+        gpu.alloc_tensor(&[rows * mi], DType::F32).unwrap(),
+        gpu.alloc_tensor(&[rows * mi], DType::F32).unwrap(),
+    );
+    let (xq_s, xs_s) = gpu.moe_act_scratch(rows, k).unwrap();
+    gpu.gemm_oq_compact_moe_grouped_iu8_prequant(
+        &ptr_t,
+        &tiles_t,
+        &sorted_t,
+        &xq_s,
+        &xs_s,
+        &y_q,
+        m,
+        k,
+        1,
+        m_total,
+        block_stride,
+        Some((&g_un, &u_un)),
+    )
+    .unwrap();
+    gpu.device_synchronize().unwrap();
+    let (g_v, u_v) = (
+        gpu.download_f32(&g_un).unwrap(),
+        gpu.download_f32(&u_un).unwrap(),
+    );
+    let unscatter_diff = (0..rows)
+        .flat_map(|f| (0..m).map(move |r| (f, r)))
+        .filter(|&(f, r)| {
+            let got = if r < mi {
+                g_v[f * mi + r]
+            } else {
+                u_v[f * mi + r - mi]
+            };
+            got.to_bits() != y_iu8[f * m + r].to_bits()
+        })
+        .count();
     // Its oracle runs on the activations it actually saw -- the int8 rows and
     // per-group scales left in its scratch -- so the integer path must match to
     // f32 rounding, and anything more is an addressing or layout defect.
@@ -471,8 +509,16 @@ fn main() {
     let e_iu8 = max_rel(&oracle, &y_iu8);
     println!("  iu8grp vs its oracle: {e_iu8_q:.3e}   (same int8 activations: integer path)");
     println!("  iu8grp vs oracle    : {e_iu8:.3e}   (the int8 activation gap)");
+    println!(
+        "  iu8grp unscattered vs y_grouped: {unscatter_diff} differing values   {}",
+        if unscatter_diff == 0 {
+            "BIT-EXACT"
+        } else {
+            "MISMATCH"
+        }
+    );
     // The integer path is exact; what is left is f32 accumulation order.
-    let iu8_ok = e_iu8_q < 1e-4;
+    let iu8_ok = e_iu8_q < 1e-4 && unscatter_diff == 0;
     let ok = (!wmma_checked || (e_grp < 5e-3 && cross < 5e-3)) && exact == 0 && iu8_ok;
     println!(
         "{}",

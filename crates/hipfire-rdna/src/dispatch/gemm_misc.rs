@@ -665,6 +665,33 @@ impl Gpu {
             0,
             "gemm_oq_compact_moe_grouped_iu8: K % 256 != 0 (K={k})"
         );
+        let (xq, xs) = self.moe_act_scratch(x_src_rows, k)?;
+        self.quantize_act_oq8(x_src, &xq, &xs, x_src_rows, k, 256)?;
+        self.gemm_oq_compact_moe_grouped_iu8_prequant(
+            expert_weight_ptrs,
+            expert_tile_ids,
+            sorted_slot_index,
+            &xq,
+            &xs,
+            y_grouped,
+            m,
+            k,
+            x_row_div,
+            m_total,
+            block_stride,
+            None,
+        )
+    }
+
+    /// The grouped GEMM's int8 activation scratch for `rows` rows of `k`
+    /// (non-owning views, grown on demand): where `quantize_act_oq8` or a fused
+    /// rotate+quantize writes and [`Self::gemm_oq_compact_moe_grouped_iu8_prequant`]
+    /// reads.
+    pub fn moe_act_scratch(
+        &mut self,
+        x_src_rows: usize,
+        k: usize,
+    ) -> HipResult<(GpuTensor, GpuTensor)> {
         let (need_q, need_s) = (x_src_rows * k, x_src_rows * (k / 256));
         if self
             .moe_xq_scratch
@@ -696,7 +723,40 @@ impl Gpu {
             shape: vec![need_s],
             dtype: DType::F32,
         };
-        self.quantize_act_oq8(x_src, &xq, &xs, x_src_rows, k, 256)?;
+        Ok((xq, xs))
+    }
+
+    /// [`Self::gemm_oq_compact_moe_grouped_iu8`] on an activation already
+    /// quantized into `xq` / `xs` (from [`Self::moe_act_scratch`]). With
+    /// `unscatter = Some((gate, up))` (gate_up, `x_row_div == 1`) the epilogue
+    /// writes each slot straight to its [N x K_TOP x M/2] gate / up rows, as
+    /// `moe_gate_up_unscatter_k8` would from `y_grouped` (which is then unused):
+    /// same values, so bit-identical.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_oq_compact_moe_grouped_iu8_prequant(
+        &mut self,
+        expert_weight_ptrs: &GpuTensor,
+        expert_tile_ids: &GpuTensor,
+        sorted_slot_index: &GpuTensor,
+        xq: &GpuTensor,
+        xs: &GpuTensor,
+        y_grouped: &GpuTensor,
+        m: usize,
+        k: usize,
+        x_row_div: usize,
+        m_total: usize,
+        block_stride: usize,
+        unscatter: Option<(&GpuTensor, &GpuTensor)>,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        assert!(
+            unscatter.is_none() || x_row_div == 1,
+            "unscatter needs flat slot rows (x_row_div == 1)"
+        );
+        let (gate_ptr, up_ptr) = unscatter
+            .map_or((std::ptr::null_mut(), std::ptr::null_mut()), |(g, u)| {
+                (g.buf.as_ptr(), u.buf.as_ptr())
+            });
         let kernel_name = "gemm_oq_compact_iu4x2_moe_grouped";
         self.ensure_kernel(
             kernel_name,
@@ -732,7 +792,9 @@ impl Gpu {
                 i32 k_value,
                 i32 row_div_value,
                 i32 total_value,
-                i32 stride_value
+                i32 stride_value,
+                ptr gate_ptr,
+                ptr up_ptr
             ],
         )
     }

@@ -69,7 +69,12 @@ extern "C" __global__ void gemm_oq_compact_iu4x2_moe_grouped(
     const int8_t*             __restrict__ Xq,
     const float*              __restrict__ Xs,
     float*                    __restrict__ Y_grouped,
-    int M, int K, int x_row_div, int m_total, int block_stride
+    int M, int K, int x_row_div, int m_total, int block_stride,
+    // Non-null (gate_up, x_row_div == 1): write each slot's rows straight to
+    // their per-(token, k_rank) gate / up rows -- `moe_gate_up_unscatter_k8`'s
+    // job, done here so Y_grouped is never written and read back.
+    float*                    __restrict__ Y_gate,
+    float*                    __restrict__ Y_up
 ) {
     const int tile_y = blockIdx.y;
     const int expert = expert_tile_ids[tile_y];
@@ -180,6 +185,17 @@ extern "C" __global__ void gemm_oq_compact_iu4x2_moe_grouped(
     const int xr = xrow_s[lane];
     if (row_start >= M || xr < 0) return;
     const int slot = slot_start + lane;
+    if (Y_gate != nullptr) {
+        // xr is the slot's flat (token * K_TOP + k_rank) index here.
+        const int mi = M >> 1;
+        #pragma unroll
+        for (int j = 0; j < 8; ++j) {
+            const int m_row = row_start + 2 * j + half;
+            if (m_row < mi) Y_gate[(long long)xr * mi + m_row] = facc[j];
+            else if (m_row < M) Y_up[(long long)xr * mi + (m_row - mi)] = facc[j];
+        }
+        return;
+    }
     #pragma unroll
     for (int j = 0; j < 8; ++j) {
         const int m_row = row_start + 2 * j + half;

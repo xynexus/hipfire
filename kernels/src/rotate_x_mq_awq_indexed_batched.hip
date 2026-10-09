@@ -3,6 +3,7 @@
 // hipfire — see LICENSE and NOTICE in the project root.
 
 #include <hip/hip_runtime.h>
+#include <stdint.h>
 
 // Per-EXPERT AWQ rotate for the indexed MoE path. Derived from
 // `rotate_x_mq_awq` (same FWHT, same normalisation); the only difference is
@@ -135,4 +136,135 @@ __global__ void rotate_x_mq_awq_indexed_batched(
     x_out_b[base + 5] = v5 * s * signs2[d0 + 5];
     x_out_b[base + 6] = v6 * s * signs2[d0 + 6];
     x_out_b[base + 7] = v7 * s * signs2[d0 + 7];
+}
+
+
+// FUSED rotate + int8 quantize for the grouped (W4A8) routed-expert GEMM:
+// `rotate_x_mq_awq_indexed_batched` followed by `quantize_act_oq8` (group 256),
+// without the f32 slot buffer between them -- at a 13.3K-token A3B prefill that
+// buffer is [N*K_TOP x 2048] f32, ~870 MB written and read back per layer.
+// Same arithmetic in the same order: the rotate is this file's kernel verbatim,
+// and a rotate lane holds exactly the eight elements its quantize lane reads, so
+// Xq/Xs are bit-identical to the two-kernel chain
+// (examples/parity_rotate_quantize_indexed).
+//
+//   xq_out [N*K_TOP x K] int8    xs_out [N*K_TOP x K/256] f32
+extern "C" __launch_bounds__(32, 16)
+__global__ void rotate_quantize_awq_indexed_batched(
+    const float* __restrict__ x_in,
+    const unsigned long long* __restrict__ expert_awq_ptrs,
+    const int* __restrict__ topk_indices,
+    int8_t* __restrict__ xq_out,
+    float* __restrict__ xs_out,
+    const float* __restrict__ signs1,
+    const float* __restrict__ signs2,
+    int K,
+    int K_TOP
+) {
+    const int group = blockIdx.x;
+    const int tid = threadIdx.x;
+    const int groups_total = K / 256;
+    if (group >= groups_total) return;
+
+    const int slot = blockIdx.y;          // token * K_TOP + krank
+    const int token = slot / K_TOP;
+
+    // Input is shared across kranks (every routed expert consumes the same
+    // post-rmsnorm x); only the scale and the destination differ.
+    const float* __restrict__ x_in_b = x_in + (long long)token * K;
+    const float* __restrict__ awq =
+        expert_awq_ptrs == nullptr
+            ? nullptr
+            : reinterpret_cast<const float*>(expert_awq_ptrs[topk_indices[slot]]);
+
+    int d0 = tid * 8;
+    int base = group * 256 + d0;
+
+    // AWQ divide BEFORE the FWHT — see rotate_x_mq_awq.hip. awq is indexed in
+    // the unrotated x basis.
+    float v0, v1, v2, v3, v4, v5, v6, v7;
+    if (awq != nullptr) {
+        v0 = (x_in_b[base    ] / awq[base    ]) * signs1[d0    ];
+        v1 = (x_in_b[base + 1] / awq[base + 1]) * signs1[d0 + 1];
+        v2 = (x_in_b[base + 2] / awq[base + 2]) * signs1[d0 + 2];
+        v3 = (x_in_b[base + 3] / awq[base + 3]) * signs1[d0 + 3];
+        v4 = (x_in_b[base + 4] / awq[base + 4]) * signs1[d0 + 4];
+        v5 = (x_in_b[base + 5] / awq[base + 5]) * signs1[d0 + 5];
+        v6 = (x_in_b[base + 6] / awq[base + 6]) * signs1[d0 + 6];
+        v7 = (x_in_b[base + 7] / awq[base + 7]) * signs1[d0 + 7];
+    } else {
+        v0 = x_in_b[base    ] * signs1[d0    ];
+        v1 = x_in_b[base + 1] * signs1[d0 + 1];
+        v2 = x_in_b[base + 2] * signs1[d0 + 2];
+        v3 = x_in_b[base + 3] * signs1[d0 + 3];
+        v4 = x_in_b[base + 4] * signs1[d0 + 4];
+        v5 = x_in_b[base + 5] * signs1[d0 + 5];
+        v6 = x_in_b[base + 6] * signs1[d0 + 6];
+        v7 = x_in_b[base + 7] * signs1[d0 + 7];
+    }
+
+    // Local butterfly: strides 1, 2, 4
+    float t;
+    t = v0; v0 = v0 + v1; v1 = t - v1;
+    t = v2; v2 = v2 + v3; v3 = t - v3;
+    t = v4; v4 = v4 + v5; v5 = t - v5;
+    t = v6; v6 = v6 + v7; v7 = t - v7;
+
+    t = v0; v0 = v0 + v2; v2 = t - v2;
+    t = v1; v1 = v1 + v3; v3 = t - v3;
+    t = v4; v4 = v4 + v6; v6 = t - v6;
+    t = v5; v5 = v5 + v7; v7 = t - v7;
+
+    t = v0; v0 = v0 + v4; v4 = t - v4;
+    t = v1; v1 = v1 + v5; v5 = t - v5;
+    t = v2; v2 = v2 + v6; v6 = t - v6;
+    t = v3; v3 = v3 + v7; v7 = t - v7;
+
+    // Wave butterfly: strides 1-16 in thread space via ds_swizzle.
+    #define HBFLY(v, pat, str) do { \
+        float _p = __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(v), (pat))); \
+        if (tid & (str)) { (v) = _p - (v); } else { (v) = (v) + _p; } \
+    } while(0)
+
+    #define HBFLY8(pat, str) \
+        HBFLY(v0,pat,str); HBFLY(v1,pat,str); HBFLY(v2,pat,str); HBFLY(v3,pat,str); \
+        HBFLY(v4,pat,str); HBFLY(v5,pat,str); HBFLY(v6,pat,str); HBFLY(v7,pat,str)
+
+    HBFLY8(0x041F, 1);
+    HBFLY8(0x081F, 2);
+    HBFLY8(0x101F, 4);
+    HBFLY8(0x201F, 8);
+    HBFLY8(0x401F, 16);
+    #undef HBFLY8
+    #undef HBFLY
+
+    const float s = 0.0625f;
+    float r[8];
+    r[0] = v0 * s * signs2[d0    ];
+    r[1] = v1 * s * signs2[d0 + 1];
+    r[2] = v2 * s * signs2[d0 + 2];
+    r[3] = v3 * s * signs2[d0 + 3];
+    r[4] = v4 * s * signs2[d0 + 4];
+    r[5] = v5 * s * signs2[d0 + 5];
+    r[6] = v6 * s * signs2[d0 + 6];
+    r[7] = v7 * s * signs2[d0 + 7];
+
+    // quantize_act_oq8 (group 256), from registers: its lane L reads elements
+    // 8L..8L+7 of the group, which is exactly what this lane holds.
+    const int lane = tid;
+    const int per_lane = 8;
+    float amax = 0.0f;
+    for (int i = 0; i < per_lane; ++i) amax = fmaxf(amax, fabsf(r[i]));
+    for (int off = 16; off > 0; off >>= 1) amax = fmaxf(amax, __shfl_down(amax, off));
+    amax = __shfl(amax, 0);
+    const float scale = (amax > 0.0f) ? (amax / 127.0f) : 1.0f;
+    const float inv = (amax > 0.0f) ? (127.0f / amax) : 0.0f;
+    if (lane == 0) xs_out[(long long)slot * groups_total + group] = scale;
+    int8_t* out = xq_out + (long long)slot * K + (long long)group * 256;
+    for (int i = 0; i < per_lane; ++i) {
+        const int idx = lane * per_lane + i;
+        int q = (int)lroundf(r[i] * inv);
+        q = max(-127, min(127, q));
+        out[idx] = (int8_t)q;
+    }
 }

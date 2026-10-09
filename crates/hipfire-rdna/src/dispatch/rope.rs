@@ -256,6 +256,59 @@ impl Gpu {
         result
     }
 
+    /// [`Self::rotate_x_mq_awq_indexed_batched`] and `quantize_act_oq8` (group
+    /// 256) in one kernel, writing the int8 activation and its scales straight
+    /// into `xq` / `xs` (rows = N*K_TOP slots) with no f32 slot buffer between.
+    /// Bit-identical to the two-kernel chain.
+    #[allow(clippy::too_many_arguments)]
+    pub fn rotate_quantize_awq_indexed_batched(
+        &mut self,
+        x: &GpuTensor,
+        expert_awq_ptrs: Option<&GpuTensor>,
+        topk_indices: &GpuTensor,
+        xq: &GpuTensor,
+        xs: &GpuTensor,
+        k: usize,
+        k_top: usize,
+        n_tokens: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        self.ensure_kernel(
+            "rotate_x_mq_awq_indexed_batched",
+            kernels::ROTATE_X_MQ_AWQ_INDEXED_BATCHED_SRC,
+            "rotate_quantize_awq_indexed_batched",
+        )?;
+        let s1 = self.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2 = self.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let n_groups = super::fwht_groups(k)?;
+        let slots = (n_tokens * k_top) as u32;
+        let xp = x.buf.as_ptr();
+        let ap = expert_awq_ptrs.map_or(std::ptr::null_mut(), |t| t.buf.as_ptr());
+        let ip = topk_indices.buf.as_ptr();
+        let (qp, sp) = (xq.buf.as_ptr(), xs.buf.as_ptr());
+        let kv = k as i32;
+        let ktv = k_top as i32;
+        let bytes = (k * 4 + k + 2 * 256 * 4) * n_tokens * k_top;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "fwht",
+            "rotate_quantize_awq_indexed_batched",
+            bytes,
+        );
+        let result = self.launch_kernargs(
+            "rotate_quantize_awq_indexed_batched",
+            [n_groups, slots, 1],
+            [32, 1, 1],
+            0,
+            &kernargs![ptr xp, ptr ap, ptr ip, ptr qp, ptr sp, ptr s1, ptr s2, i32 kv, i32 ktv],
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     pub fn rotate_x_mq_awq_batched(
         &mut self,
         x: &GpuTensor,
