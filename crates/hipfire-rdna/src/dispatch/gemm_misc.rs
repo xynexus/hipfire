@@ -679,6 +679,7 @@ impl Gpu {
             x_row_div,
             m_total,
             block_stride,
+            None,
         )
     }
 
@@ -726,7 +727,11 @@ impl Gpu {
     }
 
     /// [`Self::gemm_oq_compact_moe_grouped_iu8`] on an activation already
-    /// quantized into `xq` / `xs` (from [`Self::moe_act_scratch`]).
+    /// quantized into `xq` / `xs` (from [`Self::moe_act_scratch`]). With
+    /// `unscatter = Some((gate, up))` (gate_up, `x_row_div == 1`) the epilogue
+    /// writes each slot straight to its [N x K_TOP x M/2] gate / up rows, as
+    /// `moe_gate_up_unscatter_k8` would from `y_grouped` (which is then unused):
+    /// same values, so bit-identical.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_oq_compact_moe_grouped_iu8_prequant(
         &mut self,
@@ -741,8 +746,17 @@ impl Gpu {
         x_row_div: usize,
         m_total: usize,
         block_stride: usize,
+        unscatter: Option<(&GpuTensor, &GpuTensor)>,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        assert!(
+            unscatter.is_none() || x_row_div == 1,
+            "unscatter needs flat slot rows (x_row_div == 1)"
+        );
+        let (gate_ptr, up_ptr) = unscatter
+            .map_or((std::ptr::null_mut(), std::ptr::null_mut()), |(g, u)| {
+                (g.buf.as_ptr(), u.buf.as_ptr())
+            });
         let kernel_name = "gemm_oq_compact_iu4x2_moe_grouped";
         self.ensure_kernel(
             kernel_name,
@@ -778,7 +792,9 @@ impl Gpu {
                 i32 k_value,
                 i32 row_div_value,
                 i32 total_value,
-                i32 stride_value
+                i32 stride_value,
+                ptr gate_ptr,
+                ptr up_ptr
             ],
         )
     }

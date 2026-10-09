@@ -1213,6 +1213,9 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                             1,
                             m_total,
                             super::prefill_batch::oq_compact_block_stride(&ffn.experts[0].gate_up)?,
+                            // Straight to gate_batch / up_batch: the unscatter
+                            // below is skipped for this dtype.
+                            Some((gate_batch, up_batch)),
                         )?;
                     }
                     DType::MQ6G256 => gpu.gemm_hfq6g256_moe_grouped_wmma(
@@ -1381,15 +1384,18 @@ pub(crate) fn prefill_moe_ffn_body_batched(
                 }
 
                 // Stage 3 unscatter combine. Fans Y_grouped → gate_batch + up_batch.
-                gpu.moe_gate_up_unscatter_k8(
-                    y_gu_grouped,
-                    sorted,
-                    gate_batch,
-                    up_batch,
-                    mi,
-                    k_top,
-                    m_total,
-                )?;
+                // The compact GEMM's epilogue already wrote them.
+                if dtypes.expert_gate_up != DType::OqCompactG256 {
+                    gpu.moe_gate_up_unscatter_k8(
+                        y_gu_grouped,
+                        sorted,
+                        gate_batch,
+                        up_batch,
+                        mi,
+                        k_top,
+                        m_total,
+                    )?;
+                }
             }
         } else {
             // Path 1 fallback (CDNA/gfx10): per-token indexed GEMV, batched
