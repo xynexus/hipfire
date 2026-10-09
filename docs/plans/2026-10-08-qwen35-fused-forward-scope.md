@@ -325,6 +325,24 @@ at every K). What D1 found instead is that the layer's distance from its byte fl
 sits inside the GEMVs -- the wide multicol at 18-63% of 233 GB/s cold -- and that is
 where the decode work went next.
 
+**Status, P and what replaced D (2026-10-09, later).** Decode: the wide multicol GEMV
+now issues a round's loads together, pipelines the next round's under the math up to 4
+columns, and runs one row per wave where waves are scarce (#482; bit-identical; cold
+wqkv/wz/wo 31-55% -> 45-79% of 233 GB/s at 1-2 columns; served A3B n=2 +11%, 27B n=2
++4.5%), after the multicol widths stopped producing the tiled GEMM's dead activation
+layouts (#480, +4% at n=2-8). Expert-major routed-expert GEMVs were measured and ruled
+out (bit-identical, slower: repeat expert reads already come from the MALL).
+P1/P3 for the MoE (#483): the routed experts' per-slot rotate and int8 quantize are one
+kernel writing the grouped GEMM's scratch, and the grouped GEMM's epilogue writes the
+gate/up rows that `moe_gate_up_unscatter_k8` used to copy -- both bit-identical, A3B
+cold 13.3K prefill 10.5 -> ~10.1 s each step. Not built, with reasons: the expert
+combine (a cross-slot reduction -- an epilogue would need atomics); the dense 27B
+down-input fusion (silu*up -> rotate -> quantize, ~1.3% of cold prefill by the trace,
+under P1's 2% kill line); the gate/up silu epilogue (the rotate needs 256-row FWHT
+groups across a 128-row WMMA tile); and the overlay pass (11% of 27B prefill, but
+fusing it into the GEMM was already measured slower three ways -- the overlay-free
+format is its own plan).
+
 ## What D1 must prove that ZAYA did not
 
 ZAYA reached full cooperative residency (160 workgroups) and stayed at ~48 GB/s,
