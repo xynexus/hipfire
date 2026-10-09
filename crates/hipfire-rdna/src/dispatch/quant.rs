@@ -548,6 +548,17 @@ impl Gpu {
     /// gate+up and q/k/v off a shared quantize) on iu8, and a kernel trace put
     /// it at 54.8% of prefill kernel time against iu4x2's 15.1%.
     #[allow(clippy::too_many_arguments)]
+    /// Whether a compact W4A8 projection of `n` rows at K=`k` (group 256) runs
+    /// the multi-column GEMV rather than the tiled GEMM -- see
+    /// `compact_batched_route`, the only consumer of the decision besides
+    /// `quantize_act_oq8_batched_interleaved`, which skips the activation
+    /// layouts only the tiled GEMM reads.
+    fn oq_compact_multicol_takes(&self, n: usize, k: usize) -> bool {
+        let serving_wide = self.oq_batch_serving && (k / 256) % 4 == 0;
+        let small_n = if serving_wide && k > 4096 { 16 } else { 32 };
+        n <= small_n && std::env::var("HIPFIRE_OQ_COMPACT_SMALL_N").as_deref() != Ok("0")
+    }
+
     fn compact_batched_route(
         &mut self,
         w_blocks: &GpuTensor,
@@ -595,12 +606,7 @@ impl Gpu {
         // serving (aggregate tok/s, bound 16 -> 32 for every K): Qwen3.6-35B-A3B
         // (K 2048/4096) B=24 170 -> 200, B=32 187 -> 197; Qwen3.8-27B (K 5120+)
         // B=24 126 -> 100, B=32 136 -> 119. So 32 below K=4096, 16 above.
-        let serving_wide = self.oq_batch_serving && (k / 256) % 4 == 0;
-        let small_n = if serving_wide && k > 4096 { 16 } else { 32 };
-        if n <= small_n
-            && group == 256
-            && std::env::var("HIPFIRE_OQ_COMPACT_SMALL_N").as_deref() != Ok("0")
-        {
+        if group == 256 && self.oq_compact_multicol_takes(n, k) {
             return self.gemv_oq_compact_multicol(w_blocks, xq, xs, y, m, k, n, block_stride);
         }
         if std::env::var("HIPFIRE_OQ_COMPACT_IU4X2").as_deref() != Ok("0") {
@@ -2517,6 +2523,13 @@ impl Gpu {
         n: usize,
     ) -> HipResult<()> {
         self.quantize_act_oq8_batched(x_rot, m_max, k, n)?;
+        // At decode widths every projection off this activation runs the
+        // multi-column GEMV, which reads only the int8 activation and its scales:
+        // the interleaved nibbles and the k-major transpose below were two dead
+        // launches at each quantize -- 14 per A3B layer. The A4 path keeps them.
+        if k % 256 == 0 && self.oq_compact_multicol_takes(n, k) && !oq_compact_a4() {
+            return Ok(());
+        }
         let xq = GpuTensor {
             buf: unsafe { self.oq8_xq_batch.as_ref().unwrap().buf.alias() },
             shape: vec![n * k],
