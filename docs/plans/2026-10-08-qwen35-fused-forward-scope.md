@@ -313,6 +313,18 @@ Order: 0, K0 (independent of everything else and the largest sure win at depth),
 D1 (the decisive experiment -- it either breaks ZAYA's flat result or
 confirms it for this hardware), then D2 or stop; P1-P3 are independent and small.
 
+**Status (2026-10-09).** 0: done (#471). K0: done (#468-#470). V: closed -- neither
+model serves DFlash (the 27B drafters are slower than plain decode), so there is no
+accept loop to move. **D1: killed at M1** -- the whole DeltaNet attention half as one
+bit-identical persistent kernel ran at 0.86x the op chain at every batch, because a
+persistent kernel's registers are its heaviest op's and the latency-bound GEMVs and
+recurrence lose ~35-40% of their waves (`2026-10-09-d1-persistent-layer-kernel.md`).
+By the rule below the decode megakernel is dead on this hardware for the second time,
+so **D2 is dropped** and the plan reduces to V + P. P2: landed as #475 (the w64 GEMM
+at every K). What D1 found instead is that the layer's distance from its byte floor
+sits inside the GEMVs -- the wide multicol at 18-63% of 233 GB/s cold -- and that is
+where the decode work went next.
+
 ## What D1 must prove that ZAYA did not
 
 ZAYA reached full cooperative residency (160 workgroups) and stayed at ~48 GB/s,
