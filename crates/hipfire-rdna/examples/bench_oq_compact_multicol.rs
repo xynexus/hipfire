@@ -30,28 +30,62 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(3usize);
     let stride = 2 + GROUP / 2 + 2 * n_out; // 136 at n_out=3 => 4.25 bits
-    let iters = 30usize;
+    let iters = 60usize;
 
     println!("gemv_oq_compact_multicol at Qwen3.8-27B shapes (n_out={n_out}, stride={stride})");
     println!("weight bytes only; 233 GB/s is the measured achievable ceiling\n");
     println!("  proj             M      K   B    MiB      ms      GB/s   % of 233");
 
-    for &(name, m, k, b) in &[
-        ("gate/up", 17408usize, 5120usize, 8usize),
-        ("down", 5120, 17408, 8),
-        ("qkv", 6144, 5120, 8),
-        ("wo", 5120, 4096, 8),
-        ("gate/up B=1", 17408, 5120, 1),
-        ("gate/up B=16", 17408, 5120, 16),
-        // Past 16 the entry macro drops RW (narrow 4/2/1, wide 3/1) because the
-        // N*RW accumulators stop fitting. Tree verify linearizes a budget-B tree
-        // to B+1 tokens, so these are the widths a DDTree actually asks for, and
-        // the cliff between 16 and 17 is what decides whether wide trees pay.
-        ("gate/up B=12", 17408, 5120, 12),
-        ("gate/up B=17", 17408, 5120, 17),
-        ("gate/up B=24", 17408, 5120, 24),
-        ("gate/up B=32", 17408, 5120, 32),
-    ] {
+    // BENCH_A3B=1: Qwen3.6-35B-A3B's DeltaNet + shared-expert shapes across the
+    // multi-session decode widths (run with HIPFIRE_OQ_COMPACT_MULTICOL_WIDE=1 for
+    // the kernel serving takes).
+    let a3b: Vec<(&str, usize, usize, usize)> = [1usize, 2, 4, 8, 16, 32]
+        .iter()
+        .flat_map(|&b| {
+            [
+                ("a3b wqkv", 8192usize, 2048usize, b),
+                ("a3b wz", 4096, 2048, b),
+                ("a3b wo", 2048, 4096, b),
+            ]
+        })
+        .collect();
+    let mut a3b = a3b;
+    // BENCH_27B=1: Qwen3.8-27B's projections at the narrow widths.
+    if std::env::var("BENCH_27B").as_deref() == Ok("1") {
+        a3b = [1usize, 2, 4, 8]
+            .iter()
+            .flat_map(|&b| {
+                [
+                    ("27b qkv", 6144usize, 5120usize, b),
+                    ("27b wo", 5120, 4096, b),
+                    ("27b gate/up", 17408, 5120, b),
+                    ("27b down", 5120, 17408, b),
+                ]
+            })
+            .collect();
+    }
+    let a3b_on = std::env::var("BENCH_A3B").as_deref() == Ok("1")
+        || std::env::var("BENCH_27B").as_deref() == Ok("1");
+    for &(name, m, k, b) in if a3b_on {
+        &a3b[..]
+    } else {
+        &[
+            ("gate/up", 17408usize, 5120usize, 8usize),
+            ("down", 5120, 17408, 8),
+            ("qkv", 6144, 5120, 8),
+            ("wo", 5120, 4096, 8),
+            ("gate/up B=1", 17408, 5120, 1),
+            ("gate/up B=16", 17408, 5120, 16),
+            // Past 16 the entry macro drops RW (narrow 4/2/1, wide 3/1) because the
+            // N*RW accumulators stop fitting. Tree verify linearizes a budget-B tree
+            // to B+1 tokens, so these are the widths a DDTree actually asks for, and
+            // the cliff between 16 and 17 is what decides whether wide trees pay.
+            ("gate/up B=12", 17408, 5120, 12),
+            ("gate/up B=17", 17408, 5120, 17),
+            ("gate/up B=24", 17408, 5120, 24),
+            ("gate/up B=32", 17408, 5120, 32),
+        ][..]
+    } {
         let ng = k / GROUP;
         let nblk = m * ng;
         let bytes = nblk * stride;
@@ -93,7 +127,14 @@ fn main() {
         let xs: Vec<f32> = (0..b * ng)
             .map(|_| (rnd() % 1000) as f32 * 1e-5 + 1e-4)
             .collect();
-        let wb = gpu.upload_raw(&dev, &[dev.len()]).expect("w");
+        // Cold weights: enough copies that a pass over them all (>= 96 MB) evicts
+        // the 32 MB MALL, as a decode step's 40 layers do. One copy at the
+        // shapes that fit the MALL measures cache, not DRAM.
+        let copies = (96 << 20) / bytes + 1;
+        let wbs: Vec<_> = (0..copies)
+            .map(|_| gpu.upload_raw(&dev, &[dev.len()]).expect("w"))
+            .collect();
+        let wb = &wbs[0];
         let xqb = gpu
             .upload_raw(
                 unsafe { std::slice::from_raw_parts(xq.as_ptr() as *const u8, xq.len()) },
@@ -103,23 +144,33 @@ fn main() {
         let xsb = gpu.upload_f32(&xs, &[xs.len()]).expect("xs");
         let yb = gpu.alloc_tensor(&[b * m], DType::F32).expect("y");
 
-        gpu.gemv_oq_compact_multicol(&wb, &xqb, &xsb, &yb, m, k, b, stride)
+        gpu.gemv_oq_compact_multicol(wb, &xqb, &xsb, &yb, m, k, b, stride)
             .expect("warm");
         gpu.device_synchronize().expect("sync");
         let t0 = Instant::now();
-        for _ in 0..iters {
-            gpu.gemv_oq_compact_multicol(&wb, &xqb, &xsb, &yb, m, k, b, stride)
+        for i in 0..iters {
+            gpu.gemv_oq_compact_multicol(&wbs[i % copies], &xqb, &xsb, &yb, m, k, b, stride)
                 .expect("launch");
         }
         gpu.device_synchronize().expect("sync");
         let ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
+        // Output hash: a kernel change that claims bit-identity must print the same.
+        let hash = gpu
+            .download_f32(&yb)
+            .expect("y")
+            .iter()
+            .fold(0xcbf2_9ce4_8422_2325u64, |h, v| {
+                (h ^ v.to_bits() as u64).wrapping_mul(0x100_0000_01b3)
+            });
         let gbs = bytes as f64 / (ms * 1e-3) / 1e9;
         println!(
-            "  {name:<12} {m:>6} {k:>6} {b:>3} {:>6.1} {ms:>7.3} {gbs:>9.1} {:>9.1}%",
+            "  {name:<12} {m:>6} {k:>6} {b:>3} {:>6.1} {ms:>7.3} {gbs:>9.1} {:>9.1}%  {hash:016x}",
             bytes as f64 / (1024.0 * 1024.0),
             100.0 * gbs / 233.0
         );
-        let _ = gpu.free_tensor(wb);
+        for w in wbs {
+            let _ = gpu.free_tensor(w);
+        }
         let _ = gpu.free_tensor(xqb);
         let _ = gpu.free_tensor(xsb);
         let _ = gpu.free_tensor(yb);

@@ -60,6 +60,12 @@ fn main() {
         (16, 512, 8, 3),
         (64, 1024, 16, 3),
         (512, 5120, 8, 3),
+        // Wide path, one row per wave and pipelined (run with
+        // HIPFIRE_OQ_COMPACT_MULTICOL_WIDE=1): B <= 4, and B <= 8 at M <= 2048.
+        (1024, 2048, 2, 3),
+        (2048, 4096, 8, 3),
+        // Wide, three rows per wave, pipelined (B <= 4 past M = 8192).
+        (8200, 2048, 3, 3),
     ] {
         let ng = k / GROUP;
         let stride = 2 + GROUP / 2 + 2 * n_out;

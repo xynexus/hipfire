@@ -59,6 +59,73 @@ static __device__ __forceinline__ void oqcmw_decode(uint32_t w, uint32_t* p0, ui
     *p1 = b;
 }
 
+typedef unsigned oqcmw_v4u __attribute__((ext_vector_type(4)));
+
+// One group-round's operands, loaded by `oqcmw_load` and consumed by the round's
+// math. `xt` is this thread's share of the workgroup's activation tile (16 bytes
+// per chunk), on its way to LDS.
+template <int BC, int RW>
+struct oqcmw_round {
+    static constexpr int XCH = (4 * BC * 256 + 256 * 16 - 1) / (256 * 16);
+    oqcmw_v4u xt[XCH];
+    uint32_t wv[RW][4];
+    float sw[RW];
+    const uint8_t* table[RW];
+    int oidx[RW];
+    int oval[RW];
+    float sx[BC];
+};
+
+struct oqcmw_src {
+    const int8_t* Xq;
+    const float* Xs;
+    const uint8_t* const* n_row;
+    const uint8_t* const* s_row;
+    int K, ng, n_ov, side_stride, gir, lig;
+};
+
+template <int BC, int RW>
+static __device__ __forceinline__ void oqcmw_load(oqcmw_round<BC, RW>& R, const oqcmw_src& s,
+                                                  int g0) {
+    const int gi = g0 + s.gir;
+    #pragma unroll
+    for (int c = 0; c < oqcmw_round<BC, RW>::XCH; ++c) {
+        const int off = (threadIdx.x + c * 256) * 16;
+        if (off < 4 * BC * 256) {
+            const int gl = off / (BC * 256);
+            const int rem = off - gl * (BC * 256);
+            const int b = rem >> 8;
+            const int byte = rem & 255;
+            const int gsrc = g0 + gl;
+            const int8_t* src = (gsrc < s.ng)
+                ? s.Xq + (long long)b * s.K + (long long)gsrc * 256 + byte
+                : s.Xq;
+            R.xt[c] = *reinterpret_cast<const oqcmw_v4u*>(src);
+        }
+    }
+    // 16 bytes = this lane's 32 weights, 16-byte aligned inside a 128-byte-aligned row.
+    #pragma unroll
+    for (int r = 0; r < RW; ++r)
+        __builtin_memcpy(R.wv[r], s.n_row[r] + (long long)gi * 128 + s.lig * 16, 16);
+    #pragma unroll
+    for (int r = 0; r < RW; ++r) {
+        const uint8_t* sb = s.s_row[r] + (long long)gi * s.side_stride;
+        R.table[r] = sb + 2;
+        R.sw[r] = (float)(*(const _Float16*)sb);
+    }
+    // Overlay: 8 lanes per group, so lane `lig` owns slot `lig`, exactly as v3
+    // does. Branchless -- the inactive lanes multiply by zero.
+    const bool has_ov = s.lig < s.n_ov;
+    #pragma unroll
+    for (int r = 0; r < RW; ++r) {
+        const int oe = has_ov ? s.lig : 0;
+        R.oidx[r] = (int)R.table[r][2 * oe];
+        R.oval[r] = has_ov ? (int)(int8_t)R.table[r][2 * oe + 1] : 0;
+    }
+    #pragma unroll
+    for (int b = 0; b < BC; ++b) R.sx[b] = s.Xs[(long long)b * s.ng + gi];
+}
+
 template <int BC, int RW>
 static __device__ __forceinline__ void oqcmw_body(
     const uint8_t* __restrict__ W,
@@ -125,66 +192,41 @@ static __device__ __forceinline__ void oqcmw_body(
             #pragma unroll
             for (int b = 0; b < BC; ++b) facc[r][b] = 0.0f;
 
+        // EVERY GLOBAL LOAD OF A ROUND IS ISSUED TOGETHER -- the activation
+        // tile's, the weights', their scales and overlay tables, the activation
+        // scales -- and the tile reaches LDS through registers between two
+        // LDS-only barriers, so a round exposes one memory latency, not two (the
+        // tile used to be fetched after the first barrier and the weights after
+        // the second, in lockstep across the workgroup). At up to 4 columns (8
+        // with one row per wave) the NEXT round's loads are also issued before
+        // this round's math, so they fly under it; wider, the second register
+        // set costs more occupancy than it hides (cold, 3-row waves at 8
+        // columns: 27B qkv 89.6% of 233 GB/s without it, 82.0% with). At
+        // K = 2048 a wave's whole job is two rounds, so the latency it waits on
+        // is most of its time. Same arithmetic in the same order: bit-identical.
+        constexpr bool PIPE = BC <= 4 || (RW == 1 && BC <= 8);
+        const oqcmw_src src{Xq, Xs, n_row, s_row, K, ng, n_ov, side_stride, gir, lig};
+        oqcmw_round<BC, RW> cur, nxt;
+        if constexpr (PIPE) oqcmw_load<BC, RW>(cur, src, 0);
         for (int g0 = 0; g0 < ng; g0 += 4) {
-            // Stage this round's four groups for all BC columns. 16 bytes per
-            // thread per step keeps the copy on dwordx4 like the compute path.
-            __syncthreads();
-            {
-                const int tid = threadIdx.x;
-                const int nthr = blockDim.x;
-                const int bytes = 4 * BC * 256;
-                for (int off = tid * 16; off < bytes; off += nthr * 16) {
-                    const int gl = off / (BC * 256);
-                    const int rem = off - gl * (BC * 256);
-                    const int b = rem >> 8;
-                    const int byte = rem & 255;
-                    const int gsrc = g0 + gl;
-                    const int8_t* src = (gsrc < ng)
-                        ? Xq + (long long)b * K + (long long)gsrc * 256 + byte
-                        : Xq;
-                    __builtin_memcpy(&lds_x[off], src, 16);
-                }
-            }
-            __syncthreads();
-            const int gi = g0 + gir;
-
-            // 16 bytes = this lane's 32 weights, 16-byte aligned inside a
-            // 128-byte-aligned row.
-            uint32_t wv[RW][4];
+            if constexpr (!PIPE) oqcmw_load<BC, RW>(cur, src, g0);
+            asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
             #pragma unroll
-            for (int r = 0; r < RW; ++r)
-                __builtin_memcpy(wv[r], n_row[r] + (long long)gi * 128 + lig * 16, 16);
+            for (int c = 0; c < oqcmw_round<BC, RW>::XCH; ++c) {
+                const int off = (threadIdx.x + c * 256) * 16;
+                if (off < 4 * BC * 256) *reinterpret_cast<oqcmw_v4u*>(&lds_x[off]) = cur.xt[c];
+            }
+            asm volatile("s_waitcnt lgkmcnt(0)\n\ts_barrier" ::: "memory");
+            if constexpr (PIPE) {
+                if (g0 + 4 < ng) oqcmw_load<BC, RW>(nxt, src, g0 + 4);
+            }
 
             uint32_t p[RW][8];
             #pragma unroll
             for (int r = 0; r < RW; ++r)
                 #pragma unroll
                 for (int j = 0; j < 4; ++j)
-                    oqcmw_decode(wv[r][j], &p[r][2 * j], &p[r][2 * j + 1]);
-
-            float sw[RW];
-            const uint8_t* table[RW];
-            #pragma unroll
-            for (int r = 0; r < RW; ++r) {
-                const uint8_t* sb = s_row[r] + (long long)gi * side_stride;
-                table[r] = sb + 2;
-                sw[r] = (float)(*(const _Float16*)sb);
-            }
-
-            // Overlay: 8 lanes per group, so lane `lig` owns slot `lig`, exactly
-            // as v3 does. Branchless — the inactive lanes multiply by zero.
-            const bool has_ov = lig < n_ov;
-            int oidx[RW], oval[RW];
-            #pragma unroll
-            for (int r = 0; r < RW; ++r) {
-                const int oe = has_ov ? lig : 0;
-                oidx[r] = (int)table[r][2 * oe];
-                oval[r] = has_ov ? (int)(int8_t)table[r][2 * oe + 1] : 0;
-            }
-
-            float sx[BC];
-            #pragma unroll
-            for (int b = 0; b < BC; ++b) sx[b] = Xs[(long long)b * ng + gi];
+                    oqcmw_decode(cur.wv[r][j], &p[r][2 * j], &p[r][2 * j + 1]);
 
             #pragma unroll
             for (int b = 0; b < BC; ++b) {
@@ -199,13 +241,14 @@ static __device__ __forceinline__ void oqcmw_body(
                     #pragma unroll
                     for (int j = 0; j < 8; ++j)
                         acc = oqcmw_dot4_i8((int)p[r][j], (int)xv[j], acc);
-                    acc += oval[r] * (int)xq[oidx[r]];
+                    acc += cur.oval[r] * (int)xq[cur.oidx[r]];
                     for (int e = lig + 8; e < n_ov; e += 8) {
-                        acc += (int)(int8_t)table[r][2 * e + 1] * (int)xq[(int)table[r][2 * e]];
+                        acc += (int)(int8_t)cur.table[r][2 * e + 1] * (int)xq[(int)cur.table[r][2 * e]];
                     }
-                    facc[r][b] += (float)acc * sw[r] * sx[b];
+                    facc[r][b] += (float)acc * cur.sw[r] * cur.sx[b];
                 }
             }
+            if constexpr (PIPE) cur = nxt;
         }
 
         #pragma unroll
@@ -235,6 +278,22 @@ static __device__ __forceinline__ void oqcmw_body(
         const float* __restrict__ Xs, float* __restrict__ Y,                   \
         int M, int K, int B, int block_stride                                  \
     ) { (void)B; oqcmw_body<N, (N <= 16 ? 3 : 2)>(W, Xq, Xs, Y, M, K, block_stride); }
+
+// ONE ROW PER WAVE, for calls with too few waves to keep loads in flight: a
+// 3-row wave at 1-4 columns does little math per byte, so the call is bounded by
+// how many waves are waiting on memory, and 2048-row wo at 3 rows gives the whole
+// GPU ~680 waves. Per-row arithmetic does not depend on RW: bit-identical. The
+// dispatch rule is in `Gpu::gemv_oq_compact_multicol`.
+#define OQCMW_ENTRY_R1(N)                                                      \
+    __launch_bounds__(256) extern "C" __global__                               \
+    void gemv_oq_compact_multicol_w##N##_r1(                                   \
+        const uint8_t* __restrict__ W, const int8_t* __restrict__ Xq,          \
+        const float* __restrict__ Xs, float* __restrict__ Y,                   \
+        int M, int K, int B, int block_stride                                  \
+    ) { (void)B; oqcmw_body<N, 1>(W, Xq, Xs, Y, M, K, block_stride); }
+
+OQCMW_ENTRY_R1(1) OQCMW_ENTRY_R1(2) OQCMW_ENTRY_R1(3) OQCMW_ENTRY_R1(4)
+OQCMW_ENTRY_R1(5) OQCMW_ENTRY_R1(6) OQCMW_ENTRY_R1(7) OQCMW_ENTRY_R1(8)
 
 OQCMW_ENTRY(1)  OQCMW_ENTRY(2)  OQCMW_ENTRY(3)  OQCMW_ENTRY(4)
 OQCMW_ENTRY(5)  OQCMW_ENTRY(6)  OQCMW_ENTRY(7)  OQCMW_ENTRY(8)
