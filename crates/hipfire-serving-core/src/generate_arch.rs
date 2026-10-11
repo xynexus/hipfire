@@ -20,6 +20,7 @@ use hipfire_arch_minimax as minimax;
 use hipfire_prompt as prompt_frame;
 use hipfire_runtime::arch::{
     decode_loop_with_timing, DecodeLoopTiming, GenerateCtx, ServingBackend, SimpleAr,
+    IMAGE_PLACEHOLDER,
 };
 
 use crate::events::{
@@ -60,6 +61,9 @@ pub fn generate_registered_backend(
     // Explicit per-request `"raw"` override; `None` = auto. Threaded rather
     // than read from a global — see `effective_raw`.
     raw_override: Option<bool>,
+    // Encoded image bytes, one per `<image>` placeholder in `prompt`; only a
+    // backend whose `caps().vision` is set is routed here with any.
+    images: &[&[u8]],
 ) {
     let Some(tokenizer) = m.tokenizer.as_ref() else {
         emit_error_with_id(stdout, id, "tokenizer not loaded".to_string());
@@ -70,6 +74,10 @@ pub fn generate_registered_backend(
         return;
     };
     let raw = effective_raw(m, raw_override);
+    // One placeholder per image ahead of the user text, as HF templates render
+    // `[{image}.., {text}]` content.
+    let image_prompt = format!("{}{prompt}", IMAGE_PLACEHOLDER.repeat(images.len()));
+    let prompt = image_prompt.as_str();
     let bos_token = loaded.profile.bos_token;
     let require_official_template = loaded.profile.require_official_template;
     let family = loaded.family;
@@ -144,6 +152,17 @@ pub fn generate_registered_backend(
         tokenizer.decode(&ids)
     };
 
+    // The frame escapes special tokens in user content; un-escape exactly the
+    // placeholders inserted above (a user-typed `<image>` stays literal text).
+    let framed = framed.replacen(
+        &format!(
+            "{}{IMAGE_PLACEHOLDER}",
+            hipfire_runtime::tokenizer::LITERAL_ESC
+        ),
+        IMAGE_PLACEHOLDER,
+        images.len(),
+    );
+
     let mut stop_sequences = request_stop_sequences.to_vec();
     for stop in &loaded.profile.eos_filter.stop_at {
         if let Ok(stop) = std::str::from_utf8(stop) {
@@ -165,7 +184,6 @@ pub fn generate_registered_backend(
         .repeat_penalty
         .unwrap_or(repeat_penalty);
 
-    let no_images: [&[u8]; 0] = [];
     let mut ctx = GenerateCtx {
         id,
         prompt: &framed,
@@ -182,7 +200,7 @@ pub fn generate_registered_backend(
         output_holdback_prefixes: &output_holdback_prefixes,
         strip_think,
         output_protocol,
-        images: &no_images,
+        images,
         sink: stdout,
     };
     let result = m

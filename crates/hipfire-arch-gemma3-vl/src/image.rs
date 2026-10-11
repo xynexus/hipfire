@@ -60,8 +60,13 @@ fn preprocess_decoded(
             &ResizeOptions::new().resize_alg(ResizeAlg::Convolution(FilterType::Bilinear)),
         )
         .map_err(|e| format!("gemma3-vl: resize: {e}"))?;
-    let resized = dst.buffer(); // [size·size·3] interleaved RGB u8
+    Ok(patchify_rgb8(dst.buffer(), cfg))
+}
 
+/// An `image_size²` interleaved RGB u8 buffer → the SigLIP patch tensor
+/// `[num_patches, 3·patch²]`, normalized with mean = std = 0.5 (shared by every
+/// SigLIP-family preprocessor that has already resized/cropped to the grid).
+pub fn patchify_rgb8(resized: &[u8], cfg: &SigLipConfig) -> Vec<f32> {
     let s = cfg.image_size;
     let ps = cfg.patch_size;
     let grid = cfg.grid_side();
@@ -95,7 +100,7 @@ fn preprocess_decoded(
             }
         }
     }
-    Ok(out)
+    out
 }
 
 #[cfg(test)]

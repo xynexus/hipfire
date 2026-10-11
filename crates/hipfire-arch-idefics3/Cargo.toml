@@ -1,0 +1,16 @@
+[package]
+name = "hipfire-arch-idefics3"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Idefics3 vision-language models (Granite-Docling, SmolVLM): SigLIP tower + pixel-shuffle connector spliced into the LLaMA decoder. arch_id=27."
+
+[dependencies]
+hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-rdna = { path = "../hipfire-rdna" }
+hipfire-arch-api = { path = "../hipfire-arch-api" }
+hipfire-arch-llama = { path = "../hipfire-arch-llama" }
+hipfire-arch-gemma3-vl = { path = "../hipfire-arch-gemma3-vl" }
+serde_json = "1"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+fast_image_resize = "5"

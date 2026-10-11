@@ -1558,6 +1558,11 @@ impl HfqFile {
             if let Some(&idx) = self.tensor_map.get(&long) {
                 return Some(idx);
             }
+            // Idefics3 (Granite-Docling/SmolVLM) nests its LLaMA decoder here.
+            let text = format!("model.text_model.{rest}");
+            if let Some(&idx) = self.tensor_map.get(&text) {
+                return Some(idx);
+            }
         }
         // Try with `model.` / `model.language_model.` added when name has no
         // `model.` prefix at all (e.g. `lm_head.weight`).
@@ -2245,6 +2250,8 @@ impl ModelSource for HfqFile {
 pub fn config_from_hfq(hfq: &HfqFile) -> Option<LlamaConfig> {
     let meta: serde_json::Value = serde_json::from_str(&hfq.metadata_json).ok()?;
     let config = meta.get("config")?;
+    // A multimodal wrapper (Idefics3) nests the decoder shape under text_config.
+    let config = config.get("text_config").unwrap_or(config);
 
     let arch_str = config.get("model_type")?.as_str()?;
     let arch = match arch_str {

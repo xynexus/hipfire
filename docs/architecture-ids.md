@@ -47,6 +47,7 @@ and 4 are historically retired and must not be reused.
 | 23 | `ARCH_ID_FLUX2`             | flux2        | `hipfire-diffusion` | `Flux2Transformer2DModel` / `Flux2KleinPipeline` / `SEFIInferencePipeline` |
 | 24 | `ARCH_ID_GEMMA4`            | gemma4       | `hipfire-arch-gemma4` | `gemma4`, `gemma4_text`, `gemma4_unified`, `gemma4_unified_text` (one text-core id; wrappers remain typed config distinctions) |
 | 25 | `ARCH_ID_COHERE2_MOE`       | cohere2-moe  | not yet served | `cohere2_moe` (BLS Mini Code; offline identity and ingest are registered before serving bring-up) |
+| 27 | `ARCH_ID_IDEFICS3`          | idefics3     | `hipfire-arch-idefics3` | `idefics3` (Granite-Docling, SmolVLM: SigLIP + pixel-shuffle connector + LLaMA decoder) |
 
 The per-arch capability matrix (prefill / dflash / mtp / kv / vision support)
 lives in `docs/model-support.toml`, keyed by these same ids.

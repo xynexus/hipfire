@@ -20,5 +20,6 @@ hipfire-arch-template-spec = { path = "../hipfire-arch-template-spec" }
 # Every migrated family's offline Ingest spec, via the lean bundle.
 hipfire-arch-specs = { path = "../hipfire-arch-specs" }
 hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2" }
+hipfire-arch-idefics3 = { path = "../hipfire-arch-idefics3" }
 hipfire-arch-gemma4 = { path = "../hipfire-arch-gemma4" }
 hipfire-arch-qwen4exp = { path = "../hipfire-arch-qwen4exp" }

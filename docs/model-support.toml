@@ -140,6 +140,17 @@ mtp = "none"
 kv = "none"
 vision = "none"
 
+# Idefics3 (Granite-Docling, SmolVLM): SigLIP tower + pixel-shuffle connector
+# reused from gemma3-vl, spliced into the LLaMA decoder's batched prefill.
+[[arch]]
+ids = [27]
+label = "idefics3"
+prefill = "full"
+dflash = "none"
+mtp = "none"
+kv = "fp32"
+vision = "full"
+
 [[arch]]
 # Qwen3.8-Flash-Next. The offline half is complete — arch/ingest/quant policy,
 # config, weight plan, and a CPU trunk differenced end-to-end against the pinned
@@ -793,6 +804,60 @@ quant = "oq8++"
 feature = "prefill"
 support = "partial"
 note = "Gemma3-VL text-side OQ8++ has calibrated tiny KLD and fixture golden evidence on gfx1103 while SigLIP/projector tensors remain q8f16. OQ checklist producer=text-only-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-text-calib eval=pending artifact=pending; separate SigLIP/projector OQ policy remains unadmitted"
+
+# Idefics3 (arch 27, Granite-Docling-258M). The LLaMA decoder's hidden size is
+# 576, not a multiple of 256: GPU Opus kernels need K % 256 == 0, so the
+# K=576 projections ship as Q8F16 (HIPFIRE_OQ_RAGGED_Q8=1) and only down_proj
+# (K=1536) is true Oq8G256. The default ragged encoding (Oq8G256RowPadded) is
+# NPU-only and the GPU loader refuses it. SigLIP tower + connector stay BF16.
+[[gate]]
+arch = 27
+quant = "oq8"
+feature = "prefill"
+support = "partial"
+note = "Idefics3 text-side OQ8: down_proj Oq8G256, K=576 projections Q8F16 (ragged-K GPU Opus unsupported), vision/connector BF16; greedy DocTags match HF fp32 teacher-forced argmax on 100% of 400 + 300 tokens (two pages) on gfx1151. OQ checklist producer=ragged-q8 loader=yes decode=yes prefill=yes tiny=none golden=none eval=hf-oracle-gfx1151 artifact=Granite-Docling-258M--oq8"
+
+[[gate]]
+arch = 27
+quant = "oq4"
+feature = "prefill"
+support = "none"
+note = "Idefics3 oq4 not produced: no idefics3 calibration adapter (+/++), and 4-bit K=576 shares the ragged-K GPU Opus gap. OQ checklist producer=none loader=none decode=none prefill=none tiny=none golden=none eval=none artifact=none"
+
+[[gate]]
+arch = 27
+quant = "oq4+"
+feature = "prefill"
+support = "none"
+note = "Idefics3 oq4+ not produced: no idefics3 calibration adapter (+/++), and 4-bit K=576 shares the ragged-K GPU Opus gap. OQ checklist producer=none loader=none decode=none prefill=none tiny=none golden=none eval=none artifact=none"
+
+[[gate]]
+arch = 27
+quant = "oq4++"
+feature = "prefill"
+support = "none"
+note = "Idefics3 oq4++ not produced: no idefics3 calibration adapter (+/++), and 4-bit K=576 shares the ragged-K GPU Opus gap. OQ checklist producer=none loader=none decode=none prefill=none tiny=none golden=none eval=none artifact=none"
+
+[[gate]]
+arch = 27
+quant = "oq4.25++"
+feature = "prefill"
+support = "none"
+note = "Idefics3 oq4.25++ not produced: no idefics3 calibration adapter (+/++), and 4-bit K=576 shares the ragged-K GPU Opus gap. OQ checklist producer=none loader=none decode=none prefill=none tiny=none golden=none eval=none artifact=none"
+
+[[gate]]
+arch = 27
+quant = "oq8+"
+feature = "prefill"
+support = "none"
+note = "Idefics3 oq8+ not produced: no idefics3 calibration adapter (+/++), and 4-bit K=576 shares the ragged-K GPU Opus gap. OQ checklist producer=none loader=none decode=none prefill=none tiny=none golden=none eval=none artifact=none"
+
+[[gate]]
+arch = 27
+quant = "oq8++"
+feature = "prefill"
+support = "none"
+note = "Idefics3 oq8++ not produced: no idefics3 calibration adapter (+/++), and 4-bit K=576 shares the ragged-K GPU Opus gap. OQ checklist producer=none loader=none decode=none prefill=none tiny=none golden=none eval=none artifact=none"
 
 # LLaMA (arch 0) OQ int8-activation: the shared load_weights_hfq gained the OQ8/OQ+
 # arms (33/35/36) it was missing — it previously only wired OQ4 (34/37), so llama

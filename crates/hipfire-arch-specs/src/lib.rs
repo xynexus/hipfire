@@ -29,6 +29,7 @@ use hipfire_arch_flux2_spec as _;
 use hipfire_arch_gemma3_spec as _;
 use hipfire_arch_gemma3_vl_spec as _;
 use hipfire_arch_gemma4_spec as _;
+use hipfire_arch_idefics3_spec as _;
 use hipfire_arch_krea2_spec as _;
 use hipfire_arch_lfm2moe_spec as _;
 use hipfire_arch_llama_spec as _;
@@ -50,7 +51,7 @@ mod tests {
         // Every migrated arch id must be reachable with an Ingest policy through the
         // bundle (the path the quantizer uses).
         for id in [
-            0u16, 1, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 23, 24, 25, 26,
+            0u16, 1, 5, 6, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 23, 24, 25, 26, 27,
         ] {
             let a = reg
                 .get(ArchId(id))

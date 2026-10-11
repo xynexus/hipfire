@@ -1,0 +1,9 @@
+[package]
+name = "hipfire-arch-idefics3-spec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Lean offline spec for the Idefics3 vision-language family (arch_id 27): identity + Ingest quant-policy, no runtime/kernel deps."
+
+[dependencies]
+hipfire-arch-api = { path = "../hipfire-arch-api" }
