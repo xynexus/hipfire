@@ -55,6 +55,7 @@ This per-arch chart is the **`family × feature` projection** of the 5-axis capa
 | embeddinggemma (19) | ✅ | ❌ | ❌ | none | ❌ |
 | gemma4 (24) | 🟡 | ❌ | ❌ | fp32+kvarn | ❌ |
 | cohere2-moe (25) | ❌ | ❌ | ❌ | none | ❌ |
+| idefics3 (27) | ✅ | ❌ | ❌ | fp32 | ✅ |
 | qwen4-exp (26) | 🟡 | ❌ | ❌ | fp32 | ❌ |
 | qwen2 (7) | ✅ | ❌ | ❌ | fp32 | ❌ |
 | dots-ocr (8) | ✅ | ❌ | ❌ | fp32 | ✅ |
@@ -148,6 +149,13 @@ Per-quant overrides of an arch capability (admission consults these before green
 | 13 | oq8 | prefill | 🟡 | Gemma3-VL text-side OQ8 W8A8 loads through the Gemma3 text decoder while SigLIP/projector tensors remain q8f16; synthetic image splice tiny KLD and text-only fixture golden are finite on gfx1103. OQ checklist producer=text-only loader=yes decode=yes prefill=smoke tiny=gfx1103 golden=gfx1103-text eval=pending artifact=pending |
 | 13 | oq8+ | prefill | 🟡 | Gemma3-VL text-side OQ8+ shares OQ8 runtime kernels and has Hessian-backed activation-aware tiny KLD plus fixture golden evidence on gfx1103 while SigLIP/projector tensors remain q8f16. OQ checklist producer=text-only-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-text-calib eval=pending artifact=pending; separate SigLIP/projector OQ policy remains unadmitted |
 | 13 | oq8++ | prefill | 🟡 | Gemma3-VL text-side OQ8++ has calibrated tiny KLD and fixture golden evidence on gfx1103 while SigLIP/projector tensors remain q8f16. OQ checklist producer=text-only-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-text-calib eval=pending artifact=pending; separate SigLIP/projector OQ policy remains unadmitted |
+| 27 | oq8 | prefill | 🟡 | Idefics3 text-side OQ8: down_proj Oq8G256, K=576 projections Q8F16 (ragged-K GPU Opus unsupported), vision/connector BF16; greedy DocTags match HF fp32 teacher-forced argmax on 100% of 400 + 300 tokens (two pages) on gfx1151. OQ checklist producer=ragged-q8 loader=yes decode=yes prefill=yes tiny=none golden=none eval=hf-oracle-gfx1151 artifact=Granite-Docling-258M--oq8 |
+| 27 | oq4 | prefill | ❌ | Idefics3 oq4 not produced: no idefics3 calibration adapter (+/++), and 4-bit K=576 shares the ragged-K GPU Opus gap. OQ checklist producer=none loader=none decode=none prefill=none tiny=none golden=none eval=none artifact=none |
+| 27 | oq4+ | prefill | ❌ | Idefics3 oq4+ not produced: no idefics3 calibration adapter (+/++), and 4-bit K=576 shares the ragged-K GPU Opus gap. OQ checklist producer=none loader=none decode=none prefill=none tiny=none golden=none eval=none artifact=none |
+| 27 | oq4++ | prefill | ❌ | Idefics3 oq4++ not produced: no idefics3 calibration adapter (+/++), and 4-bit K=576 shares the ragged-K GPU Opus gap. OQ checklist producer=none loader=none decode=none prefill=none tiny=none golden=none eval=none artifact=none |
+| 27 | oq4.25++ | prefill | ❌ | Idefics3 oq4.25++ not produced: no idefics3 calibration adapter (+/++), and 4-bit K=576 shares the ragged-K GPU Opus gap. OQ checklist producer=none loader=none decode=none prefill=none tiny=none golden=none eval=none artifact=none |
+| 27 | oq8+ | prefill | ❌ | Idefics3 oq8+ not produced: no idefics3 calibration adapter (+/++), and 4-bit K=576 shares the ragged-K GPU Opus gap. OQ checklist producer=none loader=none decode=none prefill=none tiny=none golden=none eval=none artifact=none |
+| 27 | oq8++ | prefill | ❌ | Idefics3 oq8++ not produced: no idefics3 calibration adapter (+/++), and 4-bit K=576 shares the ragged-K GPU Opus gap. OQ checklist producer=none loader=none decode=none prefill=none tiny=none golden=none eval=none artifact=none |
 | 0 | oq4 | prefill | 🟡 | LLaMA OQ4 W4A4 loads via oq4_arch_load; K must be % 256 else the linear stays BF16; tiny KLD and fixture golden are finite on aligned gfx1103 fixture tensors; quality admission pending. OQ checklist producer=aligned-only loader=yes decode=smoke prefill=smoke tiny=gfx1103-aligned golden=gfx1103-aligned eval=pending artifact=pending |
 | 0 | oq4+ | prefill | 🟡 | LLaMA OQ4+ W4A8 loads via oq4_to_oq8_combined into the shared int8-activation route and has Hessian-backed calibrated tiny KLD plus fixture golden evidence on aligned gfx1103 fixture tensors; real-model eval admission remains pending. OQ checklist producer=aligned-only-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending |
 | 0 | oq4++ | prefill | 🟡 | LLaMA OQ4++ has Hessian-backed calibrated tiny KLD and fixture golden evidence on aligned gfx1103 fixture tensors; real-model eval admission remains pending. OQ checklist producer=aligned-only-hessian loader=yes decode=smoke prefill=smoke tiny=gfx1103-calib golden=gfx1103-calib eval=pending artifact=pending; ragged linears stay BF16/F16 |
@@ -277,6 +285,7 @@ Projection of the dflash axis over **family × gfx-class**: the per-family `[[ar
 | embeddinggemma (19) | ❌ | ❌ | ❌ | ❌ | ❌ |
 | gemma4 (24) | ❌ | ❌ | ❌ | ❌ | ❌ |
 | cohere2-moe (25) | ❌ | ❌ | ❌ | ❌ | ❌ |
+| idefics3 (27) | ❌ | ❌ | ❌ | ❌ | ❌ |
 | qwen4-exp (26) | ❌ | ❌ | ❌ | ❌ | ❌ |
 | qwen2 (7) | ❌ | ❌ | ❌ | ❌ | ❌ |
 | dots-ocr (8) | ❌ | ❌ | ❌ | ❌ | ❌ |

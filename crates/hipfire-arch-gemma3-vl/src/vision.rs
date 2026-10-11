@@ -53,8 +53,19 @@ pub struct SigLipWeights {
 
 impl SigLipWeights {
     pub fn load(hfq: &mut HfqFile, cfg: &SigLipConfig, gpu: &mut Gpu) -> Result<Self, String> {
-        load_vision_weights(hfq, cfg, gpu)
-            .map_err(|e| format!("gemma3-vl: vision load failed: {e:?}"))
+        Self::load_prefixed(hfq, cfg, gpu, "vision_tower.vision_model")
+    }
+
+    /// Load a SigLIP tower stored under `prefix` (gemma3: `vision_tower.vision_model`,
+    /// idefics3: `model.vision_model`).
+    pub fn load_prefixed(
+        hfq: &mut HfqFile,
+        cfg: &SigLipConfig,
+        gpu: &mut Gpu,
+        prefix: &str,
+    ) -> Result<Self, String> {
+        load_vision_weights(hfq, cfg, gpu, prefix)
+            .map_err(|e| format!("siglip: vision load failed: {e:?}"))
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
@@ -83,7 +94,7 @@ impl SigLipWeights {
 /// Read a tensor to a host F32 vector. Handles float sources (F16/F32/BF16) and
 /// dequantizes a quantized vision tower back to f32 (`hfq --vision-quant`, e.g.
 /// `.vloq8+`: Q8F16 qt=3, Oq8G256 qt=35).
-fn read_f32(hfq: &HfqFile, name: &str) -> Vec<f32> {
+pub fn read_f32(hfq: &HfqFile, name: &str) -> Vec<f32> {
     // tensor_data_vec (pread) not tensor_data (mmap): on UMA APUs the loader
     // drops the mmap, so the mmap accessor returns None.
     let (info, data) = hfq
@@ -133,7 +144,7 @@ fn f32_to_bf16_bits(x: f32) -> u16 {
 
 /// Upload an f32 host slice as a `DType::BF16` device tensor (for the bf16 WMMA
 /// linears — the matrix-core path halves weight bandwidth, the UMA bottleneck).
-fn upload_bf16(gpu: &Gpu, vals: &[f32]) -> HipResult<GpuTensor> {
+pub fn upload_bf16(gpu: &Gpu, vals: &[f32]) -> HipResult<GpuTensor> {
     let bytes: Vec<u8> = vals
         .iter()
         .flat_map(|&x| f32_to_bf16_bits(x).to_le_bytes())
@@ -160,12 +171,12 @@ fn load_vision_weights(
     hfq: &mut HfqFile,
     cfg: &SigLipConfig,
     gpu: &mut Gpu,
+    vp: &str,
 ) -> HipResult<SigLipWeights> {
     let h = cfg.hidden_size;
     let inter = cfg.intermediate_size;
     let patch_dim = cfg.num_channels * cfg.patch_size * cfg.patch_size; // 3*14*14 = 588
     let n_patches = cfg.num_patches();
-    let vp = "vision_tower.vision_model";
 
     // Conv2d patch_embedding.weight is [hidden, 3, patch, patch]; flatten to the
     // linear `[hidden, 3·patch²]`. (Row-major flatten matches im2col patch order.)

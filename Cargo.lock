@@ -1642,6 +1642,27 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-idefics3"
+version = "0.3.0"
+dependencies = [
+ "fast_image_resize",
+ "hipfire-arch-api",
+ "hipfire-arch-gemma3-vl",
+ "hipfire-arch-llama",
+ "hipfire-rdna",
+ "hipfire-runtime",
+ "image",
+ "serde_json",
+]
+
+[[package]]
+name = "hipfire-arch-idefics3-spec"
+version = "0.3.0"
+dependencies = [
+ "hipfire-arch-api",
+]
+
+[[package]]
 name = "hipfire-arch-krea2-spec"
 version = "0.3.0"
 dependencies = [
@@ -1836,6 +1857,7 @@ dependencies = [
  "hipfire-arch-gemma3-spec",
  "hipfire-arch-gemma3-vl-spec",
  "hipfire-arch-gemma4-spec",
+ "hipfire-arch-idefics3-spec",
  "hipfire-arch-krea2-spec",
  "hipfire-arch-lfm2moe-spec",
  "hipfire-arch-llama-spec",
@@ -1897,6 +1919,7 @@ version = "0.3.0"
 dependencies = [
  "hipfire-arch-api",
  "hipfire-arch-gemma4",
+ "hipfire-arch-idefics3",
  "hipfire-arch-qwen2",
  "hipfire-arch-qwen4exp",
  "hipfire-arch-specs",

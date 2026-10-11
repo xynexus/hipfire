@@ -427,6 +427,11 @@ pub struct GenerateCtx<'a> {
     pub sink: &'a mut dyn std::io::Write,
 }
 
+/// Text marking where one [`GenerateCtx::images`] entry sits in a vision prompt
+/// (the HF processor convention). The serving layer prepends one per image to
+/// the user turn; the backend expands each into its own token layout.
+pub const IMAGE_PLACEHOLDER: &str = "<image>";
+
 /// Object-safe serving handle the daemon holds per loaded model
 /// (`Box<dyn ServingBackend>`), replacing the per-arch `generate_*` dispatch and
 /// the `LoadedModel` Option-soup. It is **one output strategy among several**:

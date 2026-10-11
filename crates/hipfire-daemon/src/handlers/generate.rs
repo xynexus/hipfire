@@ -673,7 +673,13 @@ pub(crate) fn text(
     let is_dots_ocr = m.arch_id == ARCH_ID_DOTS_OCR;
     let is_gemma3_vl = m.gemma3_vl.is_some(); // arch 13 (medgemma)
     let has_media = has_image || video.is_some() || !images.is_empty();
-    let has_vl = m.vision_config.is_some() || is_dots_ocr || is_gemma3_vl;
+    // A factory-registered backend that declares vision (idefics3) consumes the
+    // decoded frames itself through `GenerateCtx::images`.
+    let registered_vision = m
+        .registered_backend
+        .as_ref()
+        .is_some_and(|loaded| loaded.backend.caps().vision);
+    let has_vl = m.vision_config.is_some() || is_dots_ocr || is_gemma3_vl || registered_vision;
 
     if video.is_some() && !is_gemma3_vl {
         write_error(
@@ -721,6 +727,36 @@ pub(crate) fn text(
                     &params,
                     &frames,
                     &image_labels,
+                );
+            }
+            Err(e) => write_error(&mut daemon_state.out.sink, id, &e),
+        }
+    } else if registered_vision && has_media {
+        match decode_vl_frames(image, &images, image_base64, None, max_frames) {
+            Ok(frames) => {
+                let frame_refs: Vec<&[u8]> = frames.iter().map(Vec::as_slice).collect();
+                hipfire_serving_core::generate_arch::generate_registered_backend(
+                    m,
+                    &mut daemon_state.gpu,
+                    &mut daemon_state.out.sink,
+                    id,
+                    prompt,
+                    system,
+                    temp,
+                    top_p,
+                    top_k,
+                    max_tokens,
+                    repeat_penalty,
+                    repeat_window,
+                    presence_penalty,
+                    frequency_penalty,
+                    max_think_tokens,
+                    assistant_prefix,
+                    tools_json.as_deref(),
+                    None,
+                    &request_stop_sequences,
+                    raw_override,
+                    &frame_refs,
                 );
             }
             Err(e) => write_error(&mut daemon_state.out.sink, id, &e),

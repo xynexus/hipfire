@@ -914,8 +914,12 @@ pub(crate) fn load(
                 },
                 |loaded| loaded.family,
             );
-            let vl =
-                m.vision_config.is_some() || m.dots_ocr_config.is_some() || m.gemma3_vl.is_some();
+            let vl = m.vision_config.is_some()
+                || m.dots_ocr_config.is_some()
+                || m.gemma3_vl.is_some()
+                || m.registered_backend
+                    .as_ref()
+                    .is_some_and(|loaded| loaded.backend.caps().vision);
             let (dim, layers, vocab) = if let Some(ref loaded) = m.registered_backend {
                 (
                     loaded.shape.hidden_size,

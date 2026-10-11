@@ -165,8 +165,8 @@ pub fn has_worker_or_model_identity(msg: &Value) -> bool {
 // See `docs/architecture-ids.md` for the id table and where the constants live.
 pub use hipfire_arch_api::{
     ARCH_ID_COHERE2_MOE, ARCH_ID_DEEPSEEK4_FLASH, ARCH_ID_DOTS_OCR, ARCH_ID_EMBEDDINGGEMMA,
-    ARCH_ID_FLUX2, ARCH_ID_GEMMA3_TEXT, ARCH_ID_GEMMA3_VL, ARCH_ID_GEMMA4, ARCH_ID_KREA2,
-    ARCH_ID_LFM2_MOE, ARCH_ID_LLAMA_MISTRAL, ARCH_ID_MAMBA2, ARCH_ID_MINIMAX_M2,
+    ARCH_ID_FLUX2, ARCH_ID_GEMMA3_TEXT, ARCH_ID_GEMMA3_VL, ARCH_ID_GEMMA4, ARCH_ID_IDEFICS3,
+    ARCH_ID_KREA2, ARCH_ID_LFM2_MOE, ARCH_ID_LLAMA_MISTRAL, ARCH_ID_MAMBA2, ARCH_ID_MINIMAX_M2,
     ARCH_ID_NEMOTRON_H, ARCH_ID_QWEN2, ARCH_ID_QWEN35_DENSE, ARCH_ID_QWEN35_MOE,
     ARCH_ID_QWEN3_QWEN2_LEGACY, ARCH_ID_QWEN4EXP, ARCH_ID_QWEN_IMAGE, ARCH_ID_ZAYA,
 };
@@ -191,6 +191,7 @@ pub const KNOWN_RUNTIME_ARCH_IDS: &[(u32, &str)] = &[
     (ARCH_ID_GEMMA4, "gemma4"),
     (ARCH_ID_COHERE2_MOE, "cohere2-moe"),
     (ARCH_ID_QWEN4EXP, "qwen4-exp"),
+    (ARCH_ID_IDEFICS3, "idefics3"),
 ];
 
 /// Diffusion (image/video denoiser) arch IDs that must appear in the separate
@@ -227,6 +228,7 @@ pub enum ModelArchFamily {
     /// [`KNOWN_RUNTIME_ARCH_IDS`], which asserts a `docs/model-support.toml` row and
     /// therefore a serving claim. Add it there when the serving crate lands.
     Qwen4Exp,
+    Idefics3,
     Unknown,
 }
 
@@ -250,6 +252,7 @@ pub fn model_arch_family(arch_id: u32) -> ModelArchFamily {
         ARCH_ID_GEMMA4 => ModelArchFamily::Gemma4,
         ARCH_ID_COHERE2_MOE => ModelArchFamily::Cohere2Moe,
         ARCH_ID_QWEN4EXP => ModelArchFamily::Qwen4Exp,
+        ARCH_ID_IDEFICS3 => ModelArchFamily::Idefics3,
         _ => ModelArchFamily::Unknown,
     }
 }

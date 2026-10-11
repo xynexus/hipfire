@@ -625,6 +625,21 @@ pub fn prefill_forward(
     tokens: &[u32],
     kv_cache: &mut KvCache,
 ) -> HipResult<Vec<f32>> {
+    prefill_forward_spliced(gpu, weights, config, tokens, None, kv_cache)
+}
+
+/// [`prefill_forward`] with a multimodal splice: every position whose token is
+/// `splice.0` takes the next `dim`-wide F32 row of `splice.1` (row-major, in
+/// prompt order) instead of an embedding lookup. Used by VLMs on a LLaMA
+/// decoder (Idefics3), whose projector output is already in embedding space.
+pub fn prefill_forward_spliced(
+    gpu: &mut Gpu,
+    weights: &LlamaWeights,
+    config: &LlamaConfig,
+    tokens: &[u32],
+    splice: Option<(u32, &GpuTensor)>,
+    kv_cache: &mut KvCache,
+) -> HipResult<Vec<f32>> {
     let batch = tokens.len();
     let dim = config.dim;
     let n_heads = config.n_heads;
@@ -655,7 +670,19 @@ pub fn prefill_forward(
     let result = (|| -> HipResult<Vec<f32>> {
         // Embedding: lookup each token individually into the batch buffer
         let x_single = gpu.alloc_owned(&[dim], DType::F32)?;
+        let mut splice_row = 0usize;
         for (i, &token) in tokens.iter().enumerate() {
+            if let Some((_, rows)) = splice.filter(|&(t, _)| t == token) {
+                gpu.hip.memcpy_dtod_at(
+                    &x_batch.buf,
+                    i * dim * 4,
+                    &rows.buf,
+                    splice_row * dim * 4,
+                    dim * 4,
+                )?;
+                splice_row += 1;
+                continue;
+            }
             match weights.embd_format {
                 EmbeddingFormat::HFQ4G256 => {
                     gpu.embedding_lookup_hfq4g256(&weights.token_embd, &x_single, token, dim)?

@@ -108,6 +108,10 @@ pub const ARCH_ID_COHERE2_MOE: u32 = 25;
 /// 512-expert MoE, a 4-wide gated residual, and a hashed n-gram embedding table.
 pub const ARCH_ID_QWEN4EXP: u32 = 26;
 
+/// Idefics3 vision-language models (IBM Granite-Docling, SmolVLM): SigLIP vision
+/// tower + pixel-shuffle connector spliced into a plain LLaMA text decoder.
+pub const ARCH_ID_IDEFICS3: u32 = 27;
+
 impl core::fmt::Display for ArchId {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         write!(f, "arch#{}", self.0)

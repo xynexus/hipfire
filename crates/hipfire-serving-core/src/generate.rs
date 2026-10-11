@@ -3774,6 +3774,7 @@ pub fn generate_start(
             messages_history,
             request_stop_sequences,
             raw_override,
+            &[],
         );
         return Qwen35Start::Handled;
     }

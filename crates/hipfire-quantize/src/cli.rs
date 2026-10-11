@@ -3627,6 +3627,10 @@ fn should_quantize(name: &str) -> bool {
         // Gemma3 multimodal projector (mm_input_projection_weight) — kept F32 so
         // the SigLIP/projector loader's source-precision reader consumes it.
         || name.starts_with("multi_modal_projector.")
+        // Idefics3 (Granite-Docling/SmolVLM) SigLIP tower + pixel-shuffle
+        // connector — read at source precision by the reused gemma3-vl tower.
+        || name.starts_with("model.vision_model.")
+        || name.starts_with("model.connector.")
     {
         return false;
     }
@@ -10082,6 +10086,10 @@ pub fn main() {
         "tokenizer": tokenizer_str.as_deref().unwrap_or("{}"),
         "tokenizer_config": tokenizer_config,
         "generation_config": generation_config,
+        // VLM image-processor geometry (resize/tile sizes) read by the serving
+        // preprocessor, e.g. Idefics3's `size` / `max_image_size`.
+        "preprocessor_config": read_sidecar("preprocessor_config.json")
+            .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok()),
     });
     let embedding_metadata = sentence_transformers_embedding_metadata(
         input_dir,
