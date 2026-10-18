@@ -353,6 +353,30 @@
     "env": []
   },
   {
+    "key": "expert_cache_mb",
+    "type": {
+      "kind": "u32"
+    },
+    "requirement": {
+      "kind": "optional"
+    },
+    "default": "8192",
+    "scopes": [
+      "global",
+      "model",
+      "runtime"
+    ],
+    "mutability": "load_time",
+    "owner": "hipfire-config",
+    "description": "Resident budget in MiB for the routed-expert cache of every model that pages its experts (qwen3.5-MoE with qwen35_paged_experts, deepseek4, qwen4_exp). Least-recently-used experts are evicted past it. Bigger is not faster: on gfx1151 a 48 GiB cache decoded slower than 8 GiB. Set per model under model_overrides.",
+    "validation": null,
+    "secret": false,
+    "restart_impact": "none",
+    "env": [
+      "HIPFIRE_EXPERT_CACHE_MB"
+    ]
+  },
+  {
     "key": "flash_mode",
     "type": {
       "kind": "enum",
@@ -1484,30 +1508,6 @@
     "secret": false,
     "restart_impact": "none",
     "env": []
-  },
-  {
-    "key": "qwen35_expert_cache_mb",
-    "type": {
-      "kind": "u32"
-    },
-    "requirement": {
-      "kind": "optional"
-    },
-    "default": "8192",
-    "scopes": [
-      "global",
-      "model",
-      "runtime"
-    ],
-    "mutability": "load_time",
-    "owner": "hipfire-config",
-    "description": "Resident budget in MiB for the paged routed-expert cache. Only meaningful with qwen35_paged_experts. Larger trades host memory for fewer expert fetches.",
-    "validation": null,
-    "secret": false,
-    "restart_impact": "none",
-    "env": [
-      "HIPFIRE_QWEN35_EXPERT_CACHE_MB"
-    ]
   },
   {
     "key": "qwen35_final_checkpoints",

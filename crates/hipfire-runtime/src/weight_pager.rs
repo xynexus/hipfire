@@ -1485,18 +1485,38 @@ pub enum ResidencyPolicy {
     },
 }
 
+/// Env var the daemon sets, for the duration of one load, from the resolved
+/// `expert_cache_mb` setting (`ModelLoadParams::module_vram_budget_bytes`). The
+/// arch loaders take `&Gpu` + `HfqFile`, not load params, so this is how the
+/// setting crosses that boundary — the same scoped-env seam as every other
+/// load-time knob. Set by hand it is a debug override; outside the daemon it is
+/// the only way to pick a budget.
+pub const EXPERT_CACHE_BYTES_ENV: &str = "HIPFIRE_EXPERT_CACHE_BYTES";
+
+/// Byte budget for a routed-expert pager: `HIPFIRE_EXPERT_CACHE_BYTES` when set
+/// to a positive integer, else [`ResidencyPolicy::DEFAULT_EXPERT_LRU_BYTES`].
+/// Every paged-expert family reads its budget here, so one setting covers all
+/// of them.
+pub fn expert_cache_budget_bytes() -> u64 {
+    std::env::var(EXPERT_CACHE_BYTES_ENV)
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .filter(|b| *b > 0)
+        .unwrap_or(ResidencyPolicy::DEFAULT_EXPERT_LRU_BYTES)
+}
+
 impl ResidencyPolicy {
     /// LRU budget a routed-expert pager gets when nothing names one. Matches
-    /// `qwen35_expert_cache_mb`'s default. Pinning is NOT a safe default: a
-    /// model whose experts exceed host memory (Qwen3.8-Flash-Next: ~160 GB of
+    /// `expert_cache_mb`'s default. Pinning is NOT a safe default: a model
+    /// whose experts exceed host memory (Qwen3.8-Flash-Next: ~160 GB of
     /// experts on a 124 GB box) pins its way into OOM a few hundred tokens in.
     /// Bigger is not faster either — 48 GiB measured slower than 8 GiB.
     pub const DEFAULT_EXPERT_LRU_BYTES: u64 = 8 << 30;
 
-    /// `LazyLru` against `budget`, or against the default when none is set.
-    pub fn expert_lru(budget: Option<u64>) -> Self {
+    /// `LazyLru` against the configured expert-cache budget.
+    pub fn expert_lru() -> Self {
         Self::LazyLru {
-            vram_budget_bytes: budget.unwrap_or(Self::DEFAULT_EXPERT_LRU_BYTES),
+            vram_budget_bytes: expert_cache_budget_bytes(),
         }
     }
 }

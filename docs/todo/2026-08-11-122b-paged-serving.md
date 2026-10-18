@@ -24,7 +24,7 @@ tensor count. It does not run.
 | result | `hipMalloc: out of memory` | `{"type":"loaded"}`, 48 layers |
 
 12,288 routed expert modules register against an 8 GiB cache
-(`HIPFIRE_QWEN35_EXPERT_CACHE_MB`, default 8192). This is the mechanism that
+(`expert_cache_mb`, default 8192). This is the mechanism that
 makes large MoE viable here at all, and it reframes the earlier "a 397B needs
 ~800 GB resident" projection: under paging the resident set is dense weights
 plus a bounded cache, not the whole model.

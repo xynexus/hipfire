@@ -2942,8 +2942,10 @@ impl ModelLoadParams {
         params.mtp_mode = non_empty_value(&config.mtp_mode);
         params.mtp_k = Some(config.mtp_k);
         params.residency_mode = non_empty_value(&config.model_residency_mode);
-        params.module_vram_budget_bytes =
-            (config.scheduler_vram_budget_bytes > 0).then_some(config.scheduler_vram_budget_bytes);
+        // The expert cache budget, NOT `scheduler_vram_budget_bytes`: that is the
+        // scheduler's whole-device claim, and forwarding it here handed every
+        // paged-expert model the entire budget as its cache.
+        params.module_vram_budget_bytes = Some(config.expert_cache_mb.saturating_mul(1 << 20));
         params
     }
 
