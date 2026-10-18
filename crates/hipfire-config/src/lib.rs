@@ -137,8 +137,8 @@ fn default_qwen35_paged_experts() -> bool {
 fn default_qwen35_final_checkpoints() -> bool {
     false
 }
-/// Matches the historical `HIPFIRE_QWEN35_EXPERT_CACHE_MB` fallback.
-fn default_qwen35_expert_cache_mb() -> u64 {
+/// `ResidencyPolicy::DEFAULT_EXPERT_LRU_BYTES` in MiB.
+fn default_expert_cache_mb() -> u64 {
     8192
 }
 /// On. The check is what turns an over-large load into a refusal instead of an
@@ -424,10 +424,9 @@ pub struct HipfireConfig {
     /// freed. The env var `HIPFIRE_QWEN35_FINAL_CHECKPOINTS` still overrides.
     #[serde(default = "default_qwen35_final_checkpoints")]
     pub qwen35_final_checkpoints: bool,
-    /// Resident budget for the paged-expert cache, in MiB. Only meaningful with
-    /// `qwen35_paged_experts`.
-    #[serde(default = "default_qwen35_expert_cache_mb")]
-    pub qwen35_expert_cache_mb: u64,
+    /// Resident budget for every paged-expert model's expert cache, in MiB.
+    #[serde(default = "default_expert_cache_mb")]
+    pub expert_cache_mb: u64,
     /// Refuse a load that would not fit in `MemAvailable`. Turning this off on a
     /// unified-memory host lets an over-large load invoke the OOM killer.
     #[serde(default = "default_load_mem_check")]
@@ -699,7 +698,7 @@ impl Default for HipfireConfig {
             oq_compact_multicol_wide: default_oq_compact_multicol_wide(),
             qwen35_paged_experts: default_qwen35_paged_experts(),
             qwen35_final_checkpoints: default_qwen35_final_checkpoints(),
-            qwen35_expert_cache_mb: default_qwen35_expert_cache_mb(),
+            expert_cache_mb: default_expert_cache_mb(),
             load_mem_check: default_load_mem_check(),
             load_mem_reserve_gib: default_load_mem_reserve_gib(),
             lmhead_twostage: default_lmhead_twostage(),

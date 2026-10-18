@@ -193,24 +193,6 @@ pub(crate) fn qwen35_paged_experts_enabled(num_experts: usize) -> bool {
         .qwen35_paged_experts
 }
 
-pub(crate) fn qwen35_expert_cache_budget_bytes() -> u64 {
-    if let Some(bytes) = std::env::var("HIPFIRE_QWEN35_EXPERT_CACHE_BYTES")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-    {
-        return bytes;
-    }
-    std::env::var("HIPFIRE_QWEN35_EXPERT_CACHE_MB")
-        .ok()
-        .and_then(|s| s.parse::<u64>().ok())
-        .unwrap_or_else(|| {
-            hipfire_config::load_config_bundle()
-                .config
-                .qwen35_expert_cache_mb
-        })
-        .saturating_mul(1024 * 1024)
-}
-
 pub(crate) fn infer_attn_output_gate_from_hfq(
     hfq: &HfqFile,
     n_layers: usize,

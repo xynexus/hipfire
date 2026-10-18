@@ -291,7 +291,7 @@ pub fn config_from_hfq(hfq: &HfqFile) -> Option<Qwen35Config> {
         has_shared_expert,
         norm_topk_prob,
         paged_experts: qwen35_paged_experts_enabled(num_experts),
-        vram_budget_bytes: qwen35_expert_cache_budget_bytes(),
+        vram_budget_bytes: hipfire_runtime::weight_pager::expert_cache_budget_bytes(),
     })
 }
 
@@ -437,6 +437,6 @@ pub fn config_from_safetensors(source: &dyn ModelSource) -> Option<Qwen35Config>
         has_shared_expert,
         norm_topk_prob,
         paged_experts: qwen35_paged_experts_enabled(num_experts),
-        vram_budget_bytes: qwen35_expert_cache_budget_bytes(),
+        vram_budget_bytes: hipfire_runtime::weight_pager::expert_cache_budget_bytes(),
     })
 }

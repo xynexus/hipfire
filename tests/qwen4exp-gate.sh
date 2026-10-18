@@ -248,7 +248,7 @@ step "GPU: PAGED routed experts vs resident, on the same artifact"
 if [ -f "$TMP/fx.oq4.hfq" ]; then
   res="$(HIPFIRE_QWEN4EXP_PAGED_EXPERTS=0 \
          ./target/release/examples/serve_fixture "$TMP/fx.oq4.hfq" 2>&1 || true)"
-  pag="$(HIPFIRE_QWEN4EXP_EXPERT_CACHE_BYTES=524288 \
+  pag="$(HIPFIRE_EXPERT_CACHE_BYTES=524288 \
          ./target/release/examples/serve_fixture "$TMP/fx.oq4.hfq" 2>&1 || true)"
   res_am="$(echo "$res" | grep -oE 'argmax [0-9]+' | head -1 | awk '{print $2}')"
   pag_am="$(echo "$pag" | grep -oE 'argmax [0-9]+' | head -1 | awk '{print $2}')"
