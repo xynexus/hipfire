@@ -158,16 +158,15 @@ impl Qwen4ExpBackend {
         ) {
             return Ok(None);
         }
-        // No budget = pin on first touch and never evict, which still skips every
-        // expert the prompt does not route to. A budget adds LRU eviction on top.
-        let residency = match std::env::var("HIPFIRE_QWEN4EXP_EXPERT_CACHE_BYTES")
-            .ok()
-            .and_then(|v| v.parse::<u64>().ok())
-            .filter(|b| *b > 0)
-        {
-            Some(vram_budget_bytes) => ResidencyPolicy::LazyLru { vram_budget_bytes },
-            None => ResidencyPolicy::PinAll,
-        };
+        // LRU eviction by default: the routed experts outsize host memory, so
+        // pinning on first touch OOMs mid-conversation. The env var is a debug
+        // override of the budget.
+        let residency = ResidencyPolicy::expert_lru(
+            std::env::var("HIPFIRE_QWEN4EXP_EXPERT_CACHE_BYTES")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|b| *b > 0),
+        );
         let mut pager = WeightPager::with_env_transport(
             hfq.path(),
             PagerConfig {

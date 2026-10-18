@@ -1522,16 +1522,9 @@ impl DeepseekV4 {
                     // consumer choice is a decision here and not an inheritance.
                     expert_layout:
                         hipfire_runtime::weight_pager::ExpertResidentLayout::IndexedMoeBlocks,
-                    // No budget set = pin everything. #310 landed the rename,
-                    // so the old `u64::MAX` sentinel is now a named policy.
-                    residency: match budget {
-                        Some(vram_budget_bytes) => {
-                            hipfire_runtime::weight_pager::ResidencyPolicy::LazyLru {
-                                vram_budget_bytes,
-                            }
-                        }
-                        None => hipfire_runtime::weight_pager::ResidencyPolicy::PinAll,
-                    },
+                    // LRU by default; pinning every touched expert OOMs once
+                    // the routed set outgrows host memory.
+                    residency: hipfire_runtime::weight_pager::ResidencyPolicy::expert_lru(budget),
                     trace: matches!(
                         std::env::var("HIPFIRE_DEEPSEEK4_EXPERT_CACHE_TRACE")
                             .ok()

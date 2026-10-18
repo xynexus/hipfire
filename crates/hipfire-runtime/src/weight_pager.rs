@@ -1485,6 +1485,22 @@ pub enum ResidencyPolicy {
     },
 }
 
+impl ResidencyPolicy {
+    /// LRU budget a routed-expert pager gets when nothing names one. Matches
+    /// `qwen35_expert_cache_mb`'s default. Pinning is NOT a safe default: a
+    /// model whose experts exceed host memory (Qwen3.8-Flash-Next: ~160 GB of
+    /// experts on a 124 GB box) pins its way into OOM a few hundred tokens in.
+    /// Bigger is not faster either — 48 GiB measured slower than 8 GiB.
+    pub const DEFAULT_EXPERT_LRU_BYTES: u64 = 8 << 30;
+
+    /// `LazyLru` against `budget`, or against the default when none is set.
+    pub fn expert_lru(budget: Option<u64>) -> Self {
+        Self::LazyLru {
+            vram_budget_bytes: budget.unwrap_or(Self::DEFAULT_EXPERT_LRU_BYTES),
+        }
+    }
+}
+
 impl PagerConfig {
     /// The eviction budget, or `None` when nothing is ever evicted. Every
     /// budget consult goes through here so `PinAll` cannot be half-honoured.
