@@ -1488,15 +1488,21 @@ impl DeltaNetSnapshot {
         }
     }
 
+    /// Sized by each tensor's `byte_size()`, never its buffer's: the pool hands
+    /// out buffers rounded up to a size bucket, so two states built from one
+    /// config can carry different capacities. Copying `buf.size()` made a
+    /// snapshot sized from the load-time state overrun when a later session's
+    /// state drew a bigger bucket (`size <= dst.size` panic on the second
+    /// DFlash request).
     fn alloc_like(&mut self, gpu: &mut Gpu, state: &DeltaNetState) -> HipResult<()> {
         for t in &state.s_matrices {
-            self.s_matrix_bufs.push(gpu.hip.malloc(t.buf.size())?);
+            self.s_matrix_bufs.push(gpu.hip.malloc(t.byte_size())?);
         }
         for t in &state.s_scales {
-            self.s_scale_bufs.push(gpu.hip.malloc(t.buf.size())?);
+            self.s_scale_bufs.push(gpu.hip.malloc(t.byte_size())?);
         }
         for t in &state.conv_states {
-            self.conv_state_bufs.push(gpu.hip.malloc(t.buf.size())?);
+            self.conv_state_bufs.push(gpu.hip.malloc(t.byte_size())?);
         }
         Ok(())
     }
@@ -1504,13 +1510,13 @@ impl DeltaNetSnapshot {
     /// Copy live state → backup.
     pub fn save_from(&mut self, state: &DeltaNetState, gpu: &mut Gpu) -> HipResult<()> {
         for (dst, src) in self.s_matrix_bufs.iter().zip(state.s_matrices.iter()) {
-            gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size())?;
+            gpu.hip.memcpy_dtod(dst, &src.buf, src.byte_size())?;
         }
         for (dst, src) in self.s_scale_bufs.iter().zip(state.s_scales.iter()) {
-            gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size())?;
+            gpu.hip.memcpy_dtod(dst, &src.buf, src.byte_size())?;
         }
         for (dst, src) in self.conv_state_bufs.iter().zip(state.conv_states.iter()) {
-            gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size())?;
+            gpu.hip.memcpy_dtod(dst, &src.buf, src.byte_size())?;
         }
         Ok(())
     }
@@ -1527,15 +1533,15 @@ impl DeltaNetSnapshot {
     ) -> HipResult<()> {
         for (dst, src) in self.s_matrix_bufs.iter().zip(state.s_matrices.iter()) {
             gpu.hip
-                .memcpy_dtod_async_at(dst, 0, &src.buf, 0, src.buf.size(), stream)?;
+                .memcpy_dtod_async_at(dst, 0, &src.buf, 0, src.byte_size(), stream)?;
         }
         for (dst, src) in self.s_scale_bufs.iter().zip(state.s_scales.iter()) {
             gpu.hip
-                .memcpy_dtod_async_at(dst, 0, &src.buf, 0, src.buf.size(), stream)?;
+                .memcpy_dtod_async_at(dst, 0, &src.buf, 0, src.byte_size(), stream)?;
         }
         for (dst, src) in self.conv_state_bufs.iter().zip(state.conv_states.iter()) {
             gpu.hip
-                .memcpy_dtod_async_at(dst, 0, &src.buf, 0, src.buf.size(), stream)?;
+                .memcpy_dtod_async_at(dst, 0, &src.buf, 0, src.byte_size(), stream)?;
         }
         Ok(())
     }
