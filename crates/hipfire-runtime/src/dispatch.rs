@@ -18,6 +18,7 @@ pub use hipfire_dispatch::families::attention::{AttnParams, FullAttnParams};
 pub use hipfire_dispatch::families::fused_qkv::FusedQkvParams;
 pub use hipfire_dispatch::families::gemv::{RotInput, RotateInputs, RotatedActivation};
 pub use hipfire_dispatch::families::kv_tier::{KvTierInputs, KvTierPlan};
+pub use hipfire_dispatch::moe_telemetry;
 pub use hipfire_dispatch::types::{GemvVariant, KernelKey, ShapeInfo};
 
 pub fn gemv_family() -> &'static hipfire_dispatch::families::gemv::GemvFamily {

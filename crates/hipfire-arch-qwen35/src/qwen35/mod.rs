@@ -898,6 +898,7 @@ pub fn forward_scratch(
     dn_state: &mut DeltaNetState,
     scratch: &Qwen35Scratch,
 ) -> HipResult<()> {
+    let _trace_rows = hipfire_dispatch::moe_telemetry::trace_rows([pos]);
     let dim = config.dim;
     // hipGraph capture for MoE was previously gated off-by-default behind
     // HIPFIRE_GRAPH_MOE=1 because of a known drift bug (task #100): under
@@ -4578,8 +4579,8 @@ mod tests {
     fn moe_router_histogram_records_top1_topk_weights_and_drops() {
         reset_moe_router_histogram(4, 2);
 
-        record_moe_router_selection(3, &[1, 2, 3], &[0.75, 0.25, 0.0]);
-        record_moe_router_selection(3, &[8, 2], &[0.6, 0.4]);
+        record_moe_router_selection(3, 0, &[1, 2, 3], &[0.75, 0.25, 0.0]);
+        record_moe_router_selection(3, 0, &[8, 2], &[0.6, 0.4]);
 
         let hist = take_moe_router_histogram().expect("histogram should be collected");
         assert_eq!(hist.num_experts, 4);

@@ -409,7 +409,7 @@ fn run_moe_decode_routed(
             .into_iter()
             .map(crate::moe_telemetry::router_index_i32_to_usize)
             .collect();
-        crate::moe_telemetry::record_moe_router_selection(p.layer, &indices, &weights);
+        crate::moe_telemetry::record_moe_router_selection(p.layer, 0, &indices, &weights);
     }
 
     moe_step!(__step, "after topk + any host readback");
@@ -1026,7 +1026,7 @@ fn run_moe_decode_cpu_fallback(
     // for every model routed through this executor — which is every MoE whose
     // `k != 8`, since those fail the `use_gpu_topk` guard and land here.
     // Indices/weights are already on the host, so this costs nothing extra.
-    crate::moe_telemetry::record_moe_router_selection(p.layer, &topk_indices, &topk_weights);
+    crate::moe_telemetry::record_moe_router_selection(p.layer, 0, &topk_indices, &topk_weights);
 
     // ── 3. Shared-expert down (identical to the GPU-top-K shared-down block) ──
     if p.shared_down_w.dtype == DType::MQ4G256 {

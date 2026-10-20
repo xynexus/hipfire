@@ -2369,6 +2369,9 @@ fn qwen35_prefill_tokens(
     tokens: &[u32],
     id: &str,
 ) -> Result<usize, String> {
+    // The march loop interleaves requests; route this forward's trace rows to
+    // this one.
+    hipfire_runtime::dispatch::moe_telemetry::trace_select(id);
     if kv.quant_kvarn && kvarn_forced_per_token() {
         // ROLLBACK ONLY. This used to be unconditional, on the reasoning that
         // KVarN required the per-token attention dispatch -- the batched forward
@@ -2878,6 +2881,7 @@ fn qwen35_decode_one(
     cfg: &Qwen35DecodeCfg,
     st: &mut Qwen35DecodeState,
 ) -> Qwen35Step {
+    hipfire_runtime::dispatch::moe_telemetry::trace_select(id);
     let filter_stop = match qwen35_decode_before_forward(tokenizer, stdout, id, t0, st, cursor) {
         PreForward::Stop => return Qwen35Step::Stop,
         PreForward::Ready { filter_stop } => filter_stop,

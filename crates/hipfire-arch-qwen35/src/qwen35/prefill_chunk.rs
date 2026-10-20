@@ -601,7 +601,12 @@ pub(crate) fn prefill_moe_ffn_body_batched(
         for token_idx in 0..n {
             let start = token_idx * k_top;
             let end = start + k_top;
-            record_moe_router_selection(layer_idx, &indices[start..end], &weights[start..end]);
+            record_moe_router_selection(
+                layer_idx,
+                token_idx,
+                &indices[start..end],
+                &weights[start..end],
+            );
         }
     }
     let bucketed_routed_experts = ffn.experts.is_empty() || dtypes.routed_profile.is_mixed();
@@ -2466,6 +2471,12 @@ pub(crate) fn forward_prefill_chunk(
         "forward_prefill_chunk: routed_out requires a single-layer band (EP driver invariant)",
     );
 
+    // Row i of this chunk is position start_pos + i (or the override's i-th),
+    // for the session routing trace.
+    let _trace_rows = hipfire_dispatch::moe_telemetry::trace_rows(match positions_override {
+        Some(p) => p.to_vec(),
+        None => (start_pos..start_pos + tokens.len()).collect(),
+    });
     let dim = config.dim;
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
     let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;

@@ -412,6 +412,11 @@ impl StreamTable {
         ids.into_iter().map(|(_, id)| id).collect()
     }
 
+    /// Request ids of every live stream.
+    pub(crate) fn request_ids(&self) -> impl Iterator<Item = &str> {
+        self.streams.values().map(|s| s.request_id.as_str())
+    }
+
     pub(crate) fn len(&self) -> usize {
         self.streams.len()
     }

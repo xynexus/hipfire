@@ -342,7 +342,9 @@ impl MoeScratch {
     }
 }
 
-/// One token through the block. `x` and `out` are `[hidden]`.
+/// One token through the block. `x` and `out` are `[hidden]`. `layer` is the
+/// trunk layer the routing trace records it under; `None` (the MTP head) is
+/// not recorded.
 pub fn moe_forward(
     gpu: &mut Gpu,
     cfg: &Qwen4ExpConfig,
@@ -350,6 +352,7 @@ pub fn moe_forward(
     s: &mut MoeScratch,
     x: &GpuTensor,
     out: &GpuTensor,
+    layer: Option<usize>,
 ) -> HipResult<()> {
     let m = &cfg.moe;
     let (hidden, mi) = (cfg.hidden, m.intermediate);
@@ -368,6 +371,14 @@ pub fn moe_forward(
         .iter()
         .map(|v| v.to_bits() as i32)
         .collect();
+    use hipfire_runtime::dispatch::moe_telemetry as telemetry;
+    if let Some(layer) = layer.filter(|_| telemetry::moe_router_histogram_active()) {
+        let picks: Vec<usize> = idx
+            .iter()
+            .map(|&e| telemetry::router_index_i32_to_usize(e))
+            .collect();
+        telemetry::record_moe_router_selection(layer, 0, &picks, &gpu.download_f32(&s.topk_w)?);
+    }
     for (slot, &e) in idx.iter().enumerate() {
         let e = e.max(0) as usize;
         // `weight_gemv` dispatches on the stack's dtype, so a quantised expert
