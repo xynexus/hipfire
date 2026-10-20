@@ -102,7 +102,12 @@ pub fn generate_registered_backend(
             system: system_prompt,
             user: prompt,
             reasoning_effort: hipfire_prompt::template_reasoning_effort(max_think_tokens),
-            enable_thinking: max_think_tokens > 0,
+            // 1 is the serving layer's "thinking off" sentinel; 0 is "no budget",
+            // which is thinking ON — the convention every other frame here uses.
+            // `> 0` closed the think block for any request without a budget, while
+            // the server streamed it as open: the whole answer went out as
+            // `reasoning_content` with `content` empty.
+            enable_thinking: max_think_tokens != 1,
             bos_token,
         };
         let rendered = if let Some(messages) = messages_history {
