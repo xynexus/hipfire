@@ -342,6 +342,20 @@ impl MoeScratch {
     }
 }
 
+/// Diagnostic routing record, appended in call order (per token, layer-major).
+pub struct RoutingTrace {
+    /// The `experts_per_tok` experts the GPU routed to.
+    pub ids: Vec<u16>,
+    /// Raw router logits, `num_experts` per call — enough to rebuild any
+    /// alternative selection offline.
+    pub logits: Vec<f32>,
+}
+
+/// While `Some`, every `moe_forward` appends to it. Drained by the
+/// `routing_trace_qwen4exp` probe; `None` costs one uncontended lock per layer
+/// next to a GPU download.
+pub static ROUTING_TRACE: std::sync::Mutex<Option<RoutingTrace>> = std::sync::Mutex::new(None);
+
 /// One token through the block. `x` and `out` are `[hidden]`. `layer` is the
 /// trunk layer the routing trace records it under; `None` (the MTP head) is
 /// not recorded.
@@ -378,6 +392,10 @@ pub fn moe_forward(
             .map(|&e| telemetry::router_index_i32_to_usize(e))
             .collect();
         telemetry::record_moe_router_selection(layer, 0, &picks, &gpu.download_f32(&s.topk_w)?);
+    }
+    if let Some(t) = ROUTING_TRACE.lock().unwrap().as_mut() {
+        t.ids.extend(idx.iter().map(|&e| e as u16));
+        t.logits.extend(gpu.download_f32(&s.logits)?);
     }
     for (slot, &e) in idx.iter().enumerate() {
         let e = e.max(0) as usize;
