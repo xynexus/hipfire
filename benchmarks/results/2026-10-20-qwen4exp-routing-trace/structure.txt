@@ -1,0 +1,91 @@
+trace: S=112 T=512 L=48 K=10 E=512; uniform overlap K/E=0.020
+
+1. routed weight by rank (renormalised, descending prob)
+  0.219 0.149 0.118 0.099 0.087 0.077 0.070 0.064 0.060 0.056
+  cumulative 0.22 0.37 0.49 0.59 0.67 0.75 0.82 0.88 0.94 1.00
+
+2. reuse: overlap of S(t) with ...
+                                  L0-11 L12-23 L24-35 L36-47
+  same stream, t-1                0.322  0.366  0.372  0.397
+  same stream, t-2                0.232  0.293  0.305  0.308
+  same stream, t-4                0.194  0.249  0.260  0.260
+  same stream, t-16               0.154  0.190  0.197  0.204
+  same stream, t-64               0.118  0.143  0.147  0.155
+  same stream, t-256              0.097  0.116  0.119  0.126
+  other stream, same group, same t  0.081  0.093  0.099  0.098
+  other stream, other group, same t  0.035  0.039  0.041  0.040
+
+3. same token id (45075 pairs, 15186 cross-doc)
+                                  L0-11 L12-23 L24-35 L36-47
+  same id, same doc               0.531  0.422  0.364  0.434
+  same id, other doc              0.387  0.296  0.244  0.301
+  random pair                     0.035  0.038  0.039  0.040
+
+4. prefetch recall@10 (fraction of S(t,l) in the 10 predicted)
+                                  L0-11 L12-23 L24-35 L36-47
+  popularity (static)             0.096  0.106  0.109  0.109
+  previous tokens, same layer     0.344  0.365  0.370  0.396
+  previous layer, co-occurrence   0.414  0.378  0.373  0.420
+  prev tokens + prev layer        0.373  0.393  0.400  0.425
+
+4. prefetch recall@20 (fraction of S(t,l) in the 20 predicted)
+                                  L0-11 L12-23 L24-35 L36-47
+  popularity (static)             0.157  0.173  0.177  0.175
+  previous tokens, same layer     0.465  0.510  0.521  0.527
+  previous layer, co-occurrence   0.585  0.543  0.537  0.588
+  prev tokens + prev layer        0.559  0.566  0.575  0.598
+
+4. prefetch recall@40 (fraction of S(t,l) in the 40 predicted)
+                                  L0-11 L12-23 L24-35 L36-47
+  popularity (static)             0.247  0.268  0.273  0.271
+  previous tokens, same layer     0.589  0.637  0.652  0.649
+  previous layer, co-occurrence   0.745  0.707  0.703  0.740
+  prev tokens + prev layer        0.783  0.767  0.767  0.795
+
+4. prefetch recall@80 (fraction of S(t,l) in the 80 predicted)
+                                  L0-11 L12-23 L24-35 L36-47
+  popularity (static)             0.385  0.407  0.415  0.410
+  previous tokens, same layer     0.677  0.721  0.733  0.729
+  previous layer, co-occurrence   0.872  0.843  0.843  0.856
+  prev tokens + prev layer        0.912  0.896  0.894  0.905
+
+5. static hot set 22% (113/512) from train popularity; test picks
+                                  L0-11 L12-23 L24-35 L36-47
+  miss rate p                     0.535  0.503  0.493  0.497
+  routed weight on misses         0.521  0.483  0.473  0.476
+  misses with resident substitute  0.729  0.753  0.789  0.730
+  p(substitute) / p(missed)       0.378  0.414  0.426  0.421
+  tokens with no miss             0.020  0.032  0.027  0.033
+
+6. hot set 22% hit rate on a group's test streams, built from ...
+                                  L0-11 L12-23 L24-35 L36-47
+  its own group's train streams   0.653  0.701  0.710  0.742
+  all train streams               0.465  0.497  0.507  0.503
+  a different group               0.284  0.291  0.295  0.295
+    own group: rust               0.694  0.732  0.750  0.743
+    own group: docs               0.639  0.702  0.704  0.765
+    own group: samedoc            0.711  0.764  0.757  0.822
+    own group: wiki               0.608  0.650  0.676  0.695
+    own group: math               0.697  0.771  0.783  0.739
+    own group: pycode             0.535  0.603  0.625  0.604
+    own group: chinese            0.688  0.684  0.674  0.829
+
+7. distinct experts used by one stream in W tokens, / E
+                                  L0-11 L12-23 L24-35 L36-47
+  W=16 (uniform 0.27)             0.146  0.129  0.126  0.125
+  W=64 (uniform 0.72)             0.316  0.276  0.270  0.264
+  W=256 (uniform 0.99)            0.547  0.491  0.480  0.462
+  W=512 (uniform 1.00)            0.662  0.606  0.592  0.570
+
+8. per-stream LRU 22% + one-layer-ahead prefetch; per routed pick
+                                  L0-11 L12-23 L24-35 L36-47
+  no prefetch: demand misses      0.209  0.157  0.146  0.138
+  top-10: demand misses           0.208  0.157  0.146  0.138
+  top-10: prefetch loads          0.002  0.000  0.000  0.000
+  top-10: prefetch loads used     0.001  0.000  0.000  0.000
+  top-20: demand misses           0.192  0.150  0.141  0.129
+  top-20: prefetch loads          0.037  0.019  0.016  0.022
+  top-20: prefetch loads used     0.018  0.007  0.005  0.009
+  top-40: demand misses           0.153  0.125  0.122  0.108
+  top-40: prefetch loads          0.322  0.232  0.207  0.219
+  top-40: prefetch loads used     0.075  0.041  0.032  0.040

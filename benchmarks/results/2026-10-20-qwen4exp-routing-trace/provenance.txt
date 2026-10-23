@@ -1,0 +1,11 @@
+model: Qwen3.8-Flash-Next-180B--oq4.hfq  md5 02401673ed15c19972ca2561fae9a04c
+probe: routing_trace_qwen4exp (branch exp/qwen4exp-routing-locality, uncommitted), md5 7f3a4babfc5872f7c58779af88d545d0
+gpu: gfx1151 (Strix Halo), HIP 7.16; run 2026-10-20 07:29-10:16
+corpus: routing_locality_corpus.py seed 1234, md5 25de9fb15fe36184ffa14fc563902d80
+args: n_tok 512, top_n 32; 112 docs, 0 skipped; mean 5.74 tok/s
+host/GPU top-k mismatches: 7 of 2,752,512 calls, all exact ties at rank k (GPU took rank 10)
+
+bc99ce783acb362c36403be7ea2c14c6  trace512/alt_ids.bin
+d269d0110aa835fc4af70d3013592ab8  trace512/alt_p.bin
+3664fb1935363a128a055c31b5d2b939  trace512/routing.bin
+de8d45b908f652d4b7840a66484cd7c4  trace512/tokens.bin

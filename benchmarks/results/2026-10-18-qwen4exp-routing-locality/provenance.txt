@@ -1,0 +1,4 @@
+25de9fb15fe36184ffa14fc563902d80  routing_docs.jsonl
+89c9212090ed740ae7a4bdc1bb15c647  trace/routing.bin
+mean tok/s 5.75714 docs 112
+model ~/.hipfire/models/Qwen3.8-Flash-Next-180B--oq4.hfq, n_tok 256, probe routing_trace_qwen4exp, corpus benchmarks/scripts/routing_locality_corpus.py
