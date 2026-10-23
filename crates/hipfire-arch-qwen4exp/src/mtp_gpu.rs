@@ -183,7 +183,7 @@ pub fn mtp_decode_step(
     hc_write(gpu, cfg, &s.hc, &s.wide, &s.block_out)?;
 
     hc_read(gpu, cfg, &w.mlp_hc, &mut s.hc, &s.wide, &s.mixed)?;
-    moe_forward(gpu, cfg, &w.moe, &mut s.moe, &s.mixed, &s.block_out)?;
+    moe_forward(gpu, cfg, &w.moe, &mut s.moe, &s.mixed, &s.block_out, None)?;
     hc_write(gpu, cfg, &s.hc, &s.wide, &s.block_out)?;
 
     // The mixer's own norm is the last normalisation, as in the trunk.

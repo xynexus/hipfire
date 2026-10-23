@@ -468,6 +468,12 @@ pub trait ServingBackend: Send {
     fn kld_forward(&mut self) -> Option<&mut dyn crate::kld_eval::ChunkScoredForward> {
         None
     }
+
+    /// Routed-expert pager counters, for per-request statistics; `None` when
+    /// the model's experts are not paged.
+    fn expert_pager_stats(&self) -> Option<crate::weight_pager::ModulePagerStats> {
+        None
+    }
 }
 
 /// Shape metadata returned alongside a boxed backend. This is deliberately

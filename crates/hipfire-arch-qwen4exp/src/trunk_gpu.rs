@@ -1001,7 +1001,15 @@ pub fn decode_step_into(
         hc_write(gpu, cfg, &s.hc, &s.wide, &s.block_out)?;
 
         hc_read(gpu, cfg, &lw.mlp_hc, &mut s.hc, &s.wide, &s.mixed)?;
-        moe_forward(gpu, cfg, &lw.moe, &mut s.moe, &s.mixed, &s.block_out)?;
+        moe_forward(
+            gpu,
+            cfg,
+            &lw.moe,
+            &mut s.moe,
+            &s.mixed,
+            &s.block_out,
+            Some(l),
+        )?;
         hc_write(gpu, cfg, &s.hc, &s.wide, &s.block_out)?;
     }
 

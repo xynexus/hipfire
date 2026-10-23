@@ -160,7 +160,7 @@ fn main() {
 
             let gx = gpu.upload_f32(&x, &[hidden]).unwrap();
             let gout = gpu.zeros(&[hidden], DType::F32).unwrap();
-            moe_forward(&mut gpu, &cfg, &w, &mut s, &gx, &gout).unwrap();
+            moe_forward(&mut gpu, &cfg, &w, &mut s, &gx, &gout, None).unwrap();
             let got = gpu.download_f32(&gout).unwrap();
             worst = worst.max(
                 got.iter()

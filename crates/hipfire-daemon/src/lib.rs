@@ -1223,6 +1223,7 @@ mod resource_reservation_tests {
 mod generate_batch_prefill_tests;
 
 mod handlers;
+mod moe_trace;
 mod queue;
 mod state;
 mod stream;
@@ -1543,6 +1544,10 @@ fn drain_streams(daemon_state: &mut state::DaemonState) {
     let mut guard = 0usize;
     while !daemon_state.streams.runnable().is_empty() {
         march_streams(daemon_state);
+        daemon_state.moe_trace.sweep(
+            daemon_state.model.as_ref(),
+            daemon_state.streams.request_ids(),
+        );
         guard += 1;
         if guard > 1_000_000 {
             eprintln!(
@@ -1906,6 +1911,10 @@ pub fn main() {
         }
         let Some(frame) = pending.pop_next() else {
             march_streams(&mut daemon_state);
+            daemon_state.moe_trace.sweep(
+                daemon_state.model.as_ref(),
+                daemon_state.streams.request_ids(),
+            );
             continue;
         };
         // Scheduling decisions are otherwise unobservable from outside: replies
@@ -2099,6 +2108,12 @@ pub fn main() {
                         daemon_state.streams.retire(id);
                     }
                 }
+                // Close the trace of a request that ran inline; a marching one
+                // closes on the sweep after the pass that retires it.
+                daemon_state.moe_trace.sweep(
+                    daemon_state.model.as_ref(),
+                    daemon_state.streams.request_ids(),
+                );
             }
 
             DaemonRequest::ReleaseSessions => {

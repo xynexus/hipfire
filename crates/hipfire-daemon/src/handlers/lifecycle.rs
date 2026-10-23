@@ -873,6 +873,16 @@ pub(crate) fn load(
                 df.adaptive_b = spec_adaptive_block;
                 df.spec_block = spec_block;
             }
+            let moe_trace = msg
+                .get("params")
+                .and_then(|p| p.get("moe_trace"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(ngram_cfg.moe_trace);
+            if moe_trace {
+                daemon_state.moe_trace.models.insert(m.model_path.clone());
+            } else {
+                daemon_state.moe_trace.models.remove(&m.model_path);
+            }
             daemon_state
                 .resource_reservations
                 .set_worker_usage(requested_worker_id.clone(), planned_resource_usage);

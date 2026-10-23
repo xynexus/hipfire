@@ -361,6 +361,7 @@ impl Qwen4ExpBackend {
                 Some(&streamed)
             }
         };
+        let _trace_rows = hipfire_runtime::dispatch::moe_telemetry::trace_rows([pos]);
         decode_step_into(
             gpu, cfg, weights, state, scratch, embed, rows, history, pos, *eos,
         )
@@ -426,6 +427,10 @@ impl ServingBackend for Qwen4ExpBackend {
     ) -> Result<ServeOutcome, String> {
         let eos = self.eos;
         run_simple_ar(gpu, self, tok, eos, ctx)
+    }
+
+    fn expert_pager_stats(&self) -> Option<hipfire_runtime::weight_pager::ModulePagerStats> {
+        Qwen4ExpBackend::expert_pager_stats(self)
     }
 
     fn reset_session(&mut self, gpu: &mut Gpu, _session_id: &str) -> Result<(), String> {

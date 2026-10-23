@@ -1307,7 +1307,7 @@ pub(crate) fn moe_ffn_decode_impl(
                     .map(router_index_i32_to_usize)
                     .collect::<Vec<_>>();
                 let weights = gpu.download_f32(s.topk_weights)?;
-                record_moe_router_selection(layer_idx, &indices, &weights);
+                record_moe_router_selection(layer_idx, 0, &indices, &weights);
             }
             (None, None)
         } else {
@@ -1339,7 +1339,7 @@ pub(crate) fn moe_ffn_decode_impl(
                     }
                 }
             }
-            record_moe_router_selection(layer_idx, &topk_indices, &topk_weights);
+            record_moe_router_selection(layer_idx, 0, &topk_indices, &topk_weights);
             (Some(topk_indices), Some(topk_weights))
         };
     if ffn.experts.is_empty() {

@@ -914,6 +914,7 @@ pub(crate) fn text(
         // the same steps in the same order — but the loop being HERE is what
         // lets the executor interleave two streams instead of running one
         // request to completion inside a single call.
+        daemon_state.moe_trace.open(m, id, session_id);
         let started = generate_start(
             m,
             &mut daemon_state.gpu,

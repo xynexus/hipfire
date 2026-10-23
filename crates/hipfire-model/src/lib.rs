@@ -2788,6 +2788,9 @@ pub struct ModelLoadParams {
     pub spec_adaptive_block: Option<bool>,
     /// Fixed speculative verify block; `None`/0 = auto. See `spec_block`.
     pub spec_block: Option<u32>,
+    /// Per-request MoE routing trace. See `moe_trace`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub moe_trace: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub draft: Option<String>,
     /// Render prompts through the model's Jinja chat template. `None` is `auto` —
@@ -2913,6 +2916,7 @@ impl ModelLoadParams {
         params.kv_adaptive = non_off_value(&config.kv_adaptive);
         params.spec_adaptive_block = Some(config.spec_adaptive_block);
         params.spec_block = Some(config.spec_block);
+        params.moe_trace = Some(config.moe_trace);
         params.gpu_slab_load = non_auto_value(&config.gpu_slab_load);
         params.mmq_screen = Some(config.mmq_screen != "off");
         params.mmq_screen_threshold = Some(config.mmq_screen_threshold);

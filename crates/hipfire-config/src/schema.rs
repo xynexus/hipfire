@@ -810,6 +810,27 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         validation: "0, or 2..=32"
     ),
     field!(
+        "moe_trace",
+        ConfigType::Bool,
+        Requirement::Optional,
+        Some("false"),
+        GLOBAL_MODEL_RUNTIME,
+        ConfigMutability::LoadTime,
+        "Record every MoE routing decision of every generate request, for offline \
+         expert-scheduling and cache analysis. Each request writes \
+         `~/.hipfire/moe_traces/<time>-<request>.bin` (per routed row: u32 position, \
+         u16 layer, u16 k, k u16 experts, k u16 weights scaled by 65535) and a \
+         `.json` beside it with the request's statistics: model, session, wall \
+         time, positions, experts touched per layer, weight by rank, and the \
+         expert pager's hits/cold loads/evictions. Covers qwen3.5-MoE and \
+         qwen4_exp decode and prefill; rows of the multi-session batched executor \
+         are counted but not written. Costs a device-to-host copy of the top-k \
+         per layer per token: ~4% decode on Qwen3.5-35B-A3B (gfx1151, 57.6 vs \
+         60.0 tok/s), none measurable in prefill, so leave it off for \
+         benchmarks. Files are never pruned: 40 bytes per token per layer at \
+         top-8 (~1.6 KB per token on a 40-layer model)."
+    ),
+    field!(
         "ngram_spec",
         ConfigType::Bool,
         Requirement::Optional,

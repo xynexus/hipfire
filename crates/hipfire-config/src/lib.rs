@@ -171,6 +171,9 @@ fn default_dflash_draft() -> String {
 fn default_spec_adaptive_block() -> bool {
     false
 }
+fn default_moe_trace() -> bool {
+    false
+}
 fn default_spec_block() -> u32 {
     0
 }
@@ -450,6 +453,8 @@ pub struct HipfireConfig {
     pub spec_adaptive_block: bool,
     #[serde(default = "default_spec_block")]
     pub spec_block: u32,
+    #[serde(default = "default_moe_trace")]
+    pub moe_trace: bool,
     #[serde(default = "default_dflash_no_repeat_ngram")]
     pub dflash_no_repeat_ngram: serde_json::Value,
     /// Opt-in drafter-free n-gram speculative decode. Drafts from token
@@ -708,6 +713,7 @@ impl Default for HipfireConfig {
             dflash_draft: default_dflash_draft(),
             spec_adaptive_block: default_spec_adaptive_block(),
             spec_block: default_spec_block(),
+            moe_trace: default_moe_trace(),
             ngram_spec: default_ngram_spec(),
             ngram_spec_store_root: default_ngram_spec_store_root(),
             ngram_spec_scope: default_ngram_spec_scope(),

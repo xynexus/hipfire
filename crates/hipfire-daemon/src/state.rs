@@ -65,6 +65,8 @@ pub(crate) struct DaemonState {
     /// LoraTrainSession). Some between quanta of a run; runner drives one
     /// quantum per TrainLora request.
     pub lora_train_session: Option<LoraTrainSession>,
+    /// Per-request MoE routing traces (`moe_trace`).
+    pub moe_trace: crate::moe_trace::MoeTraces,
     /// Resident micro-step-preemptible SSM-drafter training session (see
     /// DrafterTrainSession). Some between quanta of a run; runner drives one
     /// quantum of EPOCHS per TrainDrafter request.
@@ -213,6 +215,7 @@ impl DaemonState {
             pflash_drafter_gpu: None,
             dummy_model: None,
             lora_train_session: None,
+            moe_trace: Default::default(),
             drafter_train_session: None,
             calibrate_session: None,
             resource_reservations: ResourceReservationManager::from_env(),
