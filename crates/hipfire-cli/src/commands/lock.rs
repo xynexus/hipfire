@@ -727,6 +727,17 @@ mod tests {
                 .write_holder("ghost host=h acquired_epoch=1 holder=2147483646 mode=run")
                 .unwrap();
         } // guard dropped: flock released, record still on disk
+          // A flock belongs to the open file description, and a child that a parallel
+          // test forks shares every fd until its exec closes the CLOEXEC ones -- so the
+          // lock can outlive this drop by that window. It flaked CI once; wait it out.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while !matches!(
+            hipfire_lock::probe(&path),
+            Ok(hipfire_lock::LockState::Free)
+        ) && std::time::Instant::now() < deadline
+        {
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
         assert!(matches!(
             hipfire_lock::probe(&path),
             Ok(hipfire_lock::LockState::Free)

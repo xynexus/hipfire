@@ -200,6 +200,26 @@ fn incomplete_utf8_tail(b: &[u8]) -> usize {
     0
 }
 
+/// Decoded text one token at a time, for a decode loop that streams each token as
+/// it is sampled. Byte-level BPE splits a codepoint's bytes across tokens, and
+/// `decode(&[token])` turns each half into U+FFFD; this holds an incomplete
+/// codepoint back until the token that completes it, so it arrives whole, once.
+#[derive(Default)]
+pub struct Utf8Stream {
+    pending: Vec<u8>,
+}
+
+impl Utf8Stream {
+    /// The text `token` completes: empty while a codepoint is still split.
+    pub fn push(&mut self, tok: &Tokenizer, token: u32) -> String {
+        self.pending.extend(tok.decode_bytes(&[token]));
+        let cut = self.pending.len() - incomplete_utf8_tail(&self.pending);
+        let out = String::from_utf8_lossy(&self.pending[..cut]).into_owned();
+        self.pending.drain(..cut);
+        out
+    }
+}
+
 /// `text` without the marks [`Tokenizer::decode_marked`] put in it.
 pub fn unmark_literal(text: &str) -> std::borrow::Cow<'_, str> {
     if text.contains(LITERAL_ESC) {
@@ -2967,6 +2987,20 @@ mod literal_escape_tests {
         assert_eq!(incomplete_utf8_tail(&"├".as_bytes()[..2]), 2);
         assert_eq!(incomplete_utf8_tail(&"😀".as_bytes()[..3]), 3);
         assert_eq!(incomplete_utf8_tail(b"ab"), 0);
+    }
+
+    #[test]
+    fn a_token_by_token_stream_holds_a_split_codepoint_until_it_completes() {
+        let t = tok();
+        let ids = t.encode_raw("a├b─c 😀");
+        let mut s = Utf8Stream::default();
+        let pieces: Vec<String> = ids.iter().map(|&id| s.push(&t, id)).collect();
+        assert_eq!(pieces.concat(), "a├b─c 😀");
+        assert!(pieces.iter().all(|p| !p.contains('\u{FFFD}')), "{pieces:?}");
+        assert!(
+            pieces.iter().any(String::is_empty),
+            "nothing was held back: {pieces:?}"
+        );
     }
 
     #[test]
