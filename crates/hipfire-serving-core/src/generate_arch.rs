@@ -829,6 +829,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         let mut spec_last_token = deepseek4::spec_decode::logits_argmax(&last_logits) as u32;
         let mut spec_last_position = pos_after_prefill;
         let mut last_hidden_ref = state.mtp_last_hidden.as_ref().map(|t| t as *const _);
+        let mut utf8 = hipfire_model::tokenizer::Utf8Stream::default();
         'outer: while generated_count < max_tokens {
             let lh: Option<&hipfire_rdna::GpuTensor> = unsafe {
                 last_hidden_ref.and_then(|p| (p as *const hipfire_rdna::GpuTensor).as_ref())
@@ -874,7 +875,7 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
                 if generated_count >= max_tokens || t == eos_tok {
                     break 'outer;
                 }
-                let frag = tokenizer.decode(&[t]);
+                let frag = utf8.push(tokenizer, t);
                 if grammar_active {
                     for ev in parser.feed(&frag) {
                         absorb_event(&ev);
@@ -1087,11 +1088,12 @@ You MUST be very thorough in your thinking and comprehensively decompose the pro
         // it reaches neither of the other cancellation points — the arch-generic
         // `decode_loop_*` nor `emit_filter_action`. Without this check an `abort`
         // against a deepseek4 generation would be accepted and then ignored.
+        let mut utf8 = hipfire_model::tokenizer::Utf8Stream::default();
         while generated_count < max_tokens
             && next_tok != eos_tok
             && !hipfire_runtime::cancel::is_cancelled(id)
         {
-            let frag = tokenizer.decode(&[next_tok]);
+            let frag = utf8.push(tokenizer, next_tok);
             for ev in parser.feed(&frag) {
                 absorb_event(&ev);
                 emit_stream_event(stdout, id, ev);
@@ -2326,6 +2328,7 @@ pub fn generate_minimax(
     }
 
     // ── Decode loop. Sample host-side from the running logits vector.
+    let mut utf8 = hipfire_model::tokenizer::Utf8Stream::default();
     // `temp <= 0` makes sample_token greedy; otherwise top_p nucleus.
     // Seed the PRNG from wall-clock nanos so successive same-prompt runs
     // don't lock-step (greedy is still deterministic). ──
@@ -2351,7 +2354,7 @@ pub fn generate_minimax(
         // `id` or arbitrary-UTF-8 fragment can't corrupt the JSONL line.
         let frag = {
             let tokenizer = m.tokenizer.as_ref().unwrap();
-            tokenizer.decode(&[next_tok])
+            utf8.push(tokenizer, next_tok)
         };
         let envelope = serde_json::json!({
             "type": "token",
@@ -2704,6 +2707,7 @@ pub fn generate_lfm2moe(
     }
 
     // ── Decode loop. Sample host-side from the running logits vector. ──
+    let mut utf8 = hipfire_model::tokenizer::Utf8Stream::default();
     let seed = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as u64)
@@ -2723,7 +2727,7 @@ pub fn generate_lfm2moe(
 
         let frag = {
             let tokenizer = m.tokenizer.as_ref().unwrap();
-            tokenizer.decode(&[next_tok])
+            utf8.push(tokenizer, next_tok)
         };
         let envelope = serde_json::json!({
             "type": "token",
@@ -3096,13 +3100,15 @@ fn generate_lfm2moe_dflash(
         return;
     }
 
+    let mut utf8 = hipfire_model::tokenizer::Utf8Stream::default();
     let emit_token = |stdout: &mut dyn std::io::Write,
                       id: &str,
                       token: u32,
                       ordinal: usize,
                       elapsed_ms: u64,
-                      tokenizer: &hipfire_model::tokenizer::Tokenizer| {
-        let frag = tokenizer.decode(&[token]);
+                      tokenizer: &hipfire_model::tokenizer::Tokenizer,
+                      utf8: &mut hipfire_model::tokenizer::Utf8Stream| {
+        let frag = utf8.push(tokenizer, token);
         let envelope = serde_json::json!({
             "type": "token",
             "id": id,
@@ -3122,6 +3128,7 @@ fn generate_lfm2moe_dflash(
             0,
             t0.elapsed().as_millis() as u64,
             tokenizer,
+            &mut utf8,
         );
     }
     m.active.cursor.conversation_tokens.push(first_token);
@@ -3194,6 +3201,7 @@ fn generate_lfm2moe_dflash(
                     generated_count,
                     t0.elapsed().as_millis() as u64,
                     tokenizer,
+                    &mut utf8,
                 );
             }
             m.active.cursor.conversation_tokens.push(tok);
