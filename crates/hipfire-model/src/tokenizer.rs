@@ -181,6 +181,25 @@ impl From<serde_json::Error> for TokenizerError {
 /// noncharacter, so no real text carries one undoubled.
 pub const LITERAL_ESC: char = '\u{FFFF}';
 
+/// How many bytes at the end of `b` start a UTF-8 codepoint that `b` does not finish
+/// (0 when it ends on a whole codepoint, or on bytes that cannot start one).
+fn incomplete_utf8_tail(b: &[u8]) -> usize {
+    for i in 1..=b.len().min(3) {
+        let byte = b[b.len() - i];
+        if byte & 0xC0 == 0x80 {
+            continue; // a continuation byte: its lead is further back
+        }
+        let need = match byte {
+            0xF0.. => 4,
+            0xE0.. => 3,
+            0xC0.. => 2,
+            _ => 1,
+        };
+        return if i < need { i } else { 0 };
+    }
+    0
+}
+
 /// `text` without the marks [`Tokenizer::decode_marked`] put in it.
 pub fn unmark_literal(text: &str) -> std::borrow::Cow<'_, str> {
     if text.contains(LITERAL_ESC) {
@@ -1023,7 +1042,12 @@ impl Tokenizer {
             b.extend_from_slice(&tail);
             tail = b;
         }
-        let mut out = Vec::new();
+        // A codepoint whose bytes straddle the call boundary is emitted by the call it
+        // completes in: its start is taken from `history` here, and a codepoint still
+        // incomplete at the end is left to the next call. The Qwen decode paths stream
+        // one call per token / per step, and decoding each alone turned every split
+        // codepoint into U+FFFDs (`├` arrived as two of them).
+        let mut out = tail[tail.len() - incomplete_utf8_tail(&tail)..].to_vec();
         for &t in tokens {
             let piece = bytes(t);
             if is_special(t) {
@@ -1057,6 +1081,7 @@ impl Tokenizer {
             let keep = tail.len().saturating_sub(longest);
             tail.drain(..keep);
         }
+        out.truncate(out.len() - incomplete_utf8_tail(&out));
         String::from_utf8_lossy(&out).into_owned()
     }
 
@@ -2917,6 +2942,31 @@ mod literal_escape_tests {
         assert_eq!(unmark_literal(&piece), "m_end|>");
         // The control token itself is never marked.
         assert_eq!(t.decode_marked(&ids, &[im_end]), t.decode(&[im_end]));
+    }
+
+    // The Qwen decode paths stream `decode_marked(history, step)` per token or per
+    // step; their concatenation must be the whole reply. A 27B reply drawing a file
+    // tree came back with `├` as two U+FFFDs: its bytes split across two steps and
+    // each step was decoded alone.
+    #[test]
+    fn a_codepoint_split_across_calls_is_emitted_whole_once() {
+        let t = tok();
+        let ids = t.encode_raw("a├b─c 😀");
+        assert!(
+            ids.len() > "a├b─c 😀".chars().count(),
+            "the test splits codepoints"
+        );
+        for step in [1, 2, 4] {
+            let mut streamed = String::new();
+            for (k, chunk) in ids.chunks(step).enumerate() {
+                streamed.push_str(&t.decode_marked(&ids[..k * step], chunk));
+            }
+            assert_eq!(streamed, "a├b─c 😀", "{step} token(s) per call");
+        }
+        assert_eq!(incomplete_utf8_tail("├".as_bytes()), 0);
+        assert_eq!(incomplete_utf8_tail(&"├".as_bytes()[..2]), 2);
+        assert_eq!(incomplete_utf8_tail(&"😀".as_bytes()[..3]), 3);
+        assert_eq!(incomplete_utf8_tail(b"ab"), 0);
     }
 
     #[test]
