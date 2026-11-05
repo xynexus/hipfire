@@ -118,9 +118,9 @@ impl Lfm2DflashTargetSnapshot {
             kv_k_scales,
             kv_v_scales,
             conv_states,
-            h: gpu.hip.malloc(state.h.buf.size())?,
-            final_norm_buf: gpu.hip.malloc(state.final_norm_buf.buf.size())?,
-            logits: gpu.hip.malloc(state.logits.buf.size())?,
+            h: gpu.hip.malloc(state.h.byte_size())?,
+            final_norm_buf: gpu.hip.malloc(state.final_norm_buf.byte_size())?,
+            logits: gpu.hip.malloc(state.logits.byte_size())?,
         })
     }
 
@@ -166,17 +166,17 @@ impl Lfm2DflashTargetSnapshot {
             self.kv_rows,
         )?;
         for (dst, src) in self.conv_states.iter().zip(state.conv_states.iter()) {
-            gpu.hip.memcpy_dtod(dst, &src.buf, src.buf.size())?;
+            gpu.hip.memcpy_dtod(dst, &src.buf, src.byte_size())?;
         }
         gpu.hip
-            .memcpy_dtod(&self.h, &state.h.buf, state.h.buf.size())?;
+            .memcpy_dtod(&self.h, &state.h.buf, state.h.byte_size())?;
         gpu.hip.memcpy_dtod(
             &self.final_norm_buf,
             &state.final_norm_buf.buf,
-            state.final_norm_buf.buf.size(),
+            state.final_norm_buf.byte_size(),
         )?;
         gpu.hip
-            .memcpy_dtod(&self.logits, &state.logits.buf, state.logits.buf.size())?;
+            .memcpy_dtod(&self.logits, &state.logits.buf, state.logits.byte_size())?;
         Ok(())
     }
 
@@ -693,10 +693,12 @@ fn greedy_acceptance(
     Ok((accepted, bonus_token, committed))
 }
 
+/// Snapshot buffers and row offsets come from `byte_size()`, not the pooled
+/// buffer's bucket-rounded capacity (see `DeltaNetSnapshot::alloc_like`).
 fn alloc_like_tensors(gpu: &mut Gpu, tensors: &[GpuTensor]) -> HipResult<Vec<DeviceBuffer>> {
     let mut out = Vec::with_capacity(tensors.len());
     for tensor in tensors {
-        out.push(gpu.hip.malloc(tensor.buf.size())?);
+        out.push(gpu.hip.malloc(tensor.byte_size())?);
     }
     Ok(out)
 }
@@ -712,7 +714,7 @@ fn alloc_kv_rows(
     }
     let mut out = Vec::with_capacity(tensors.len());
     for tensor in tensors {
-        let row_bytes = tensor.buf.size() / physical_cap;
+        let row_bytes = tensor.byte_size() / physical_cap;
         out.push(gpu.hip.malloc(row_bytes.saturating_mul(max_rows))?);
     }
     Ok(out)
@@ -730,7 +732,7 @@ fn save_kv_rows(
         return Ok(());
     }
     for (snapshot, tensor) in snapshots.iter().zip(tensors.iter()) {
-        let row_bytes = tensor.buf.size() / physical_cap;
+        let row_bytes = tensor.byte_size() / physical_cap;
         gpu.hip.memcpy_dtod_at(
             snapshot,
             0,
@@ -754,7 +756,7 @@ fn restore_kv_rows(
         return Ok(());
     }
     for (snapshot, tensor) in snapshots.iter().zip(tensors.iter()) {
-        let row_bytes = tensor.buf.size() / physical_cap;
+        let row_bytes = tensor.byte_size() / physical_cap;
         gpu.hip.memcpy_dtod_at(
             &tensor.buf,
             start_pos * row_bytes,
