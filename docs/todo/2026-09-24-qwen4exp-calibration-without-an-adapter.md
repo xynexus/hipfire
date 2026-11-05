@@ -119,7 +119,7 @@ modules x 4.05 MiB is ~100 GB.
 Set a budget for calibration runs:
 
     HIPFIRE_CALIB_MAX_K=8192 \
-    HIPFIRE_QWEN4EXP_EXPERT_CACHE_BYTES=21474836480 \
+    HIPFIRE_EXPERT_CACHE_BYTES=21474836480 \
       calibrate_qwen4exp <model.hfq> benchmarks/calib/calib-multi-8m.txt <out> 16384
 
 `PinAll` is right for serving, where a session's routing is narrow and stable.

@@ -158,15 +158,9 @@ impl Qwen4ExpBackend {
         ) {
             return Ok(None);
         }
-        // LRU eviction by default: the routed experts outsize host memory, so
-        // pinning on first touch OOMs mid-conversation. The env var is a debug
-        // override of the budget.
-        let residency = ResidencyPolicy::expert_lru(
-            std::env::var("HIPFIRE_QWEN4EXP_EXPERT_CACHE_BYTES")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .filter(|b| *b > 0),
-        );
+        // LRU against `expert_cache_mb`: the routed experts outsize host
+        // memory, so pinning on first touch OOMs mid-conversation.
+        let residency = ResidencyPolicy::expert_lru();
         let mut pager = WeightPager::with_env_transport(
             hfq.path(),
             PagerConfig {

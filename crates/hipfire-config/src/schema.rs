@@ -122,6 +122,8 @@ pub fn dflash_draft_setting(value: &str) -> (&str, Option<&str>) {
 /// does with n-grams, and "block" everywhere else here means the block of B
 /// speculative tokens.
 pub const RENAMED_KEYS: &[(&str, &str)] = &[
+    // One budget for every paged-expert family, not a qwen3.5-only knob.
+    ("qwen35_expert_cache_mb", "expert_cache_mb"),
     ("ngram_store_root", "ngram_spec_store_root"),
     ("ngram_scope", "ngram_spec_scope"),
     ("ngram_store_mb", "ngram_spec_store_mb"),
@@ -610,16 +612,18 @@ pub static CONFIG_FIELDS: &[ConfigField] = &[
         env: ["HIPFIRE_QWEN35_FINAL_CHECKPOINTS"]
     ),
     field!(
-        "qwen35_expert_cache_mb",
+        "expert_cache_mb",
         ConfigType::U32,
         Requirement::Optional,
         Some("8192"),
         GLOBAL_MODEL_RUNTIME,
         ConfigMutability::LoadTime,
-        "Resident budget in MiB for the paged routed-expert cache. Only \
-         meaningful with qwen35_paged_experts. Larger trades host memory for \
-         fewer expert fetches.",
-        env: ["HIPFIRE_QWEN35_EXPERT_CACHE_MB"]
+        "Resident budget in MiB for the routed-expert cache of every model \
+         that pages its experts (qwen3.5-MoE with qwen35_paged_experts, \
+         deepseek4, qwen4_exp). Least-recently-used experts are evicted past \
+         it. Bigger is not faster: on gfx1151 a 48 GiB cache decoded slower \
+         than 8 GiB. Set per model under model_overrides.",
+        env: ["HIPFIRE_EXPERT_CACHE_MB"]
     ),
     field!(
         "load_mem_check",

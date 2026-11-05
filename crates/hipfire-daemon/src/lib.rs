@@ -508,7 +508,7 @@ fn model_load_env_guards(params: Option<&hipfire_model::ModelLoadParams>) -> Vec
     }
     if let Some(bytes) = params.module_vram_budget_bytes.filter(|bytes| *bytes > 0) {
         guards.push(ScopedEnvVar::set(
-            "HIPFIRE_QWEN35_EXPERT_CACHE_BYTES",
+            hipfire_runtime::weight_pager::EXPERT_CACHE_BYTES_ENV,
             bytes.to_string(),
         ));
     }

@@ -540,7 +540,10 @@ pub(crate) async fn ensure_model_loaded(
         .await
         .map_err(|e| e.to_string())?;
     params.residency_mode = Some(residency_plan.residency_mode.as_str().to_string());
-    params.module_vram_budget_bytes = residency_plan.module_vram_budget_bytes;
+    params.module_vram_budget_bytes = capped_expert_cache_bytes(
+        params.module_vram_budget_bytes,
+        residency_plan.module_vram_budget_bytes,
+    );
 
     // Fast path: the model is already loaded with sufficient max_seq. Return its
     // context without touching the engine mutex. The batch runner takes the
@@ -776,6 +779,17 @@ async fn effective_vram_budget_bytes(state: &SharedState, configured: u64) -> u6
     }
     *state.detected_vram_bytes.lock().await = Some(detected);
     detected
+}
+
+/// The configured expert cache (`expert_cache_mb`), capped by what the
+/// residency plan leaves room for. The plan only ever lowers it: in
+/// `qwen_moe_modules` mode it offers the whole remaining VRAM budget, and a
+/// cache that large decodes slower, not faster.
+fn capped_expert_cache_bytes(configured: Option<u64>, planned: Option<u64>) -> Option<u64> {
+    match (configured, planned) {
+        (Some(c), Some(p)) => Some(c.min(p)),
+        (c, p) => c.or(p),
+    }
 }
 
 async fn plan_residency_for_load(
@@ -4445,6 +4459,14 @@ mod tests {
         assert_eq!(plan.residency_mode, ResidencyMode::QwenMoeModules);
         assert_eq!(plan.module_vram_budget_bytes, Some(768));
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn residency_plan_caps_but_never_raises_the_expert_cache() {
+        assert_eq!(capped_expert_cache_bytes(Some(8), Some(100)), Some(8));
+        assert_eq!(capped_expert_cache_bytes(Some(8), Some(3)), Some(3));
+        assert_eq!(capped_expert_cache_bytes(Some(8), None), Some(8));
+        assert_eq!(capped_expert_cache_bytes(None, Some(3)), Some(3));
     }
 
     #[tokio::test]

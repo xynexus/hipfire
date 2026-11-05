@@ -119,7 +119,7 @@ The HFQM v2 repacked file with the module table is required for paged experts:
 
 ```bash
 HIPFIRE_QWEN35_PAGED_EXPERTS=1 \
-HIPFIRE_QWEN35_EXPERT_CACHE_MB=128 \
+HIPFIRE_EXPERT_CACHE_MB=128 \
 ./target/debug/examples/daemon <<'EOF'
 {"type":"load","model":"/home/sadara/.hipfire/models/qwen3.5-397b-a17b.mq6.hfqm2.hfq.tmp","params":{"max_seq":512}}
 {"type":"generate","id":"r1","prompt":"Hello","temperature":0.0,"max_tokens":8}
@@ -137,7 +137,7 @@ per test case until repeated-prefill lifecycle is fixed.
 | Var | Default | Notes |
 |-----|---------|-------|
 | `HIPFIRE_QWEN35_PAGED_EXPERTS` | off | Set to `1` to enable expert paging |
-| `HIPFIRE_QWEN35_EXPERT_CACHE_MB` | 8192 | Budget for resident expert modules |
+| `HIPFIRE_EXPERT_CACHE_MB` (`expert_cache_mb`) | 8192 | Budget for resident expert modules, every paged-expert family |
 | `HIPFIRE_QWEN35_EXPERT_CACHE_TRACE` | off | Set to `1` for eviction log |
 | `HIPFIRE_PREFILL_MAX_BATCH` | 256 | Prefill scratch rows; leave unset for paged (live-row sizing) |
 

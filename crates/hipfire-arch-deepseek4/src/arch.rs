@@ -1510,10 +1510,6 @@ impl DeepseekV4 {
         // the slot the kernel dereferences, which is why the dispatch side
         // never patches anything itself.
         if paged_experts {
-            let budget = std::env::var("HIPFIRE_DEEPSEEK4_EXPERT_CACHE_BYTES")
-                .ok()
-                .and_then(|v| v.parse::<u64>().ok())
-                .filter(|b| *b > 0);
             let mut pager = hipfire_runtime::weight_pager::WeightPager::with_env_transport(
                 hfq.path(),
                 hipfire_runtime::weight_pager::PagerConfig {
@@ -1522,9 +1518,9 @@ impl DeepseekV4 {
                     // consumer choice is a decision here and not an inheritance.
                     expert_layout:
                         hipfire_runtime::weight_pager::ExpertResidentLayout::IndexedMoeBlocks,
-                    // LRU by default; pinning every touched expert OOMs once
-                    // the routed set outgrows host memory.
-                    residency: hipfire_runtime::weight_pager::ResidencyPolicy::expert_lru(budget),
+                    // LRU against `expert_cache_mb`; pinning every touched
+                    // expert OOMs once the routed set outgrows host memory.
+                    residency: hipfire_runtime::weight_pager::ResidencyPolicy::expert_lru(),
                     trace: matches!(
                         std::env::var("HIPFIRE_DEEPSEEK4_EXPERT_CACHE_TRACE")
                             .ok()
