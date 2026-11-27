@@ -57,6 +57,47 @@ test('expired session presents login and recovers', async ({ page }) => {
   await expect(page.getByRole('heading', { name: 'System overview' })).toBeVisible();
 });
 
+test('access drafts survive background stats polling without reloading the user list', async ({ page }) => {
+  let userListLoads = 0;
+  page.on('request', request => {
+    const url = new URL(request.url());
+    if (url.pathname === '/admin/access/users' && request.method() === 'GET') userListLoads += 1;
+  });
+  await mockAdmin(page);
+  await page.goto(base);
+  await page.getByRole('button', { name: 'Access' }).click();
+  await expect(page.getByRole('button', { name: /Ada Research/ })).toBeVisible();
+  await page.getByRole('button', { name: 'New API user' }).click();
+  await page.getByLabel('Display name').fill('Persistent draft');
+
+  // The telemetry loop polls every two seconds. It must not remount AccessPanel.
+  await page.waitForTimeout(2200);
+  await expect(page.getByText('Create API user', { exact: true })).toBeVisible();
+  await expect(page.getByLabel('Display name')).toHaveValue('Persistent draft');
+  expect(userListLoads).toBe(1);
+});
+
+test('token creation requires a label and reveals the generated secret', async ({ page }) => {
+  let tokenCreates = 0;
+  page.on('request', request => {
+    const url = new URL(request.url());
+    if (url.pathname.endsWith('/tokens') && request.method() === 'POST') tokenCreates += 1;
+  });
+  await mockAdmin(page);
+  await page.goto(base);
+  await page.getByRole('button', { name: 'Access' }).click();
+  await page.getByRole('button', { name: /Ada Research/ }).click();
+  const tokenLabel = page.getByLabel('Token label');
+  await expect(tokenLabel).toHaveAttribute('required', '');
+  await page.getByRole('button', { name: 'Generate token' }).click();
+  expect(await tokenLabel.evaluate(input => input.checkValidity())).toBe(false);
+  expect(tokenCreates).toBe(0);
+  await tokenLabel.fill('batch-runner');
+  await page.getByRole('button', { name: 'Generate token' }).click();
+  await expect(page.getByText('hfr_tok_new_4VbY8R0JgQeV7kR3')).toBeVisible();
+  expect(tokenCreates).toBe(1);
+});
+
 test('access and usage workflows remain clear at desktop and mobile sizes', async ({ page }) => {
   await mockAdmin(page);
   await page.goto(base);

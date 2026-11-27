@@ -186,6 +186,8 @@ fn UserDetail(
     let (copied, set_copied) = signal(false);
     let (confirm_revoke, set_confirm_revoke) = signal(None::<String>);
     let (feedback, set_feedback) = signal(None::<String>);
+    let (token_feedback, set_token_feedback) = signal(None::<String>);
+    let (issuing_token, set_issuing_token) = signal(false);
 
     let limits_user_id = user_id.clone();
     let save_limits = move || {
@@ -268,9 +270,11 @@ fn UserDetail(
         }
         let label = token_label.get_untracked().trim().to_string();
         if label.is_empty() || scopes.is_empty() {
-            set_feedback.set(Some("Add a label and at least one scope.".into()));
+            set_token_feedback.set(Some("Add a label and at least one scope.".into()));
             return;
         }
+        set_token_feedback.set(None);
+        set_issuing_token.set(true);
         let body = CreateAccessTokenRequest {
             label,
             scopes,
@@ -289,14 +293,16 @@ fn UserDetail(
                     set_tokens.update(|items| items.push(value.token.clone()));
                     set_created.set(Some(value));
                     set_token_label.set(String::new());
+                    set_token_feedback.set(None);
                 }
                 Err(error) => {
                     if error.is_unauthorized() {
                         auth.0.set(true);
                     }
-                    set_feedback.set(Some(error.to_string()));
+                    set_token_feedback.set(Some(error.to_string()));
                 }
             }
+            set_issuing_token.set(false);
         });
     };
     let revoke = move |id: String| {
@@ -353,10 +359,13 @@ fn UserDetail(
                 view! { <div class="secret-panel" role="alert"><div><strong>"Copy this token now"</strong><p>"It cannot be shown again after this panel is closed."</p></div><code>{secret.clone()}</code><div class="actions"><button on:click=move |_| { if let Some(window) = web_sys::window() { let _ = window.navigator().clipboard().write_text(&secret); set_copied.set(true); } }>{move || if copied.get() { "Copied" } else { "Copy token" }}</button><button class="primary" on:click=move |_| set_created.set(None)>"I saved it"</button></div></div> }
             })}
             <form class="token-create" on:submit=move |event: leptos::ev::SubmitEvent| { event.prevent_default(); issue_token(); }>
-                <label>"Token label"<input placeholder="production-client" prop:value=move || token_label.get() on:input=move |event| set_token_label.set(event_target_value(&event))/></label>
+                <label>"Token label"<input required aria-describedby="token-form-feedback" placeholder="production-client" prop:value=move || token_label.get() on:input=move |event| { set_token_label.set(event_target_value(&event)); set_token_feedback.set(None); }/></label>
                 <fieldset><legend>"Scopes"</legend><label><input type="checkbox" prop:checked=move || scope_text.get() on:change=move |event| set_scope_text.set(event_target_checked(&event))/>"Text"</label><label><input type="checkbox" prop:checked=move || scope_embeddings.get() on:change=move |event| set_scope_embeddings.set(event_target_checked(&event))/>"Embeddings"</label><label><input type="checkbox" prop:checked=move || scope_images.get() on:change=move |event| set_scope_images.set(event_target_checked(&event))/>"Images"</label><label><input type="checkbox" prop:checked=move || scope_training.get() on:change=move |event| set_scope_training.set(event_target_checked(&event))/>"Training"</label></fieldset>
-                <button class="primary" type="submit">"Generate token"</button>
+                <button class="primary" type="submit" disabled=move || issuing_token.get()>{move || if issuing_token.get() { "Generating…" } else { "Generate token" }}</button>
             </form>
+            <div id="token-form-feedback" aria-live="polite">
+                {move || token_feedback.get().map(|message| view! { <p class="inline-feedback token-feedback" role="status">{message}</p> })}
+            </div>
             <div class="token-list">
                 {move || if tokens.get().is_empty() { view! { <div class="empty compact"><strong>"No tokens yet"</strong><p>"Generate a scoped credential for this user."</p></div> }.into_any() } else { tokens.get().into_iter().map(|token| {
                     let id = token.id.clone(); let confirm_id = id.clone(); let revoke_id = id.clone();
