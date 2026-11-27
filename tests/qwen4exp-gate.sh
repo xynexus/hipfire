@@ -273,6 +273,27 @@ else
   fail=1
 fi
 
+step "GPU: device-side expert repack vs host, byte for byte"
+# The pager builds each paged module's device form with kernels
+# (`kernels/src/pager_repack.hip`) instead of on the host. The paged arm above
+# only proves the logits agree; this requires every repacked byte to match the
+# host transform, and fails if no module took the device path at all.
+if ! cargo build --quiet --release -p hipfire-runtime --example pager_repack_parity 2>&1 | tail -5; then
+  echo "qwen4exp-gate: pager_repack_parity build FAILED"
+  exit 2
+fi
+if [ -f "$TMP/fx.oq4.hfq" ]; then
+  rp="$(./target/release/examples/pager_repack_parity "$TMP/fx.oq4.hfq" 64 2>&1 || true)"
+  echo "$rp" | grep -E "bytes compared|skipped" | sed 's/^/  /'
+  case "$rp" in
+    *"pager_repack_parity: OK"*|*skipped*) ;;
+    *) echo "qwen4exp-gate: device repack differs from host"; fail=1 ;;
+  esac
+else
+  echo "qwen4exp-gate: no oq4 artifact for the repack parity check"
+  fail=1
+fi
+
 if [ "$CPU_ONLY" = "1" ]; then
   [ "$fail" = "0" ] && echo && echo "qwen4exp-gate: PASS (cpu-only)"
   exit "$fail"

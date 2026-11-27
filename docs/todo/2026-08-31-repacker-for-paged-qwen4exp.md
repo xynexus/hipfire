@@ -1,5 +1,32 @@
 # TODO: one derived layout that serves BOTH qwen4_exp consumers
 
+> **Update 2026-11-27 — the page-in transform now runs ON THE DEVICE**
+> (`kernels/src/pager_repack.hip`, `weight_pager::device_repack`). For
+> `PerExpertNative` modules whose tensors are canonical `Oq4G256` and/or kept-
+> compact `OqPlusCompact*`, the pager uploads the DISK bytes and kernels write
+> the per-expert form in GPU memory — byte-identical to the host transform
+> (`examples/pager_repack_parity`: 512 modules of the shipped 180B, 2.18 GB,
+> 0 bytes differ; also a `tests/qwen4exp-gate.sh` stage). Anything else still
+> takes the host path; `HIPFIRE_PAGER_CPU_REPACK=1` forces it for A/B.
+>
+> Measured, 180B oq4, 160 decode steps, halo gfx1151:
+>
+> | expert cache | host repack | device repack | cold load |
+> |---|---|---|---|
+> | 8 GiB (default) | 0.17 s/tok | **0.13 s/tok** (−24%) | 533 → 330 us |
+> | 16 GiB | 0.14 s/tok | **0.12 s/tok** (−14%) | 569 → 382 us |
+>
+> Cold-load counts are identical between arms (same routing, same tokens).
+> This makes the on-disk repack this note describes much less valuable: the
+> host transform is gone without changing the format. What remains:
+>
+> * a resident module is **4.25 MB but costs ~6 MB** of the cache budget
+>   (8 GiB holds 1365 modules) — the 2 MiB GTT granule; grouping modules per
+>   allocation is the lever (see the grouped-allocation measurements);
+> * the device form still carries BOTH the split planes (batched GEMM) and the
+>   interleaved decode copy of `Oq4G256` gate_up (~2x its bytes); a
+>   decode-only form would roughly double the experts a budget holds.
+
 > **Update 2026-08-31 — this is an OPTIMISATION, not a prerequisite.** Paged
 > qwen4_exp shipped without it: `hipfire-quantize` already emits an HFQM v2
 > module table, so artifacts are pageable as written. What the repacker would buy

@@ -1238,6 +1238,210 @@ fn module_resident_len(
     Ok(len)
 }
 
+/// One tensor's device-side repack (see `kernels/src/pager_repack.hip`).
+#[derive(Clone, Copy, Debug)]
+enum DeviceRepack {
+    /// Canonical `Oq4G256` -> arch combined layout.
+    Oq4Combined { m: usize, k: usize },
+    /// `OqPlusCompact*` interleaved blocks -> normalised split planes.
+    CompactSplit {
+        n_groups: usize,
+        block_bytes: usize,
+        group: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug)]
+struct DeviceRepackStep {
+    src_rel: usize,
+    src_len: usize,
+    dst_rel: usize,
+    dst_len: usize,
+    op: DeviceRepack,
+}
+
+/// How a module's DISK bytes become its per-expert device form on the GPU:
+/// the same tensor order, alignment and offsets as [`prepare_expert_module`],
+/// with each transform done by a kernel instead of the host.
+#[derive(Clone, Debug)]
+struct DeviceRepackPlan {
+    steps: Vec<DeviceRepackStep>,
+    total: usize,
+    gate_up_rel: usize,
+    down_rel: usize,
+    gate_up_len: usize,
+    down_len: usize,
+}
+
+/// `HIPFIRE_PAGER_CPU_REPACK=1` — DEBUG A/B only: page in through the host
+/// repack (the pre-device path) instead of the device kernels.
+fn device_repack_enabled() -> bool {
+    std::env::var("HIPFIRE_PAGER_CPU_REPACK").as_deref() != Ok("1")
+}
+
+/// The device plan for `module`, or `None` when any tensor needs a transform
+/// the kernels do not implement — the caller then takes the host path for the
+/// WHOLE module, so a module is never half device-, half host-repacked.
+fn device_repack_plan(
+    module: &HfqModuleRecord,
+    layout: ExpertResidentLayout,
+) -> Option<DeviceRepackPlan> {
+    if layout != ExpertResidentLayout::PerExpertNative {
+        return None;
+    }
+    let mut tensors = module.tensors.iter().collect::<Vec<_>>();
+    tensors.sort_by_key(|t| t.rel_offset);
+    let (mut steps, mut cursor) = (Vec::new(), 0usize);
+    let (mut gate_up, mut down) = (None, None);
+    for t in tensors {
+        let (m, k) = module_tensor_shape(t).ok()?;
+        let op = match QuantType::from_code(t.quant_type)? {
+            QuantType::Oq4G256 if crate::oq4_arch::oq4_arch_unsupported_reason(m, k).is_none() => {
+                DeviceRepack::Oq4Combined { m, k }
+            }
+            qt @ (QuantType::OqPlusCompact | QuantType::OqPlusCompactG128)
+                if crate::oq8_arch::compact_kept_resident(m, k) =>
+            {
+                let group = if qt == QuantType::OqPlusCompactG128 {
+                    128
+                } else {
+                    256
+                };
+                let n_groups = m * (k / group);
+                if n_groups == 0 || t.data_size % n_groups != 0 {
+                    return None;
+                }
+                let block_bytes = t.data_size / n_groups;
+                let header = 2 + group / 2;
+                // The host transforms pass a malformed block through untouched;
+                // leave that case to them rather than reproduce it.
+                if block_bytes < header + 2 || (block_bytes - header) % 2 != 0 {
+                    return None;
+                }
+                DeviceRepack::CompactSplit {
+                    n_groups,
+                    block_bytes,
+                    group,
+                }
+            }
+            _ => return None,
+        };
+        let dst_len = match op {
+            DeviceRepack::Oq4Combined { m, k } => crate::oq4_arch::oq4_arch_combined_len(m, k),
+            DeviceRepack::CompactSplit { .. } => t.data_size,
+        };
+        let dst_rel = align_up(cursor, MODULE_TENSOR_ALIGN);
+        cursor = dst_rel + dst_len;
+        match expert_module_tensor_role(&t.name) {
+            Some(ExpertRole::GateUp) => gate_up = Some((dst_rel, dst_len)),
+            Some(ExpertRole::Down) => down = Some((dst_rel, dst_len)),
+            None => {}
+        }
+        steps.push(DeviceRepackStep {
+            src_rel: t.rel_offset,
+            src_len: t.data_size,
+            dst_rel,
+            dst_len,
+            op,
+        });
+    }
+    // The pager budgets from `module_resident_len` before reading; a plan
+    // that disagrees with it would mis-account every eviction.
+    if module_resident_len(module, layout).ok()? != cursor {
+        return None;
+    }
+    let ((gate_up_rel, gate_up_len), (down_rel, down_len)) = (gate_up?, down?);
+    Some(DeviceRepackPlan {
+        steps,
+        total: cursor,
+        gate_up_rel,
+        down_rel,
+        gate_up_len,
+        down_len,
+    })
+}
+
+/// Upload `disk` (the module's on-disk bytes) and repack it into a fresh
+/// POOLED device tensor of `plan.total` bytes. Alignment padding between
+/// tensors is left unwritten; nothing reads it.
+fn device_repack(gpu: &mut Gpu, plan: &DeviceRepackPlan, disk: &[u8]) -> HipResult<GpuTensor> {
+    let staging = gpu.upload_raw_pooled(disk, &[disk.len()])?;
+    let run = |gpu: &mut Gpu| -> HipResult<GpuTensor> {
+        let dst = gpu.alloc_tensor(&[plan.total], hipfire_rdna::DType::Raw)?;
+        for st in &plan.steps {
+            let src = staging.sub_offset(st.src_rel, st.src_len);
+            let out = dst.sub_offset(st.dst_rel, st.dst_len);
+            let r = match st.op {
+                DeviceRepack::Oq4Combined { m, k } => gpu.pager_oq4_combined(&src, &out, m, k),
+                DeviceRepack::CompactSplit {
+                    n_groups,
+                    block_bytes,
+                    group,
+                } => gpu.pager_compact_split(&src, &out, n_groups, block_bytes, group),
+            };
+            if let Err(e) = r {
+                let _ = gpu.free_tensor(dst);
+                return Err(e);
+            }
+        }
+        Ok(dst)
+    };
+    let r = run(gpu);
+    // Same stream: the kernels above are ordered before any later reuse of
+    // the staging buffer, including a synchronous upload into it.
+    gpu.free_tensor(staging)?;
+    r
+}
+
+/// PARITY HOOK: repack `module` (whose on-disk bytes are `disk`) both ways and
+/// compare every tensor's bytes. `Ok(None)` when the device path declines the
+/// module; otherwise `(bytes_compared, bytes_differing)`.
+pub fn device_repack_parity(
+    gpu: &mut Gpu,
+    module: &HfqModuleRecord,
+    disk: &[u8],
+) -> Result<Option<(usize, usize)>, String> {
+    let layout = ExpertResidentLayout::PerExpertNative;
+    let Some(plan) = device_repack_plan(module, layout) else {
+        return Ok(None);
+    };
+    let host = prepare_expert_module(module, disk, layout).map_err(|e| format!("{e:?}"))?;
+    if (
+        host.gate_up_rel,
+        host.down_rel,
+        host.gate_up_len,
+        host.down_len,
+    ) != (
+        plan.gate_up_rel,
+        plan.down_rel,
+        plan.gate_up_len,
+        plan.down_len,
+    ) || host.bytes.len() != plan.total
+    {
+        return Err(format!(
+            "module {}: device plan layout differs from host",
+            module.module_id
+        ));
+    }
+    let dev = device_repack(gpu, &plan, disk).map_err(|e| format!("{e:?}"))?;
+    let got = gpu
+        .download_raw(&dev, plan.total)
+        .map_err(|e| format!("{e:?}"));
+    gpu.free_tensor(dev).map_err(|e| format!("{e:?}"))?;
+    let got = got?;
+    let (mut compared, mut differ) = (0usize, 0usize);
+    for st in &plan.steps {
+        let r = st.dst_rel..st.dst_rel + st.dst_len;
+        compared += st.dst_len;
+        differ += host.bytes[r.clone()]
+            .iter()
+            .zip(&got[r])
+            .filter(|(a, b)| a != b)
+            .count();
+    }
+    Ok(Some((compared, differ)))
+}
+
 fn prepare_expert_module(
     module: &HfqModuleRecord,
     disk_bytes: &[u8],
@@ -1991,63 +2195,85 @@ impl WeightPager {
             self.evict_lru_until(need, gpu)?;
         }
         let layout = self.config.expert_layout;
-        let (tensor, gate_up_rel, down_rel, gate_up_len, down_len) =
-            if module_requires_host_repack(&module, layout) {
-                let disk_bytes = page_timing::timed(page_timing::Phase::ColdRead, || {
-                    self.transport
-                        .read_host(module.data_offset, module.data_size, gpu)
-                })?;
-                let prepared = page_timing::timed(page_timing::Phase::ColdRepack, || {
-                    prepare_expert_module(&module, &disk_bytes, layout)
-                })?;
-                // POOLED, not `upload_raw`. Eviction returns the buffer via
-                // `free_tensor` -> `pool.free`, so allocating outside the pool means
-                // every cold load takes fresh GTT while every eviction piles into a
-                // free-list nothing draws from. `upload_raw_pooled` exists for this
-                // call site and its doc says so; the pager just never used it.
-                //
-                // This is the host-repack branch, and `module_requires_host_repack`
-                // is true for exactly Oq4G256 / Oq8G256 / OqPlusCompact — every Opus
-                // artifact — so it is the branch a paging Opus MoE actually takes.
-                // Its sibling `else` was already pooled, which is why the bug needed
-                // a paging Opus model to show up at all.
-                //
-                // Found twice independently, so both measurements are kept:
-                //   * paged 122B: ~9.6 MB leaked per page-in, system memory climbing
-                //     ~1.1 GB/s to 116 GB, then OOM on a 9 MiB allocation — while the
-                //     pager's own accounting sat correctly at its 8 GiB budget and
-                //     the daemon's RSS stayed at 0 (it is GTT, so it never shows in
-                //     RSS).
-                //   * 32768-token KLD of Qwen3.6-35B-A3B--oq4 at a 6144 MB expert
-                //     cache: died at ~1 min before, runs 1h49m to completion after,
-                //     returning a KLD bit-identical to the same score with paging
-                //     disabled. A SMALLER cache died FASTER — backwards for a budget,
-                //     and the signature of a leak proportional to eviction count.
-                // `cargo run -p hipfire-rdna --example pool_churn_upload_raw` bounds
-                // it: 200 unpooled cycles strand 400 MiB, 4000 pooled cycles strand
-                // nothing.
-                let tensor = page_timing::timed(page_timing::Phase::ColdUpload, || {
-                    gpu.upload_raw_pooled(&prepared.bytes, &[prepared.bytes.len()])
-                })?;
-                (
-                    tensor,
-                    prepared.gate_up_rel,
-                    prepared.down_rel,
-                    prepared.gate_up_len,
-                    prepared.down_len,
-                )
-            } else {
-                let (tensor, _handle) =
-                    self.transport
-                        .fetch(module.data_offset, module.data_size, gpu)?;
-                let gate_up_rel = find_module_tensor_rel_ptr(&module, ExpertRole::GateUp)
-                    .ok_or_else(|| WeightPagerError::InvalidModule(module.module_id.clone()))?;
-                let down_rel = find_module_tensor_rel_ptr(&module, ExpertRole::Down)
-                    .ok_or_else(|| WeightPagerError::InvalidModule(module.module_id.clone()))?;
-                let gate_up_len = find_module_tensor_len(&module, ExpertRole::GateUp).unwrap_or(0);
-                let down_len = find_module_tensor_len(&module, ExpertRole::Down).unwrap_or(0);
-                (tensor, gate_up_rel, down_rel, gate_up_len, down_len)
-            };
+        let device_plan = (device_repack_enabled() && module_requires_host_repack(&module, layout))
+            .then(|| device_repack_plan(&module, layout))
+            .flatten();
+        let (tensor, gate_up_rel, down_rel, gate_up_len, down_len) = if let Some(plan) = device_plan
+        {
+            // DEVICE repack: the host reads the disk bytes and uploads them as
+            // they are; kernels write the per-expert form on the GPU. Saves the
+            // host transform (~196 us/module on the 180B) and uploads the disk
+            // size instead of the ~2.4x larger device form.
+            let disk_bytes = page_timing::timed(page_timing::Phase::ColdRead, || {
+                self.transport
+                    .read_host(module.data_offset, module.data_size, gpu)
+            })?;
+            let tensor = page_timing::timed(page_timing::Phase::ColdUpload, || {
+                device_repack(gpu, &plan, &disk_bytes)
+            })?;
+            (
+                tensor,
+                plan.gate_up_rel,
+                plan.down_rel,
+                plan.gate_up_len,
+                plan.down_len,
+            )
+        } else if module_requires_host_repack(&module, layout) {
+            let disk_bytes = page_timing::timed(page_timing::Phase::ColdRead, || {
+                self.transport
+                    .read_host(module.data_offset, module.data_size, gpu)
+            })?;
+            let prepared = page_timing::timed(page_timing::Phase::ColdRepack, || {
+                prepare_expert_module(&module, &disk_bytes, layout)
+            })?;
+            // POOLED, not `upload_raw`. Eviction returns the buffer via
+            // `free_tensor` -> `pool.free`, so allocating outside the pool means
+            // every cold load takes fresh GTT while every eviction piles into a
+            // free-list nothing draws from. `upload_raw_pooled` exists for this
+            // call site and its doc says so; the pager just never used it.
+            //
+            // This is the host-repack branch, and `module_requires_host_repack`
+            // is true for exactly Oq4G256 / Oq8G256 / OqPlusCompact — every Opus
+            // artifact — so it is the branch a paging Opus MoE actually takes.
+            // Its sibling `else` was already pooled, which is why the bug needed
+            // a paging Opus model to show up at all.
+            //
+            // Found twice independently, so both measurements are kept:
+            //   * paged 122B: ~9.6 MB leaked per page-in, system memory climbing
+            //     ~1.1 GB/s to 116 GB, then OOM on a 9 MiB allocation — while the
+            //     pager's own accounting sat correctly at its 8 GiB budget and
+            //     the daemon's RSS stayed at 0 (it is GTT, so it never shows in
+            //     RSS).
+            //   * 32768-token KLD of Qwen3.6-35B-A3B--oq4 at a 6144 MB expert
+            //     cache: died at ~1 min before, runs 1h49m to completion after,
+            //     returning a KLD bit-identical to the same score with paging
+            //     disabled. A SMALLER cache died FASTER — backwards for a budget,
+            //     and the signature of a leak proportional to eviction count.
+            // `cargo run -p hipfire-rdna --example pool_churn_upload_raw` bounds
+            // it: 200 unpooled cycles strand 400 MiB, 4000 pooled cycles strand
+            // nothing.
+            let tensor = page_timing::timed(page_timing::Phase::ColdUpload, || {
+                gpu.upload_raw_pooled(&prepared.bytes, &[prepared.bytes.len()])
+            })?;
+            (
+                tensor,
+                prepared.gate_up_rel,
+                prepared.down_rel,
+                prepared.gate_up_len,
+                prepared.down_len,
+            )
+        } else {
+            let (tensor, _handle) =
+                self.transport
+                    .fetch(module.data_offset, module.data_size, gpu)?;
+            let gate_up_rel = find_module_tensor_rel_ptr(&module, ExpertRole::GateUp)
+                .ok_or_else(|| WeightPagerError::InvalidModule(module.module_id.clone()))?;
+            let down_rel = find_module_tensor_rel_ptr(&module, ExpertRole::Down)
+                .ok_or_else(|| WeightPagerError::InvalidModule(module.module_id.clone()))?;
+            let gate_up_len = find_module_tensor_len(&module, ExpertRole::GateUp).unwrap_or(0);
+            let down_len = find_module_tensor_len(&module, ExpertRole::Down).unwrap_or(0);
+            (tensor, gate_up_rel, down_rel, gate_up_len, down_len)
+        };
         let base = tensor.buf.as_ptr() as usize;
         self.vram_used_bytes = self.vram_used_bytes.saturating_add(need);
         let gate_up_ptr = base.saturating_add(gate_up_rel) as u64;
