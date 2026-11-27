@@ -69,21 +69,34 @@ pub fn ple_step(
     ngram_embed: &GpuTensor,
     out: &GpuTensor,
 ) -> HipResult<()> {
-    let n = cfg.ngram.as_ref().expect("ple_step needs an ngram config");
+    weight_gemv(gpu, &w.key_proj, ngram_embed, &s.key)?;
+    weight_gemv(gpu, &w.value_proj, ngram_embed, &s.value)?;
+    ple_tail(gpu, cfg, w, s, hidden_wide, &s.key, &s.value, out)
+}
+
+/// Everything in [`ple_step`] after the two projections, for ONE token.
+///
+/// Split out so the batched prefill can run `key_proj`/`value_proj` as one GEMM
+/// over the chunk and then feed each row through here — the dilated conv ring
+/// in `s.conv_state` is sequential, so this part stays per token. `key` is
+/// `[hc_count * hidden]`, `value` is `[hidden]`.
+#[allow(clippy::too_many_arguments)]
+pub fn ple_tail(
+    gpu: &mut Gpu,
+    cfg: &Qwen4ExpConfig,
+    w: &PleWeights,
+    s: &PleScratch,
+    hidden_wide: &GpuTensor,
+    key: &GpuTensor,
+    value: &GpuTensor,
+    out: &GpuTensor,
+) -> HipResult<()> {
+    let n = cfg.ngram.as_ref().expect("ple_tail needs an ngram config");
     let hc = cfg.gated_residual.count;
     let width = hc * cfg.hidden;
     let (h32, hc32) = (cfg.hidden as i32, hc as i32);
 
-    weight_gemv(gpu, &w.key_proj, ngram_embed, &s.key)?;
-    gpu.hc_grouped_rmsnorm(
-        &s.key,
-        &w.norm_key,
-        &s.key_normed,
-        h32,
-        hc32,
-        cfg.rms_norm_eps,
-    )?;
-    weight_gemv(gpu, &w.value_proj, ngram_embed, &s.value)?;
+    gpu.hc_grouped_rmsnorm(key, &w.norm_key, &s.key_normed, h32, hc32, cfg.rms_norm_eps)?;
     gpu.hc_grouped_rmsnorm(
         hidden_wide,
         &w.norm_query,
@@ -92,7 +105,7 @@ pub fn ple_step(
         hc32,
         cfg.rms_norm_eps,
     )?;
-    gpu.ple_stream_gate(&s.key_normed, &s.query, &s.value, &s.gated, hc32, h32)?;
+    gpu.ple_stream_gate(&s.key_normed, &s.query, value, &s.gated, hc32, h32)?;
 
     // The conv reads the NORMED gated value; the residual adds the UN-normed one.
     gpu.hc_grouped_rmsnorm(

@@ -35,6 +35,7 @@ use crate::arch::{load_ngram_table, HfqTensorReader, Qwen4Exp};
 use crate::config::Qwen4ExpConfig;
 use crate::ngram::NgramHasher;
 use crate::ngram_rows::{HfqShardRows, NgramRows, ResidentRows};
+use crate::prefill_gpu::{prefill_chunk_into, BatchScratch};
 use crate::trunk_gpu::{decode_step_into, TensorReader, TrunkScratch, TrunkState, TrunkWeights};
 use hipfire_arch_api::ARCH_ID_QWEN4EXP;
 use hipfire_rdna::{Gpu, GpuTensor};
@@ -98,6 +99,23 @@ pub struct Qwen4ExpBackend {
     /// own `Arc` clones, so this is not what keeps it alive — it is the handle
     /// for the teardown the stacks deliberately do not do.
     pager: Option<crate::moe_gpu::ExpertPager>,
+    /// Chunk-wide scratch for the batched prefill, allocated on first use so a
+    /// backend that only ever decodes never pays for it.
+    batch: Option<BatchScratch>,
+    /// Upper bound on a prefill chunk (`PREFILL_CHUNK`, capped by `max_seq`).
+    chunk_rows: usize,
+}
+
+/// Tokens per batched prefill chunk. Every routed expert hit in a chunk is read
+/// once for the whole chunk, so bigger amortises the expert sweep further; the
+/// scratch is ~25 MB at this size (logits excluded — those are only allocated
+/// when a scorer asks for every position).
+const PREFILL_CHUNK: usize = 512;
+
+/// `HIPFIRE_QWEN4EXP_PER_TOKEN_PREFILL=1` — DEBUG A/B only: prefill through the
+/// per-token decode step, the pre-batching path, to difference against it.
+fn per_token_prefill() -> bool {
+    std::env::var("HIPFIRE_QWEN4EXP_PER_TOKEN_PREFILL").as_deref() == Ok("1")
 }
 
 impl Qwen4ExpBackend {
@@ -259,6 +277,8 @@ impl Qwen4ExpBackend {
             history: Vec::new(),
             eos,
             pager,
+            batch: None,
+            chunk_rows: PREFILL_CHUNK.min(max_seq),
         })
     }
 
@@ -331,11 +351,14 @@ impl Qwen4ExpBackend {
         self.weights.layers.first().map(|l| l.moe.gate_up.dtype())
     }
 
-    /// One trunk step at absolute position `pos`, leaving logits on the GPU.
+    /// Run `history[pos0..]` through the trunk, leaving the last position's
+    /// logits on the GPU. One row takes the decode step; more take the batched
+    /// layer-major forward (`prefill_gpu`). `all_logits` forces the batched path
+    /// and also keeps every row's logits in the batch scratch.
     ///
     /// `self` is destructured so the n-gram provider (which borrows `ngram`) and
     /// the mutable trunk state are disjoint borrows rather than two of `self`.
-    fn step(&mut self, gpu: &mut Gpu, pos: usize) -> Result<(), String> {
+    fn forward(&mut self, gpu: &mut Gpu, pos0: usize, all_logits: bool) -> Result<(), String> {
         let Self {
             cfg,
             weights,
@@ -347,6 +370,8 @@ impl Qwen4ExpBackend {
             eos,
             // Reached through the expert stacks, not from here.
             pager: _,
+            batch,
+            chunk_rows,
         } = self;
         let resident;
         let streamed;
@@ -361,16 +386,46 @@ impl Qwen4ExpBackend {
                 Some(&streamed)
             }
         };
-        let _trace_rows = hipfire_runtime::dispatch::moe_telemetry::trace_rows([pos]);
-        decode_step_into(
-            gpu, cfg, weights, state, scratch, embed, rows, history, pos, *eos,
+        let n = history.len() - pos0;
+        let _trace_rows = hipfire_runtime::dispatch::moe_telemetry::trace_rows(pos0..pos0 + n);
+        if n == 1 && !all_logits {
+            return decode_step_into(
+                gpu, cfg, weights, state, scratch, embed, rows, history, pos0, *eos,
+            )
+            .map_err(|e| format!("qwen4_exp decode: {e:?}"));
+        }
+        if batch.is_none() {
+            *batch = Some(
+                BatchScratch::new(gpu, cfg, *chunk_rows)
+                    .map_err(|e| format!("qwen4_exp prefill scratch: {e:?}"))?,
+            );
+        }
+        let b = batch.as_mut().expect("just allocated");
+        prefill_chunk_into(
+            gpu, cfg, weights, state, scratch, b, embed, rows, history, pos0, *eos, all_logits,
         )
-        .map_err(|e| format!("qwen4_exp decode: {e:?}"))
+        .map_err(|e| format!("qwen4_exp prefill: {e:?}"))
     }
-}
 
-impl SimpleAr for Qwen4ExpBackend {
-    fn prefill(&mut self, gpu: &mut Gpu, tokens: &[u32]) -> Result<(), String> {
+    /// Override the prefill chunk size (capped at `PREFILL_CHUNK`). For tests: a
+    /// small chunk puts a chunk boundary inside a short prompt.
+    pub fn set_prefill_chunk(&mut self, gpu: &mut Gpu, rows: usize) {
+        self.chunk_rows = rows.clamp(1, PREFILL_CHUNK);
+        if let Some(b) = self.batch.take() {
+            b.free(gpu);
+        }
+    }
+
+    /// Restart the sequence and run `tokens` from position 0, in chunks.
+    /// `at_chunk(pos0, n, backend)` runs after each chunk — the scorer reads the
+    /// chunk's logits there, before the next chunk overwrites them.
+    fn prefill_chunks(
+        &mut self,
+        gpu: &mut Gpu,
+        tokens: &[u32],
+        all_logits: bool,
+        at_chunk: &mut dyn FnMut(&mut Gpu, usize, usize, &Self) -> Result<(), String>,
+    ) -> Result<(), String> {
         if tokens.is_empty() {
             return Err("qwen4_exp prefill: empty prompt".to_string());
         }
@@ -381,16 +436,29 @@ impl SimpleAr for Qwen4ExpBackend {
         self.state
             .reset(gpu)
             .map_err(|e| format!("qwen4_exp reset: {e:?}"))?;
-        for (pos, &tok) in tokens.iter().enumerate() {
-            self.history.push(tok);
-            self.step(gpu, pos)?;
+        let chunk = if per_token_prefill() && !all_logits {
+            1
+        } else {
+            self.chunk_rows
+        };
+        for (c, part) in tokens.chunks(chunk).enumerate() {
+            let pos0 = c * chunk;
+            self.history.extend_from_slice(part);
+            self.forward(gpu, pos0, all_logits)?;
+            at_chunk(gpu, pos0, part.len(), self)?;
         }
         Ok(())
+    }
+}
+
+impl SimpleAr for Qwen4ExpBackend {
+    fn prefill(&mut self, gpu: &mut Gpu, tokens: &[u32]) -> Result<(), String> {
+        self.prefill_chunks(gpu, tokens, false, &mut |_, _, _, _| Ok(()))
     }
 
     fn decode_step(&mut self, gpu: &mut Gpu, token: u32, pos: usize) -> Result<(), String> {
         self.history.push(token);
-        self.step(gpu, pos)
+        self.forward(gpu, pos, false)
     }
 
     fn logits(&self) -> &GpuTensor {
@@ -408,8 +476,10 @@ impl ServingBackend for Qwen4ExpBackend {
     }
 
     fn caps(&self) -> ArchCaps {
-        // Everything off by design: no batched prefill, no DFlash drafter, no
-        // CASK, no VL wiring yet. `docs/model-support.toml` says the same, and a
+        // Everything off by design: no DFlash drafter, no CASK, no VL or MTP
+        // serving yet. Prefill IS batched, but inside `SimpleAr::prefill` — the
+        // arch-api `batched_prefill` seam (cross-request batching) is not
+        // implemented, so it is not claimed. `docs/model-support.toml` says the same, and a
         // capability claimed here that the trunk cannot honour is worse than one
         // that is simply absent.
         ArchCaps::default()
@@ -433,6 +503,20 @@ impl ServingBackend for Qwen4ExpBackend {
         Qwen4ExpBackend::expert_pager_stats(self)
     }
 
+    /// Makes arch 26 scorable by the daemon's `kld_eval` (the multi-arch PPL/KLD
+    /// path `hipfire eval` drives). Without this the daemon reported "this
+    /// architecture cannot produce logits" for a model that decodes fine.
+    fn kld_forward(&mut self) -> Option<&mut dyn hipfire_runtime::kld_eval::ChunkScoredForward> {
+        if per_token_prefill() {
+            // The blanket `SimpleAr` walk: one decode step per position. Kept as
+            // the A/B reference for the batched scorer below.
+            return Some(self);
+        }
+        // SAFETY: `BatchedScorer` is `#[repr(transparent)]` over this exact type,
+        // so the two references have the same layout and the same lifetime.
+        Some(unsafe { &mut *(self as *mut Self as *mut BatchedScorer) })
+    }
+
     fn reset_session(&mut self, gpu: &mut Gpu, _session_id: &str) -> Result<(), String> {
         self.history.clear();
         self.state
@@ -445,6 +529,9 @@ impl ServingBackend for Qwen4ExpBackend {
         m.weights.free(gpu);
         m.state.free(gpu);
         m.scratch.free(gpu);
+        if let Some(b) = m.batch {
+            b.free(gpu);
+        }
         // The expert stacks deliberately free nothing — the pager owns those
         // buffers, and it outlives any one of them.
         if let Some(pager) = m.pager {
@@ -452,6 +539,65 @@ impl ServingBackend for Qwen4ExpBackend {
                 p.free_all(gpu);
             }
         }
+    }
+}
+
+/// Teacher-forced scoring through the BATCHED forward: every row's logits from
+/// one layer-major pass per chunk, instead of the blanket `SimpleAr` walk's one
+/// decode step per position.
+///
+/// A newtype because the blanket `impl<T: SimpleAr> ChunkScoredForward for T`
+/// already covers the backend itself and cannot be specialised.
+#[repr(transparent)]
+pub struct BatchedScorer(Qwen4ExpBackend);
+
+impl hipfire_runtime::kld_eval::ChunkScoredForward for BatchedScorer {
+    fn forward_chunk_scored(
+        &mut self,
+        gpu: &mut Gpu,
+        chunk: &[u32],
+        scoring_start: usize,
+        at_scored: &mut dyn FnMut(&hipfire_runtime::kld_eval::ScoredWindow<'_>),
+    ) -> Result<(), String> {
+        let n = chunk.len();
+        if n < 2 {
+            return Ok(());
+        }
+        let vocab = self.0.cfg.vocab;
+        // Row p predicts chunk[p + 1], so the last token is a label only.
+        self.0
+            .prefill_chunks(gpu, &chunk[..n - 1], true, &mut |gpu, pos0, rows, be| {
+                let (lo, hi) = (scoring_start.max(pos0), pos0 + rows);
+                if lo >= hi {
+                    return Ok(());
+                }
+                let all = be
+                    .batch
+                    .as_ref()
+                    .and_then(|b| b.all_logits())
+                    .ok_or("qwen4_exp scorer: batched forward left no logits")?;
+                let view = all.sub_offset((lo - pos0) * vocab, (hi - lo) * vocab);
+                let logits = gpu
+                    .download_f32(&view)
+                    .map_err(|e| format!("qwen4_exp scorer: download logits: {e:?}"))?;
+                at_scored(&hipfire_runtime::kld_eval::ScoredWindow {
+                    j0: lo - scoring_start,
+                    logits: &logits,
+                    vocab,
+                    nexts: &chunk[lo + 1..hi + 1],
+                });
+                Ok(())
+            })
+    }
+
+    fn kld_vocab_size(&self) -> usize {
+        self.0.cfg.vocab
+    }
+
+    fn final_position_logits(&mut self, gpu: &mut Gpu, tokens: &[u32]) -> Result<Vec<f32>, String> {
+        self.0.prefill(gpu, tokens)?;
+        gpu.download_f32(self.0.logits())
+            .map_err(|e| format!("qwen4_exp final logits: {e:?}"))
     }
 }
 

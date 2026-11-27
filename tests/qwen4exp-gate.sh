@@ -235,6 +235,30 @@ else
   fail=1
 fi
 
+step "GPU: BATCHED prefill vs per-token, at int8 activations"
+# serve_fixture differences the batched layer-major prefill (one chunk, and
+# chunks of 3 so a boundary falls inside the prompt) against the per-token decode
+# step. Under oq4's default small-batch W4A4 GEMM it can only apply a loose bound;
+# at ACT_BITS=8 the strict 2% bound applies, so a wrong row, state hand-off or
+# chunk boundary cannot hide behind activation-quantisation noise.
+if [ -f "$TMP/fx.oq4.hfq" ]; then
+  a8="$(HIPFIRE_OQ4_PREFILL_ACT_BITS=8 \
+        ./target/release/examples/serve_fixture "$TMP/fx.oq4.hfq" 2>&1 || true)"
+  echo "$a8" | grep -E "vs per-token" | sed 's/^/  /'
+  case "$a8" in
+    *"serve_fixture: OK"*) ;;
+    *) echo "qwen4exp-gate: batched prefill diverges from per-token at A8"
+       echo "$a8" | tail -3 | sed 's/^/    /'; fail=1 ;;
+  esac
+  if [ "$(echo "$a8" | grep -c 'vs per-token')" -lt 2 ]; then
+    echo "qwen4exp-gate: the batched-vs-per-token comparison did not run"
+    fail=1
+  fi
+else
+  echo "qwen4exp-gate: no oq4 artifact for the batched-prefill check"
+  fail=1
+fi
+
 step "GPU: PAGED routed experts vs resident, on the same artifact"
 # Routed experts are 97.3% of this trunk, so paging them is what decides whether
 # the shipped model loads at all. Both arms read the SAME file: the only

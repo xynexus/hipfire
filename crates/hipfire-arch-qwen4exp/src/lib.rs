@@ -29,6 +29,7 @@ pub mod ngram_rows;
 pub mod ngram_store;
 pub mod ple;
 pub mod ple_gpu;
+pub mod prefill_gpu;
 pub mod qsa;
 pub mod rope;
 pub mod serving;

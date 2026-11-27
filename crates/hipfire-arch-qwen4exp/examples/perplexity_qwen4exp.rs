@@ -20,7 +20,7 @@
 
 use hipfire_arch_qwen4exp::serving::Qwen4ExpBackend;
 use hipfire_model::tokenizer::Tokenizer;
-use hipfire_runtime::arch::SimpleAr;
+use hipfire_runtime::arch::ServingBackend;
 use hipfire_runtime::hfq::HfqFile;
 use std::path::Path;
 use std::time::Instant;
@@ -56,29 +56,35 @@ fn main() {
     // Teacher-forced: score the TRUE next token at each position, never the
     // model's own argmax. Scoring a self-generated continuation measures the
     // model against itself and is not a perplexity at all.
+    // Scored through `kld_forward` — the seam the daemon's `kld_eval` uses — so
+    // this measures what `hipfire eval` would. That is the BATCHED scorer;
+    // HIPFIRE_QWEN4EXP_PER_TOKEN_PREFILL=1 selects the per-position decode walk,
+    // the A/B reference for it.
     let t1 = Instant::now();
-    m.prefill(&mut gpu, &ids[..1]).expect("prefill");
     let mut nll = 0.0f64;
     let mut scored = 0usize;
-    for i in 1..ids.len() {
-        if i > 1 {
-            m.decode_step(&mut gpu, ids[i - 1], i - 1).expect("decode");
-        }
-        let lg = gpu.download_f32(m.trunk_logits()).expect("logits");
-        let target = ids[i] as usize;
-        assert!(
-            target < lg.len(),
-            "token {target} outside vocab {}",
-            lg.len()
-        );
-        // log_softmax in f64 off a max-shifted f32 vector: the sum runs over
-        // 248320 terms, and an f32 accumulator loses the tail that distinguishes
-        // two close quantisations -- which is the entire point of this measurement.
-        let max = lg.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
-        let sum: f64 = lg.iter().map(|&v| ((v - max) as f64).exp()).sum();
-        nll -= (lg[target] - max) as f64 - sum.ln();
-        scored += 1;
-    }
+    let scorer = m.kld_forward().expect("qwen4_exp is KLD-scorable");
+    scorer
+        .forward_chunk_scored(&mut gpu, ids, 0, &mut |w| {
+            for i in 0..w.rows() {
+                let lg = w.row(i);
+                let target = w.nexts[i] as usize;
+                assert!(
+                    target < lg.len(),
+                    "token {target} outside vocab {}",
+                    lg.len()
+                );
+                // log_softmax in f64 off a max-shifted f32 vector: the sum runs over
+                // 248320 terms, and an f32 accumulator loses the tail that
+                // distinguishes two close quantisations -- which is the entire point
+                // of this measurement.
+                let max = lg.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+                let sum: f64 = lg.iter().map(|&v| ((v - max) as f64).exp()).sum();
+                nll -= (lg[target] - max) as f64 - sum.ln();
+                scored += 1;
+            }
+        })
+        .expect("score");
     let ppl = (nll / scored as f64).exp();
     println!(
         "scored {scored} tokens in {:.1}s",

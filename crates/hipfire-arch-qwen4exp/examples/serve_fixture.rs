@@ -124,6 +124,151 @@ fn main() {
         prompt.len()
     );
 
+    // 3b. BATCHED prefill vs the per-token decode step. `prefill` above ran the
+    // layer-major batched forward; here the same prompt goes one token at a time
+    // through the decode step (the pre-batching path), and again in chunks of 3
+    // so a chunk boundary — the n-gram window and every recurrent state crossing
+    // it — is exercised on an 8-token prompt. Not a hash compare: Opus GEMMs
+    // quantise activations where the GEMV does not. One decode step after each
+    // arm then checks the STATE the prefill left, not just its last logits.
+    {
+        let max_abs = |l: &[f32]| l.iter().fold(0.0f32, |a, v| a.max(v.abs()));
+        let argmax = |l: &[f32]| {
+            l.iter()
+                .enumerate()
+                .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
+                    if v > bv {
+                        (i, v)
+                    } else {
+                        (bi, bv)
+                    }
+                })
+                .0
+        };
+        let run = |m: &mut Qwen4ExpBackend, gpu: &mut hipfire_rdna::Gpu, mode: &str| {
+            m.reset_session(gpu, "serve_fixture")
+                .unwrap_or_else(|e| fail(format!("reset: {e}")));
+            match mode {
+                "per-token" => {
+                    for (pos, &t) in prompt.iter().enumerate() {
+                        if pos == 0 {
+                            m.prefill(gpu, &prompt[..1])
+                        } else {
+                            m.decode_step(gpu, t, pos)
+                        }
+                        .unwrap_or_else(|e| fail(format!("per-token step {pos}: {e}")));
+                    }
+                }
+                _ => m
+                    .prefill(gpu, &prompt)
+                    .unwrap_or_else(|e| fail(format!("{mode} prefill: {e}"))),
+            }
+            let after_prefill = gpu.download_f32(m.logits()).unwrap();
+            m.decode_step(gpu, prompt[0], prompt.len())
+                .unwrap_or_else(|e| fail(format!("{mode} decode: {e}")));
+            (after_prefill, gpu.download_f32(m.logits()).unwrap())
+        };
+        let (ref_p, ref_d) = run(&mut m, &mut gpu, "per-token");
+        let one = run(&mut m, &mut gpu, "batched");
+        m.set_prefill_chunk(&mut gpu, 3);
+        let chunked = run(&mut m, &mut gpu, "chunked");
+        m.set_prefill_chunk(&mut gpu, 64);
+        let scale = max_abs(&ref_p).max(max_abs(&ref_d)).max(1e-6);
+        for (name, (p, d)) in [("batched", &one), ("chunk=3", &chunked)] {
+            let dp = p
+                .iter()
+                .zip(&ref_p)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
+            let dd = d
+                .iter()
+                .zip(&ref_d)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0, f32::max);
+            println!(
+                "  {name:8} vs per-token: prefill argmax {} / {}, max|d| {dp:.3e}; \
+                 next-step argmax {} / {}, max|d| {dd:.3e} (scale {scale:.3})",
+                argmax(p),
+                argmax(&ref_p),
+                argmax(d),
+                argmax(&ref_d)
+            );
+            if argmax(p) != argmax(&ref_p) || argmax(d) != argmax(&ref_d) {
+                fail(format!("{name} prefill changed the argmax vs per-token"));
+            }
+            // 2% of the logit scale: int8 activation quantisation is ~0.4% per
+            // GEMM; a wrong row, state or chunk boundary is O(1) — bf16 agrees to
+            // ~1e-7, so the layer-major forward itself contributes nothing.
+            //
+            // EXCEPT Oq4G256 at batch < 64, whose `weight_gemm` default is W4A4
+            // (int4 activations — the same small-batch policy qwen35's production
+            // prefill runs). That alone measured 13-15% here, and 1% with
+            // HIPFIRE_OQ4_PREFILL_ACT_BITS=8. It is a precision POLICY, so it gets
+            // its own bound rather than masking a structural bug at 2%: the gate
+            // also runs this fixture at ACT_BITS=8, where the 2% bound applies.
+            let a4 = m.routed_expert_dtype() == Some(hipfire_rdna::DType::Oq4G256)
+                && std::env::var("HIPFIRE_OQ4_PREFILL_ACT_BITS").is_err();
+            let bound = if a4 { 0.25 } else { 0.02 };
+            if dp.max(dd) > bound * scale {
+                fail(format!(
+                    "{name} prefill diverges from per-token: max|d| {:.3e} > {}% of {scale:.3}{}",
+                    dp.max(dd),
+                    bound * 100.0,
+                    if a4 { " (W4A4 bound)" } else { "" }
+                ));
+            }
+        }
+    }
+
+    // 3c. The KLD/PPL scorer the daemon's `kld_eval` drives: the batched scorer
+    // (`kld_forward`) against the blanket per-position `SimpleAr` walk, over the
+    // same chunk with a chunk boundary inside it. Mean NLL must agree; the row
+    // count must cover exactly `[scoring_start, len-1)`.
+    {
+        use hipfire_runtime::kld_eval::ChunkScoredForward;
+        let chunk: Vec<u32> = (0..12u32).map(|i| (i * 37 + 5) % vocab as u32).collect();
+        let start = 2usize;
+        let nll = |w: &hipfire_runtime::kld_eval::ScoredWindow<'_>, out: &mut Vec<f64>| {
+            for i in 0..w.rows() {
+                let r = w.row(i);
+                let mx = r.iter().fold(f32::NEG_INFINITY, |a, &v| a.max(v)) as f64;
+                let lse = mx + r.iter().map(|&v| (v as f64 - mx).exp()).sum::<f64>().ln();
+                out.push(lse - r[w.nexts[i] as usize] as f64);
+            }
+        };
+        let mut walk = Vec::new();
+        ChunkScoredForward::forward_chunk_scored(&mut m, &mut gpu, &chunk, start, &mut |w| {
+            nll(w, &mut walk)
+        })
+        .unwrap_or_else(|e| fail(format!("walk scorer: {e}")));
+        m.set_prefill_chunk(&mut gpu, 4);
+        let mut batched = Vec::new();
+        m.kld_forward()
+            .unwrap_or_else(|| fail("no kld_forward".into()))
+            .forward_chunk_scored(&mut gpu, &chunk, start, &mut |w| nll(w, &mut batched))
+            .unwrap_or_else(|e| fail(format!("batched scorer: {e}")));
+        m.set_prefill_chunk(&mut gpu, 64);
+        let want = chunk.len() - 1 - start;
+        let mean = |v: &[f64]| v.iter().sum::<f64>() / v.len().max(1) as f64;
+        println!(
+            "  scorer:  batched {} rows mean NLL {:.5}, walk {} rows {:.5}",
+            batched.len(),
+            mean(&batched),
+            walk.len(),
+            mean(&walk)
+        );
+        if batched.len() != want || walk.len() != want {
+            fail(format!(
+                "scorer row count: batched {} walk {} want {want}",
+                batched.len(),
+                walk.len()
+            ));
+        }
+        if (mean(&batched) - mean(&walk)).abs() > 0.02 * mean(&walk).abs().max(1.0) {
+            fail("batched scorer NLL disagrees with the per-position walk".into());
+        }
+    }
+
     // Decode a few steps, feeding the argmax back in. A forward that is dead
     // (zeroed weights, unwired state) pins the argmax; that is the failure mode
     // this catches, so track whether it ever moves.

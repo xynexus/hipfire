@@ -356,6 +356,35 @@ pub struct RoutingTrace {
 /// next to a GPU download.
 pub static ROUTING_TRACE: std::sync::Mutex<Option<RoutingTrace>> = std::sync::Mutex::new(None);
 
+/// Feed one routed expert's input rows to an armed calibration collector, by NAME.
+///
+/// The `weight_gemv` tap keys on the weight's device pointer, which cannot name
+/// a PAGED expert: its pointer is a slot in the pager's rotating buffer, so the
+/// expert that lives there changes from call to call. Before this, every routed
+/// expert — 97% of this model — reached calibration with no data, and `oq4.25++`
+/// shipped them RTN. Naming them here at the call site, where the expert id is
+/// known, is what the pointer map could not do.
+///
+/// `leaf` is `gate_up_proj` (input `[n, hidden]`) or `down_proj` (input
+/// `[n, moe_intermediate]`); the name is the quantizer's per-expert split name,
+/// which is the key `imatrix_weights_for` looks up first. A no-op unless a
+/// collector is armed, so serving pays one `Option` check per expert.
+pub(crate) fn capture_routed_input(
+    gpu: &mut Gpu,
+    layer: Option<usize>,
+    expert: usize,
+    leaf: &str,
+    input: &GpuTensor,
+    n: usize,
+    k: usize,
+) {
+    let (Some(l), Some(cap)) = (layer, gpu.active_capture.clone()) else {
+        return;
+    };
+    let name = format!("model.language_model.layers.{l}.mlp.experts.{expert}.{leaf}.weight");
+    cap.capture(gpu, &name, input, n, k);
+}
+
 /// One token through the block. `x` and `out` are `[hidden]`. `layer` is the
 /// trunk layer the routing trace records it under; `None` (the MTP head) is
 /// not recorded.
@@ -402,6 +431,7 @@ pub fn moe_forward(
         // `weight_gemv` dispatches on the stack's dtype, so a quantised expert
         // runs its own kernel rather than being dequantised into scratch.
         let (gu, dn) = ExpertStack::expert_pair(&w.gate_up, &w.down, gpu, e)?;
+        capture_routed_input(gpu, layer, e, "gate_up_proj", x, 1, hidden);
         hipfire_runtime::weight_pager::page_timing::timed(
             hipfire_runtime::weight_pager::page_timing::Phase::ExpertGemv,
             || weight_gemv(gpu, &gu, x, &s.gu),
@@ -410,6 +440,7 @@ pub fn moe_forward(
         let gate = s.gu.sub_offset(0, mi);
         let up = s.gu.sub_offset(mi, mi);
         gpu.silu_mul_f32(&gate, &up, &s.inter)?;
+        capture_routed_input(gpu, layer, e, "down_proj", &s.inter, 1, mi);
         hipfire_runtime::weight_pager::page_timing::timed(
             hipfire_runtime::weight_pager::page_timing::Phase::ExpertGemv,
             || weight_gemv(gpu, &dn, &s.inter, &s.expert_out),

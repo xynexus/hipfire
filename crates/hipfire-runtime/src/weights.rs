@@ -1711,6 +1711,76 @@ pub fn weight_gemm(
             gpu.free_tensor(xs)?;
             result
         }
+        // Compact Opus (W4 + sparse outlier overlay), the batched twin of the
+        // `weight_gemv` arm. qwen4_exp's routed experts are this dtype, so without
+        // it a batched expert GEMM fell through to the per-column fallback below
+        // and re-read the expert once per routed token — no better than decode.
+        // Same stride derivation as the gemv arm: the overlay count is
+        // per-artifact, and a wrong stride is silent garbage.
+        DType::OqCompactG256 | DType::OqCompactG128 => {
+            let group: usize = if w.gpu_dtype == DType::OqCompactG128 {
+                128
+            } else {
+                256
+            };
+            let ng = w.k / group;
+            let blocks = w.m * ng;
+            if w.k % group != 0 || blocks == 0 || w.buf.byte_size() % blocks != 0 {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "compact Opus weight_gemm: {} bytes over {blocks} blocks (M={} K={} \
+                         group={group}) is not a whole block stride",
+                        w.buf.byte_size(),
+                        w.m,
+                        w.k
+                    ),
+                ));
+            }
+            let block_stride = w.buf.byte_size() / blocks;
+            gpu.ensure_mq_signs()?;
+            let x_rot = gpu.alloc_tensor(&[batch_size * w.k], DType::F32)?;
+            let result = if group == 256 {
+                (|| {
+                    rotate_x_mq_batched_for(gpu, w, x, &x_rot, w.k, batch_size)?;
+                    gpu.gemm_oq_compact_act_batched(
+                        &w.buf,
+                        &x_rot,
+                        y,
+                        w.m,
+                        w.k,
+                        batch_size,
+                        block_stride,
+                    )
+                })()
+            } else {
+                // G128 weights are FWHT-128 rotated; the 256 basis would not
+                // cancel. No AWQ branch, matching `rotate_x_mq_128_for`.
+                let xq = gpu.alloc_tensor(&[batch_size * w.k], DType::Raw)?;
+                let xs = gpu.alloc_tensor(&[batch_size * ng], DType::F32)?;
+                let r = (|| {
+                    gpu.ensure_mq_signs_128()?;
+                    gpu.rotate_x_mq_128_batched(x, &x_rot, w.k, batch_size)?;
+                    gpu.quantize_act_oq8(&x_rot, &xq, &xs, batch_size, w.k, group)?;
+                    gpu.gemm_oq_compact_grouped_wmma(
+                        &w.buf,
+                        &xq,
+                        &xs,
+                        y,
+                        w.m,
+                        w.k,
+                        batch_size,
+                        group,
+                        block_stride,
+                    )
+                })();
+                gpu.free_tensor(xq)?;
+                gpu.free_tensor(xs)?;
+                r
+            };
+            gpu.free_tensor(x_rot)?;
+            result
+        }
         DType::W8A8Ref => {
             // W8A8 reference path. buf = [M*K int8 weights | M f32 per-channel scales].
             // Quantize activations per-token to int8, iu8 WMMA, dequant by w·x scale.

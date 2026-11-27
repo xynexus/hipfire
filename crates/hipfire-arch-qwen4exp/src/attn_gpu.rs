@@ -47,6 +47,10 @@ pub struct QsaCache {
 }
 
 impl QsaCache {
+    pub fn max_seq(&self) -> usize {
+        self.max_seq
+    }
+
     pub fn new(gpu: &mut Gpu, cfg: &Qwen4ExpConfig, max_seq: usize) -> HipResult<Self> {
         let ix = &cfg.indexer;
         Ok(Self {
@@ -204,14 +208,51 @@ pub fn qsa_decode_step(
         .map(|v| f32::from_bits(*v as u32))
         .collect();
     let n_vis = vis_f.len();
-    // ponytail: fresh upload per step. The list is `n_vis` i32s and this is the
-    // correctness path; a persistent buffer is the obvious win once it matters.
+    // ponytail: fresh upload per step, O(context) bytes. A persistent prefix
+    // buffer (as the batched prefill uses) is the upgrade if decode traces show it.
     let visible = gpu.upload_f32(&vis_f, &[n_vis])?;
+    let r = qsa_select_attend(
+        gpu, cfg, w, s, cache, &s.qn, &s.ix_q, &s.gate, &visible, n_vis, &s.gated,
+    );
+    // Both are pooled uploads with no Drop. `visible` is `pos+1` entries, so
+    // leaking it cost O(context^2) device memory over a generation.
+    gpu.free_tensor(visible)?;
+    gpu.free_tensor(pos_buf)?;
+    r?;
+    weight_gemv(gpu, &w.o_proj, &s.gated, out)
+}
+
+/// Block selection, gather, and attention for ONE query row, leaving the gated
+/// context (the `o_proj` input) in `gated`.
+///
+/// `qn` is the normed+rotated query `[n_heads * head_dim]`, `ix_q` the indexer
+/// query `[ix_heads * ix_head_dim]`, `gate` the output gate. `visible` holds
+/// `n_vis` positions (f32-bit-cast i32). The cache must already hold every
+/// visible position — the batched prefill writes the whole chunk first, which
+/// is exact because the causal `visible` list never names a later position.
+#[allow(clippy::too_many_arguments)]
+pub fn qsa_select_attend(
+    gpu: &mut Gpu,
+    cfg: &Qwen4ExpConfig,
+    w: &QsaWeights,
+    s: &QsaScratch,
+    cache: &QsaCache,
+    qn: &GpuTensor,
+    ix_q: &GpuTensor,
+    gate: &GpuTensor,
+    visible: &GpuTensor,
+    n_vis: usize,
+    gated: &GpuTensor,
+) -> HipResult<()> {
+    let (nh, nkv, hd) = (cfg.n_heads, cfg.n_kv_heads, cfg.head_dim);
+    let ix = &cfg.indexer;
+    let eps = cfg.rms_norm_eps;
+    let ms = cache.max_seq;
     let n_blocks = n_vis / ix.compress_ratio;
     if n_blocks > 0 {
         gpu.qsa_pool_norm_blocks(
             &cache.ix_keys,
-            &visible,
+            visible,
             &w.ix_k_norm,
             &s.block_keys,
             &s.starts,
@@ -235,7 +276,7 @@ pub fn qsa_decode_step(
             0,
         )?;
         gpu.qsa_score_prepared(
-            &s.ix_q,
+            ix_q,
             &s.block_keys,
             &s.scores,
             ix.n_heads as i32,
@@ -251,7 +292,7 @@ pub fn qsa_decode_step(
     }
     gpu.qsa_select_indices(
         &s.block_mask,
-        &visible,
+        visible,
         &s.slots,
         &s.count,
         n_vis as i32,
@@ -273,7 +314,7 @@ pub fn qsa_decode_step(
         )?;
     }
     gpu.attention_cold_slots(
-        &s.qn,
+        qn,
         &s.gath_k,
         &s.gath_v,
         &s.ctx,
@@ -289,8 +330,8 @@ pub fn qsa_decode_step(
         None,
         hd,
     )?;
-    gpu.qsa_apply_output_gate(&s.ctx, &s.gate, &s.gated, (nh * hd) as i32)?;
-    weight_gemv(gpu, &w.o_proj, &s.gated, out)
+    gpu.qsa_apply_output_gate(&s.ctx, gate, gated, (nh * hd) as i32)?;
+    Ok(())
 }
 
 // ── GPU teardown ────────────────────────────────────────────────────────────

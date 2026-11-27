@@ -50,22 +50,22 @@ pub struct TrunkWeights {
 /// Per-sequence state: one recurrent state per Gated DeltaNet layer, one KV cache
 /// per sparse-attention layer, one conv ring per PLE layer.
 pub struct TrunkState {
-    gdn: Vec<Option<GdnState>>,
-    qsa: Vec<Option<QsaCache>>,
-    ple: Vec<Option<PleScratch>>,
+    pub(crate) gdn: Vec<Option<GdnState>>,
+    pub(crate) qsa: Vec<Option<QsaCache>>,
+    pub(crate) ple: Vec<Option<PleScratch>>,
 }
 
 pub struct TrunkScratch {
     hc: HcScratch,
     gdn: GdnScratch,
-    qsa: QsaScratch,
+    pub(crate) qsa: QsaScratch,
     moe: MoeScratch,
     mixed: GpuTensor,
     block_out: GpuTensor,
-    wide: GpuTensor,
+    pub(crate) wide: GpuTensor,
     ple_out: GpuTensor,
-    collapsed: GpuTensor,
-    logits: GpuTensor,
+    pub(crate) collapsed: GpuTensor,
+    pub(crate) logits: GpuTensor,
 }
 
 /// Yields one tensor at a time as f32.
@@ -129,8 +129,27 @@ fn load_linear(
                         .map(|(b, d)| (b.into_owned(), d))
                 }
             });
+        // Not Opus: keep the stored form if a GEMV reads it, exactly as the shared
+        // `TransformerLoader::load_weight` does. Without this, every BF16/F16/Q8F16
+        // linear was WIDENED to f32 — memory-irrelevant at 2.7% of the trunk, but
+        // not bandwidth-irrelevant: on the shipped oq4 artifact the Q8F16 lm_head
+        // alone went 0.68 -> 2.54 GB read per token, and the hyper-connection
+        // `mix_up`s (Q8F16), routers and shared `down`s (BF16/Q8F16) added ~1.7 GB.
+        let converted = converted.or_else(|| match qt {
+            16 => Some((bytes.clone(), DType::BF16)),
+            49 | 50 => hipfire_runtime::hfq::decode_bf16_packed(qt, &bytes, m * k)
+                .map(|b| (b, DType::BF16)),
+            _ => hipfire_runtime::quant::dtype_for_quant_type(qt, k)
+                .filter(|d| hipfire_runtime::weights::gemv_dtype_supported(*d, false).is_ok())
+                .map(|d| (bytes.clone(), d)),
+        });
         if let Some((bytes, dtype)) = converted {
-            let buf = gpu.upload_raw(&bytes, &[bytes.len()])?;
+            let mut buf = gpu.upload_raw(&bytes, &[bytes.len()])?;
+            // Same tagging as `TransformerLoader::load_weight`: BF16 carries its
+            // dtype on the buffer, the byte-level formats stay Raw.
+            if dtype == DType::BF16 {
+                buf.dtype = DType::BF16;
+            }
             return Ok(WeightTensor {
                 buf,
                 gpu_dtype: dtype,
@@ -947,6 +966,9 @@ pub fn decode_step_into(
     let seeded: Vec<f32> = (0..hc).flat_map(|_| e.iter().copied()).collect();
     let wide = gpu.upload_f32(&seeded, &[hc * hidden])?;
     gpu.memcpy_dtod_auto(&s.wide.buf, &wide.buf, hc * hidden * 4)?;
+    // Pooled, and a GpuTensor has no Drop: an upload that is not freed is gone
+    // for the life of the process, every token.
+    gpu.free_tensor(wide)?;
 
     let visible: Vec<usize> = (0..=pos).collect();
 
@@ -973,6 +995,7 @@ pub fn decode_step_into(
             let emb = src.gather(&rows, hd).map_err(|e| HipError::new(0, &e))?;
             let g_emb = gpu.upload_f32(&emb, &[n.embed_dim])?;
             ple_step(gpu, cfg, pw, ps, &s.wide, &g_emb, &s.ple_out)?;
+            gpu.free_tensor(g_emb)?;
             gpu.add_inplace_f32(&s.wide, &s.ple_out)?;
         }
 
