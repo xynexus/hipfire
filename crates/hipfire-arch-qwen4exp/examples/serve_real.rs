@@ -36,7 +36,18 @@ fn main() {
     };
 
     let t0 = Instant::now();
-    let mut m = match Qwen4ExpBackend::load(&mut gpu, &mut hfq, 256) {
+    // Sized from the prompt so a long-prompt prefill measurement is not capped
+    // (the batched chunk is min(512, max_seq)).
+    let want: usize = std::env::args()
+        .nth(3)
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(4)
+        + std::env::args()
+            .nth(2)
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(4)
+        + 8;
+    let mut m = match Qwen4ExpBackend::load(&mut gpu, &mut hfq, want.max(256)) {
         Ok(m) => m,
         Err(e) => {
             eprintln!("serve_real: load FAILED: {e}");
@@ -51,10 +62,9 @@ fn main() {
         m.config().eos_token_id
     );
 
-    // A short prompt: prefill is per-token, and this model has 48 layers.
-    // Length overridable (argv[3]) so prefill SCALING can be measured: this
-    // trunk prefills one token at a time, so cost should be strictly linear and
-    // the slope is what a batched forward would attack.
+    // Length overridable (argv[3]) so prefill SCALING can be measured. Batched
+    // prefill should bend the slope; HIPFIRE_QWEN4EXP_PER_TOKEN_PREFILL=1 gives
+    // the old strictly linear per-token curve to compare against.
     let prompt_len: usize = std::env::args()
         .nth(3)
         .and_then(|v| v.parse().ok())

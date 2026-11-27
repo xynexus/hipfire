@@ -1590,6 +1590,26 @@ pub fn weight_gemm(
     y: &GpuTensor,
     batch_size: usize,
 ) -> HipResult<()> {
+    weight_gemm_oq4_act(gpu, w, x, y, batch_size, None)
+}
+
+/// [`weight_gemm`] with the caller's preferred Oq4G256 ACTIVATION precision
+/// (`Some(4 | 8 | 16)`); `None` keeps the default routing (W4A4 below batch 64,
+/// W4A8 MMQ at or above). `HIPFIRE_OQ4_PREFILL_ACT_BITS` still overrides both —
+/// it is the debug A/B knob. Every other dtype ignores the preference.
+///
+/// Exists because the default is a speed policy that costs accuracy, and a
+/// caller can measure that it is the wrong trade: qwen4_exp's batched prefill
+/// scored held-out PPL 4.0868 at the default, 4.0709 at A8 and 4.0550 at A16,
+/// against 4.0411 for its per-token GEMV path — at the same wall time.
+pub fn weight_gemm_oq4_act(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    batch_size: usize,
+    oq4_act_bits: Option<u8>,
+) -> HipResult<()> {
     // Calibration tap (batched analog of `weight_gemv`): when a Hessian/imatrix
     // collector is armed (`gpu.active_capture`) and this weight is a known target
     // (`gpu.capture_names`), accumulate the WHOLE batch of input activations in
@@ -1650,7 +1670,9 @@ pub fn weight_gemm(
             let x_rot = gpu.alloc_tensor(&[batch_size * w.k], DType::F32)?;
             let result = (|| {
                 rotate_x_mq_batched_for(gpu, w, x, &x_rot, w.k, batch_size)?;
-                let act_bits = std::env::var("HIPFIRE_OQ4_PREFILL_ACT_BITS").ok();
+                let act_bits = std::env::var("HIPFIRE_OQ4_PREFILL_ACT_BITS")
+                    .ok()
+                    .or_else(|| oq4_act_bits.map(|b| b.to_string()));
                 match act_bits.as_deref() {
                     Some("4") => {
                         gpu.gemm_oq4_grouped_act_batched(&w.buf, &x_rot, y, w.m, w.k, batch_size)

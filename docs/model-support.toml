@@ -172,8 +172,9 @@ vision = "full"
 #   - quality evidence is PPL only: held-out wikitext2 (4095 tokens) oq4 4.040,
 #     oq4.25 4.042, oq4.25++ 5.061 (2026-09-24, `perplexity_qwen4exp`). No KLD
 #     against a bf16 reference, no eval battery.
-#   - prefill is now BATCHED (layer-major, `prefill_gpu.rs`): differenced against
-#     the per-token path on fixtures, NOT yet measured on the shipped checkpoint.
+#   - prefill is now BATCHED (layer-major, `prefill_gpu.rs`): 512 tokens in
+#     10.6 s on the 180B (~8x), held-out PPL 4.0550 vs 4.0411 per-token (+0.34%,
+#     the int8 activations of the Oq8/compact GEMMs). Decode is still ~0.19 s/tok.
 #   - no VL wiring, though mRoPE's vision interleave exists. The MTP head drafts
 #     at 60.9% acceptance on the 180B (`spec_decode_mtp`) but is not wired into
 #     serving: it needs a 2-token batched verify.

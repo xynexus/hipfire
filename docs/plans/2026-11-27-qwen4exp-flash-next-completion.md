@@ -130,7 +130,33 @@ for 1.61 tokens). Needs its own serve loop beside `run_simple_ar`.
     per token, ~1.7 GB more across mix_up/router/shared down). Decode upload
     leaks freed (QSA `visible` was O(context²) over a generation).
   - (4) `kld_forward` → batched scorer; fixture NLL matches the walk to 1e-4.
-- **Queued for a GPU window** (needs the serving daemon stopped):
+- 2026-11-27 **180B measured** (halo gfx1151, `Qwen3.8-Flash-Next-180B--oq4`,
+  experts paged LRU 8 GiB, warm kernels):
+  - prefill, batched: 4/8/16/32/64/512 tokens = 1.28/1.84/2.26/3.30/4.46/
+    **10.55 s** (512 → 48.5 tok/s). Per-token: 64 tokens 9.34 s; the old 512
+    extrapolation was ~88 s. **~8x at 512**, and the slope bends.
+  - decode unchanged, 0.17-0.21 s/tok (August 0.18-0.19). Keeping the dense
+    linears native did NOT move decode — issue (3)'s bottleneck is elsewhere
+    (cold expert page-ins: ~3-6k cold loads per 32-step run). Next: rocprofv3.
+  - held-out PPL, `wikitext2-1024s-2048ctx.txt`, 4095 scored tokens:
+    per-token walk **4.0411** (reproduces 2026-09-24's 4.0400) in 724 s;
+    batched Oq4@A4 (shared default) 4.0868 (+1.13%), @A8 4.0709 (+0.74%),
+    **@A16 4.0550 (+0.34%)** at 116-136 s — A16 is no slower, so qwen4exp's
+    prefill now requests it (`weight_gemm_oq4_act`). The residual +0.34% is
+    the int8 activations of the Oq8 (GDN) and compact-G128 GEMMs.
+  - calibration smoke: first run OOM'd — every per-expert imatrix accumulator
+    staged a 256-row tile (~80 GB over 49152 accumulators); imatrix-only
+    accumulators now stage 16 rows. Rerun: 16384 tokens in 535 s (~31 tok/s,
+    was ~3), **23597 / 24576 experts** (96%) carry an imatrix, keyed
+    `…experts.E.{gate_up,down}_proj.weight.imatrix`, 0.29 GiB package.
+  - `tiny-affected-gate`: quant 12/14 pass; the 2 fails (qwen3_5_moe oq8 KLD
+    0.0141 vs 0.00156; qwen3_5_moe_indexed oq8++ 0.000333 vs 0.000446)
+    reproduce BIT-IDENTICALLY with origin/master's `weights.rs` — pre-existing.
+    tiny-state: inconclusive, no baselines at HIP 7.16 for any family.
+- **Next:** rebuild `oq4.25++` from a full calibration (dense Hessians + the
+  expert imatrix) and compare with oq4 4.0411 on the same corpus; rocprofv3 a
+  decode run; MTP serving per the design above.
+- ~~Queued for a GPU window~~ (done above):
   `tiny-affected-gate --require-coverage` (selects 18 families via
   `weights.rs`); 180B `serve_real` prefill at 8/16/32/64/512; decode argmax
   1892 + tok/s before/after the native-weights change; held-out PPL batched vs

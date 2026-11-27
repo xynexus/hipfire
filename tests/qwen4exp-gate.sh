@@ -238,8 +238,8 @@ fi
 step "GPU: BATCHED prefill vs per-token, at int8 activations"
 # serve_fixture differences the batched layer-major prefill (one chunk, and
 # chunks of 3 so a boundary falls inside the prompt) against the per-token decode
-# step. Under oq4's default small-batch W4A4 GEMM it can only apply a loose bound;
-# at ACT_BITS=8 the strict 2% bound applies, so a wrong row, state hand-off or
+# step, under the strict 2% bound (qwen4exp asks for A16 on Oq4). Repeated at
+# ACT_BITS=8 (the debug override) so a wrong row, state hand-off or
 # chunk boundary cannot hide behind activation-quantisation noise.
 if [ -f "$TMP/fx.oq4.hfq" ]; then
   a8="$(HIPFIRE_OQ4_PREFILL_ACT_BITS=8 \

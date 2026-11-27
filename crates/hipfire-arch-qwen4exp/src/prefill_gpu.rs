@@ -35,7 +35,21 @@ use crate::ple_gpu::ple_tail;
 use crate::trunk_gpu::{TokenMixer, TrunkScratch, TrunkState, TrunkWeights};
 use hipfire_rdna::{DType, Gpu, GpuTensor, HipError, HipResult};
 use hipfire_runtime::weight_pager::page_timing;
-use hipfire_runtime::weights::{weight_gemm, weight_gemv, WeightTensor};
+use hipfire_runtime::weights::{weight_gemm_oq4_act, weight_gemv, WeightTensor};
+
+/// Every batched linear in this module. Oq4G256 runs at f16 ACTIVATIONS rather
+/// than `weight_gemm`'s default small-batch int4: on the shipped 180B, held-out
+/// PPL (4095 tokens) was 4.0868 at the default, 4.0709 at A8, 4.0550 at A16,
+/// against 4.0411 per-token — and A16 was no slower (128 s vs 136 s).
+fn weight_gemm(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    n: usize,
+) -> HipResult<()> {
+    weight_gemm_oq4_act(gpu, w, x, y, n, Some(16))
+}
 
 /// Row `t` of a row-major `[rows, width]` buffer.
 fn row(t: &GpuTensor, r: usize, width: usize) -> GpuTensor {

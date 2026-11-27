@@ -200,21 +200,15 @@ fn main() {
             // GEMM; a wrong row, state or chunk boundary is O(1) — bf16 agrees to
             // ~1e-7, so the layer-major forward itself contributes nothing.
             //
-            // EXCEPT Oq4G256 at batch < 64, whose `weight_gemm` default is W4A4
-            // (int4 activations — the same small-batch policy qwen35's production
-            // prefill runs). That alone measured 13-15% here, and 1% with
-            // HIPFIRE_OQ4_PREFILL_ACT_BITS=8. It is a precision POLICY, so it gets
-            // its own bound rather than masking a structural bug at 2%: the gate
-            // also runs this fixture at ACT_BITS=8, where the 2% bound applies.
-            let a4 = m.routed_expert_dtype() == Some(hipfire_rdna::DType::Oq4G256)
-                && std::env::var("HIPFIRE_OQ4_PREFILL_ACT_BITS").is_err();
-            let bound = if a4 { 0.25 } else { 0.02 };
+            // qwen4_exp's prefill asks for f16 activations on Oq4 (the shared
+            // default is int4 at small batch, 13-15% here); the gate also runs
+            // this at HIPFIRE_OQ4_PREFILL_ACT_BITS=8, which must hold the bound too.
+            let bound = 0.02;
             if dp.max(dd) > bound * scale {
                 fail(format!(
-                    "{name} prefill diverges from per-token: max|d| {:.3e} > {}% of {scale:.3}{}",
+                    "{name} prefill diverges from per-token: max|d| {:.3e} > {}% of {scale:.3}",
                     dp.max(dd),
-                    bound * 100.0,
-                    if a4 { " (W4A4 bound)" } else { "" }
+                    bound * 100.0
                 ));
             }
         }
