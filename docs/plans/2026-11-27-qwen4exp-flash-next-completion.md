@@ -94,7 +94,46 @@ Batching (1) already amortises all of these for prefill.
 - **docs:** the model-support row still says "NO QUALITY EVIDENCE"; the
   2026-09-24 PPL table exists. Correct it.
 
+### MTP serving — design (not started)
+
+The head is a SEPARATE sidecar artifact (`spec_decode_mtp <base> <mtp>`), so it
+needs a schema field naming it (an absolute `Path`, `Exists`), loaded by the
+factory. A verify step is `prefill_chunk_into` over `[t, draft]` (n=2,
+`all_logits`). The cost is rollback when the draft is rejected (~39%):
+
+- re-running the accepted token costs a full trunk step, which takes the win
+  from 1.25x to ~1.0x at 61% acceptance — not worth wiring;
+- so roll back from a checkpoint AFTER ROW 0, which is exact and free of
+  compute: GDN recurrence + conv ring already have snapshot variants
+  (`gated_delta_net_f32_batch_seq_opts`, `conv1d_silu_split_f32_n_opts`, used
+  by DFlash rollback); the PLE ring runs per row in `ple_tail`, so copy
+  `conv_state` after row 0; the QSA caches only need `len` reset.
+
+Expected ~1.25x decode at 61% acceptance (1.28 trunk-equivalents per verify
+for 1.61 tokens). Needs its own serve loop beside `run_simple_ar`.
+
 ## Log
 
 - 2026-11-27: plan written. GPU held by the production daemon, so work
   proceeds on fixtures; 180B measurements are queued for a daemon window.
+- 2026-11-27 (`7a8cd7670`): landed on fixtures, `tests/qwen4exp-gate.sh` PASS.
+  - (1) batched prefill. Fixture max|Δlogit| vs per-token, prefill + one
+    decode step, single chunk AND chunk=3: bf16 1.5e-3 of scale (BF16 GEMM vs
+    GEMV; 1.2e-7 when both arms were f32), oq8 0.7%, oq4@A8 1.0%, mi640
+    compact-G128 experts@A8 0.9%. **oq4 at the default small-batch W4A4: 13-15%,
+    argmax unchanged** — the shared `weight_gemm` policy (qwen35 production
+    prefill runs O/down at A4). Whether qwen4exp should opt out is a 180B PPL
+    question: batched vs per-token PPL decides it.
+  - (2) expert capture by name (`capture_routed_input`); calibrate example's
+    off-by-one feed fixed and now batched.
+  - (3) BF16/F16/Q8F16 linears load native (were f32: lm_head 2.54 → 0.68 GB
+    per token, ~1.7 GB more across mix_up/router/shared down). Decode upload
+    leaks freed (QSA `visible` was O(context²) over a generation).
+  - (4) `kld_forward` → batched scorer; fixture NLL matches the walk to 1e-4.
+- **Queued for a GPU window** (needs the serving daemon stopped):
+  `tiny-affected-gate --require-coverage` (selects 18 families via
+  `weights.rs`); 180B `serve_real` prefill at 8/16/32/64/512; decode argmax
+  1892 + tok/s before/after the native-weights change; held-out PPL batched vs
+  `HIPFIRE_QWEN4EXP_PER_TOKEN_PREFILL=1`, default vs ACT_BITS=8; a calibration
+  run confirming per-expert imatrix keys land, then `oq4.25` with expert
+  imatrix vs `oq4` (4.040).
