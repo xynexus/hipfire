@@ -32,6 +32,8 @@ pub mod stream;
 /// efficient than per-token (N=1) launches (the tiled GEMM is built for N≥16),
 /// so this is the dominant calibration-throughput lever.
 const FLUSH_BATCH: usize = 256;
+/// Staging rows for accumulators that keep no Hessian (see `capture`).
+const IMATRIX_ONLY_FLUSH: usize = 16;
 
 /// Calibration-only HFQM quant_type for compact Hessians:
 /// exact F32 diagonal followed by BF16 lower strict triangle.
@@ -1872,7 +1874,17 @@ impl ActivationCapture for CalibCollector {
             } else {
                 None
             };
-            let buf = gpu.zeros(&[FLUSH_BATCH, k], DType::F32).unwrap();
+            // Imatrix-only accumulators get a small staging tile. A routed-expert
+            // capture names every expert separately (qwen4_exp: 512 x 48 x 2 =
+            // 49152 accumulators) and each one sees ~k_top*rows/n_experts rows
+            // per chunk, so a FLUSH_BATCH tile each was ~80 GB of device staging
+            // for no benefit — it OOM'd the 180B calibration on a 128 GB box.
+            let capacity = if h.is_some() {
+                FLUSH_BATCH
+            } else {
+                IMATRIX_ONLY_FLUSH
+            };
+            let buf = gpu.zeros(&[capacity, k], DType::F32).unwrap();
             let h_f64 = if self.f64_audit && h.is_some() {
                 Some(vec![0.0f64; k * k])
             } else {
@@ -1891,7 +1903,7 @@ impl ActivationCapture for CalibCollector {
                     h_f64,
                     buf,
                     buf_rows: 0,
-                    buf_capacity: FLUSH_BATCH,
+                    buf_capacity: capacity,
                     k,
                     n_tokens: 0,
                 },

@@ -150,10 +150,15 @@ fn main() {
     };
 
     let t1 = Instant::now();
-    m.prefill(&mut gpu, &toks[..1]).expect("prefill");
-    for i in 1..toks.len() {
-        m.decode_step(&mut gpu, toks[i - 1], i).expect("decode");
-    }
+    // One batched prefill over the whole stream. The dense taps fire in
+    // `weight_gemm` (a whole chunk of rows per launch) and the routed experts are
+    // named at their call site (`capture_routed_input`), so this captures the same
+    // statistics the per-token loop did at a fraction of the weight sweeps.
+    //
+    // The loop this replaced fed `decode_step(toks[i - 1], i)` — the PREVIOUS
+    // token at each position, so `toks[0]` ran twice and every later activation
+    // came from a stream shifted by one.
+    m.prefill(&mut gpu, toks).expect("prefill");
     println!(
         "captured over {n_use} real tokens ({distinct} distinct) in {:.1}s",
         t1.elapsed().as_secs_f32()
