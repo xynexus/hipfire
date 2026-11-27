@@ -372,7 +372,17 @@ async fn execute_responses_owned(
         };
     // Split the marked text: a `</think>` the answer quotes is not the end of
     // the reasoning. Then the marks come off.
-    let (reasoning, visible) = split_thinking(&generated.marked, true);
+    // A reply the token cap cut off inside the template's open think block has
+    // no marker at all; `split_thinking` would read it as the answer.
+    let (reasoning, visible) = if super::chat::cut_off_in_think(
+        &generated.marked,
+        generated.opened_think,
+        generated.done.finish_reason.as_deref(),
+    ) {
+        (generated.marked.trim().to_string(), String::new())
+    } else {
+        split_thinking(&generated.marked, true)
+    };
     let unmark = |s: String| hipfire_model::tokenizer::unmark_literal(&s).into_owned();
     let (reasoning, visible) = (unmark(reasoning), unmark(visible));
     let text = if client_preserve {
@@ -1501,7 +1511,10 @@ mod tests {
         assert!(r.is_empty());
         assert_eq!(v, "just an answer");
 
-        // unterminated block (budget/limit cut it): keep it as reasoning, not as answer
+        // No closer and no opener: `split_thinking` alone cannot tell a cut-off
+        // thought from a model that did not think, so it keeps the text as the
+        // answer. The route decides the cut-off case first, from the finish
+        // reason (`chat::cut_off_in_think`).
         let (r, v) = split_thinking("still reasoning when the cap hit", true);
         assert!(r.is_empty(), "no closer and no opener -> not reasoning");
         assert_eq!(v, "still reasoning when the cap hit");
