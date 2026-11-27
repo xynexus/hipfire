@@ -839,18 +839,19 @@ impl ZayaDecodeState {
         // Opt-in low-bit KV: HIPFIRE_ZAYA_KVARN=2|4|8. Falls back to the f32 rings
         // when unset.
         //
-        // K is deliberately NOT Hadamard-rotated here, although the KVarN paper
-        // specifies a rotation and the qwen3.5/gemma callers apply one: on ZAYA1-8B
-        // it HURTS. Measured 2026-11-27 (bf16 weights, 2047 wikitext positions,
-        // `examples/kld --cand-kvarn`, KLD vs the same model with f32 KV):
-        //   KVarN-4 un-rotated 0.0565 · KVarN-4 FWHT-128-rotated 0.0676 (+20%) ·
-        //   KVarN-8 rotated 0.0097.
-        // The FWHT-128 is exactly orthonormal, so this is the quantiser, not the
-        // scores: KVarN's per-channel scales already isolate channel-aligned
-        // outliers, and a rotation spreads them into every channel. (Flash-Next's
-        // sparse attention went the other way: +0.81% -> -0.34% PPL.) Note how
-        // KV-sensitive zaya is overall — even 8-bit is ~1e-2 KLD, ~1000x Qwen3.5's —
-        // which is why this stays opt-in.
+        // K is not Hadamard-rotated by default (`HIPFIRE_ZAYA_KVARN_ROTATE=1` turns
+        // it on for A/Bs, see `kvarn_debug_rotate_qk`): measured inconclusive.
+        //
+        // MEASURING KV QUANT ON ZAYA: plain KLD vs f32 KV is dominated by top-1
+        // routing tie-flips, not KV error. ~0.6% of router decisions have margins
+        // of 1e-4..3e-3; ANY perturbation (f16-rounding V, or a different correct
+        // implementation) flips a few, and a flip cascades (one at layer 9 moved
+        // KLD at the next position to 1.28). Reference points, 2026-11-27, bf16:
+        //   HF fp32 (Zyphra fork) vs this forward: PPL 65.74 vs 66.18, KLD 3.2e-3
+        //   (median 2.8e-4, top-3 of 299 positions = 50%) — the chaos floor.
+        // Use `HIPFIRE_ZAYA_PIN_ROUTES=1` (candidate replays the reference's
+        // routes) + true-token PPL from `examples/kld`. Pinned, 2047 positions:
+        //   f16 V 4.0e-4 · KVarN-8 1.1e-3 · KVarN-4 3.1e-2 · KVarN-4 rotated 3.4e-2.
         let kvarn_bits = std::env::var("HIPFIRE_ZAYA_KVARN")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
@@ -1097,6 +1098,8 @@ pub fn gpu_forward_serve(
         if let Some(kv) = state.kvarn.as_ref() {
             // Fused KVarN prefill (n=s): quantize+store the whole K/V run and
             // flash-attend into `ctx` in one call. Positions [0, s) uploaded above.
+            kvarn_debug_rotate_qk(gpu, &query, &key, s, nq, nkv, hd)
+                .map_err(|e| format!("{e:?}"))?;
             gpu.kvarn_attend(
                 &kv.cache.k_gpu[li],
                 &kv.cache.k_window[li],
@@ -2139,6 +2142,8 @@ fn gpu_decode_body(
                 shape: vec![1],
                 dtype: DType::F32,
             };
+            kvarn_debug_rotate_qk(gpu, &query, &key, 1, nq, nkv, hd)
+                .map_err(|e| format!("{e:?}"))?;
             gpu.kvarn_attend(
                 &kv.cache.k_gpu[li],
                 &kv.cache.k_window[li],
@@ -2485,6 +2490,38 @@ fn gpu_decode_body(
                     bestv = v;
                     best = e;
                 }
+            }
+            // DEBUG (`HIPFIRE_ZAYA_PIN_ROUTES=1`, two models in one process): the
+            // f32-KV reference records its top-1 choices, a candidate replays
+            // them, so a KV-quant A/B measures KV error instead of top-1 tie-flip
+            // cascades (a 1e-3-margin flip at one layer moves KLD by ~1).
+            if std::env::var("HIPFIRE_ZAYA_PIN_ROUTES").is_ok() {
+                use std::collections::HashMap;
+                use std::sync::Mutex;
+                static PINNED: Mutex<Option<HashMap<(usize, usize), usize>>> = Mutex::new(None);
+                let mut g = PINNED.lock().unwrap();
+                let m = g.get_or_insert_with(HashMap::new);
+                if state.kvarn.is_some() {
+                    if let Some(&b) = m.get(&(pos, li)) {
+                        best = b;
+                    }
+                } else {
+                    m.insert((pos, li), best);
+                }
+            }
+            if std::env::var("HIPFIRE_ZAYA_ROUTELOG").is_ok() {
+                let mut second = f32::NEG_INFINITY;
+                for e in 0..n_route {
+                    let v = probs[e] + lw.balancing_biases[e];
+                    if e != best && v > second {
+                        second = v;
+                    }
+                }
+                eprintln!(
+                    "[route] tag={} pos={pos} li={li} best={best} margin={:.3e}",
+                    if state.kvarn.is_some() { "cand" } else { "ref" },
+                    bestv - second
+                );
             }
             if best != n_exp {
                 let weight = probs[best];
@@ -3682,5 +3719,34 @@ mod tests {
         // Non-OQ quant_types fall through to linear_dtype / dequant.
         assert!(oq_repack(13, &data, 1, 256).is_none());
         assert!(oq_repack(3, &data, 1, 256).is_none());
+    }
+}
+
+/// DEBUG (`HIPFIRE_ZAYA_KVARN_ROTATE=1`): FWHT-rotate Q and K in place before
+/// `kvarn_attend`, the paper's Hadamard half. Off by default — see the KVarN
+/// comment in the decode body for the measurement.
+fn kvarn_debug_rotate_qk(
+    gpu: &mut Gpu,
+    q: &GpuTensor,
+    k: &GpuTensor,
+    rows: usize,
+    nq: usize,
+    nkv: usize,
+    hd: usize,
+) -> hipfire_rdna::HipResult<()> {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if !*ON.get_or_init(|| std::env::var("HIPFIRE_ZAYA_KVARN_ROTATE").as_deref() == Ok("1")) {
+        return Ok(());
+    }
+    match hd {
+        128 => {
+            gpu.rotate_x_mq_128_batched(q, q, hd, rows * nq)?;
+            gpu.rotate_x_mq_128_batched(k, k, hd, rows * nkv)
+        }
+        256 => {
+            gpu.rotate_x_mq_batched(q, q, hd, rows * nq)?;
+            gpu.rotate_x_mq_batched(k, k, hd, rows * nkv)
+        }
+        _ => Ok(()),
     }
 }
