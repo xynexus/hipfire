@@ -89,11 +89,19 @@ fn App() -> impl IntoView {
     leptos::task::spawn_local(async move {
         loop {
             let result = hipfire_web_ui::get_json_typed::<AdminStats>("/admin/stats").await;
-            if result.as_ref().is_err_and(|error| error.is_unauthorized()) {
+            if result.as_ref().is_err_and(|error| error.is_unauthorized())
+                && !auth.0.get_untracked()
+            {
                 auth.0.set(true);
             }
             if let Ok(s) = &result {
-                auth.0.set(false);
+                // `auth` gates the entire active tab. Rewriting the same value
+                // invalidates that branch and remounts its component, which
+                // discards in-progress forms and restarts their data loads.
+                // Only publish real authentication transitions.
+                if auth.0.get_untracked() {
+                    auth.0.set(false);
+                }
                 set_history.update(|h| {
                     h.push_back(sample_from(s));
                     while h.len() > HISTORY {
