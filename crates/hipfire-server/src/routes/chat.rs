@@ -366,6 +366,9 @@ pub(crate) struct BlockingChatResult {
     pub(crate) done: hipfire_generate::DoneEvent,
     pub(crate) tool_calls: Vec<Value>,
     pub(crate) request_max_tokens: u32,
+    /// The request rendered an OPEN think block (`open_think`), so the reply
+    /// began as reasoning. See [`cut_off_in_think`].
+    pub(crate) opened_think: bool,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -1798,6 +1801,28 @@ fn detect_tool_call_truncation(
     }))
 }
 
+/// A whole reply that began inside the template's open think block and hit the
+/// token limit before `</think>`: it never reached its answer, so all of it is
+/// reasoning.
+///
+/// [`strip_visible_thinking`] cannot tell this apart from a model that simply
+/// did not think, because neither carries a marker — it treats "no `</think>`"
+/// as "plain answer". That is right for a reply that ENDED (EOS) without one, and
+/// wrong for one the cap CUT OFF: Qwen3.8-Flash-Next at `max_tokens` 48 came
+/// back as `content: "We need to answer user: ..."`. The streaming filter, which
+/// starts inside the block for every `open_think` request, already classed the
+/// same text as reasoning; this makes the non-streaming answer agree.
+pub(crate) fn cut_off_in_think(
+    text: &str,
+    opened_think: bool,
+    finish_reason: Option<&str>,
+) -> bool {
+    opened_think
+        && finish_reason == Some("length")
+        && !text.contains("<think>")
+        && !text.contains("</think>")
+}
+
 pub(crate) fn strip_visible_thinking(
     content: String,
     preserve: bool,
@@ -2493,7 +2518,14 @@ where
             .get("prompt_tokens")
             .and_then(Value::as_u64)
             .map(|n| n as u32);
-        let final_text = strip_visible_thinking(text, preserve_thinking, true);
+        let opened_think = controls.assistant_prefix.as_deref() != Some("closed_think");
+        let final_text = if !preserve_thinking
+            && cut_off_in_think(&text, opened_think, Some(finish_reason.as_str()))
+        {
+            String::new()
+        } else {
+            strip_visible_thinking(text, preserve_thinking, true)
+        };
         // The daemon's batch decode returns text only, so parse calls the way the
         // legacy path does when the daemon hands it none.
         let (final_text, tool_calls) =
@@ -2531,6 +2563,7 @@ where
             done,
             tool_calls,
             request_max_tokens,
+            opened_think,
         }));
     }
 
@@ -2547,7 +2580,7 @@ where
         return Err(json!({"error": {"message": e, "type": "server_error"}}));
     }
 
-    let gen_req = {
+    let (gen_req, opened_think) = {
         let cfg = state.config.lock().await;
         let resolved = cfg.resolve_for_model(&model_arg);
         let controls = request_generation_controls(
@@ -2558,7 +2591,8 @@ where
             body.presence_penalty,
             body.frequency_penalty,
         );
-        generate_request_from_chat(
+        let opened_think = controls.assistant_prefix.as_deref() != Some("closed_think");
+        let req = generate_request_from_chat(
             req_id.clone(),
             &body.messages,
             GenerationSamplingPolicy::from_defaults(
@@ -2578,7 +2612,8 @@ where
             stop,
             image_base64,
             controls,
-        )
+        );
+        (req, opened_think)
     };
 
     let mut engine_guard = state.lock_engine().await;
@@ -2628,7 +2663,13 @@ where
     match result {
         Ok(Some(done)) => {
             let raw_reply = raw_text.clone();
-            let mut text = strip_visible_thinking(raw_text, preserve_thinking, true);
+            let mut text = if !preserve_thinking
+                && cut_off_in_think(&raw_text, opened_think, done.finish_reason.as_deref())
+            {
+                String::new()
+            } else {
+                strip_visible_thinking(raw_text, preserve_thinking, true)
+            };
             let mut tool_calls = daemon_tool_calls_to_openai(raw_tool_calls, &req_id);
             if tool_calls.is_empty() {
                 let (content, parsed) =
@@ -2648,6 +2689,7 @@ where
                 done,
                 tool_calls,
                 request_max_tokens,
+                opened_think,
             }))
         }
         Ok(None) => {
@@ -3379,6 +3421,33 @@ mod tests {
             strip_visible_thinking("<think>x</think> answer".to_string(), true, false),
             "<think>x</think> answer"
         );
+    }
+
+    #[test]
+    fn a_reply_cut_off_inside_the_open_think_block_is_reasoning() {
+        // The shape that leaked: template opened <think>, the cap hit mid-thought,
+        // so the text carries neither marker.
+        assert!(cut_off_in_think(
+            "We need to answer user",
+            true,
+            Some("length")
+        ));
+        // Ended on its own without a closer: the model did not think -> answer.
+        assert!(!cut_off_in_think("plain answer", true, Some("stop")));
+        assert!(!cut_off_in_think("plain answer", true, None));
+        // Thinking off (closed_think): the reply is never reasoning.
+        assert!(!cut_off_in_think(
+            "Red, yellow and blue",
+            false,
+            Some("length")
+        ));
+        // The block closed (or reopened) inside the reply: the marker split wins.
+        assert!(!cut_off_in_think(
+            "why</think>\n\nanswer",
+            true,
+            Some("length")
+        ));
+        assert!(!cut_off_in_think("a<think>b", true, Some("length")));
     }
 
     #[test]
