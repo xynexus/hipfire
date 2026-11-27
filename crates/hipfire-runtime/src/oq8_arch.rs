@@ -461,6 +461,14 @@ fn compact_shape_selected(m: usize, k: usize) -> bool {
         && dim_selected(&hipfire_env::OQ_COMPACT_RESIDENT_ONLY_M, m)
 }
 
+/// Whether `oq8_arch_load_allow_compact` keeps an `[m, k]` `OqPlusCompact*`
+/// tensor COMPACT (split planes) rather than expanding it. The weight pager's
+/// device repack only reproduces the compact form, so it asks this — the same
+/// two switches, not a copy of them.
+pub fn compact_kept_resident(m: usize, k: usize) -> bool {
+    compact_resident_enabled() && compact_shape_selected(m, k)
+}
+
 /// Load an OQ8-family tensor, EXPANDING `OqPlusCompact` to `Oq8G256`.
 ///
 /// This is the entry every arch gets by default, and it must stay the expanding

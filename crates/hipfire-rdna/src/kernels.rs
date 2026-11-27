@@ -5447,3 +5447,8 @@ mod dispatch_tests {
         }
     }
 }
+
+/// Routed-expert page-in repack on the device (`pager_oq4_combined`,
+/// `pager_compact_split`): byte-for-byte ports of the host transforms the
+/// weight pager used to run per cold load. See the kernel header.
+pub const PAGER_REPACK_SRC: &str = include_str!("../../../kernels/src/pager_repack.hip");
