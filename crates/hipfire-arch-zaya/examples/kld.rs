@@ -29,7 +29,7 @@
 //! `KLD(ref‖A)` and `KLD(ref‖B)` are measured on identical inputs.
 //!
 //! Run: cargo run --release -p hipfire-arch-zaya --example kld -- \
-//!        <ref.bf16.hfq> <candA.hfq> [candB.hfq] --corpus <txt> [--ntok N]
+//!        <ref.bf16.hfq> <candA.hfq> [candB.hfq] --corpus <txt> [--ntok N] [--cand-kvarn 2|4|8]
 
 use hipfire_arch_zaya::arch::ZayaModel;
 use hipfire_arch_zaya::ZayaConfig;
@@ -92,7 +92,7 @@ fn main() {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--corpus" | "--ntok" => i += 2,
+            "--corpus" | "--ntok" | "--cand-kvarn" => i += 2,
             s if s.starts_with("--") => i += 1,
             s => {
                 positionals.push(s.to_string());
@@ -127,7 +127,17 @@ fn main() {
     eprintln!("GPU: {}", gpu.arch);
     let max_seq = n + 16;
 
+    // The REFERENCE always gets f32 KV; `--cand-kvarn <2|4|8>` gives only the
+    // candidates a KVarN cache (zaya reads `HIPFIRE_ZAYA_KVARN` when each model's
+    // state is built), so the same weights isolate the KV-quant effect.
+    let cand_kvarn = flag(&args, "--cand-kvarn");
+    // Single-threaded here: no other thread reads the environment.
+    std::env::remove_var("HIPFIRE_ZAYA_KVARN");
     let mut reference = load(&mut gpu, ref_path, max_seq);
+    if let Some(bits) = cand_kvarn.as_deref() {
+        std::env::set_var("HIPFIRE_ZAYA_KVARN", bits);
+        eprintln!("candidates: KVarN-{bits} KV (reference: f32 KV)");
+    }
     let mut cands: Vec<Model> = cand_paths
         .iter()
         .map(|p| load(&mut gpu, p, max_seq))

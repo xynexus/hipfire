@@ -169,3 +169,33 @@ against an f16/bf16 reference on the same corpus; "lossless" = KLD within noise.
 The earlier hier-KV result that the f16 hot ring is "PPL-identical to f32" is the
 bar a kvarn hot ring must clear — and the 0.085-KLD single-tier number is the gap
 it currently fails by.
+
+## Hadamard rotation: helps Flash-Next, HURTS zaya (2026-11-27)
+
+The paper's method is "a Hadamard rotation followed by dual-scaling variance
+normalization"; `kvarn_quantize_tile` is only the second half. Where the
+rotation is applied today: the qwen3.5 (decode, batched prefill, multi-session
+batch), gemma3 and gemma4 callers of `kvarn_attend`, at head_dim 256 only, via
+`rotate_x_mq_batched` on K and Q (`HIPFIRE_KVARN_ROTATE=0` opts out);
+`kv_hier.rs`; and Qwen3.8-Flash-Next's sparse attention (own KVarN path). Not
+applied: zaya (head_dim 128).
+
+Measured, same weights, KV quant isolated:
+
+| model / metric | KVarN-4 un-rotated | KVarN-4 rotated | KVarN-8 |
+|---|---|---|---|
+| Qwen3.8-Flash-Next 180B oq4, PPL vs f32 4.0550 (4K) | 4.0880 (+0.81%) | **4.0411 (−0.34%)** | 4.0306 rotated |
+| ZAYA1-8B bf16, KLD vs f32 KV (2047 pos) | **0.0565** | 0.0676 (+20%) | 0.0097 rotated |
+
+Both rotations are exactly orthonormal (FWHT-256 / FWHT-128, ±1 signs,
+1/√n), so scores are preserved and the difference is the quantiser's.
+Rotation is therefore NOT a universal win: it spreads channel-aligned outliers
+that KVarN's per-channel scales already isolate. Decide per family by
+measurement, never on the paper's say-so; zaya keeps un-rotated K. zaya is
+also ~1000x more KV-sensitive than Qwen3.5 even at 8-bit (temperature-scaled
+L2-normalised attention), which is why its KVarN stays opt-in.
+
+Reproduce zaya: `cargo run --release -p hipfire-arch-zaya --example kld --
+<ref.bf16.hfq> <same.hfq> --corpus <txt> --ntok 2048 --cand-kvarn 4`
+(`HIPFIRE_KVARN_ROTATE=0` toggles nothing there now — the rotation was
+measured on a scratch build and removed).

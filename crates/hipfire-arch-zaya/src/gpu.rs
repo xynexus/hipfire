@@ -836,8 +836,21 @@ impl ZayaDecodeState {
         let nkv = cfg.attn.num_kv_heads;
         let nq = cfg.attn.num_heads;
         let hd = cfg.attn.head_dim;
-        // Opt-in low-bit KV: HIPFIRE_ZAYA_KVARN=2|4|8. head_dim=128 → no rotation
-        // (FWHT is head_dim=256-only). Falls back to the f32 rings when unset.
+        // Opt-in low-bit KV: HIPFIRE_ZAYA_KVARN=2|4|8. Falls back to the f32 rings
+        // when unset.
+        //
+        // K is deliberately NOT Hadamard-rotated here, although the KVarN paper
+        // specifies a rotation and the qwen3.5/gemma callers apply one: on ZAYA1-8B
+        // it HURTS. Measured 2026-11-27 (bf16 weights, 2047 wikitext positions,
+        // `examples/kld --cand-kvarn`, KLD vs the same model with f32 KV):
+        //   KVarN-4 un-rotated 0.0565 · KVarN-4 FWHT-128-rotated 0.0676 (+20%) ·
+        //   KVarN-8 rotated 0.0097.
+        // The FWHT-128 is exactly orthonormal, so this is the quantiser, not the
+        // scores: KVarN's per-channel scales already isolate channel-aligned
+        // outliers, and a rotation spreads them into every channel. (Flash-Next's
+        // sparse attention went the other way: +0.81% -> -0.34% PPL.) Note how
+        // KV-sensitive zaya is overall — even 8-bit is ~1e-2 KLD, ~1000x Qwen3.5's —
+        // which is why this stays opt-in.
         let kvarn_bits = std::env::var("HIPFIRE_ZAYA_KVARN")
             .ok()
             .and_then(|s| s.parse::<usize>().ok())
