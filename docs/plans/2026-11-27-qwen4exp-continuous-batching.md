@@ -179,3 +179,41 @@ valuable on its own (single-stream memory) whether or not batching lands.
   page-ins per token. `max_batch_sessions` should be set from P5, not assumed.
 - The batched path is greedy-only (a server-side rule today); sampled requests
   keep taking the legacy path.
+
+## Log
+
+- 2026-11-27 **P0a DONE — KVarN for the QSA layers, default KVarN-8.**
+  `QsaCache` holds K as KVarN tiles (128 tokens; open block in an f32 window)
+  and V as Q8_0; `qsa_gather_kvarn` dequantises only the SELECTED slots into the
+  existing f32 gather scratch, so the attention kernel is unchanged. K is stored
+  Hadamard-rotated (`rotate_x_mq`, orthonormal per 256 channels) with the query
+  rotated to match. Gated by `parity_qsa_kvarn` (in `qwen4exp-gate.sh`) and the
+  MTP fixture crossing a block boundary under f32 and KVarN-8.
+
+  180B oq4, held-out wikitext2:
+
+  | KV | 4K PPL | 32K PPL |
+  |---|---|---|
+  | f32 | 4.0550 | 4.4188 |
+  | KVarN-4 un-rotated | 4.0880 (+0.81%, FAILS) | — |
+  | KVarN-4 rotated | 4.0411 | not run |
+  | KVarN-8 un-rotated | 4.0345 | 4.4135 (−0.12%) |
+  | KVarN-8 rotated (default) | 4.0306 | not run |
+
+  **Why KVarN-4 failed:** the paper's method is "a Hadamard rotation followed by
+  dual-scaling variance normalization"; this QSA path had only the second half
+  (`hipfire_kvquant::kvarn::hadamard_rows` already documents the gap). Adding
+  the rotation turns +0.81% into −0.34%. The qwen3.5 / gemma3 / gemma4 callers
+  of `kvarn_attend` already rotate at the call site (head_dim 256); zaya does
+  not, and no site rotates head_dim 128.
+
+  **Memory correction:** asymmetric KVarN (K quantised, V Q8_0, indexer keys
+  f32) is ~2.9x smaller than f32 at 8-bit K, ~3.5x at 4-bit — not the ~7x
+  estimated above. Per 32K session: f32 1.81 GB, KVarN-8 624 MB, KVarN-4
+  523 MB. The f32 indexer keys are now ~1/3 of the cache: f16 indexer keys
+  are the next cheap win (needs a selection-quality check).
+
+  Default: `kv_cache=auto` -> KVarN-8 for this family; on halo a
+  `model_overrides` entry sets `kv_cache: kvarn8` (the server's loader rewrites
+  `auto` to the generic `kvarn` = 4-bit, and the global config is `kvarn4`).
+  Rotated KVarN-4 is the candidate to replace it once measured at 32K.

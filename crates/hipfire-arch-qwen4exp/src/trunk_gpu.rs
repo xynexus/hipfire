@@ -626,7 +626,17 @@ impl TrunkWeights {
 }
 
 impl TrunkState {
+    /// f32 KV — the reference the parity examples difference against.
     pub fn new(gpu: &mut Gpu, cfg: &Qwen4ExpConfig, max_seq: usize) -> HipResult<Self> {
+        Self::with_kv(gpu, cfg, max_seq, crate::attn_gpu::QsaKvMode::F32)
+    }
+
+    pub fn with_kv(
+        gpu: &mut Gpu,
+        cfg: &Qwen4ExpConfig,
+        max_seq: usize,
+        kv: crate::attn_gpu::QsaKvMode,
+    ) -> HipResult<Self> {
         let mut gdn = Vec::with_capacity(cfg.layers);
         let mut qsa = Vec::with_capacity(cfg.layers);
         let mut ple = Vec::with_capacity(cfg.layers);
@@ -640,7 +650,7 @@ impl TrunkState {
             qsa.push(if linear {
                 None
             } else {
-                Some(QsaCache::new(gpu, cfg, max_seq)?)
+                Some(QsaCache::with_kv(gpu, cfg, max_seq, kv)?)
             });
             ple.push(match cfg.ngram.as_ref().filter(|n| n.layer_idx == l) {
                 Some(_) => Some(PleScratch::new(gpu, cfg)?),

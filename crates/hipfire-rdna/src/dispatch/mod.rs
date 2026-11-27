@@ -220,6 +220,7 @@ mod norm;
 mod npu_io;
 pub use npu_io::OpusNpuIoLayout;
 mod overlays;
+mod qsa_kvarn;
 mod quant;
 mod rocblas;
 mod rope;

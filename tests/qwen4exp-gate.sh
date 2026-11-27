@@ -270,18 +270,41 @@ if ! cargo build --quiet --release -p hipfire-arch-qwen4exp \
   echo "qwen4exp-gate: mtp_serve_fixture build FAILED"
   exit 2
 fi
+# The prompt ends just short of a 128-token KVarN block, so speculation crosses
+# the boundary. Run under f32 KV (the logic, strictly) and KVarN-8 (the same
+# block close / re-quantise / rollback code, inside the bound); KVarN-4's own
+# cache is checked byte-level by parity_qsa_kvarn below.
 if [ -f "$TMP/fx.oq4.hfq" ]; then
-  mt="$(./target/release/examples/mtp_serve_fixture "$TMP/fx.oq4.hfq" 2>&1 || true)"
-  echo "$mt" | grep -E "argmax agree|skipped" | sed 's/^/  /'
-  case "$mt" in
-    *"mtp_serve_fixture: OK"*|*skipped*) ;;
-    *) echo "qwen4exp-gate: MTP speculation FAILED"
-       echo "$mt" | tail -3 | sed 's/^/    /'; fail=1 ;;
-  esac
+  for kv in f32 kvarn8; do
+    mt="$(./target/release/examples/mtp_serve_fixture "$TMP/fx.oq4.hfq" "$kv" 2>&1 || true)"
+    echo "$mt" | grep -E "argmax agree|skipped" | sed "s/^/  [$kv] /"
+    case "$mt" in
+      *"mtp_serve_fixture: OK"*|*skipped*) ;;
+      *) echo "qwen4exp-gate: MTP speculation FAILED under kv=$kv"
+         echo "$mt" | tail -3 | sed 's/^/    /'; fail=1 ;;
+    esac
+  done
 else
   echo "qwen4exp-gate: no oq4 artifact for the MTP check"
   fail=1
 fi
+
+step "GPU: KVarN sparse-attention cache, write + gather"
+# Writes 300 and 4100 positions at the shipped geometry and gathers them back:
+# open block exact, closed blocks cosine >= 0.98 with an off-by-one negative
+# control, V within its Q8 bound, scattered gathers equal to the sweep.
+if ! cargo build --quiet --release -p hipfire-arch-qwen4exp --example parity_qsa_kvarn 2>&1 | tail -5; then
+  echo "qwen4exp-gate: parity_qsa_kvarn build FAILED"
+  exit 2
+fi
+for n in 300 4100; do
+  kq="$(./target/release/examples/parity_qsa_kvarn "$n" 2>&1 || true)"
+  echo "$kq" | grep -E "positions|skipped" | sed 's/^/  /'
+  case "$kq" in
+    *"parity_qsa_kvarn: OK"*|*skipped*) ;;
+    *) echo "qwen4exp-gate: KVarN QSA cache FAILED at n=$n"; fail=1 ;;
+  esac
+done
 
 step "GPU: PAGED routed experts vs resident, on the same artifact"
 # Routed experts are 97.3% of this trunk, so paging them is what decides whether
