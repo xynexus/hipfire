@@ -104,6 +104,81 @@ pub struct Qwen4ExpBackend {
     batch: Option<BatchScratch>,
     /// Upper bound on a prefill chunk (`PREFILL_CHUNK`, capped by `max_seq`).
     chunk_rows: usize,
+    /// Sequence capacity the state was built for (KV caches, positions).
+    max_seq: usize,
+    /// MTP speculative decode, when a head is attached (`attach_mtp`).
+    mtp: Option<Box<MtpState>>,
+}
+
+/// Counters for MTP speculation. A `verify` is one 2-row trunk forward; each
+/// one is followed by exactly one `hit` (the draft was the next token, so that
+/// step cost no forward) or one `miss` (rolled back), except a verify still
+/// pending when generation stopped.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct MtpStats {
+    pub verifies: u64,
+    pub hits: u64,
+    pub misses: u64,
+}
+
+/// A verify's second row: the trunk has already run `draft` at `pos`.
+struct Pending {
+    pos: usize,
+    draft: u32,
+}
+
+/// Everything MTP speculation holds. Boxed: it is ~3 GB of head on the GPU and
+/// a backend without one should not carry the fields.
+struct MtpState {
+    head: crate::mtp_gpu::MtpWeightsGpu,
+    scratch: crate::mtp_gpu::MtpScratchGpu,
+    /// The head's OWN attention cache — it is a full QSA layer.
+    cache: crate::attn_gpu::QsaCache,
+    /// `[vocab]` — the head's draft logits through the shared `lm_head`.
+    logits: GpuTensor,
+    /// Chunk-wide scratch for writing the head cache over a prompt.
+    hb: BatchScratch,
+    /// Two-row scratch for verifies (a separate one: the prefill scratch's
+    /// all-position logits would be 512 x vocab for a 2-row forward).
+    vb: BatchScratch,
+    ckpt: crate::prefill_gpu::Row0Checkpoint,
+    pending: Option<Pending>,
+    /// Test hook: drafts by absolute position instead of the head's.
+    script: Option<Vec<u32>>,
+    stats: MtpStats,
+}
+
+impl MtpState {
+    fn free(self, gpu: &mut Gpu) {
+        let Self {
+            head,
+            scratch,
+            cache,
+            logits,
+            hb,
+            vb,
+            ckpt,
+            pending: _,
+            script: _,
+            stats: _,
+        } = self;
+        head.free(gpu);
+        scratch.free(gpu);
+        cache.free(gpu);
+        let _ = gpu.free_tensor(logits);
+        hb.free(gpu);
+        vb.free(gpu);
+        ckpt.free(gpu);
+    }
+}
+
+/// Which forward a step takes.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rows {
+    /// The rows go through the batched prefill scratch.
+    Batch { all_logits: bool },
+    /// `[token, draft]` through the verify scratch, with a row-0 checkpoint.
+    Verify,
 }
 
 /// Tokens per batched prefill chunk. Every routed expert hit in a chunk is read
@@ -111,6 +186,10 @@ pub struct Qwen4ExpBackend {
 /// scratch is ~25 MB at this size (logits excluded — those are only allocated
 /// when a scorer asks for every position).
 const PREFILL_CHUNK: usize = 512;
+
+/// How the head folds the token embedding into the trunk's streams: the
+/// reading that measured 60.9% acceptance on the shipped 180B.
+const MTP_FUSION: crate::mtp::Fusion = crate::mtp::Fusion::BroadcastAllStreams;
 
 /// `HIPFIRE_QWEN4EXP_PER_TOKEN_PREFILL=1` — DEBUG A/B only: prefill through the
 /// per-token decode step, the pre-batching path, to difference against it.
@@ -279,6 +358,8 @@ impl Qwen4ExpBackend {
             pager,
             batch: None,
             chunk_rows: PREFILL_CHUNK.min(max_seq),
+            max_seq,
+            mtp: None,
         })
     }
 
@@ -359,6 +440,11 @@ impl Qwen4ExpBackend {
     /// `self` is destructured so the n-gram provider (which borrows `ngram`) and
     /// the mutable trunk state are disjoint borrows rather than two of `self`.
     fn forward(&mut self, gpu: &mut Gpu, pos0: usize, all_logits: bool) -> Result<(), String> {
+        self.run_rows(gpu, pos0, Rows::Batch { all_logits })
+    }
+
+    fn run_rows(&mut self, gpu: &mut Gpu, pos0: usize, mode: Rows) -> Result<(), String> {
+        let all_logits = matches!(mode, Rows::Batch { all_logits: true } | Rows::Verify);
         let Self {
             cfg,
             weights,
@@ -372,6 +458,8 @@ impl Qwen4ExpBackend {
             pager: _,
             batch,
             chunk_rows,
+            max_seq: _,
+            mtp,
         } = self;
         let resident;
         let streamed;
@@ -388,6 +476,25 @@ impl Qwen4ExpBackend {
         };
         let n = history.len() - pos0;
         let _trace_rows = hipfire_runtime::dispatch::moe_telemetry::trace_rows(pos0..pos0 + n);
+        if mode == Rows::Verify {
+            let m = mtp.as_mut().ok_or("qwen4_exp verify without an MTP head")?;
+            return prefill_chunk_into(
+                gpu,
+                cfg,
+                weights,
+                state,
+                scratch,
+                &mut m.vb,
+                embed,
+                rows,
+                history,
+                pos0,
+                *eos,
+                true,
+                Some(&m.ckpt),
+            )
+            .map_err(|e| format!("qwen4_exp verify: {e:?}"));
+        }
         if n == 1 && !all_logits {
             return decode_step_into(
                 gpu, cfg, weights, state, scratch, embed, rows, history, pos0, *eos,
@@ -403,8 +510,251 @@ impl Qwen4ExpBackend {
         let b = batch.as_mut().expect("just allocated");
         prefill_chunk_into(
             gpu, cfg, weights, state, scratch, b, embed, rows, history, pos0, *eos, all_logits,
+            None,
         )
         .map_err(|e| format!("qwen4_exp prefill: {e:?}"))
+    }
+
+    /// Attach an MTP head (read from `sidecar`, a `<Model>--mtp.<quant>.hfq`).
+    /// From then on `decode_step` speculates: see [`Self::spec_decode_step`].
+    pub fn attach_mtp(&mut self, gpu: &mut Gpu, sidecar: &std::path::Path) -> Result<(), String> {
+        let mut hfq = HfqFile::open(sidecar)
+            .map_err(|e| format!("qwen4_exp mtp: open {}: {e}", sidecar.display()))?;
+        let head = {
+            let reader = HfqTensorReader { hfq: &mut hfq };
+            crate::mtp_gpu::MtpWeightsGpu::upload(gpu, &self.cfg, &reader)
+                .map_err(|e| format!("qwen4_exp mtp: upload head: {e:?}"))?
+        };
+        self.attach_mtp_weights(gpu, head)
+    }
+
+    /// [`Self::attach_mtp`] for a head already on the GPU (tests build one from
+    /// synthetic weights).
+    pub fn attach_mtp_weights(
+        &mut self,
+        gpu: &mut Gpu,
+        head: crate::mtp_gpu::MtpWeightsGpu,
+    ) -> Result<(), String> {
+        let e = |e: hipfire_rdna::HipError| format!("qwen4_exp mtp state: {e:?}");
+        let cfg = &self.cfg;
+        let state = MtpState {
+            head,
+            scratch: crate::mtp_gpu::MtpScratchGpu::new(gpu, cfg, self.max_seq).map_err(e)?,
+            cache: crate::attn_gpu::QsaCache::new(gpu, cfg, self.max_seq).map_err(e)?,
+            logits: gpu
+                .zeros(&[cfg.vocab], hipfire_rdna::DType::F32)
+                .map_err(e)?,
+            hb: BatchScratch::new(gpu, cfg, self.chunk_rows).map_err(e)?,
+            vb: BatchScratch::new(gpu, cfg, crate::prefill_gpu::Row0Checkpoint::ROWS).map_err(e)?,
+            ckpt: crate::prefill_gpu::Row0Checkpoint::new(gpu, cfg, &self.state).map_err(e)?,
+            pending: None,
+            script: None,
+            stats: MtpStats::default(),
+        };
+        if let Some(old) = self.mtp.replace(Box::new(state)) {
+            old.free(gpu);
+        }
+        Ok(())
+    }
+
+    /// Speculation counters, when a head is attached.
+    pub fn mtp_stats(&self) -> Option<MtpStats> {
+        self.mtp.as_ref().map(|m| m.stats)
+    }
+
+    /// TEST HOOK: draft `script[pos]` for absolute position `pos` instead of
+    /// asking the head. A script of the true continuation makes every verify a
+    /// hit, a wrong one makes every verify a miss — the two paths a random
+    /// test head would otherwise exercise only by chance.
+    #[doc(hidden)]
+    pub fn set_draft_script(&mut self, script: Option<Vec<u32>>) {
+        if let Some(m) = self.mtp.as_mut() {
+            m.script = script;
+        }
+    }
+
+    /// Write the head's cache over the prompt rows `pos0 .. pos0+n` of the
+    /// chunk just run. Row t pairs the trunk's wide state at t with the
+    /// embedding of token t+1, so the LAST prompt row is left for the first
+    /// draft, which is the first point that token is known.
+    fn mtp_prefill_rows(&mut self, gpu: &mut Gpu, pos0: usize, n: usize) -> Result<(), String> {
+        let total = self.history.len();
+        let k = n.min(total.saturating_sub(1).saturating_sub(pos0));
+        let Some(m) = self.mtp.as_mut() else {
+            return Ok(());
+        };
+        if k == 0 {
+            return Ok(());
+        }
+        let width = self.cfg.gated_residual.count * self.cfg.hidden;
+        // A one-row chunk took the decode path, which leaves its wide state in
+        // the trunk scratch rather than the batch scratch.
+        let wide = match (n, self.batch.as_ref()) {
+            (1, _) | (_, None) => self.scratch.wide().sub_offset(0, width),
+            (_, Some(b)) => b.wide_rows(&self.cfg, k),
+        };
+        let mut embeds = Vec::with_capacity(k * self.cfg.hidden);
+        for &t in &self.history[pos0 + 1..pos0 + 1 + k] {
+            let h = self.cfg.hidden;
+            embeds.extend_from_slice(&self.embed[t as usize * h..(t as usize + 1) * h]);
+        }
+        crate::prefill_gpu::mtp_cache_rows(
+            gpu,
+            &self.cfg,
+            &m.head,
+            &m.hb,
+            &mut m.cache,
+            &wide,
+            &embeds,
+            pos0,
+            k,
+            MTP_FUSION,
+        )
+        .map_err(|e| format!("qwen4_exp mtp prefill: {e:?}"))
+    }
+
+    /// One generated token with speculation. Exact under ANY sampler: every
+    /// logit row the caller sees comes from the trunk over the true history.
+    ///
+    /// * VERIFY — draft `d` for `pos+1` from the head, run `[token, d]` as one
+    ///   2-row forward, hand back row 0's logits, keep row 1 pending.
+    /// * HIT — the caller's next token IS `d`: row 1 already ran, so its logits
+    ///   are ready and this step costs no trunk forward at all.
+    /// * MISS — restore the state checkpointed after row 0, then verify the
+    ///   real token.
+    fn spec_decode_step(&mut self, gpu: &mut Gpu, token: u32, pos: usize) -> Result<(), String> {
+        let vocab = self.cfg.vocab;
+        let width = self.cfg.gated_residual.count * self.cfg.hidden;
+        let hidden = self.cfg.hidden;
+        let ge = |e: hipfire_rdna::HipError| format!("qwen4_exp mtp: {e:?}");
+        let m = self.mtp.as_mut().expect("spec_decode_step needs a head");
+
+        if let Some(p) = m.pending.take() {
+            if p.pos == pos && p.draft == token {
+                m.stats.hits += 1;
+                let lg = m.vb.all_logits().expect("a verify leaves logits");
+                gpu.memcpy_dtod_auto(
+                    &self.scratch.logits().buf,
+                    &lg.sub_offset(vocab, vocab).buf,
+                    vocab * 4,
+                )
+                .map_err(ge)?;
+                // The head never drafted from row 0's position; fill its cache
+                // there so the head's attention stays complete.
+                let row0 = m.vb.wide_row(&self.cfg, 0);
+                let e = self.embed[token as usize * hidden..(token as usize + 1) * hidden].to_vec();
+                return crate::prefill_gpu::mtp_cache_rows(
+                    gpu,
+                    &self.cfg,
+                    &m.head,
+                    &m.hb,
+                    &mut m.cache,
+                    &row0,
+                    &e,
+                    pos - 1,
+                    1,
+                    MTP_FUSION,
+                )
+                .map_err(|e| format!("qwen4_exp mtp fill: {e:?}"));
+            }
+            m.stats.misses += 1;
+            m.ckpt.restore(gpu, &mut self.state, pos).map_err(ge)?;
+            self.history.truncate(pos);
+            gpu.memcpy_dtod_auto(
+                &self.scratch.wide().buf,
+                &m.vb.wide_row(&self.cfg, 0).buf,
+                width * 4,
+            )
+            .map_err(ge)?;
+        }
+
+        // Draft pos+1 from the head at pos-1: the trunk's wide state there plus
+        // the embedding of `token`, exactly the pairing the head was trained on.
+        let draft = match m.script.as_ref() {
+            Some(s) => s.get(pos + 1).copied().unwrap_or(0),
+            None => {
+                let g_emb = gpu
+                    .upload_f32(
+                        &self.embed[token as usize * hidden..(token as usize + 1) * hidden],
+                        &[hidden],
+                    )
+                    .map_err(ge)?;
+                let r = crate::mtp_gpu::mtp_decode_step(
+                    gpu,
+                    &self.cfg,
+                    &m.head,
+                    &mut m.cache,
+                    &mut m.scratch,
+                    self.scratch.wide(),
+                    &g_emb,
+                    pos - 1,
+                    MTP_FUSION,
+                );
+                gpu.free_tensor(g_emb).map_err(ge)?;
+                r.map_err(ge)?;
+                hipfire_runtime::weights::weight_gemv(
+                    gpu,
+                    &self.weights.lm_head,
+                    &m.scratch.collapsed,
+                    &m.logits,
+                )
+                .map_err(ge)?;
+                let lg = gpu.download_f32(&m.logits).map_err(ge)?;
+                lg.iter()
+                    .enumerate()
+                    .fold((0usize, f32::NEG_INFINITY), |(bi, bv), (i, &v)| {
+                        if v > bv {
+                            (i, v)
+                        } else {
+                            (bi, bv)
+                        }
+                    })
+                    .0 as u32
+            }
+        };
+        if m.script.is_some() {
+            // The scripted path skips the head, so keep its cache complete here.
+            let e = self.embed[token as usize * hidden..(token as usize + 1) * hidden].to_vec();
+            let wide = self.scratch.wide().sub_offset(0, width);
+            crate::prefill_gpu::mtp_cache_rows(
+                gpu,
+                &self.cfg,
+                &m.head,
+                &m.hb,
+                &mut m.cache,
+                &wide,
+                &e,
+                pos - 1,
+                1,
+                MTP_FUSION,
+            )
+            .map_err(|e| format!("qwen4_exp mtp fill: {e:?}"))?;
+        }
+        m.stats.verifies += 1;
+        m.pending = Some(Pending {
+            pos: pos + 1,
+            draft,
+        });
+        self.history.push(token);
+        self.history.push(draft);
+        self.run_rows(gpu, pos, Rows::Verify)?;
+        // The caller wants THIS position's logits: row 0.
+        let m = self.mtp.as_ref().expect("still attached");
+        let lg = m.vb.all_logits().expect("a verify leaves logits");
+        gpu.memcpy_dtod_auto(
+            &self.scratch.logits().buf,
+            &lg.sub_offset(0, vocab).buf,
+            vocab * 4,
+        )
+        .map_err(ge)
+    }
+
+    /// Drop speculation state at a sequence boundary.
+    fn mtp_reset(&mut self) {
+        if let Some(m) = self.mtp.as_mut() {
+            m.pending = None;
+            m.cache.reset();
+        }
     }
 
     /// Override the prefill chunk size (capped at `PREFILL_CHUNK`). For tests: a
@@ -433,6 +783,7 @@ impl Qwen4ExpBackend {
         // prefix, so a prefill must start from a reset trunk, not from whatever
         // the previous request left behind.
         self.history.clear();
+        self.mtp_reset();
         self.state
             .reset(gpu)
             .map_err(|e| format!("qwen4_exp reset: {e:?}"))?;
@@ -441,10 +792,20 @@ impl Qwen4ExpBackend {
         } else {
             self.chunk_rows
         };
+        // The head's prompt cache pairs row t with token t+1, so the whole
+        // prompt must be in `history` before a chunk's head rows are written.
+        self.history.extend_from_slice(tokens);
         for (c, part) in tokens.chunks(chunk).enumerate() {
             let pos0 = c * chunk;
-            self.history.extend_from_slice(part);
-            self.forward(gpu, pos0, all_logits)?;
+            let end = pos0 + part.len();
+            // The trunk sees exactly the history up to this chunk's end.
+            let rest = self.history.split_off(end);
+            let r = self.forward(gpu, pos0, all_logits);
+            self.history.extend(rest);
+            r?;
+            if !all_logits {
+                self.mtp_prefill_rows(gpu, pos0, part.len())?;
+            }
             at_chunk(gpu, pos0, part.len(), self)?;
         }
         Ok(())
@@ -457,6 +818,25 @@ impl SimpleAr for Qwen4ExpBackend {
     }
 
     fn decode_step(&mut self, gpu: &mut Gpu, token: u32, pos: usize) -> Result<(), String> {
+        // Speculate when a head is attached and the verify's second row fits.
+        if self.mtp.is_some() && pos >= 1 && pos + 1 < self.max_seq {
+            return self.spec_decode_step(gpu, token, pos);
+        }
+        if let Some(m) = self.mtp.as_mut() {
+            // Out of room to speculate: a pending draft can no longer be
+            // honoured, so undo it before taking the plain step.
+            if let Some(p) = m.pending.take() {
+                m.ckpt
+                    .restore(gpu, &mut self.state, p.pos)
+                    .map_err(|e| format!("qwen4_exp mtp: {e:?}"))?;
+                self.history.truncate(p.pos);
+                if !(p.pos == pos && p.draft == token) {
+                    m.stats.misses += 1;
+                } else {
+                    m.stats.hits += 1;
+                }
+            }
+        }
         self.history.push(token);
         self.forward(gpu, pos, false)
     }
@@ -482,7 +862,10 @@ impl ServingBackend for Qwen4ExpBackend {
         // implemented, so it is not claimed. `docs/model-support.toml` says the same, and a
         // capability claimed here that the trunk cannot honour is worse than one
         // that is simply absent.
-        ArchCaps::default()
+        ArchCaps {
+            mtp: self.mtp.is_some(),
+            ..ArchCaps::default()
+        }
     }
 
     fn eos_token(&self) -> u32 {
@@ -519,6 +902,7 @@ impl ServingBackend for Qwen4ExpBackend {
 
     fn reset_session(&mut self, gpu: &mut Gpu, _session_id: &str) -> Result<(), String> {
         self.history.clear();
+        self.mtp_reset();
         self.state
             .reset(gpu)
             .map_err(|e| format!("qwen4_exp reset: {e:?}"))
@@ -531,6 +915,9 @@ impl ServingBackend for Qwen4ExpBackend {
         m.scratch.free(gpu);
         if let Some(b) = m.batch {
             b.free(gpu);
+        }
+        if let Some(s) = m.mtp {
+            s.free(gpu);
         }
         // The expert stacks deliberately free nothing — the pager owns those
         // buffers, and it outlives any one of them.
@@ -601,6 +988,27 @@ impl hipfire_runtime::kld_eval::ChunkScoredForward for BatchedScorer {
     }
 }
 
+/// The MTP sidecar for `model`: a sibling `<Model>--mtp.<quant>.hfq`, where
+/// `<Model>` is the model's human-readable name (left of its `--`). Several
+/// quants of the head resolve to the lexically first, so the pick is stable.
+pub fn mtp_sidecar(model: &std::path::Path) -> Option<std::path::PathBuf> {
+    let name = model.file_name()?.to_str()?;
+    let stem = name.split_once("--")?.0;
+    let prefix = format!("{stem}--mtp.");
+    let mut found: Vec<std::path::PathBuf> = std::fs::read_dir(model.parent()?)
+        .ok()?
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with(&prefix) && n.ends_with(".hfq"))
+        })
+        .collect();
+    found.sort();
+    found.into_iter().next()
+}
+
 pub struct Qwen4ExpServingFactory;
 
 pub static QWEN4EXP_SERVING_FACTORY: Qwen4ExpServingFactory = Qwen4ExpServingFactory;
@@ -621,7 +1029,30 @@ impl ServingFactory for Qwen4ExpServingFactory {
         options: &ServingFactoryOptions<'_>,
     ) -> Result<FactoryLoadedBackend, String> {
         let max_seq = options.max_seq;
-        let backend = Qwen4ExpBackend::load(gpu, hfq, max_seq)?;
+        let mut backend = Qwen4ExpBackend::load(gpu, hfq, max_seq)?;
+        // `auto` does NOT attach a found head here: speculation is exact but
+        // measured SLOWER on gfx1151 (2026-11-27, 180B oq4: 70.7% acceptance,
+        // 1.71 tokens/verify, yet 7.24 -> 5.95 tok/s) because a 2-row verify
+        // costs 2.08 decode steps. Only an explicit `on` opts in until the
+        // verify is cheaper than the 1.71x break-even.
+        match (options.mtp_mode, mtp_sidecar(hfq.path())) {
+            ("on", Some(side)) => {
+                backend.attach_mtp(gpu, &side)?;
+                eprintln!("qwen4_exp: MTP speculative decode ON ({})", side.display());
+            }
+            ("on", None) => {
+                return Err(format!(
+                    "mtp_mode=on but no MTP sidecar next to {} (expected <Model>--mtp.<quant>.hfq)",
+                    hfq.path().display()
+                ));
+            }
+            ("auto", Some(side)) => eprintln!(
+                "qwen4_exp: MTP sidecar {} found but NOT enabled under mtp_mode=auto \
+                 (measured slower than plain decode on this family); set mtp_mode=on to use it",
+                side.display()
+            ),
+            _ => {}
+        }
         let cfg = backend.config();
         let shape = ModelShapeProfile {
             hidden_size: cfg.hidden,
@@ -646,3 +1077,30 @@ impl ServingFactory for Qwen4ExpServingFactory {
 }
 
 hipfire_runtime::register_serving_factory!(QWEN4EXP_SERVING_FACTORY);
+
+#[cfg(test)]
+mod tests {
+    use super::mtp_sidecar;
+
+    #[test]
+    fn mtp_sidecar_is_the_canonical_role_sibling() {
+        let dir = std::env::temp_dir().join(format!("q4x-mtp-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let touch = |n: &str| std::fs::write(dir.join(n), b"").unwrap();
+        touch("Flash-180B--oq4.hfq");
+        touch("Flash-180B--oq4.25++.hfq");
+        touch("Other-9B--mtp.oq8.hfq"); // another model's head
+        touch("Flash-180B.mtp.hfq"); // legacy dotted form: not ours to read
+        let base = dir.join("Flash-180B--oq4.hfq");
+        assert_eq!(mtp_sidecar(&base), None, "no canonical sidecar yet");
+        touch("Flash-180B--mtp.oq8.hfq");
+        touch("Flash-180B--mtp.oq4.hfq");
+        assert_eq!(
+            mtp_sidecar(&base),
+            Some(dir.join("Flash-180B--mtp.oq4.hfq"))
+        );
+        // A dotted-name model has no `--` boundary, so nothing is guessed.
+        assert_eq!(mtp_sidecar(&dir.join("Flash-180B.oq4.hfq")), None);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}

@@ -829,6 +829,7 @@ pub fn load_model(
     state_quant_override: Option<&str>,
     cask: &CaskConfig,
     pp: usize,
+    mtp_mode: &str,
     gpu: &mut hipfire_rdna::Gpu,
 ) -> Result<LoadedModel, String> {
     check_load_headroom(path)?;
@@ -1535,6 +1536,7 @@ pub fn load_model(
                 cask_budget: cask.budget,
                 cask_beta: cask.beta,
                 physical_cap: cask_requested.then_some(physical_cap),
+                mtp_mode,
             },
         )?;
         let physical_cap = registered_backend.physical_cap;

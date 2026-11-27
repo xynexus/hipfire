@@ -306,6 +306,7 @@ fn main() {
                 None,
                 &hipfire_serving_core::model::CaskConfig::default(),
                 1,
+                "auto",
                 &mut gpu,
             )
             .unwrap_or_else(|e| {

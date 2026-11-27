@@ -195,6 +195,17 @@ impl BatchScratch {
         self.rows
     }
 
+    /// Row `r`'s final WIDE residual from the last [`prefill_chunk_into`] — the
+    /// MTP head's trunk input for that position.
+    pub fn wide_row(&self, cfg: &Qwen4ExpConfig, r: usize) -> GpuTensor {
+        row(&self.wide, r, cfg.gated_residual.count * cfg.hidden)
+    }
+
+    /// The first `n` rows of the final WIDE residual (`[n, width]`).
+    pub fn wide_rows(&self, cfg: &Qwen4ExpConfig, n: usize) -> GpuTensor {
+        rows(&self.wide, n, cfg.gated_residual.count * cfg.hidden)
+    }
+
     /// `[rows, vocab]` logits of the last [`prefill_chunk_into`] that asked for
     /// them; row `t` predicts the token after chunk position `t`.
     pub fn all_logits(&self) -> Option<&GpuTensor> {
@@ -352,6 +363,7 @@ fn gdn_rows(
     x: &GpuTensor,
     y: &GpuTensor,
     n: usize,
+    snap: Option<(&GpuTensor, &GpuTensor)>,
 ) -> HipResult<()> {
     let d = &cfg.deltanet;
     let hd = d.key_head_dim;
@@ -366,7 +378,9 @@ fn gdn_rows(
     gpu.memcpy_dtod_auto(&b.g_alpha.buf, &b.g_a.buf, n * vh * 4)?;
     gpu.fused_sigmoid_alpha_gate_f32_batched(&b.g_beta, &b.g_alpha, &w.dt_bias, &w.a_log, vh, n)?;
 
-    gpu.conv1d_silu_split_f32_n(
+    // With `snap`, the per-row state checkpoints land in it (row t's state
+    // AFTER token t), which is what speculative rollback restores from.
+    gpu.conv1d_silu_split_f32_n_opts(
         &b.g_q_raw,
         &b.g_k_raw,
         &b.g_v,
@@ -376,6 +390,7 @@ fn gdn_rows(
         d.key_heads * hd,
         d.z_dim(),
         n,
+        snap.map(|(_, conv)| conv),
     )?;
     gpu.fused_qk_l2_norm_scale_f32_batched(
         &b.g_q_raw,
@@ -403,18 +418,33 @@ fn gdn_rows(
         gpu.memcpy_dtod_auto(&b.g_q.buf, &b.g_q_raw.buf, bytes)?;
         gpu.memcpy_dtod_auto(&b.g_k.buf, &b.g_k_raw.buf, bytes)?;
     }
-    gpu.gated_delta_net_f32(
-        &b.g_q,
-        &b.g_k,
-        &b.g_v,
-        &b.g_alpha,
-        &b.g_beta,
-        &st.recurrent,
-        &b.g_attn,
-        n,
-        vh,
-        d.value_head_dim,
-    )?;
+    match snap {
+        None => gpu.gated_delta_net_f32(
+            &b.g_q,
+            &b.g_k,
+            &b.g_v,
+            &b.g_alpha,
+            &b.g_beta,
+            &st.recurrent,
+            &b.g_attn,
+            n,
+            vh,
+            d.value_head_dim,
+        )?,
+        Some((rec, _)) => gpu.gated_delta_net_f32_batch_seq_opts(
+            &b.g_q,
+            &b.g_k,
+            &b.g_v,
+            &b.g_alpha,
+            &b.g_beta,
+            &st.recurrent,
+            &b.g_attn,
+            n,
+            vh,
+            d.value_head_dim,
+            Some(rec),
+        )?,
+    }
     if d.output_gate_sigmoid {
         gpu.gated_norm_sigmoid_f32(
             &b.g_attn,
@@ -456,6 +486,46 @@ fn qsa_rows(
     cache: &mut QsaCache,
     x: &GpuTensor,
     out: &GpuTensor,
+    pos0: usize,
+    n: usize,
+    visible: &GpuTensor,
+) -> HipResult<()> {
+    qsa_project_write(gpu, cfg, w, b, cache, x, pos0, n, visible)?;
+    let (qw, ix_qw) = (
+        cfg.n_heads * cfg.head_dim,
+        cfg.indexer.n_heads * cfg.indexer.head_dim,
+    );
+    for t in 0..n {
+        let n_vis = pos0 + t + 1;
+        qsa_select_attend(
+            gpu,
+            cfg,
+            w,
+            s,
+            cache,
+            &row(&b.q_qn, t, qw),
+            &row(&b.q_ix_q, t, ix_qw),
+            &row(&b.q_gate, t, qw),
+            &visible.sub_offset(0, n_vis),
+            n_vis,
+            &row(&b.q_gated, t, qw),
+        )?;
+    }
+    weight_gemm(gpu, &w.o_proj, &b.q_gated, out, n)
+}
+
+/// The projection half of [`qsa_rows`]: every row's query (normed + rotated,
+/// left in `b`) and its K/V/indexer key WRITTEN to `cache`. On its own it is
+/// what an MTP head needs for positions whose output nobody reads — a later
+/// position's attention only ever sees this layer's cache, never its output.
+#[allow(clippy::too_many_arguments)]
+fn qsa_project_write(
+    gpu: &mut Gpu,
+    cfg: &Qwen4ExpConfig,
+    w: &QsaWeights,
+    b: &BatchScratch,
+    cache: &mut QsaCache,
+    x: &GpuTensor,
     pos0: usize,
     n: usize,
     visible: &GpuTensor,
@@ -558,25 +628,7 @@ fn qsa_rows(
         cfg.rope_theta,
         n,
         0,
-    )?;
-
-    for t in 0..n {
-        let n_vis = pos0 + t + 1;
-        qsa_select_attend(
-            gpu,
-            cfg,
-            w,
-            s,
-            cache,
-            &row(&b.q_qn, t, qw),
-            &row(&b.q_ix_q, t, ix_qw),
-            &row(&b.q_gate, t, qw),
-            &visible.sub_offset(0, n_vis),
-            n_vis,
-            &row(&b.q_gated, t, qw),
-        )?;
-    }
-    weight_gemm(gpu, &w.o_proj, &b.q_gated, out, n)
+    )
 }
 
 /// Batched [`crate::moe_gpu::moe_forward`]. Routing runs per row; the rows are
@@ -591,7 +643,7 @@ fn moe_rows(
     x: &GpuTensor,
     out: &GpuTensor,
     n: usize,
-    layer: usize,
+    layer: Option<usize>,
 ) -> HipResult<()> {
     let m = &cfg.moe;
     let (hidden, mi, ne, k) = (cfg.hidden, m.intermediate, m.num_experts, m.experts_per_tok);
@@ -632,7 +684,7 @@ fn moe_rows(
     let wts: Vec<f32> = gpu.download_f32(&rows(&b.m_w, n, k))?[..n * k].to_vec();
 
     use hipfire_runtime::dispatch::moe_telemetry as telemetry;
-    if telemetry::moe_router_histogram_active() {
+    if let Some(layer) = layer.filter(|_| telemetry::moe_router_histogram_active()) {
         for t in 0..n {
             let r = t * k..(t + 1) * k;
             telemetry::record_moe_router_selection(layer, t, &idx[r.clone()], &wts[r]);
@@ -641,7 +693,12 @@ fn moe_rows(
     // Call order here is layer-major (all rows of layer l, then l+1), where the
     // decode path appends token-major. Probes that index the trace by token must
     // drive decode, not prefill.
-    if let Some(tr) = ROUTING_TRACE.lock().unwrap().as_mut() {
+    if let Some(tr) = ROUTING_TRACE
+        .lock()
+        .unwrap()
+        .as_mut()
+        .filter(|_| layer.is_some())
+    {
         tr.ids.extend(idx.iter().map(|&e| e as u16));
         tr.logits
             .extend(gpu.download_f32(&rows(&b.m_logits, n, ne))?);
@@ -695,13 +752,13 @@ fn moe_rows(
                 weight_gemm(gpu, wt, x, y, cnt)
             }
         };
-        capture_routed_input(gpu, Some(layer), e, "gate_up_proj", &xg, cnt, hidden);
+        capture_routed_input(gpu, layer, e, "gate_up_proj", &xg, cnt, hidden);
         page_timing::timed(page_timing::Phase::ExpertGemv, || {
             lin(gpu, &gu, &xg, &gu_out)
         })?;
         // Contiguous halves per row, gate FIRST — same convention as decode.
         gpu.zaya_silu_mul_gate_up_f32(&inter, &gu_out, mi, cnt * mi)?;
-        capture_routed_input(gpu, Some(layer), e, "down_proj", &inter, cnt, mi);
+        capture_routed_input(gpu, layer, e, "down_proj", &inter, cnt, mi);
         page_timing::timed(page_timing::Phase::ExpertGemv, || {
             lin(gpu, &dn, &inter, &eo)
         })?;
@@ -734,8 +791,15 @@ pub fn prefill_chunk_into(
     pos0: usize,
     eos: u32,
     all_logits: bool,
+    ckpt: Option<&Row0Checkpoint>,
 ) -> HipResult<()> {
     let n = history.len().saturating_sub(pos0);
+    if ckpt.is_some() && n > Row0Checkpoint::ROWS {
+        return Err(HipError::new(
+            0,
+            "qwen4_exp: a row-0 checkpoint covers 2-row verifies only",
+        ));
+    }
     if n == 0 || n > b.rows {
         return Err(HipError::new(
             0,
@@ -802,6 +866,12 @@ pub fn prefill_chunk_into(
                             &row(&b.ple_value, t, hidden),
                             &row(&b.ple_out, t, width),
                         )?;
+                        // The dilated ring is per row, so its row-0 checkpoint is
+                        // a copy taken right here.
+                        if let (0, Some(c)) = (t, ckpt.and_then(|c| c.ple[l].as_ref())) {
+                            let bytes = ps.conv_state.numel() * 4;
+                            gpu.memcpy_dtod_auto(&c.buf, &ps.conv_state.buf, bytes)?;
+                        }
                     }
                     gpu.add_inplace_f32(&wide, &rows(&b.ple_out, n, width))
                 })();
@@ -813,7 +883,13 @@ pub fn prefill_chunk_into(
             match &lw.mixer {
                 TokenMixer::Gdn(gw) => {
                     let gs = st.gdn[l].as_ref().expect("gdn state on a linear layer");
-                    gdn_rows(gpu, cfg, gw, b, gs, &b.mixed, &b.block_out, n)?;
+                    let snap = ckpt.map(|c| {
+                        (
+                            c.rec[l].as_ref().expect("gdn checkpoint"),
+                            c.conv[l].as_ref().expect("gdn checkpoint"),
+                        )
+                    });
+                    gdn_rows(gpu, cfg, gw, b, gs, &b.mixed, &b.block_out, n, snap)?;
                 }
                 TokenMixer::Qsa(qw) => {
                     let cache = st.qsa[l].as_mut().expect("kv cache on a sparse-attn layer");
@@ -835,7 +911,7 @@ pub fn prefill_chunk_into(
             hc_write_rows(gpu, cfg, b, &b.wide, &b.block_out, n)?;
 
             hc_read_rows(gpu, cfg, &lw.mlp_hc, b, &b.wide, &b.mixed, n)?;
-            moe_rows(gpu, cfg, &lw.moe, b, &b.mixed, &b.block_out, n, l)?;
+            moe_rows(gpu, cfg, &lw.moe, b, &b.mixed, &b.block_out, n, Some(l))?;
             hc_write_rows(gpu, cfg, b, &b.wide, &b.block_out, n)?;
         }
 
@@ -860,4 +936,154 @@ pub fn prefill_chunk_into(
     })();
     gpu.free_tensor(visible)?;
     result
+}
+
+/// The trunk's sequence state as it stood after ROW 0 of a 2-row verify, so a
+/// rejected draft (row 1) can be undone without re-running row 0.
+///
+/// GDN recurrence and conv ring come from the kernels' own per-row snapshot
+/// outputs (the DFlash rollback mechanism); the PLE ring runs per row, so it is
+/// copied after row 0; QSA caches only need their length rewound — a position
+/// past it is never visible and is overwritten on the next write.
+pub struct Row0Checkpoint {
+    rec: Vec<Option<GpuTensor>>,
+    conv: Vec<Option<GpuTensor>>,
+    ple: Vec<Option<GpuTensor>>,
+}
+
+impl Row0Checkpoint {
+    /// Rows a checkpointed forward may carry: the token and one draft.
+    pub const ROWS: usize = 2;
+
+    pub fn new(gpu: &mut Gpu, cfg: &Qwen4ExpConfig, st: &TrunkState) -> HipResult<Self> {
+        let n = Self::ROWS;
+        let (mut rec, mut conv, mut ple) = (Vec::new(), Vec::new(), Vec::new());
+        for l in 0..cfg.layers {
+            match st.gdn[l].as_ref() {
+                Some(g) => {
+                    rec.push(Some(gpu.zeros(&[n * g.recurrent.numel()], DType::F32)?));
+                    conv.push(Some(gpu.zeros(&[n * g.conv.numel()], DType::F32)?));
+                }
+                None => {
+                    rec.push(None);
+                    conv.push(None);
+                }
+            }
+            ple.push(match st.ple[l].as_ref() {
+                Some(p) => Some(gpu.zeros(&[p.conv_state.numel()], DType::F32)?),
+                None => None,
+            });
+        }
+        Ok(Self { rec, conv, ple })
+    }
+
+    /// Put `st` back to its state after row 0; `len` is the sequence length that
+    /// row 0 ended (its position + 1).
+    pub fn restore(&self, gpu: &mut Gpu, st: &mut TrunkState, len: usize) -> HipResult<()> {
+        for l in 0..st.gdn.len() {
+            if let (Some(g), Some(r), Some(c)) = (
+                st.gdn[l].as_ref(),
+                self.rec[l].as_ref(),
+                self.conv[l].as_ref(),
+            ) {
+                // Slot 0 is the first `numel` floats of each snapshot.
+                gpu.memcpy_dtod_auto(&g.recurrent.buf, &r.buf, g.recurrent.numel() * 4)?;
+                gpu.memcpy_dtod_auto(&g.conv.buf, &c.buf, g.conv.numel() * 4)?;
+            }
+            if let (Some(p), Some(c)) = (st.ple[l].as_ref(), self.ple[l].as_ref()) {
+                gpu.memcpy_dtod_auto(&p.conv_state.buf, &c.buf, p.conv_state.numel() * 4)?;
+            }
+            if let Some(q) = st.qsa[l].as_mut() {
+                q.len = q.len.min(len);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn free(self, gpu: &mut Gpu) {
+        let Self { rec, conv, ple } = self;
+        for t in rec.into_iter().chain(conv).chain(ple).flatten() {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+}
+
+/// Write the MTP head's attention cache for positions `pos0 .. pos0+n` WITHOUT
+/// running its attention, MoE or mixer.
+///
+/// The head is one trunk layer over a fused input, and a position's cache entry
+/// depends only on that position's fused input — never on an earlier
+/// position's OUTPUT. So the prompt (and a speculative step that was accepted
+/// without the head drafting from it) only needs fuse → attn read → K/V/indexer
+/// write. `trunk_wide` is `[n, width]`, `embeds` the `n` next-token embeddings.
+#[allow(clippy::too_many_arguments)]
+pub fn mtp_cache_rows(
+    gpu: &mut Gpu,
+    cfg: &Qwen4ExpConfig,
+    head: &crate::mtp_gpu::MtpWeightsGpu,
+    hb: &BatchScratch,
+    cache: &mut QsaCache,
+    trunk_wide: &GpuTensor,
+    embeds: &[f32],
+    pos0: usize,
+    n: usize,
+    fusion: crate::mtp::Fusion,
+) -> HipResult<()> {
+    let (hidden, hc) = (cfg.hidden, cfg.gated_residual.count);
+    let width = hc * hidden;
+    let eps = cfg.rms_norm_eps;
+    if n == 0 || n > hb.rows {
+        return Err(HipError::new(0, "qwen4_exp mtp_cache_rows: bad row count"));
+    }
+    // Same arithmetic as `mtp_gpu::fuse_inputs`, batched: `fc_hidden` runs on
+    // each of the n*hc streams (one GEMM over [n*hc, hidden]), `fc_embedding`
+    // once per row, and the embedding projection is added per `fusion`.
+    for t in 0..n {
+        gpu.hc_grouped_rmsnorm(
+            &row(trunk_wide, t, width),
+            &head.pre_fc_norm_hidden,
+            &row(&hb.ple_out, t, width),
+            hidden as i32,
+            hc as i32,
+            eps,
+        )?;
+    }
+    let e = gpu.upload_f32(embeds, &[n * hidden])?;
+    let r = (|| -> HipResult<()> {
+        for t in 0..n {
+            gpu.hc_grouped_rmsnorm(
+                &row(&e, t, hidden),
+                &head.pre_fc_norm_embedding,
+                &row(&hb.mixed, t, hidden),
+                hidden as i32,
+                1,
+                eps,
+            )?;
+        }
+        weight_gemm(gpu, &head.fc_embedding, &hb.mixed, &hb.block_out, n)?;
+        weight_gemm(gpu, &head.fc_hidden, &hb.ple_out, &hb.wide, n * hc)?;
+        for t in 0..n {
+            for st in 0..hc {
+                let take = match fusion {
+                    crate::mtp::Fusion::BroadcastAllStreams => true,
+                    crate::mtp::Fusion::Stream0Only => st == 0,
+                };
+                if take {
+                    gpu.add_inplace_f32(
+                        &row(&hb.wide, t * hc + st, hidden),
+                        &row(&hb.block_out, t, hidden),
+                    )?;
+                }
+            }
+        }
+        Ok(())
+    })();
+    gpu.free_tensor(e)?;
+    r?;
+    hc_read_rows(gpu, cfg, &head.attn_hc, hb, &hb.wide, &hb.mixed, n)?;
+    let vis: Vec<f32> = (0..pos0 + n).map(bits).collect();
+    let visible = gpu.upload_f32(&vis, &[vis.len()])?;
+    let r = qsa_project_write(gpu, cfg, &head.qsa, hb, cache, &hb.mixed, pos0, n, &visible);
+    gpu.free_tensor(visible)?;
+    r
 }

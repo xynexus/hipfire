@@ -94,7 +94,7 @@ Batching (1) already amortises all of these for prefill.
 - **docs:** the model-support row still says "NO QUALITY EVIDENCE"; the
   2026-09-24 PPL table exists. Correct it.
 
-### MTP serving — design (not started)
+### MTP serving — design (LANDED 2026-11-27, see log)
 
 The head is a SEPARATE sidecar artifact (`spec_decode_mtp <base> <mtp>`), so it
 needs a schema field naming it (an absolute `Path`, `Exists`), loaded by the
@@ -163,3 +163,34 @@ for 1.61 tokens). Needs its own serve loop beside `run_simple_ar`.
   `HIPFIRE_QWEN4EXP_PER_TOKEN_PREFILL=1`, default vs ACT_BITS=8; a calibration
   run confirming per-expert imatrix keys land, then `oq4.25` with expert
   imatrix vs `oq4` (4.040).
+- 2026-11-27 **decode profiled** (180B oq4, 16-token prompt + 64 decode
+  steps, rocprofv3 + `HIPFIRE_PAGER_TIMING=1`): ~155 ms/token wall, GPU
+  kernels only ~45 ms of it (3.57 s total over the run, ~30% busy during
+  decode). The rest is COLD EXPERT PAGE-INS: 7.7 s of ~12 s, 525 us each =
+  read 173 + **host repack 196** + upload 154. Dense GEMVs are near bandwidth
+  (lm_head Q8 3.0 ms for 0.68 GB ≈ 226 GB/s). Expert-cache budget sweep, 160
+  steps: 8 GiB 0.17 s/tok (default), **16 GiB 0.13**, 24 0.13, 32 0.15, 48
+  0.13 — 16 GiB is the knee (~−24%); past it GTT residency eats the page
+  cache the misses are served from. Default NOT changed (multi-model memory is
+  the operator's call; should become a schema setting, not the debug env).
+  Next levers: drop the per-load repack (pre-repacked module layout, the
+  2026-08-31 repacker todo), then prefetch/async page-in.
+- 2026-11-27 **MTP wired into serving** (`spec_decode_step`, row-0
+  checkpoint rollback, head cache filled over the prompt and on hits without
+  running its attention/MoE). Sidecar rebuilt from the local `.hfa`:
+  `Qwen3.8-Flash-Next-180B--mtp.oq8.hfq` (2.68 GB; reading the NFS source dir
+  instead crawled at ~16 tensors/min through mmap). Fixture
+  (`mtp_serve_fixture`, in the gate): teacher-forced all-hit / all-miss /
+  synthetic-head arms all match plain decode within the 2-row forward's
+  numerics (bf16 0.4%, oq8 0.8%, oq4 1.3%, mi640 compact 2.0% — EQUAL across
+  arms). 180B, 256-token wikitext prompt, 128 greedy tokens:
+  **acceptance 70.7%, 1.71 tokens/verify, but 7.24 → 5.95 tok/s (−18%)** at
+  16 GiB (5.91 → 5.03 at 8 GiB). Cold loads only +8% (32760 → 35522), so the
+  loss is the 2-row verify's OWN cost: 2.08 decode steps against the 1.71
+  break-even (~30 ms/verify of non-paging overhead). Hence `mtp_mode=auto`
+  does NOT attach this family's head; `on` does. Next: profile the n=2
+  verify (16-wide GEMM tiles at n=2, per-call scratch alloc, per-row loops,
+  host syncs) — under 1.71x it starts paying.
+  Plain and MTP greedy outputs first differ at token 7 on the 180B; the
+  fixtures attribute such flips to near-ties, but the margin there is NOT yet
+  checked on the real model.
