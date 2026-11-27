@@ -162,7 +162,7 @@ pub const ARCH_ROWS: &[ArchRow] = &[
             label: "qwen4-exp",
             prefill: FeatureSupport::Partial,
             dflash: FeatureSupport::None,
-            mtp: FeatureSupport::None,
+            mtp: FeatureSupport::Partial,
             kv: "fp32",
             vision: FeatureSupport::None,
         },

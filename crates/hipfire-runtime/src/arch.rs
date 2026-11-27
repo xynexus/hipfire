@@ -537,6 +537,10 @@ pub struct ServingFactoryOptions<'a> {
     pub cask_budget: usize,
     pub cask_beta: usize,
     pub physical_cap: Option<usize>,
+    /// The resolved `mtp_mode` setting (`auto` / `off` / `on`). A family that
+    /// ships an MTP sidecar decides attachment from it: `off` never loads one,
+    /// `on` refuses to load without one, `auto` uses one when present.
+    pub mtp_mode: &'a str,
 }
 
 /// Object-safe architecture construction seam. Implementations live beside

@@ -259,6 +259,30 @@ else
   fail=1
 fi
 
+step "GPU: MTP speculation inside decode_step, vs plain decode"
+# A synthetic head is attached to the oq4 fixture and the decode is
+# teacher-forced against a plain run three ways: a scripted all-hit drafter
+# (row 1 of every verify is reused), a scripted all-miss drafter (every step
+# restores the row-0 checkpoint), and the head itself. The hit/miss counters
+# must show each path actually ran — a pass where nothing hit would be vacuous.
+if ! cargo build --quiet --release -p hipfire-arch-qwen4exp \
+     --example mtp_serve_fixture 2>&1 | tail -5; then
+  echo "qwen4exp-gate: mtp_serve_fixture build FAILED"
+  exit 2
+fi
+if [ -f "$TMP/fx.oq4.hfq" ]; then
+  mt="$(./target/release/examples/mtp_serve_fixture "$TMP/fx.oq4.hfq" 2>&1 || true)"
+  echo "$mt" | grep -E "argmax agree|skipped" | sed 's/^/  /'
+  case "$mt" in
+    *"mtp_serve_fixture: OK"*|*skipped*) ;;
+    *) echo "qwen4exp-gate: MTP speculation FAILED"
+       echo "$mt" | tail -3 | sed 's/^/    /'; fail=1 ;;
+  esac
+else
+  echo "qwen4exp-gate: no oq4 artifact for the MTP check"
+  fail=1
+fi
+
 step "GPU: PAGED routed experts vs resident, on the same artifact"
 # Routed experts are 97.3% of this trunk, so paging them is what decides whether
 # the shipped model loads at all. Both arms read the SAME file: the only

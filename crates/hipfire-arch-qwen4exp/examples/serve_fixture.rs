@@ -66,6 +66,7 @@ fn main() {
         cask_budget: 0,
         cask_beta: 0,
         physical_cap: None,
+        mtp_mode: "off",
     };
     let loaded = factory
         .load(&mut hfq, &mut gpu, &options)

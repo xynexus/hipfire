@@ -202,3 +202,66 @@ impl MtpWeightsGpu {
         crate::trunk_gpu::upload_mtp_head(gpu, cfg, w)
     }
 }
+
+// ── GPU teardown ────────────────────────────────────────────────────────────
+//
+// Exhaustive destructures, so a field added later fails to compile until someone
+// decides whether it needs freeing. See the note in `hc_gpu.rs`.
+
+impl MtpWeightsGpu {
+    pub fn free(self, gpu: &mut Gpu) {
+        let Self {
+            pre_fc_norm_hidden,
+            pre_fc_norm_embedding,
+            fc_hidden,
+            fc_embedding,
+            attn_hc,
+            mlp_hc,
+            qsa,
+            moe,
+            mixer,
+        } = self;
+        let _ = gpu.free_tensor(pre_fc_norm_hidden);
+        let _ = gpu.free_tensor(pre_fc_norm_embedding);
+        let _ = gpu.free_tensor(fc_hidden.buf);
+        let _ = gpu.free_tensor(fc_embedding.buf);
+        attn_hc.free(gpu);
+        mlp_hc.free(gpu);
+        qsa.free(gpu);
+        moe.free(gpu);
+        mixer.free(gpu);
+    }
+}
+
+impl MtpScratchGpu {
+    pub fn free(self, gpu: &mut Gpu) {
+        let Self {
+            hc,
+            qsa,
+            moe,
+            wide,
+            mixed,
+            block_out,
+            normed_wide,
+            normed_emb,
+            proj_emb,
+            proj_hidden,
+            collapsed,
+        } = self;
+        hc.free(gpu);
+        qsa.free(gpu);
+        moe.free(gpu);
+        for t in [
+            wide,
+            mixed,
+            block_out,
+            normed_wide,
+            normed_emb,
+            proj_emb,
+            proj_hidden,
+            collapsed,
+        ] {
+            let _ = gpu.free_tensor(t);
+        }
+    }
+}

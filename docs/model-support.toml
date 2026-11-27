@@ -175,9 +175,12 @@ vision = "full"
 #   - prefill is now BATCHED (layer-major, `prefill_gpu.rs`): 512 tokens in
 #     10.6 s on the 180B (~8x), held-out PPL 4.0550 vs 4.0411 per-token (+0.34%,
 #     the int8 activations of the Oq8/compact GEMMs). Decode is still ~0.19 s/tok.
-#   - no VL wiring, though mRoPE's vision interleave exists. The MTP head drafts
-#     at 60.9% acceptance on the 180B (`spec_decode_mtp`) but is not wired into
-#     serving: it needs a 2-token batched verify.
+#   - no VL wiring, though mRoPE's vision interleave exists.
+#   - MTP is `partial`: wired into serving (a sibling `<Model>--mtp.<quant>.hfq`,
+#     speculation inside `decode_step`, exact under any sampler) but OPT-IN ONLY
+#     (`mtp_mode=on`; `auto` ignores the sidecar). Measured on the 180B: 70.7%
+#     acceptance, 1.71 tokens/verify, yet 7.24 -> 5.95 tok/s — a 2-row verify
+#     costs 2.08 decode steps against a 1.71 break-even.
 #
 # The structural blockers are closed: the 102 GB n-gram table streams row by row
 # (bit-identically to resident), and the routed experts — 97.3% of the trunk —
@@ -186,7 +189,7 @@ ids = [26]
 label = "qwen4-exp"
 prefill = "partial"
 dflash = "none"
-mtp = "none"
+mtp = "partial"
 kv = "fp32"
 vision = "none"
 

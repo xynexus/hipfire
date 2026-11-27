@@ -56,7 +56,7 @@ This per-arch chart is the **`family × feature` projection** of the 5-axis capa
 | gemma4 (24) | 🟡 | ❌ | ❌ | fp32+kvarn | ❌ |
 | cohere2-moe (25) | ❌ | ❌ | ❌ | none | ❌ |
 | idefics3 (27) | ✅ | ❌ | ❌ | fp32 | ✅ |
-| qwen4-exp (26) | 🟡 | ❌ | ❌ | fp32 | ❌ |
+| qwen4-exp (26) | 🟡 | ❌ | 🟡 | fp32 | ❌ |
 | qwen2 (7) | ✅ | ❌ | ❌ | fp32 | ❌ |
 | dots-ocr (8) | ✅ | ❌ | ❌ | fp32 | ✅ |
 | llama (0, 1) | 🟡 | ❌ | ❌ | fp32 | ❌ |

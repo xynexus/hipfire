@@ -712,6 +712,7 @@ pub(crate) fn load(
         state_quant_override.as_deref(),
         &cask,
         pp,
+        &mtp_mode,
         &mut daemon_state.gpu,
     );
     // Explicit, so progress stops at exactly the point the old `set_sink(None)`

@@ -16,6 +16,7 @@ fn score(gpu: &mut Gpu, path: &str, tokens: &[u32]) -> Result<Vec<Vec<f32>>, Str
         cask_budget: 0,
         cask_beta: 0,
         physical_cap: None,
+        mtp_mode: "off",
     };
     let mut loaded = COHERE2_SERVING_FACTORY.load(&mut hfq, gpu, &options)?;
     let mut rows = Vec::new();
