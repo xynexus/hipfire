@@ -5447,3 +5447,8 @@ mod dispatch_tests {
         }
     }
 }
+
+/// QSA (qwen4_exp sparse attention) slot gather from a KVarN cache: K from the
+/// block records / open-block window, V from Q8_0, into the f32 layout
+/// `qsa_gather_kv` produces. See the kernel header.
+pub const QSA_GATHER_KVARN_SRC: &str = include_str!("../../../kernels/src/qsa_gather_kvarn.hip");

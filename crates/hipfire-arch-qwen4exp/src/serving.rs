@@ -32,6 +32,7 @@
 //! quantised behind `hipfire_runtime::weights::WeightTensor`.
 
 use crate::arch::{load_ngram_table, HfqTensorReader, Qwen4Exp};
+use crate::attn_gpu::QsaKvMode;
 use crate::config::Qwen4ExpConfig;
 use crate::ngram::NgramHasher;
 use crate::ngram_rows::{HfqShardRows, NgramRows, ResidentRows};
@@ -108,6 +109,8 @@ pub struct Qwen4ExpBackend {
     max_seq: usize,
     /// MTP speculative decode, when a head is attached (`attach_mtp`).
     mtp: Option<Box<MtpState>>,
+    /// How every sparse-attention layer (and the MTP head's) stores K/V.
+    kv_mode: QsaKvMode,
 }
 
 /// Counters for MTP speculation. A `verify` is one 2-row trunk forward; each
@@ -201,8 +204,19 @@ impl Qwen4ExpBackend {
     /// Build a backend from an artifact. The [`ServingFactory`] below is a thin
     /// wrapper over this, so the daemon path and any direct driver construct the
     /// SAME object — a test that exercises one is exercising the other.
+    /// Load with the family's default KV (`kv_cache=auto` = KVarN-4).
     pub fn load(gpu: &mut Gpu, hfq: &mut HfqFile, max_seq: usize) -> Result<Self, String> {
-        Self::load_with_ngram_budget(gpu, hfq, max_seq, NGRAM_HOST_BUDGET_BYTES)
+        Self::load_with_kv(gpu, hfq, max_seq, QsaKvMode::from_setting("auto"))
+    }
+
+    /// [`Self::load`] with the sparse-attention KV storage chosen explicitly.
+    pub fn load_with_kv(
+        gpu: &mut Gpu,
+        hfq: &mut HfqFile,
+        max_seq: usize,
+        kv: QsaKvMode,
+    ) -> Result<Self, String> {
+        Self::load_inner(gpu, hfq, max_seq, NGRAM_HOST_BUDGET_BYTES, kv)
     }
 
     /// [`Self::load`] with the resident/streamed threshold overridden.
@@ -297,6 +311,22 @@ impl Qwen4ExpBackend {
         max_seq: usize,
         ngram_host_budget: u64,
     ) -> Result<Self, String> {
+        Self::load_inner(
+            gpu,
+            hfq,
+            max_seq,
+            ngram_host_budget,
+            QsaKvMode::from_setting("auto"),
+        )
+    }
+
+    fn load_inner(
+        gpu: &mut Gpu,
+        hfq: &mut HfqFile,
+        max_seq: usize,
+        ngram_host_budget: u64,
+        kv_mode: QsaKvMode,
+    ) -> Result<Self, String> {
         let cfg = Qwen4Exp::config_from_hfq(hfq)?;
         // PAGED ROUTED EXPERTS, when the artifact was repacked with a module
         // table. Presence of the table IS the switch: routed experts are 97.3%
@@ -310,8 +340,8 @@ impl Qwen4ExpBackend {
                 .map_err(|e| format!("qwen4_exp: {e:?}"))?
         };
         let max_seq = max_seq.min(cfg.max_position).max(1);
-        let state =
-            TrunkState::new(gpu, &cfg, max_seq).map_err(|e| format!("qwen4_exp state: {e:?}"))?;
+        let state = TrunkState::with_kv(gpu, &cfg, max_seq, kv_mode)
+            .map_err(|e| format!("qwen4_exp state: {e:?}"))?;
         let scratch = TrunkScratch::new(gpu, &cfg, max_seq)
             .map_err(|e| format!("qwen4_exp scratch: {e:?}"))?;
 
@@ -360,6 +390,7 @@ impl Qwen4ExpBackend {
             chunk_rows: PREFILL_CHUNK.min(max_seq),
             max_seq,
             mtp: None,
+            kv_mode,
         })
     }
 
@@ -460,6 +491,7 @@ impl Qwen4ExpBackend {
             chunk_rows,
             max_seq: _,
             mtp,
+            kv_mode: _,
         } = self;
         let resident;
         let streamed;
@@ -540,7 +572,8 @@ impl Qwen4ExpBackend {
         let state = MtpState {
             head,
             scratch: crate::mtp_gpu::MtpScratchGpu::new(gpu, cfg, self.max_seq).map_err(e)?,
-            cache: crate::attn_gpu::QsaCache::new(gpu, cfg, self.max_seq).map_err(e)?,
+            cache: crate::attn_gpu::QsaCache::with_kv(gpu, cfg, self.max_seq, self.kv_mode)
+                .map_err(e)?,
             logits: gpu
                 .zeros(&[cfg.vocab], hipfire_rdna::DType::F32)
                 .map_err(e)?,
@@ -1029,7 +1062,12 @@ impl ServingFactory for Qwen4ExpServingFactory {
         options: &ServingFactoryOptions<'_>,
     ) -> Result<FactoryLoadedBackend, String> {
         let max_seq = options.max_seq;
-        let mut backend = Qwen4ExpBackend::load(gpu, hfq, max_seq)?;
+        let kv = QsaKvMode::from_setting(options.kv_mode);
+        let mut backend = Qwen4ExpBackend::load_with_kv(gpu, hfq, max_seq, kv)?;
+        eprintln!(
+            "qwen4_exp: sparse-attention KV = {kv:?} (kv_cache={})",
+            options.kv_mode
+        );
         // `auto` does NOT attach a found head here: speculation is exact but
         // measured SLOWER on gfx1151 (2026-11-27, 180B oq4: 70.7% acceptance,
         // 1.71 tokens/verify, yet 7.24 -> 5.95 tok/s) because a 2-row verify
@@ -1065,7 +1103,7 @@ impl ServingFactory for Qwen4ExpServingFactory {
             ..Default::default()
         };
         let physical_cap = max_seq.min(cfg.max_position).max(1);
-        let _ = (options.kv_mode, options.triattn);
+        let _ = options.triattn;
         Ok(FactoryLoadedBackend {
             backend: Box::new(backend),
             family: self.family(),

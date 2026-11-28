@@ -20,7 +20,7 @@
 //! not). The hit/miss counters are checked too: a pass where the hit run never
 //! hit, or the miss run never missed, would prove nothing.
 //!
-//!     mtp_serve_fixture <fixture.hfq>
+//!     mtp_serve_fixture <fixture.hfq> [kv_cache]
 
 use hipfire_arch_qwen4exp::config::Qwen4ExpConfig;
 use hipfire_arch_qwen4exp::mtp_gpu::MtpWeightsGpu;
@@ -223,14 +223,20 @@ fn main() {
             return;
         }
     };
-    let mut m = Qwen4ExpBackend::load(&mut gpu, &mut hfq, 64)
+    // KVarN (the family default) quantises K in 128-token blocks, so the prompt
+    // ends a few tokens short of a block boundary and the speculative steps
+    // CROSS it: a draft that closes block 0 and is then rejected must leave the
+    // block re-quantised from the real token, not the draft.
+    // Optional 2nd arg: the `kv_cache` setting (default: the family default).
+    let kv = hipfire_arch_qwen4exp::attn_gpu::QsaKvMode::from_setting(
+        &std::env::args().nth(2).unwrap_or_else(|| "auto".into()),
+    );
+    let mut m = Qwen4ExpBackend::load_with_kv(&mut gpu, &mut hfq, 256, kv)
         .unwrap_or_else(|e| fail(format!("load: {e}")));
+    println!("  kv: {kv:?}");
     let cfg = m.config().clone();
     let vocab = cfg.vocab as u32;
-    let prompt: Vec<u32> = [3u32, 17, 42, 5, 9, 7, 61, 23]
-        .iter()
-        .map(|t| t % vocab)
-        .collect();
+    let prompt: Vec<u32> = (0..122u32).map(|i| (i * 37 + 3) % vocab).collect();
 
     let (ref_toks, ref_logits) = run(&mut m, &mut gpu, &prompt, None);
     println!("  reference: {STEPS} greedy tokens {ref_toks:?}");

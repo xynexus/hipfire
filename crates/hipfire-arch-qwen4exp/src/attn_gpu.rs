@@ -37,13 +37,98 @@ pub struct QsaWeights {
 
 /// Per-sequence cache and scratch. `max_seq` bounds the whole thing.
 pub struct QsaCache {
-    pub k: GpuTensor,
-    pub v: GpuTensor,
+    kv: QsaKv,
     /// `[max_seq, ix_head_dim]` — the indexer's own RAW keys (un-normed,
     /// un-rotated; both are applied to the POOLED key, not the per-token one).
+    /// Kept at f32 in every mode: they decide WHICH slots are attended.
     pub ix_keys: GpuTensor,
     pub len: usize,
     max_seq: usize,
+}
+
+/// Tokens per KVarN K block (one `kvarn_quantize_tile` tile per KV head).
+const KVARN_GROUP: usize = 128;
+
+/// How a sparse-attention layer stores its K and V.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum QsaKvMode {
+    /// Full f32 K and V — the reference.
+    F32,
+    /// KVarN K (`bits`-bit variance-normalised tiles of 128 tokens, an f32
+    /// window for the open tile) + Q8_0 V: the tree's asymmetric KVarN scheme.
+    Kvarn { bits: usize },
+}
+
+impl QsaKvMode {
+    /// The `kv_cache` setting for this family. `auto` is **KVarN-8**; `f32`
+    /// keeps the reference for A/B; `kvarn`/`kvarn4` mean 4-bit, as they do for
+    /// every other family.
+    ///
+    /// Measured on the 180B oq4, held-out wikitext2 (2026-11-27):
+    ///
+    /// | KV | 4K PPL | 32K PPL |
+    /// |---|---|---|
+    /// | f32 | 4.0550 | 4.4188 |
+    /// | KVarN-4, un-rotated | 4.0880 (+0.81%) | — |
+    /// | KVarN-4, rotated | 4.0411 | — |
+    /// | KVarN-8, un-rotated | 4.0345 | 4.4135 |
+    /// | KVarN-8, rotated (this default) | 4.0306 | — |
+    ///
+    /// The Hadamard rotation is what un-rotated KVarN-4 was missing. 8 stays the
+    /// default until rotated 4-bit is also measured at 32K; once K is quantised,
+    /// the Q8 V and f32 indexer keys dominate, so 8-bit K costs only ~100 MB per
+    /// 32K session over 4-bit.
+    ///
+    /// The deprecated single-tier modes are not implemented here, so they are
+    /// NAMED and served as the default rather than silently honoured or refused.
+    pub fn from_setting(mode: &str) -> Self {
+        match mode {
+            "f32" | "fp32" => Self::F32,
+            "kvarn2" => Self::Kvarn { bits: 2 },
+            "kvarn" | "kvarn4" => Self::Kvarn { bits: 4 },
+            "auto" | "kvarn8" => Self::Kvarn { bits: 8 },
+            other => {
+                eprintln!(
+                    "qwen4_exp: kv_cache={other} is not implemented for this family; \
+                     using kvarn8 (set kv_cache=kvarn8, or f32 for the reference)"
+                );
+                Self::Kvarn { bits: 8 }
+            }
+        }
+    }
+}
+
+enum QsaKv {
+    F32 {
+        /// `[n_kv, max_seq, head_dim]`
+        k: GpuTensor,
+        v: GpuTensor,
+    },
+    Kvarn {
+        /// `[n_blocks, n_kv, record_bytes]` — completed 128-token K blocks.
+        recs: GpuTensor,
+        /// `[KVARN_GROUP, n_kv * head_dim]` f32 — the open block (slot = pos % 128).
+        window: GpuTensor,
+        /// `[max_seq, kv_dim/32, 34]` — Q8_0 V by position.
+        v_q8: GpuTensor,
+        /// `[n_kv, head_dim * KVARN_GROUP]` f32 scratch for a closing block.
+        tiles: GpuTensor,
+        bits: usize,
+        record_bytes: usize,
+        /// K is stored in the Hadamard-rotated frame (`rotate_x_mq`, orthonormal
+        /// per 256 channels), and the query is rotated the same way at attention
+        /// time, so scores are unchanged. This is the first half of the KVarN
+        /// method — "a Hadamard rotation followed by a dual-scaling variance
+        /// normalization" (2606.03458) — which the GPU KVarN path had never
+        /// implemented (see `hipfire_kvquant::kvarn::hadamard_rows`).
+        rotated: bool,
+    },
+}
+
+/// `HIPFIRE_QSA_KVARN_NO_ROTATE=1` — DEBUG A/B only: store KVarN K un-rotated
+/// (the pre-2026-11-27 behaviour) to measure what the rotation buys.
+fn kvarn_rotate() -> bool {
+    std::env::var("HIPFIRE_QSA_KVARN_NO_ROTATE").as_deref() != Ok("1")
 }
 
 impl QsaCache {
@@ -51,15 +136,191 @@ impl QsaCache {
         self.max_seq
     }
 
+    /// An f32 cache — the reference the CPU-parity examples compare against.
     pub fn new(gpu: &mut Gpu, cfg: &Qwen4ExpConfig, max_seq: usize) -> HipResult<Self> {
+        Self::with_kv(gpu, cfg, max_seq, QsaKvMode::F32)
+    }
+
+    pub fn with_kv(
+        gpu: &mut Gpu,
+        cfg: &Qwen4ExpConfig,
+        max_seq: usize,
+        mode: QsaKvMode,
+    ) -> HipResult<Self> {
         let ix = &cfg.indexer;
+        let (nkv, hd) = (cfg.n_kv_heads, cfg.head_dim);
+        let kv = match mode {
+            QsaKvMode::F32 => QsaKv::F32 {
+                k: gpu.zeros(&[nkv * max_seq * hd], DType::F32)?,
+                v: gpu.zeros(&[nkv * max_seq * hd], DType::F32)?,
+            },
+            QsaKvMode::Kvarn { bits } => {
+                let record_bytes =
+                    hipfire_kvquant::kvarn::kvarn_record_bytes_bits(hd, KVARN_GROUP, bits);
+                let n_blocks = max_seq.div_ceil(KVARN_GROUP);
+                QsaKv::Kvarn {
+                    recs: gpu.zeros(&[n_blocks * nkv * record_bytes], DType::Raw)?,
+                    window: gpu.zeros(&[KVARN_GROUP * nkv * hd], DType::F32)?,
+                    v_q8: gpu.zeros(&[max_seq * (nkv * hd / 32) * 34], DType::Raw)?,
+                    tiles: gpu.zeros(&[nkv * hd * KVARN_GROUP], DType::F32)?,
+                    bits,
+                    record_bytes,
+                    // The MQ FWHT works in 256-wide groups; a head that is not a
+                    // whole number of them cannot be rotated per head.
+                    rotated: kvarn_rotate() && hd % 256 == 0,
+                }
+            }
+        };
         Ok(Self {
-            k: gpu.zeros(&[cfg.n_kv_heads * max_seq * cfg.head_dim], DType::F32)?,
-            v: gpu.zeros(&[cfg.n_kv_heads * max_seq * cfg.head_dim], DType::F32)?,
+            kv,
             ix_keys: gpu.zeros(&[max_seq * ix.head_dim], DType::F32)?,
             len: 0,
             max_seq,
         })
+    }
+
+    /// The query as attention must see it: `qn` itself, or `qn` rotated into
+    /// `scratch` when K is stored rotated. `qn` is `[n_heads * head_dim]`.
+    pub fn query_for_attention<'a>(
+        &self,
+        gpu: &mut Gpu,
+        cfg: &Qwen4ExpConfig,
+        qn: &'a GpuTensor,
+        scratch: &'a GpuTensor,
+    ) -> HipResult<&'a GpuTensor> {
+        match &self.kv {
+            QsaKv::Kvarn { rotated: true, .. } => {
+                gpu.rotate_x_mq(qn, scratch, cfg.n_heads * cfg.head_dim)?;
+                Ok(scratch)
+            }
+            _ => Ok(qn),
+        }
+    }
+
+    /// Whether K is held in the Hadamard-rotated frame (KVarN with rotation).
+    pub fn k_rotated(&self) -> bool {
+        matches!(&self.kv, QsaKv::Kvarn { rotated: true, .. })
+    }
+
+    pub fn kv_mode(&self) -> QsaKvMode {
+        match &self.kv {
+            QsaKv::F32 { .. } => QsaKvMode::F32,
+            QsaKv::Kvarn { bits, .. } => QsaKvMode::Kvarn { bits: *bits },
+        }
+    }
+
+    /// Store position `pos`'s K and V rows (`[n_kv * head_dim]` each, K normed
+    /// and rotated). `pos_dev` is the same position as a device i32 (the
+    /// f32-bit-cast encoding the RoPE and slot lists use). Does NOT advance
+    /// `len` — callers do, after the whole row set is written.
+    ///
+    /// KVarN: the row lands in the open-block window; when it is the block's
+    /// last slot the whole block is quantised into its record. A block can be
+    /// closed more than once (a rolled-back speculative row re-written at the
+    /// same position) — the record is simply rebuilt from the window, which
+    /// still holds every row of the block until the next block starts.
+    pub fn write(
+        &mut self,
+        gpu: &mut Gpu,
+        cfg: &Qwen4ExpConfig,
+        k_row: &GpuTensor,
+        v_row: &GpuTensor,
+        pos: usize,
+        pos_dev: &GpuTensor,
+    ) -> HipResult<()> {
+        let (nkv, hd, ms) = (cfg.n_kv_heads, cfg.head_dim, self.max_seq);
+        let kv_dim = nkv * hd;
+        match &self.kv {
+            QsaKv::F32 { k, v } => {
+                gpu.qsa_cache_write(k_row, k, pos as i32, nkv as i32, hd as i32, ms as i32)?;
+                gpu.qsa_cache_write(v_row, v, pos as i32, nkv as i32, hd as i32, ms as i32)
+            }
+            QsaKv::Kvarn {
+                recs,
+                window,
+                v_q8,
+                tiles,
+                bits,
+                record_bytes,
+                rotated,
+            } => {
+                let slot = window.sub_offset((pos % KVARN_GROUP) * kv_dim, kv_dim);
+                if *rotated {
+                    gpu.rotate_x_mq(k_row, &slot, kv_dim)?;
+                } else {
+                    gpu.memcpy_dtod_auto(&slot.buf, &k_row.buf, kv_dim * 4)?;
+                }
+                gpu.kv_cache_write_q8_0(v_q8, v_row, &pos_dev.buf, nkv, hd)?;
+                if pos % KVARN_GROUP == KVARN_GROUP - 1 {
+                    let blk = pos / KVARN_GROUP;
+                    gpu.kvarn_gather_k_tiles(window, tiles, 1, nkv, hd, KVARN_GROUP)?;
+                    let rec = recs.sub_offset(blk * nkv * record_bytes, nkv * record_bytes);
+                    gpu.kvarn_quantize_tile(
+                        tiles,
+                        &rec,
+                        nkv,
+                        hd,
+                        KVARN_GROUP,
+                        *record_bytes,
+                        *bits,
+                    )?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Gather the `n_sel` positions in `slots` into `out_k`/`out_v`
+    /// (`[n_kv, n_sel, head_dim]` f32), dequantising in KVarN mode.
+    pub fn gather(
+        &self,
+        gpu: &mut Gpu,
+        cfg: &Qwen4ExpConfig,
+        slots: &GpuTensor,
+        n_sel: usize,
+        out_k: &GpuTensor,
+        out_v: &GpuTensor,
+    ) -> HipResult<()> {
+        let (nkv, hd, ms) = (cfg.n_kv_heads, cfg.head_dim, self.max_seq);
+        match &self.kv {
+            QsaKv::F32 { k, v } => {
+                for (src, dst) in [(k, out_k), (v, out_v)] {
+                    gpu.qsa_gather_kv(
+                        src,
+                        slots,
+                        dst,
+                        nkv as i32,
+                        n_sel as i32,
+                        hd as i32,
+                        ms as i32,
+                    )?;
+                }
+                Ok(())
+            }
+            QsaKv::Kvarn {
+                recs,
+                window,
+                v_q8,
+                bits,
+                record_bytes,
+                ..
+            } => gpu.qsa_gather_kvarn(
+                recs,
+                window,
+                v_q8,
+                slots,
+                out_k,
+                out_v,
+                nkv,
+                n_sel,
+                hd,
+                KVARN_GROUP,
+                *record_bytes,
+                *bits,
+                // Only CLOSED blocks have records; the open one is the window.
+                self.len / KVARN_GROUP,
+            ),
+        }
     }
 }
 
@@ -83,6 +344,8 @@ pub struct QsaScratch {
     gath_v: GpuTensor,
     ctx: GpuTensor,
     gated: GpuTensor,
+    /// `[n_heads * head_dim]` — the rotated query, when K is stored rotated.
+    q_rot: GpuTensor,
     m: GpuTensor,
     l: GpuTensor,
 }
@@ -113,6 +376,7 @@ impl QsaScratch {
             gath_v: z(gpu, nkv * max_seq * hd)?,
             ctx: z(gpu, nh * hd)?,
             gated: z(gpu, nh * hd)?,
+            q_rot: z(gpu, nh * hd)?,
             m: z(gpu, nh)?,
             l: z(gpu, nh)?,
         })
@@ -162,10 +426,7 @@ pub fn qsa_decode_step(
         1,
         0,
     )?;
-    gpu.qsa_cache_write(
-        &s.kn, &cache.k, pos as i32, nkv as i32, hd as i32, ms as i32,
-    )?;
-    gpu.qsa_cache_write(&s.v, &cache.v, pos as i32, nkv as i32, hd as i32, ms as i32)?;
+    cache.write(gpu, cfg, &s.kn, &s.v, pos, &pos_buf)?;
     cache.len = cache.len.max(pos + 1);
 
     // ── indexer ─────────────────────────────────────────────────────────────
@@ -247,7 +508,6 @@ pub fn qsa_select_attend(
     let (nh, nkv, hd) = (cfg.n_heads, cfg.n_kv_heads, cfg.head_dim);
     let ix = &cfg.indexer;
     let eps = cfg.rms_norm_eps;
-    let ms = cache.max_seq;
     let n_blocks = n_vis / ix.compress_ratio;
     if n_blocks > 0 {
         gpu.qsa_pool_norm_blocks(
@@ -302,17 +562,8 @@ pub fn qsa_select_attend(
     let n_sel = gpu.download_f32(&s.count)?[0].to_bits() as usize;
 
     // ── gather + attend ─────────────────────────────────────────────────────
-    for (src, dst) in [(&cache.k, &s.gath_k), (&cache.v, &s.gath_v)] {
-        gpu.qsa_gather_kv(
-            src,
-            &s.slots,
-            dst,
-            nkv as i32,
-            n_sel as i32,
-            hd as i32,
-            ms as i32,
-        )?;
-    }
+    cache.gather(gpu, cfg, &s.slots, n_sel, &s.gath_k, &s.gath_v)?;
+    let qn = cache.query_for_attention(gpu, cfg, qn, &s.q_rot)?;
     gpu.attention_cold_slots(
         qn,
         &s.gath_k,
@@ -371,14 +622,30 @@ impl QsaCache {
 
     pub fn free(self, gpu: &mut Gpu) {
         let Self {
-            k,
-            v,
+            kv,
             ix_keys,
             len: _,
             max_seq: _,
         } = self;
-        for t in [k, v, ix_keys] {
-            let _ = gpu.free_tensor(t);
+        let _ = gpu.free_tensor(ix_keys);
+        match kv {
+            QsaKv::F32 { k, v } => {
+                let _ = gpu.free_tensor(k);
+                let _ = gpu.free_tensor(v);
+            }
+            QsaKv::Kvarn {
+                recs,
+                window,
+                v_q8,
+                tiles,
+                bits: _,
+                record_bytes: _,
+                rotated: _,
+            } => {
+                for t in [recs, window, v_q8, tiles] {
+                    let _ = gpu.free_tensor(t);
+                }
+            }
         }
     }
 }
@@ -405,12 +672,13 @@ impl QsaScratch {
             gath_v,
             ctx,
             gated,
+            q_rot,
             m,
             l,
         } = self;
         for t in [
             qg, query, gate, qn, k, kn, v, ix_qk, ix_q, block_keys, starts, scores, block_mask,
-            slots, count, gath_k, gath_v, ctx, gated, m, l,
+            slots, count, gath_k, gath_v, ctx, gated, q_rot, m, l,
         ] {
             let _ = gpu.free_tensor(t);
         }

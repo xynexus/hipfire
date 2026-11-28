@@ -29,7 +29,7 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let model = args
         .next()
-        .expect("usage: perplexity_qwen4exp <model.hfq> <corpus.txt> [n_tokens]");
+        .expect("usage: perplexity_qwen4exp <model.hfq> <corpus.txt> [n_tokens] [kv_cache]");
     let corpus = args.next().expect("corpus path");
     let n_tok: usize = args.next().and_then(|v| v.parse().ok()).unwrap_or(1024);
 
@@ -43,7 +43,13 @@ fn main() {
     };
     let max_seq = (n_tok + 8).next_power_of_two().max(256);
     let t0 = Instant::now();
-    let mut m = Qwen4ExpBackend::load(&mut gpu, &mut hfq, max_seq).expect("load");
+    // Optional 4th arg: the `kv_cache` setting (default: the family default,
+    // KVarN-4); `f32` is the reference.
+    let kv = hipfire_arch_qwen4exp::attn_gpu::QsaKvMode::from_setting(
+        &args.next().unwrap_or_else(|| "auto".into()),
+    );
+    println!("kv: {kv:?}");
+    let mut m = Qwen4ExpBackend::load_with_kv(&mut gpu, &mut hfq, max_seq, kv).expect("load");
     println!("loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
     let text = std::fs::read_to_string(&corpus).expect("read corpus");

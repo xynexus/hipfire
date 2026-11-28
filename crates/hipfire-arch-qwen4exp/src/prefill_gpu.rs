@@ -587,21 +587,13 @@ fn qsa_project_write(
     weight_gemm(gpu, &w.ix_qk_proj, x, &b.q_ix_qk, n)?;
     for t in 0..n {
         let p = (pos0 + t) as i32;
-        gpu.qsa_cache_write(
+        cache.write(
+            gpu,
+            cfg,
             &row(&b.q_kn, t, kvw),
-            &cache.k,
-            p,
-            nkv as i32,
-            hd as i32,
-            ms as i32,
-        )?;
-        gpu.qsa_cache_write(
             &row(&b.q_v, t, kvw),
-            &cache.v,
-            p,
-            nkv as i32,
-            hd as i32,
-            ms as i32,
+            p as usize,
+            &visible.sub_offset(p as usize, 1),
         )?;
         // The indexer key is cached RAW, exactly as the decode step does.
         let ix_key = b.q_ix_qk.sub_offset(t * ix_row + ix_qw, ix.head_dim);
