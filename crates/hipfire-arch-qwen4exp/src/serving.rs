@@ -204,7 +204,7 @@ impl Qwen4ExpBackend {
     /// Build a backend from an artifact. The [`ServingFactory`] below is a thin
     /// wrapper over this, so the daemon path and any direct driver construct the
     /// SAME object — a test that exercises one is exercising the other.
-    /// Load with the family's default KV (`kv_cache=auto` = KVarN-4).
+    /// Load with the family's default KV (`kv_cache=auto` = KVarN-8).
     pub fn load(gpu: &mut Gpu, hfq: &mut HfqFile, max_seq: usize) -> Result<Self, String> {
         Self::load_with_kv(gpu, hfq, max_seq, QsaKvMode::from_setting("auto"))
     }

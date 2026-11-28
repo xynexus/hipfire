@@ -981,12 +981,14 @@ impl Gpu {
         eps: f32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "qsa_pool_norm_blocks",
-            kernels::QSA_BLOCK_PREPARE_SRC,
-            "qsa_pool_norm_blocks",
-        )?;
-        let func = &self.functions["qsa_pool_norm_blocks"];
+        // Raw keys may be stored f16 (the qwen4exp indexer cache); same math.
+        let name = if keys.dtype == DType::F16 {
+            "qsa_pool_norm_blocks_f16"
+        } else {
+            "qsa_pool_norm_blocks"
+        };
+        self.ensure_kernel(name, kernels::QSA_BLOCK_PREPARE_SRC, name)?;
+        let func = &self.functions[name];
         let (kp, vp, wp, op, sp) = (
             keys.buf.as_ptr(),
             visible.buf.as_ptr(),
@@ -1395,12 +1397,14 @@ impl Gpu {
         max_seq: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        self.ensure_kernel(
-            "qsa_cache_write",
-            kernels::QSA_ATTN_PREP_SRC,
-            "qsa_cache_write",
-        )?;
-        let func = &self.functions["qsa_cache_write"];
+        // An f16 cache narrows on store (the qwen4exp indexer keys).
+        let name = if cache.dtype == DType::F16 {
+            "qsa_cache_write_f16"
+        } else {
+            "qsa_cache_write"
+        };
+        self.ensure_kernel(name, kernels::QSA_ATTN_PREP_SRC, name)?;
+        let func = &self.functions[name];
         let (sp, cp) = (src.buf.as_ptr(), cache.buf.as_ptr());
         let (mut p, mut nk, mut hd, mut ms) = (pos, n_kv, head_dim, max_seq);
         let mut params: Vec<*mut c_void> = vec![

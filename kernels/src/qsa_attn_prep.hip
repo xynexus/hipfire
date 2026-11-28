@@ -98,6 +98,23 @@ extern "C" __global__ void qsa_cache_write(
     cache[((long long)kv * max_seq + pos) * head_dim + d] = src[i];
 }
 
+// f16-storage twin of `qsa_cache_write` (the indexer's raw keys). Narrowing is
+// on store only; every reader accumulates in f32.
+extern "C" __global__ void qsa_cache_write_f16(
+    const float* __restrict__ src,    // [n_kv, head_dim]
+    _Float16*    __restrict__ cache,  // [n_kv, max_seq, head_dim]
+    int pos,
+    int n_kv,
+    int head_dim,
+    int max_seq
+) {
+    const int i = blockIdx.x * BLOCK + threadIdx.x;
+    if (i >= n_kv * head_dim) return;
+    const int kv = i / head_dim;
+    const int d = i - kv * head_dim;
+    cache[((long long)kv * max_seq + pos) * head_dim + d] = (_Float16)src[i];
+}
+
 // Accumulate one expert's contribution into the MoE output.
 //
 // `accumulate == 0` OVERWRITES, so the first routed expert seeds the buffer and no

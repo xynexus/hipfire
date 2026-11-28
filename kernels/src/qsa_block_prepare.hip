@@ -24,9 +24,9 @@
 // Mean-pool each block's raw keys, then per-block RMSNorm with a shared weight.
 // Also emits each block's FIRST visible position, which is the position its
 // pooled key is rotated at.
-__launch_bounds__(BLOCK)
-extern "C" __global__ void qsa_pool_norm_blocks(
-    const float* __restrict__ keys,     // [n_positions, head_dim] raw, un-normed
+template <typename KT>
+__device__ __forceinline__ void qsa_pool_norm_blocks_impl(
+    const KT*    __restrict__ keys,     // [n_positions, head_dim] raw, un-normed
     const int*   __restrict__ visible,  // [n_visible] cache positions, increasing
     const float* __restrict__ weight,   // [head_dim], shared across blocks
     float*       __restrict__ out,      // [n_blocks, head_dim]
@@ -43,7 +43,7 @@ extern "C" __global__ void qsa_pool_norm_blocks(
     for (int i = threadIdx.x; i < head_dim; i += BLOCK) {
         float acc = 0.0f;
         for (int t = 0; t < compress_ratio; ++t) {
-            acc += keys[(long long)visible[b * compress_ratio + t] * head_dim + i];
+            acc += (float)keys[(long long)visible[b * compress_ratio + t] * head_dim + i];
         }
         out[dst + i] = acc / (float)compress_ratio;
     }
@@ -66,6 +66,37 @@ extern "C" __global__ void qsa_pool_norm_blocks(
     for (int i = threadIdx.x; i < head_dim; i += BLOCK) {
         out[dst + i] = out[dst + i] * scale * (1.0f + weight[i]);
     }
+}
+
+__launch_bounds__(BLOCK)
+extern "C" __global__ void qsa_pool_norm_blocks(
+    const float* __restrict__ keys,
+    const int*   __restrict__ visible,
+    const float* __restrict__ weight,
+    float*       __restrict__ out,
+    int*         __restrict__ starts,
+    int   n_blocks,
+    int   compress_ratio,
+    int   head_dim,
+    float eps
+) {
+    qsa_pool_norm_blocks_impl<float>(keys, visible, weight, out, starts, n_blocks, compress_ratio, head_dim, eps);
+}
+
+// f16 raw keys (the indexer cache's storage); pooling and norm stay f32.
+__launch_bounds__(BLOCK)
+extern "C" __global__ void qsa_pool_norm_blocks_f16(
+    const _Float16* __restrict__ keys,
+    const int*   __restrict__ visible,
+    const float* __restrict__ weight,
+    float*       __restrict__ out,
+    int*         __restrict__ starts,
+    int   n_blocks,
+    int   compress_ratio,
+    int   head_dim,
+    float eps
+) {
+    qsa_pool_norm_blocks_impl<_Float16>(keys, visible, weight, out, starts, n_blocks, compress_ratio, head_dim, eps);
 }
 
 // Score already-prepared block keys: ReLU per head, INSIDE the sum over heads.

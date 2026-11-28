@@ -159,6 +159,43 @@ fn main() {
                     cfg.rms_norm_eps,
                 )
                 .unwrap();
+                // The serving cache stores these raw keys f16, written through
+                // `qsa_cache_write` and pooled by the `_f16` kernel: same pooled
+                // keys to f16 storage precision, or the narrowing broke something.
+                if n_blocks > 0 {
+                    let g_k16 = gpu.zeros(&[n_tok * ihd], DType::F16).unwrap();
+                    for p in 0..n_tok {
+                        let row = g_keys.sub_offset(p * ihd, ihd);
+                        gpu.qsa_cache_write(&row, &g_k16, p as i32, 1, ihd as i32, n_tok as i32)
+                            .unwrap();
+                    }
+                    let g_bk16 = gpu.zeros(&[n_blocks * ihd], DType::F32).unwrap();
+                    gpu.qsa_pool_norm_blocks(
+                        &g_k16,
+                        &g_vis,
+                        &g_kn,
+                        &g_bk16,
+                        &g_st,
+                        n_blocks as i32,
+                        ix.compress_ratio as i32,
+                        ihd as i32,
+                        cfg.rms_norm_eps,
+                    )
+                    .unwrap();
+                    let a = gpu.download_f32(&g_bk).unwrap();
+                    let b = gpu.download_f32(&g_bk16).unwrap();
+                    let amax = a.iter().fold(0f32, |m, x| m.max(x.abs()));
+                    let err = a
+                        .iter()
+                        .zip(&b)
+                        .fold(0f32, |m, (x, y)| m.max((x - y).abs()));
+                    assert!(
+                        err <= 4e-3 * amax.max(1e-6),
+                        "f16 indexer keys: pooled max err {err:.3e} vs |max| {amax:.3e} at t={t}"
+                    );
+                    gpu.free_tensor(g_k16).unwrap();
+                    gpu.free_tensor(g_bk16).unwrap();
+                }
                 if n_blocks > 0 {
                     gpu.rope_partial_interleaved_f32_batched(
                         &g_bk,
