@@ -40,7 +40,9 @@ pub struct QsaCache {
     kv: QsaKv,
     /// `[max_seq, ix_head_dim]` — the indexer's own RAW keys (un-normed,
     /// un-rotated; both are applied to the POOLED key, not the per-token one).
-    /// Kept at f32 in every mode: they decide WHICH slots are attended.
+    /// Stored f16 (pooled and normed in f32): they decide WHICH slots are
+    /// attended, so the narrowing was measured, not assumed — see the
+    /// continuous-batching plan's P0a log.
     pub ix_keys: GpuTensor,
     pub len: usize,
     max_seq: usize,
@@ -70,14 +72,15 @@ impl QsaKvMode {
     /// |---|---|---|
     /// | f32 | 4.0550 | 4.4188 |
     /// | KVarN-4, un-rotated | 4.0880 (+0.81%) | — |
-    /// | KVarN-4, rotated | 4.0411 | — |
+    /// | KVarN-4, rotated | 4.0411 | 4.4341 (+0.35%) |
     /// | KVarN-8, un-rotated | 4.0345 | 4.4135 |
     /// | KVarN-8, rotated (this default) | 4.0306 | — |
     ///
-    /// The Hadamard rotation is what un-rotated KVarN-4 was missing. 8 stays the
-    /// default until rotated 4-bit is also measured at 32K; once K is quantised,
-    /// the Q8 V and f32 indexer keys dominate, so 8-bit K costs only ~100 MB per
-    /// 32K session over 4-bit.
+    /// The Hadamard rotation is what un-rotated KVarN-4 was missing. Rotated
+    /// 4-bit passes the 0.5% bar at 32K too, but its error GROWS with context
+    /// (−0.34% at 4K, +0.35% at 32K) while 8-bit stays flat, and once K is
+    /// quantised the Q8 V and indexer keys dominate, so 8-bit costs only
+    /// ~100 MB per 32K session over 4-bit. 8 stays the default.
     ///
     /// The deprecated single-tier modes are not implemented here, so they are
     /// NAMED and served as the default rather than silently honoured or refused.
@@ -173,7 +176,7 @@ impl QsaCache {
         };
         Ok(Self {
             kv,
-            ix_keys: gpu.zeros(&[max_seq * ix.head_dim], DType::F32)?,
+            ix_keys: gpu.zeros(&[max_seq * ix.head_dim], DType::F16)?,
             len: 0,
             max_seq,
         })

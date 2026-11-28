@@ -68,8 +68,9 @@ indexer → top-k blocks → `qsa_gather_kv` → `attention_cold_slots`). Plan:
 - gather: dequantize the SELECTED slots into the existing f32 `gath_k/gath_v`
   scratch (`kvarn_gather_k_tiles` / `kvarn_dequant_tile` are the building blocks),
   so `attention_cold_slots` is unchanged;
-- indexer keys (`ix_keys`, 1×128 per token) stay at source precision — they
-  decide selection, and they are 1/4 of one K row;
+- indexer keys (`ix_keys`, 1×128 per token) — planned at source precision
+  because they decide selection; narrowed to f16 after measuring it (P0a log,
+  2026-11-28);
 - known cost: a scattered pick drags its tile's per-channel scale/zero (the
   GLM-5.3 analysis priced this at ~4× read amplification for DSA). Below 2051
   visible tokens QSA is dense, so short contexts pay nothing.
@@ -196,7 +197,7 @@ valuable on its own (single-stream memory) whether or not batching lands.
   |---|---|---|
   | f32 | 4.0550 | 4.4188 |
   | KVarN-4 un-rotated | 4.0880 (+0.81%, FAILS) | — |
-  | KVarN-4 rotated | 4.0411 | not run |
+  | KVarN-4 rotated | 4.0411 | 4.4341 (+0.35%, passes; error grows with ctx) |
   | KVarN-8 un-rotated | 4.0345 | 4.4135 (−0.12%) |
   | KVarN-8 rotated (default) | 4.0306 | not run |
 
@@ -216,4 +217,26 @@ valuable on its own (single-stream memory) whether or not batching lands.
   Default: `kv_cache=auto` -> KVarN-8 for this family; on halo a
   `model_overrides` entry sets `kv_cache: kvarn8` (the server's loader rewrites
   `auto` to the generic `kvarn` = 4-bit, and the global config is `kvarn4`).
-  Rotated KVarN-4 is the candidate to replace it once measured at 32K.
+  Rotated KVarN-4 measured at 32K (2026-11-28): 4.4341, +0.35% — inside the
+  0.5% bar, but its error grows with context (−0.34% at 4K) while 8-bit stays
+  flat, for ~100 MB/32K session. KVarN-8 stays the default; revisit 4-bit only
+  with a 64K+ measurement.
+
+- 2026-11-28 **f16 indexer keys.** `ix_keys` stored f16 (narrowed on store by
+  `qsa_cache_write_f16`; `qsa_pool_norm_blocks_f16` pools and norms in f32).
+  201 -> 101 MB per 32K session, so a KVarN-8 session is ~523 MB, not 624.
+  `parity_indexer_gpu_vs_cpu` now also pools through the f16 path (max error
+  within 4e-3 of the pooled key's magnitude).
+
+  | 180B oq4, KVarN-8 | 4K PPL | 32K PPL |
+  |---|---|---|
+  | f32 KV (reference) | 4.0550 | 4.4188 |
+  | f32 indexer keys | 4.0306 | — |
+  | f16 indexer keys | 4.0446 (−0.26%) | 4.4075 (−0.26%) |
+
+  Within the bar at both lengths. The 4K swing between the two key precisions
+  (+0.35%) is bigger than f16 rounding "should" cause: the indexer's top-k
+  block selection is discrete, so a perturbation flips near-tied picks and
+  4K PPL wobbles by several tenths of a percent in EITHER direction (fp16 GDN
+  state moved it −0.48% at 4K, +0.007% at 32K). Decide precision changes on
+  32K, not 4K.
