@@ -29,7 +29,7 @@
 //! `KLD(ref‖A)` and `KLD(ref‖B)` are measured on identical inputs.
 //!
 //! Run: cargo run --release -p hipfire-arch-zaya --example kld -- \
-//!        <ref.bf16.hfq> <candA.hfq> [candB.hfq] --corpus <txt> [--ntok N]
+//!        <ref.bf16.hfq> <candA.hfq> [candB.hfq] --corpus <txt> [--ntok N] [--cand-kvarn 2|4|8]
 
 use hipfire_arch_zaya::arch::ZayaModel;
 use hipfire_arch_zaya::ZayaConfig;
@@ -92,7 +92,7 @@ fn main() {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--corpus" | "--ntok" => i += 2,
+            "--corpus" | "--ntok" | "--cand-kvarn" => i += 2,
             s if s.starts_with("--") => i += 1,
             s => {
                 positionals.push(s.to_string());
@@ -118,16 +118,35 @@ fn main() {
     let raw = std::fs::read(&corpus).expect("read corpus");
     let take = (ntok * 8).min(raw.len());
     let text = String::from_utf8_lossy(&raw[..take]).to_string();
-    let all = tok.encode(&text);
+    // ZAYA's tokenizer is Gemma-style `add_bos_token: true`: without BOS the
+    // first content token becomes the attention sink and the model runs out of
+    // distribution (PPL ~47 and hypersensitive to any KV perturbation).
+    let mut all = vec![tok.bos_id];
+    all.extend(tok.encode(&text));
     let n = all.len().min(ntok);
     let ids = &all[..n];
     eprintln!("KLD over {n} positions; ref={ref_path}");
+    if let Ok(path) = std::env::var("HIPFIRE_KLD_DUMP_IDS") {
+        let txt: Vec<String> = ids.iter().map(|i| i.to_string()).collect();
+        std::fs::write(&path, txt.join(" ")).expect("dump ids");
+        return;
+    }
 
     let mut gpu = Gpu::init().expect("gpu init");
     eprintln!("GPU: {}", gpu.arch);
     let max_seq = n + 16;
 
+    // The REFERENCE always gets f32 KV; `--cand-kvarn <2|4|8>` gives only the
+    // candidates a KVarN cache (zaya reads `HIPFIRE_ZAYA_KVARN` when each model's
+    // state is built), so the same weights isolate the KV-quant effect.
+    let cand_kvarn = flag(&args, "--cand-kvarn");
+    // Single-threaded here: no other thread reads the environment.
+    std::env::remove_var("HIPFIRE_ZAYA_KVARN");
     let mut reference = load(&mut gpu, ref_path, max_seq);
+    if let Some(bits) = cand_kvarn.as_deref() {
+        std::env::set_var("HIPFIRE_ZAYA_KVARN", bits);
+        eprintln!("candidates: KVarN-{bits} KV (reference: f32 KV)");
+    }
     let mut cands: Vec<Model> = cand_paths
         .iter()
         .map(|p| load(&mut gpu, p, max_seq))
@@ -144,6 +163,14 @@ fn main() {
     }
 
     let mut sum_kl = vec![0.0f64; cands.len()];
+    // True-token NLL: KLD vs a reference punishes ANY divergence, NLL says
+    // whether the candidate is actually worse at predicting the text.
+    let mut ref_nll = 0.0f64;
+    // DEBUG: raw f32 log-probs of the reference, one row per scored position.
+    let mut dump_logp = std::env::var("HIPFIRE_KLD_DUMP_LOGP")
+        .ok()
+        .map(|p| std::fs::File::create(p).expect("create logp dump"));
+    let mut cand_nll = vec![0.0f64; cands.len()];
     let mut count = 0usize;
     for (i, &tok_i) in ids.iter().enumerate().skip(1) {
         // Logits now predict token i given the true prefix 0..i-1.
@@ -151,10 +178,34 @@ fn main() {
             .download_f32(reference.model.logits())
             .expect("ref logits");
         let ref_logp = log_softmax(&ref_lg);
+        ref_nll -= ref_logp[tok_i as usize];
+        if let Some(f) = dump_logp.as_mut() {
+            use std::io::Write;
+            let b: Vec<u8> = ref_logp
+                .iter()
+                .flat_map(|&x| (x as f32).to_le_bytes())
+                .collect();
+            f.write_all(&b).expect("dump logp");
+        }
         for (ci, c) in cands.iter().enumerate() {
             let c_lg = gpu.download_f32(c.model.logits()).expect("cand logits");
             let c_logp = log_softmax(&c_lg);
-            sum_kl[ci] += kl_div(&ref_logp, &c_logp);
+            let kl = kl_div(&ref_logp, &c_logp);
+            if std::env::var("HIPFIRE_KLD_PERPOS").is_ok() {
+                let am = |v: &[f64]| {
+                    v.iter()
+                        .enumerate()
+                        .fold((0, f64::MIN), |b, (j, &x)| if x > b.1 { (j, x) } else { b })
+                        .0
+                };
+                eprintln!(
+                    "[perpos] i={i} kl={kl:.5} ref_top={} cand_top={}",
+                    am(&ref_logp),
+                    am(&c_logp)
+                );
+            }
+            sum_kl[ci] += kl;
+            cand_nll[ci] -= c_logp[tok_i as usize];
         }
         count += 1;
         // Feed the true token to every model.
@@ -178,6 +229,15 @@ fn main() {
         .collect();
     for (label, mean) in &results {
         println!("  {mean:.6}  {label}");
+    }
+    let n = count.max(1) as f64;
+    println!("PPL (true tokens): ref {:.4}", (ref_nll / n).exp());
+    for (c, nll) in cands.iter().zip(&cand_nll) {
+        println!(
+            "PPL (true tokens): cand {:.4}  {}",
+            (nll / n).exp(),
+            c.label
+        );
     }
     if results.len() == 2 {
         let delta = results[0].1 - results[1].1;

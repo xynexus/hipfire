@@ -169,3 +169,56 @@ against an f16/bf16 reference on the same corpus; "lossless" = KLD within noise.
 The earlier hier-KV result that the f16 hot ring is "PPL-identical to f32" is the
 bar a kvarn hot ring must clear — and the 0.085-KLD single-tier number is the gap
 it currently fails by.
+
+## Hadamard rotation per family; zaya KLD is a routing-chaos trap (2026-11-27)
+
+The paper's method is "a Hadamard rotation followed by dual-scaling variance
+normalization"; `kvarn_quantize_tile` is only the second half. Where the
+rotation is applied today: the qwen3.5 (decode, batched prefill, multi-session
+batch), gemma3 and gemma4 callers of `kvarn_attend`, at head_dim 256 only, via
+`rotate_x_mq_batched` on K and Q (`HIPFIRE_KVARN_ROTATE=0` opts out);
+`kv_hier.rs`; and Qwen3.8-Flash-Next's sparse attention (own KVarN path). zaya
+(head_dim 128) does not rotate by default; `HIPFIRE_ZAYA_KVARN_ROTATE=1` is a
+debug A/B switch.
+
+Flash-Next 180B oq4, PPL vs f32 KV 4.0550 (4K): KVarN-4 un-rotated 4.0880
+(+0.81%), **rotated 4.0411 (−0.34%)**; KVarN-8 rotated 4.0306. Clear win.
+
+### zaya: an earlier "rotation hurts +20%" was routing noise — RETRACTED
+
+A first zaya A/B (KLD vs the same model with f32 KV) read KVarN-4 un-rotated
+0.0565 vs rotated 0.0676, and KVarN-8 at ~1e-2. That looked like a KVarN math
+bug. It is not:
+
+- the fused KVarN flash matches an f64 host reference at head_dim 128
+  (`parity_kvarn_fused_flash`, which never covered 128 before);
+- the zaya forward matches HF: Zyphra's `transformers@zaya1` fork in fp32 on
+  CPU gives PPL 65.74 on the same 300 BOS-prefixed wikitext ids, hipfire
+  66.18 (bf16 weights). The checkpoint really is ~66 PPL on wikitext;
+- ZAYA routes top-1 over 16 experts + a null expert. ~0.6% of router
+  decisions are near-ties (margin 1e-4..3e-3), so ANY perturbation flips a few
+  and a flip cascades (one at layer 9 moved the next position's KLD to 1.28).
+  f16-rounding V costs as much unpinned KLD as Q8-rounding it, and hipfire vs
+  HF fp32 — two correct implementations — differ by KLD 3.2e-3 (median
+  2.8e-4, the top 3 of 299 positions = 50%). That is the floor.
+
+Measure KV quant on zaya with routes pinned (`HIPFIRE_ZAYA_PIN_ROUTES=1`: the
+candidate replays the reference's top-1 choices; host-MoE path, i.e. bf16/AWQ
+artifacts) plus true-token PPL, both from `examples/kld`. 2047 positions:
+
+| zaya KV (routes pinned) | KLD vs f32 KV | PPL (ref 46.62) |
+|---|---|---|
+| f32, V rounded to f16 | 4.0e-4 | 46.38 |
+| KVarN-8 | 1.1e-3 | 46.70 |
+| KVarN-4 | 3.1e-2 | 47.62 |
+| KVarN-4 rotated | 3.4e-2 | 46.01 |
+
+Rotation on zaya is inconclusive (KLD slightly worse, PPL better), so the
+default stays un-rotated. KVarN-8 is safe; KVarN-4 costs ~30x KVarN-8's KLD.
+
+Reproduce: `cargo run --release -p hipfire-arch-zaya --example kld --
+<model.bf16.hfq> <same.hfq> --corpus <txt> --ntok 2048 --cand-kvarn 4` with
+`HIPFIRE_ZAYA_PIN_ROUTES=1`. For an HF oracle, `HIPFIRE_KLD_DUMP_IDS=<file>`
+writes the scored ids and `HIPFIRE_KLD_DUMP_LOGP=<file>` the reference's f32
+log-probs. The fork wants the canonical `refs/main` (67d34da5) snapshot, not
+the raw-Megatron 970cfc9f one streamed calibration uses.

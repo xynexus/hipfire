@@ -93,7 +93,8 @@ fn main() {
     // MAXDPT template refactor); head_dim 512 exercises the `_hd512` variants
     // (gemma4 global layers). The v1 f16k_q8v cross-check runs only at 256 (that
     // path is unrelated to the head_dim-512 kvarn work).
-    for &head_dim in &[256usize, 512usize] {
+    // head_dim 128 is zaya's (ZAYA1-8B); it was never in this sweep.
+    for &head_dim in &[128usize, 256usize, 512usize] {
         for &(nfb, tail) in &[
             (0usize, 50usize),
             (0, 127),
@@ -102,7 +103,7 @@ fn main() {
             (2, 40),
             (3, 1),
         ] {
-            all_pass &= run_case(&mut gpu, head_dim, nfb, tail, head_dim <= 256);
+            all_pass &= run_case(&mut gpu, head_dim, nfb, tail, head_dim == 256);
         }
     }
     if !all_pass {
