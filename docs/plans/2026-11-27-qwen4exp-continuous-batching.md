@@ -240,3 +240,32 @@ valuable on its own (single-stream memory) whether or not batching lands.
   4K PPL wobbles by several tenths of a percent in EITHER direction (fp16 GDN
   state moved it −0.48% at 4K, +0.007% at 32K). Decide precision changes on
   32K, not 4K.
+
+- 2026-11-28 **P0b FAILED — DeltaNet state stays f32.** Measured with S stored
+  f16 (`gated_delta_net_f16_batch_seq`, same update math, f32 working copy,
+  deterministic dither on write-back), KVarN-8 + f16 indexer keys, 180B oq4:
+
+  | | fp32 state | fp16 state |
+  |---|---|---|
+  | 32K PPL, batched scorer | 4.4075 | 4.4078 (+0.007%) |
+  | 2K PPL, per-token decode path | 3.0017 | 2.9837 (−0.6%) |
+  | greedy decode vs fp32 (2048 steps) | — | **diverges at step 16** |
+
+  The batched scorer narrows state once per LAUNCH, so 32K PPL barely
+  exercises f16 storage; decode narrows on EVERY token, which is what the
+  greedy bar is for. The divergence is at a near-tie (top-2 margin 0.084),
+  but it is not the noise floor: an fp32 rerun stays bit-identical for 512
+  steps, and on the shared prefix fp16 state shifts the top-2 margin by 0.23
+  logits on average (max 0.49), where the reruns shift it by 0. No kernel
+  bug (the two kernels' update math is line-for-line identical) and no
+  overflow. Quality is neutral, but the bar says "≥1K matching tokens" and
+  the payoff is only 112 → 56 MiB per session, against ~523 MB of KVarN-8
+  KV at 32K. Not worth a decode stream that no longer agrees with fp32.
+
+  Correction to this plan's premise: GDN state is NOT most of a session.
+  It dominates only at short context; at 32K the KV cache is ~5x larger.
+  The f16-state plumbing was removed again. To repeat the experiment:
+  `GdnState` allocates `DType::F16`, both recurrence call sites (decode in
+  `gdn.rs`, prefill in `prefill_gpu.rs`) dispatch to the f16 kernel by dtype,
+  and MTP rollback must refuse (the per-token snapshot kernel is f32-only).
+  `examples/greedy_qwen4exp` is the decode-cadence A/B tool.
